@@ -1,0 +1,24 @@
+[package]
+name = "ide-app"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ide-core = { path = "../ide-core" }
+ide-vfs = { path = "../ide-vfs" }
+ide-syntax = { path = "../ide-syntax" }
+ide-search = { path = "../ide-search" }
+ide-lsp = { path = "../ide-lsp" }
+ide-dap = { path = "../ide-dap" }
+ide-git = { path = "../ide-git" }
+ide-terminal = { path = "../ide-terminal" }
+ide-agent-hub = { path = "../ide-agent-hub" }
+anyhow.workspace = true
+tao.workspace = true
+softbuffer.workspace = true
+windows-sys.workspace = true
+png.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

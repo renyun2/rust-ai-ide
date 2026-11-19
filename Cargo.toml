@@ -1,0 +1,76 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ide-core",
+    "crates/ide-vfs",
+    "crates/ide-syntax",
+    "crates/ide-search",
+    "crates/ide-lsp",
+    "crates/ide-dap",
+    "crates/ide-git",
+    "crates/ide-terminal",
+    "crates/ide-agent-hub",
+    "crates/ide-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Rust AI IDE Team"]
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+anyhow = "1.0"
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.54", features = ["full"] }
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1.28", features = ["v4", "serde"] }
+url = { version = "2.5", features = ["serde"] }
+ropey = "1.6"
+similar = { version = "2.7", features = ["inline"] }
+notify = "8.2"
+walkdir = "2.5"
+ignore = "0.4"
+grep-searcher = "0.1"
+grep-regex = "0.1"
+grep-matcher = "0.1"
+globset = "0.4"
+regex = "1.13"
+lsp-types = "0.97"
+portable-pty = "0.9"
+tree-sitter = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"
+tree-sitter-javascript = "0.25"
+tree-sitter-python = "0.25"
+tao = "0.37"
+softbuffer = { version = "0.4", default-features = false }
+png = "0.18"
+tiny-skia = "0.12"
+windows-core = "0.62"
+
+[workspace.dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dwm",
+    "Win32_System_Com",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+

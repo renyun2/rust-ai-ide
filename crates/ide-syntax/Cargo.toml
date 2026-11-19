@@ -1,0 +1,9 @@
+[package]
+name = "ide-syntax"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ide-core = { path = "../ide-core" }
+serde.workspace = true
+regex.workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "ide-agent-hub"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ide-core = { path = "../ide-core" }
+ide-git = { path = "../ide-git" }
+ide-lsp = { path = "../ide-lsp" }
+ide-syntax = { path = "../ide-syntax" }
+ide-search = { path = "../ide-search" }
+anyhow.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true

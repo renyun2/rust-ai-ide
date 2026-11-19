@@ -1,0 +1,13 @@
+[package]
+name = "ide-vfs"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ide-core = { path = "../ide-core" }
+anyhow.workspace = true
+ropey.workspace = true
+notify.workspace = true
+walkdir.workspace = true
+serde.workspace = true
+parking_lot.workspace = true

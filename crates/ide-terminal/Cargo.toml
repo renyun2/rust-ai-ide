@@ -1,0 +1,11 @@
+[package]
+name = "ide-terminal"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ide-core = { path = "../ide-core" }
+anyhow.workspace = true
+portable-pty.workspace = true
+parking_lot.workspace = true
+serde.workspace = true

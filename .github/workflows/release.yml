@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Publish Windows x86_64
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Build release binary
+        run: cargo build -p ide-app --release
+
+      - name: Self-check the release binary
+        run: .\target\release\ide-app.exe --self-check
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "RI-${{ github.ref_name }}-windows-x86_64"
+          $zip = Join-Path (Get-Location) "$name.zip"
+          Compress-Archive -Path target\release\ide-app.exe -DestinationPath $zip -Force
+          $hash = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash.ToLowerInvariant()
+          Set-Content -Path "$zip.sha256" -Value "$hash  $name.zip" -Encoding ascii
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true
+          files: |
+            RI-*.zip
+            RI-*.zip.sha256

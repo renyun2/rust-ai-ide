@@ -34,6 +34,7 @@ The desktop target today is **Windows 10/11**. Language servers and agent CLIs a
 - [Requirements](#requirements)
 - [Getting started](#getting-started)
 - [Development](#development)
+- [Releases](#releases)
 - [Project layout](#project-layout)
 - [Status](#status)
 - [Brand assets](#brand-assets)
@@ -239,6 +240,28 @@ Issues and pull requests are welcome. Please run `cargo test --workspace` and `c
 
 ---
 
+## Releases
+
+GitHub Actions builds the Windows release when a version tag is pushed. The workflow file has to be in that commit. Tagging an older commit that does not contain `.github/workflows/release.yml` does not start a build.
+
+```powershell
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+[`.github/workflows/release.yml`](.github/workflows/release.yml) then runs on `windows-latest`:
+
+1. `cargo test --workspace`
+2. `cargo build -p ide-app --release`
+3. `ide-app.exe --self-check`
+4. Publish a GitHub Release with `RI-v0.1.0-windows-x86_64.zip` and a SHA-256 file
+
+A tag that contains a hyphen, such as `v0.2.0-rc.1`, is published as a pre-release. Pushing to `master` or `main`, and opening a pull request, runs tests only ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
+
+On a private repository, allow Actions to create releases: **Settings → Actions → General → Workflow permissions → Read and write permissions**.
+
+---
+
 ## Project layout
 
 ```text
@@ -254,6 +277,7 @@ rust-ai-ide/
 │   ├── ide-terminal/
 │   ├── ide-agent-hub/
 │   └── ide-app/
+├── .github/workflows/      # ci.yml, release.yml
 ├── assets/                 # ri_icon.svg, ri_icon.png
 ├── Cargo.toml              # workspace, version 0.1.0
 ├── README.md               # this file

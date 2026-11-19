@@ -34,6 +34,7 @@ RI（**R**ust **I**DE）是面向 Rust、TypeScript、JavaScript 与 Python 的�
 - [环境要求](#环境要求)
 - [快速开始](#快速开始)
 - [开发](#开发)
+- [发行版](#发行版)
 - [仓库结构](#仓库结构)
 - [现状](#现状)
 - [品牌资源](#品牌资源)
@@ -239,6 +240,28 @@ cargo run -p ide-app -- --self-check
 
 ---
 
+## 发行版
+
+推送版本标签后，GitHub Actions 会构建 Windows 发行包。工作流文件必须包含在那个提交里。给一个还没有 `.github/workflows/release.yml` 的旧提交打标签，不会开始构建。
+
+```powershell
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+[`.github/workflows/release.yml`](.github/workflows/release.yml) 在 `windows-latest` 上依次执行：
+
+1. `cargo test --workspace`
+2. `cargo build -p ide-app --release`
+3. `ide-app.exe --self-check`
+4. 发布 GitHub Release，附带 `RI-v0.1.0-windows-x86_64.zip` 和 SHA-256 校验文件
+
+标签名里带连字符时（例如 `v0.2.0-rc.1`）会标成预发布。推送到 `master` 或 `main`，以及打开 Pull Request，只跑测试（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）。
+
+私有仓库需要允许 Actions 创建 Release：**Settings → Actions → General → Workflow permissions → Read and write permissions**。
+
+---
+
 ## 仓库结构
 
 ```text
@@ -254,6 +277,7 @@ rust-ai-ide/
 │   ├── ide-terminal/
 │   ├── ide-agent-hub/
 │   └── ide-app/
+├── .github/workflows/      # ci.yml、release.yml
 ├── assets/                 # ri_icon.svg、ri_icon.png
 ├── Cargo.toml              # workspace，版本 0.1.0
 ├── README.md               # 英文主文档

@@ -4,6 +4,7 @@ mod agent_panel;
 mod canvas;
 mod ide_state;
 mod image_preview;
+mod persistence;
 mod text_input;
 
 use crate::canvas::{
@@ -101,7 +102,7 @@ fn apply_windows11_rounded_corners(window: &tao::window::Window) {
     use tao::platform::windows::WindowExtWindows;
     use windows::Win32::Foundation::HWND;
     use windows::Win32::Graphics::Dwm::{
-        DwmSetWindowAttribute, DWMWCP_ROUND, DWMWA_WINDOW_CORNER_PREFERENCE,
+        DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
     };
     let hwnd = HWND(window.hwnd() as *mut core::ffi::c_void);
     let pref = DWMWCP_ROUND.0 as u32;
@@ -193,14 +194,14 @@ fn sync_window_cursor(
     }
 }
 
-fn parse_workspace_arg(args: &[String]) -> PathBuf {
+fn parse_explicit_workspace_arg(args: &[String]) -> Option<PathBuf> {
     let mut i = 1;
     while i < args.len() {
         if args[i] == "--workspace" {
             if let Some(next) = args.get(i + 1) {
                 let p = PathBuf::from(next);
                 if p.is_dir() {
-                    return p;
+                    return Some(p);
                 }
             }
         }
@@ -210,11 +211,16 @@ fn parse_workspace_arg(args: &[String]) -> PathBuf {
         if !arg.starts_with('-') {
             let p = PathBuf::from(arg);
             if p.is_dir() {
-                return p;
+                return Some(p);
             }
         }
     }
-    env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    None
+}
+
+fn parse_workspace_arg(args: &[String]) -> PathBuf {
+    parse_explicit_workspace_arg(args)
+        .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
 fn main() -> Result<()> {
@@ -228,7 +234,14 @@ fn main() -> Result<()> {
         println!("Exported RI icon PNG: {}", out_path.display());
         return Ok(());
     }
-    let workspace_root = parse_workspace_arg(&args);
+    let storage_dir = persistence::default_storage_dir();
+    let saved_global: persistence::PersistedGlobalSettings = storage_dir
+        .as_deref()
+        .and_then(|d| persistence::load_json(&persistence::global_settings_path(d)))
+        .unwrap_or_default();
+    let workspace_root = parse_explicit_workspace_arg(&args)
+        .or_else(|| saved_global.last_workspace.clone().filter(|p| p.is_dir()))
+        .unwrap_or_else(|| parse_workspace_arg(&args));
     let ui_test_mode = args.iter().any(|a| a == "--ui-test");
 
     if args.iter().any(|a| a == "--self-check") {
@@ -281,11 +294,20 @@ fn main() -> Result<()> {
             let _ = canvas.save_png(&screenshot_dir.join("idea_ui_ctrl_k_diff.png"));
         }
 
-        println!("=== Rust AI IDE (Latest IDEA Islands UI + Full Interactive Engine) Self-Check ===");
+        println!(
+            "=== Rust AI IDE (Latest IDEA Islands UI + Full Interactive Engine) Self-Check ==="
+        );
         println!("Workspace Root : {}", state.workspace_root.display());
-        println!("System DPI     : {:.0}% (scale {:.2}x)", sys_scale * 100.0, sys_scale);
+        println!(
+            "System DPI     : {:.0}% (scale {:.2}x)",
+            sys_scale * 100.0,
+            sys_scale
+        );
         println!("Open Buffers   : {}", state.open_buffers.len());
-        println!("Visible Tree   : {}", state.project_tree.visible_entries.len());
+        println!(
+            "Visible Tree   : {}",
+            state.project_tree.visible_entries.len()
+        );
         println!(
             "Git Branch     : {} ({} changed files)",
             state.git_engine.current_branch,
@@ -308,7 +330,14 @@ fn main() -> Result<()> {
         let _ = proxy.send_event(IdeWakeupEvent::Wakeup);
     });
 
-    let (init_log_w, init_log_h) = if let Some(mon) = event_loop.primary_monitor() {
+    let (init_log_w, init_log_h) = if saved_global.window_width >= 800
+        && saved_global.window_height >= 540
+    {
+        (
+            saved_global.window_width as f64,
+            saved_global.window_height as f64,
+        )
+    } else if let Some(mon) = event_loop.primary_monitor() {
         let mscale = mon.scale_factor().max(0.5);
         let msize = mon.size();
         let mon_log_w = msize.width as f64 / mscale;
@@ -323,13 +352,11 @@ fn main() -> Result<()> {
 
     let window = Rc::new(
         WindowBuilder::new()
-            .with_title(format!(
-                "RI — Rust AI IDE [{}]",
-                workspace_root.display()
-            ))
+            .with_title(format!("RI — Rust AI IDE [{}]", workspace_root.display()))
             .with_window_icon(load_ri_window_icon())
             .with_decorations(false)
             .with_resizable(true)
+            .with_maximized(saved_global.window_maximized)
             .with_inner_size(LogicalSize::new(init_log_w, init_log_h))
             .build(&event_loop)?,
     );
@@ -341,6 +368,10 @@ fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to create rendering surface: {e}"))?;
 
     let mut app_state = IdeApplicationState::new_with_wakeup(workspace_root, Some(wakeup));
+    if let Some(dir) = storage_dir {
+        app_state.restore_from_persistence_dir(dir);
+        sync_window_title(&window, &mut app_state);
+    }
     let init_os_scale = (window.scale_factor() as f32).clamp(0.75, 4.0);
     app_state.system_dpi_scale = init_os_scale;
     app_state.window_maximized = window.is_maximized();
@@ -472,6 +503,7 @@ fn main() -> Result<()> {
             }
             Event::WindowEvent { event, .. } => match event {
                 WindowEvent::CloseRequested => {
+                    app_state.save_all_persisted_state();
                     *control_flow = ControlFlow::Exit;
                 }
                 WindowEvent::Resized(_) => {
@@ -672,6 +704,7 @@ fn main() -> Result<()> {
                                     app_state.window_maximized = next;
                                 }
                                 WindowControlCmd::Close => {
+                                    app_state.save_all_persisted_state();
                                     *control_flow = ControlFlow::Exit;
                                 }
                             }
@@ -683,6 +716,7 @@ fn main() -> Result<()> {
                         left_mouse_down = false;
                         let _ = app_state.finish_ide_drag_at(cursor_pos.0, cursor_pos.1);
                         app_state.end_splitter_drag();
+                        app_state.save_global_settings();
                         app_state.end_scrollbar_drag();
                         app_state.end_mouse_text_drag();
                         sync_window_cursor(
@@ -1017,6 +1051,12 @@ fn main() -> Result<()> {
                             } else if app_state.focus == FocusTarget::OpenProjectChoiceModal {
                                 app_state.pending_open_workspace = None;
                                 app_state.focus = FocusTarget::Editor;
+                            } else if app_state.focus == FocusTarget::EditMessageRewindModal {
+                                app_state.cancel_edit_message_rewind_modal();
+                            } else if app_state.editing_sent_msg_idx.is_some()
+                                && app_state.focus == FocusTarget::AgentChatInput
+                            {
+                                app_state.cancel_edit_sent_user_message();
                             } else if app_state.focus == FocusTarget::TerminalInput {
                                 app_state.terminal.active_pty_mut().send_raw_bytes(b"\x1b");
                             } else {
@@ -1162,14 +1202,7 @@ fn main() -> Result<()> {
                                 pty.send_raw_bytes(b"\r");
                             }
                             FocusTarget::GitCommitInput => {
-                                let msg = app_state.git_commit_input.as_str().to_string();
-                                app_state.git_engine.request_commit_with_options(
-                                    &msg,
-                                    app_state.git_amend_commit,
-                                    false,
-                                );
-                                app_state.status_notification =
-                                    "正在后台提交 Git 变更...".to_string();
+                                app_state.submit_git_commit(false);
                             }
                             FocusTarget::GitLogSearchInput => {
                                 app_state.git_log_scroll = 0;
@@ -1190,6 +1223,9 @@ fn main() -> Result<()> {
                                     }
                                 }
                                 app_state.focus = FocusTarget::Editor;
+                            }
+                            FocusTarget::EditMessageRewindModal => {
+                                app_state.confirm_edit_message_rewind(!shift);
                             }
                             FocusTarget::Editor => {
                                 if alt {
@@ -1332,4 +1368,3 @@ fn main() -> Result<()> {
         }
     });
 }
-

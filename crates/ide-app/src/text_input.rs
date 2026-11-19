@@ -75,9 +75,7 @@ impl TextInputField {
     pub fn take_and_push_history(&mut self) -> String {
         let taken = std::mem::take(&mut self.text);
         let trimmed = taken.trim();
-        if !trimmed.is_empty()
-            && self.history.last().map(|s| s.as_str()) != Some(trimmed)
-        {
+        if !trimmed.is_empty() && self.history.last().map(|s| s.as_str()) != Some(trimmed) {
             self.history.push(trimmed.to_string());
         }
         self.clear();
@@ -445,8 +443,9 @@ impl TextInputField {
                                 });
                                 break;
                             }
-                            let mut take_n =
-                                canvas.measure_caret_col_in_line(&rem_str, max_w, style).max(1);
+                            let mut take_n = canvas
+                                .measure_caret_col_in_line(&rem_str, max_w, style)
+                                .max(1);
                             let rem_len = idx - seg_start;
                             if take_n >= rem_len {
                                 take_n = rem_len.saturating_sub(1).max(1);
@@ -490,7 +489,8 @@ impl TextInputField {
             // 若当前位置正好在硬换行前的行尾（且不是被自动折行拆开的前一段），归属该行末尾
             let ends_with_newline = seg.end_char < chars.len() && chars[seg.end_char] == '\n';
             let inclusive_end = is_last || ends_with_newline;
-            if cur >= seg.start_char && (cur < seg.end_char || (inclusive_end && cur <= seg.end_char))
+            if cur >= seg.start_char
+                && (cur < seg.end_char || (inclusive_end && cur <= seg.end_char))
             {
                 return (i, cur - seg.start_char);
             }
@@ -659,8 +659,16 @@ impl TextInputField {
             let cs = sel_s.max(start_vis_char).min(end_vis_char);
             let ce = sel_e.max(start_vis_char).min(end_vis_char);
             if ce > cs {
-                let s_rel: String = display_str.chars().skip(start_vis_char).take(cs - start_vis_char).collect();
-                let e_rel: String = display_str.chars().skip(start_vis_char).take(ce - start_vis_char).collect();
+                let s_rel: String = display_str
+                    .chars()
+                    .skip(start_vis_char)
+                    .take(cs - start_vis_char)
+                    .collect();
+                let e_rel: String = display_str
+                    .chars()
+                    .skip(start_vis_char)
+                    .take(ce - start_vis_char)
+                    .collect();
                 let (sx, _) = canvas.measure_text(&s_rel, style);
                 let (ex, _) = canvas.measure_text(&e_rel, style);
                 canvas.fill_rounded_rect(
@@ -729,22 +737,22 @@ impl TextInputField {
         let mut ime = (text_rect.x, text_rect.y + line_h);
         let mut y = text_rect.y;
 
-        for (vis_idx, seg) in segs
-            .iter()
-            .enumerate()
-            .skip(self.scroll_y)
-            .take(max_lines)
-        {
+        for (vis_idx, seg) in segs.iter().enumerate().skip(self.scroll_y).take(max_lines) {
             if let Some((sel_s, sel_e)) = sel {
                 let ov_s = sel_s.max(seg.start_char).min(seg.end_char);
                 let ov_e = sel_e.max(seg.start_char).min(seg.end_char);
-                if ov_e > ov_s || (sel_s <= seg.start_char && sel_e > seg.end_char && seg.text.is_empty())
+                if ov_e > ov_s
+                    || (sel_s <= seg.start_char && sel_e > seg.end_char && seg.text.is_empty())
                 {
                     let before: String = seg.text.chars().take(ov_s - seg.start_char).collect();
                     let upto: String = seg.text.chars().take(ov_e - seg.start_char).collect();
                     let (sx, _) = canvas.measure_text(&before, style);
                     let (ex, _) = canvas.measure_text(&upto, style);
-                    let hl_w = if seg.text.is_empty() { 8 } else { (ex - sx).max(4) };
+                    let hl_w = if seg.text.is_empty() {
+                        8
+                    } else {
+                        (ex - sx).max(4)
+                    };
                     canvas.fill_rounded_rect(
                         Rect::new(text_rect.x + sx, y, hl_w, line_h - 1),
                         2,
@@ -754,14 +762,7 @@ impl TextInputField {
             }
 
             if !seg.text.is_empty() {
-                canvas.draw_text_styled(
-                    text_rect.x,
-                    y,
-                    &seg.text,
-                    text_color,
-                    text_rect.w,
-                    style,
-                );
+                canvas.draw_text_styled(text_rect.x, y, &seg.text, text_color, text_rect.w, style);
             }
 
             if vis_idx == cur_line {

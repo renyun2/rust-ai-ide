@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use similar::{ChangeTag, TextDiff};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -127,11 +127,13 @@ enum GitWorkerCmd {
         currently_staged: bool,
     },
     RollbackFile(PathBuf),
+    RollbackFiles(Vec<PathBuf>),
     RollbackAll,
     Commit {
         message: String,
         amend: bool,
         push_after: bool,
+        files: Vec<PathBuf>,
     },
     CheckoutBranch(String),
     CreateAndCheckoutBranch {
@@ -183,6 +185,8 @@ pub struct GitEngine {
     pub tags: Vec<String>,
     pub ahead_behind: (usize, usize),
     pub changed_files: Vec<GitChangedFile>,
+    pub commit_checked_files: HashSet<PathBuf>,
+    known_changed_files: HashSet<PathBuf>,
     pub working_diffs: HashMap<PathBuf, Vec<DiffLine>>,
     pub recent_commits: Vec<GitLogEntry>,
     pub commit_details: HashMap<String, GitCommitDetail>,
@@ -918,6 +922,23 @@ fn spawn_git_worker(
                             },
                         );
                     }
+                    GitWorkerCmd::RollbackFiles(files) => {
+                        let count = files.len();
+                        for file in &files {
+                            let _ = rollback_single_file(&root, file);
+                        }
+                        let snapshot = collect_snapshot(&root);
+                        let msg = format!("Rolled back {count} selected file(s).");
+                        notify(
+                            &event_tx,
+                            GitWorkerEvent::SnapshotUpdated {
+                                snapshot,
+                                notification: Some(msg.clone()),
+                                output: Some(msg),
+                                clear_commit_input: false,
+                            },
+                        );
+                    }
                     GitWorkerCmd::RollbackAll => {
                         let _ = git_command(&root).args(["reset", "--hard", "HEAD"]).output();
                         let _ = git_command(&root).args(["clean", "-fd"]).output();
@@ -937,22 +958,109 @@ fn spawn_git_worker(
                         message,
                         amend,
                         push_after,
+                        files,
                     } => {
-                        let has_staged = git_command(&root)
-                            .args(["diff", "--cached", "--name-only"])
-                            .output()
-                            .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
-                            .unwrap_or(false);
-                        if !has_staged {
-                            let _ = git_command(&root).args(["add", "-A"]).output();
+                        let trimmed_msg = message.trim();
+                        if trimmed_msg.is_empty() {
+                            let snapshot = collect_snapshot(&root);
+                            let msg = "Commit skipped: please enter a commit message.".to_string();
+                            notify(
+                                &event_tx,
+                                GitWorkerEvent::SnapshotUpdated {
+                                    snapshot,
+                                    notification: Some(msg.clone()),
+                                    output: Some(msg),
+                                    clear_commit_input: false,
+                                },
+                            );
+                            busy_ref.store(false, Ordering::Release);
+                            continue;
                         }
+                        if files.is_empty() && !amend {
+                            let snapshot = collect_snapshot(&root);
+                            let msg = "Commit skipped: no files checked to commit.".to_string();
+                            notify(
+                                &event_tx,
+                                GitWorkerEvent::SnapshotUpdated {
+                                    snapshot,
+                                    notification: Some(msg.clone()),
+                                    output: Some(msg),
+                                    clear_commit_input: false,
+                                },
+                            );
+                            busy_ref.store(false, Ordering::Release);
+                            continue;
+                        }
+
                         ensure_git_identity(&root);
+                        let has_head = git_command(&root)
+                            .args(["rev-parse", "--verify", "HEAD"])
+                            .output()
+                            .map(|o| o.status.success())
+                            .unwrap_or(false);
+
+                        let rel_files: Vec<PathBuf> = files
+                            .iter()
+                            .map(|p| p.strip_prefix(&root).unwrap_or(p).to_path_buf())
+                            .collect();
+
+                        let mut intent_added: Vec<PathBuf> = Vec::new();
+                        if !rel_files.is_empty() {
+                            if has_head {
+                                // Only track untracked files with intent-to-add right before committing them,
+                                // so `git commit -- <paths>` commits only the checked files and preserves index for others.
+                                let mut untracked_selected: Vec<PathBuf> = Vec::new();
+                                if let Ok(st_out) =
+                                    git_command(&root).args(["status", "--porcelain"]).output()
+                                {
+                                    if st_out.status.success() {
+                                        let untracked_set: HashSet<PathBuf> =
+                                            String::from_utf8_lossy(&st_out.stdout)
+                                                .lines()
+                                                .filter(|l| l.len() >= 4 && &l[0..2] == "??")
+                                                .map(|l| {
+                                                    PathBuf::from(l[3..].trim().trim_matches('"'))
+                                                })
+                                                .collect();
+                                        for rf in &rel_files {
+                                            if untracked_set.contains(rf) {
+                                                untracked_selected.push(rf.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                                if !untracked_selected.is_empty() {
+                                    let mut add_n = git_command(&root);
+                                    add_n.args(["add", "-N", "--"]);
+                                    for uf in &untracked_selected {
+                                        add_n.arg(uf);
+                                    }
+                                    if add_n.output().is_ok_and(|o| o.status.success()) {
+                                        intent_added = untracked_selected;
+                                    }
+                                }
+                            } else {
+                                let mut add_cmd = git_command(&root);
+                                add_cmd.args(["add", "--"]);
+                                for rf in &rel_files {
+                                    add_cmd.arg(rf);
+                                }
+                                let _ = add_cmd.output();
+                            }
+                        }
+
                         let mut commit_cmd = git_command(&root);
                         commit_cmd.arg("commit");
                         if amend {
                             commit_cmd.arg("--amend");
                         }
-                        commit_cmd.args(["-m", &message]);
+                        commit_cmd.args(["-m", trimmed_msg]);
+                        if has_head && !rel_files.is_empty() {
+                            commit_cmd.arg("--");
+                            for rf in &rel_files {
+                                commit_cmd.arg(rf);
+                            }
+                        }
                         let out = commit_cmd.output();
 
                         let (ok, mut summary) = match out {
@@ -964,15 +1072,35 @@ fn spawn_git_worker(
                                     .unwrap_or("Committed successfully")
                                     .to_string(),
                             ),
-                            Ok(o) => (
-                                false,
-                                String::from_utf8_lossy(&o.stderr)
-                                    .lines()
-                                    .next()
-                                    .unwrap_or("Commit skipped (nothing to commit)")
-                                    .to_string(),
-                            ),
-                            Err(e) => (false, format!("Commit failed: {e}")),
+                            Ok(o) => {
+                                if !intent_added.is_empty() {
+                                    let mut reset_cmd = git_command(&root);
+                                    reset_cmd.args(["reset", "-q", "HEAD", "--"]);
+                                    for uf in &intent_added {
+                                        reset_cmd.arg(uf);
+                                    }
+                                    let _ = reset_cmd.output();
+                                }
+                                (
+                                    false,
+                                    String::from_utf8_lossy(&o.stderr)
+                                        .lines()
+                                        .next()
+                                        .unwrap_or("Commit skipped (nothing to commit)")
+                                        .to_string(),
+                                )
+                            }
+                            Err(e) => {
+                                if !intent_added.is_empty() {
+                                    let mut reset_cmd = git_command(&root);
+                                    reset_cmd.args(["reset", "-q", "HEAD", "--"]);
+                                    for uf in &intent_added {
+                                        reset_cmd.arg(uf);
+                                    }
+                                    let _ = reset_cmd.output();
+                                }
+                                (false, format!("Commit failed: {e}"))
+                            }
                         };
 
                         if ok && push_after {
@@ -1295,10 +1423,12 @@ impl GitEngine {
             tags: Vec::new(),
             ahead_behind: (0, 0),
             changed_files: Vec::new(),
+            commit_checked_files: HashSet::new(),
+            known_changed_files: HashSet::new(),
             working_diffs: HashMap::new(),
             recent_commits: Vec::new(),
             commit_details: HashMap::new(),
-            commit_message_draft: "feat: update Rust AI IDE workspace".to_string(),
+            commit_message_draft: String::new(),
             last_operation_output: String::new(),
             has_loaded_snapshot: false,
             cmd_tx,
@@ -1318,6 +1448,24 @@ impl GitEngine {
         self.remote_branches = snapshot.remote_branches;
         self.tags = snapshot.tags;
         self.ahead_behind = snapshot.ahead_behind;
+
+        let current_paths: HashSet<PathBuf> = snapshot
+            .changed_files
+            .iter()
+            .map(|f| f.path.clone())
+            .collect();
+        self.commit_checked_files
+            .retain(|p| current_paths.contains(p));
+        self.known_changed_files
+            .retain(|p| current_paths.contains(p));
+        for ch in &snapshot.changed_files {
+            if self.known_changed_files.insert(ch.path.clone())
+                && ch.status != GitFileStatusKind::Untracked
+            {
+                self.commit_checked_files.insert(ch.path.clone());
+            }
+        }
+
         self.changed_files = snapshot.changed_files;
         self.working_diffs = snapshot.working_diffs;
         self.recent_commits = snapshot.recent_commits;
@@ -1325,6 +1473,65 @@ impl GitEngine {
         if let Some(detail) = snapshot.head_detail {
             self.commit_details.insert(detail.hash.clone(), detail);
         }
+    }
+
+    pub fn is_file_checked_for_commit(&self, path: &Path) -> bool {
+        self.commit_checked_files.contains(path)
+    }
+
+    /// IDEA 风格纯勾选/取消勾选（不触发 git add / git reset 暂存）
+    pub fn toggle_commit_file_checked(&mut self, path: &Path) -> bool {
+        if self.commit_checked_files.contains(path) {
+            self.commit_checked_files.remove(path);
+            false
+        } else {
+            self.commit_checked_files.insert(path.to_path_buf());
+            true
+        }
+    }
+
+    /// 批量勾选或取消勾选分组（`untracked_group == false` 为已跟踪变更，`true` 为未跟踪文件）
+    pub fn set_group_checked(&mut self, untracked_group: bool, checked: bool) {
+        for f in &self.changed_files {
+            let is_untracked = f.status == GitFileStatusKind::Untracked;
+            if is_untracked == untracked_group {
+                if checked {
+                    self.commit_checked_files.insert(f.path.clone());
+                } else {
+                    self.commit_checked_files.remove(&f.path);
+                }
+            }
+        }
+    }
+
+    pub fn checked_counts(&self, untracked_group: bool) -> (usize, usize) {
+        let mut checked = 0usize;
+        let mut total = 0usize;
+        for f in &self.changed_files {
+            let is_untracked = f.status == GitFileStatusKind::Untracked;
+            if is_untracked == untracked_group {
+                total += 1;
+                if self.commit_checked_files.contains(&f.path) {
+                    checked += 1;
+                }
+            }
+        }
+        (checked, total)
+    }
+
+    pub fn checked_commit_files(&self) -> Vec<PathBuf> {
+        self.changed_files
+            .iter()
+            .filter(|f| self.commit_checked_files.contains(&f.path))
+            .map(|f| f.path.clone())
+            .collect()
+    }
+
+    pub fn total_checked_count(&self) -> usize {
+        self.changed_files
+            .iter()
+            .filter(|f| self.commit_checked_files.contains(&f.path))
+            .count()
     }
 
     pub fn is_busy(&self) -> bool {
@@ -1373,6 +1580,12 @@ impl GitEngine {
             .send(GitWorkerCmd::RollbackFile(file.to_path_buf()));
     }
 
+    pub fn request_rollback_files(&self, files: Vec<PathBuf>) {
+        if !files.is_empty() {
+            let _ = self.cmd_tx.send(GitWorkerCmd::RollbackFiles(files));
+        }
+    }
+
     pub fn request_rollback_all(&self) {
         let _ = self.cmd_tx.send(GitWorkerCmd::RollbackAll);
     }
@@ -1382,11 +1595,23 @@ impl GitEngine {
     }
 
     pub fn request_commit_with_options(&mut self, message: &str, amend: bool, push_after: bool) {
+        let files = self.checked_commit_files();
+        self.request_commit_selected_files(message, amend, push_after, files);
+    }
+
+    pub fn request_commit_selected_files(
+        &mut self,
+        message: &str,
+        amend: bool,
+        push_after: bool,
+        files: Vec<PathBuf>,
+    ) {
         self.commit_message_draft = message.to_string();
         let _ = self.cmd_tx.send(GitWorkerCmd::Commit {
             message: message.to_string(),
             amend,
             push_after,
+            files,
         });
     }
 
@@ -1738,6 +1963,59 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         assert!(engine.changed_files[0].staged);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_idea_checkbox_selection_does_not_stage_and_commits_only_checked() {
+        let tmp = std::env::temp_dir().join("rust_ai_ide_idea_commit_selection_test");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let _ = git_command(&tmp).args(["init"]).output();
+        ensure_git_identity(&tmp);
+        let a_path = tmp.join("a.txt");
+        let b_path = tmp.join("b.txt");
+        let c_path = tmp.join("c.txt");
+        fs::write(&a_path, "a1\n").unwrap();
+        fs::write(&b_path, "b1\n").unwrap();
+        let _ = git_command(&tmp).args(["add", "-A"]).output();
+        let _ = git_command(&tmp).args(["commit", "-m", "init"]).output();
+
+        // Modify a & b, add untracked c
+        fs::write(&a_path, "a2\n").unwrap();
+        fs::write(&b_path, "b2\n").unwrap();
+        fs::write(&c_path, "c1\n").unwrap();
+
+        let mut engine = GitEngine::open(&tmp);
+        assert_eq!(engine.changed_files.len(), 3);
+        // Tracked modified files are checked by default, untracked file is unchecked by default
+        assert!(engine.is_file_checked_for_commit(&a_path));
+        assert!(engine.is_file_checked_for_commit(&b_path));
+        assert!(!engine.is_file_checked_for_commit(&c_path));
+
+        // Toggle b off and c on — must NOT stage anything in git index!
+        assert!(!engine.toggle_commit_file_checked(&b_path));
+        assert!(engine.toggle_commit_file_checked(&c_path));
+        engine.refresh();
+        assert!(engine.changed_files.iter().all(|f| !f.staged));
+        assert!(engine.is_file_checked_for_commit(&a_path));
+        assert!(!engine.is_file_checked_for_commit(&b_path));
+        assert!(engine.is_file_checked_for_commit(&c_path));
+
+        // Commit only checked files (a.txt and c.txt)
+        engine.request_commit_with_options("commit only checked", false, false);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let outcome = engine.poll_updates();
+            if outcome.clear_commit_input {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        // Only b.txt should remain modified in working tree
+        assert_eq!(engine.changed_files.len(), 1);
+        assert_eq!(engine.changed_files[0].path, b_path);
         let _ = fs::remove_dir_all(&tmp);
     }
 }

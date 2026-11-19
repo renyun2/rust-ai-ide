@@ -75,7 +75,6 @@ pub enum AgentProviderKind {
     GoogleAntigravityAcp,
     ClaudeCodeCli,
     OpenAiCodexCli,
-    GeminiCli,
     CustomLlmApi,
     CursorInlineEngine,
 }
@@ -87,7 +86,6 @@ impl AgentProviderKind {
             Self::GoogleAntigravityAcp,
             Self::ClaudeCodeCli,
             Self::OpenAiCodexCli,
-            Self::GeminiCli,
         ]
     }
 
@@ -97,7 +95,6 @@ impl AgentProviderKind {
             Self::GoogleAntigravityAcp => "Antigravity (agy CLI)",
             Self::ClaudeCodeCli => "Claude Code (CLI)",
             Self::OpenAiCodexCli => "OpenAI Codex (CLI)",
-            Self::GeminiCli => "Gemini (CLI)",
             Self::CustomLlmApi => "本地 CLI 网关",
         }
     }
@@ -108,7 +105,6 @@ impl AgentProviderKind {
             Self::GoogleAntigravityAcp => "Antigravity CLI",
             Self::ClaudeCodeCli => "Claude CLI",
             Self::OpenAiCodexCli => "Codex CLI",
-            Self::GeminiCli => "Gemini CLI",
             Self::CustomLlmApi => "Local CLI",
         }
     }
@@ -119,7 +115,6 @@ impl AgentProviderKind {
             Self::GoogleAntigravityAcp => "Antigravity",
             Self::ClaudeCodeCli => "Claude",
             Self::OpenAiCodexCli => "Codex",
-            Self::GeminiCli => "Gemini",
             Self::CustomLlmApi => "Local",
         }
     }
@@ -130,7 +125,6 @@ impl AgentProviderKind {
             Self::GoogleAntigravityAcp => "agy -p --model --effort",
             Self::ClaudeCodeCli => "claude -p --model",
             Self::OpenAiCodexCli => "codex exec -m",
-            Self::GeminiCli => "gemini --skip-trust -m",
             Self::CustomLlmApi => "Local CLI Auto",
         }
     }
@@ -159,11 +153,9 @@ impl AgentProviderKind {
             }
             // Codex CLI exec 仅区分读写沙箱 (`-s workspace-write`) 与只读 (`-s read-only`)
             Self::OpenAiCodexCli => &[AgentWorkbenchMode::Agent, AgentWorkbenchMode::Ask],
-            // Antigravity (`auto` / `accept-edits` / `plan`)、Claude (`bypassPermissions` / `acceptEdits` / `plan`)、
-            // Gemini (`yolo` / `auto_edit` / `plan`) 与内置网关均完整支持三种模式
+            // Antigravity (`auto` / `accept-edits` / `plan`)、Claude (`bypassPermissions` / `acceptEdits` / `plan`) 与内置网关完整支持三种模式
             Self::GoogleAntigravityAcp
             | Self::ClaudeCodeCli
-            | Self::GeminiCli
             | Self::CustomLlmApi => &[
                 AgentWorkbenchMode::Agent,
                 AgentWorkbenchMode::Edit,
@@ -217,11 +209,6 @@ impl AgentProviderKind {
                 AgentWorkbenchMode::Ask => "-s read-only",
                 AgentWorkbenchMode::Edit | AgentWorkbenchMode::Agent => "-s workspace-write",
             },
-            Self::GeminiCli => match mode {
-                AgentWorkbenchMode::Ask => "--approval-mode plan",
-                AgentWorkbenchMode::Edit => "--approval-mode auto_edit",
-                AgentWorkbenchMode::Agent => "--approval-mode yolo",
-            },
             Self::CustomLlmApi => match mode {
                 AgentWorkbenchMode::Ask => "chat-qa",
                 AgentWorkbenchMode::Edit => "patch-diff",
@@ -234,18 +221,18 @@ impl AgentProviderKind {
         match (self, mode, zh) {
             (_, AgentWorkbenchMode::Agent, true) => "自主读写工作区文件、执行命令与工具",
             (_, AgentWorkbenchMode::Agent, false) => "Autonomous workspace edits & tools",
-            (Self::GoogleAntigravityAcp | Self::ClaudeCodeCli | Self::GeminiCli, AgentWorkbenchMode::Edit, true) => {
+            (Self::GoogleAntigravityAcp | Self::ClaudeCodeCli, AgentWorkbenchMode::Edit, true) => {
                 "自动应用文件编辑，高风险操作受限"
             }
-            (Self::GoogleAntigravityAcp | Self::ClaudeCodeCli | Self::GeminiCli, AgentWorkbenchMode::Edit, false) => {
+            (Self::GoogleAntigravityAcp | Self::ClaudeCodeCli, AgentWorkbenchMode::Edit, false) => {
                 "Auto-accept file edits with guarded tools"
             }
             (_, AgentWorkbenchMode::Edit, true) => "生成可一键应用的代码补丁卡片",
             (_, AgentWorkbenchMode::Edit, false) => "Propose one-click code diff patches",
-            (Self::GoogleAntigravityAcp | Self::ClaudeCodeCli | Self::GeminiCli, AgentWorkbenchMode::Ask, true) => {
+            (Self::GoogleAntigravityAcp | Self::ClaudeCodeCli, AgentWorkbenchMode::Ask, true) => {
                 "只读规划与代码问答，不修改工作区文件"
             }
-            (Self::GoogleAntigravityAcp | Self::ClaudeCodeCli | Self::GeminiCli, AgentWorkbenchMode::Ask, false) => {
+            (Self::GoogleAntigravityAcp | Self::ClaudeCodeCli, AgentWorkbenchMode::Ask, false) => {
                 "Read-only planning & Q&A without edits"
             }
             (_, AgentWorkbenchMode::Ask, true) => "纯只读问答分析，禁止写入文件",
@@ -369,6 +356,10 @@ pub struct AgentRegistration {
     pub fast_mode: bool,
     pub reasoning_effort: ReasoningEffort,
     pub status_text: String,
+    #[serde(default)]
+    pub supports_session_resume: bool,
+    #[serde(default)]
+    pub supports_checkpoint_rewind: bool,
 }
 
 /// AI 编辑台在聊天流中直接产出的可执行代码补丁卡片
@@ -423,6 +414,98 @@ pub struct AgentChatMessage {
     pub attachments: Vec<AgentAttachedItem>,
 }
 
+/// 实时流式处理阶段快照（在 AI 处理过程中同时展示思考过程、执行步骤与流式回复）
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StreamingAgentProgress {
+    pub phase: String,
+    pub thought_text: String,
+    pub execution_steps: Vec<String>,
+    pub reply_text: String,
+}
+
+impl StreamingAgentProgress {
+    pub fn with_phase(phase: impl Into<String>) -> Self {
+        Self {
+            phase: phase.into(),
+            ..Self::default()
+        }
+    }
+
+    pub fn update_slot(
+        slot: &Arc<parking_lot::Mutex<Option<Self>>>,
+        f: impl FnOnce(&mut Self),
+    ) {
+        let mut guard = slot.lock();
+        let prog = guard.get_or_insert_with(Self::default);
+        f(prog);
+    }
+
+    pub fn push_execution_step(&mut self, step: impl Into<String>) {
+        let s = step.into();
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if self.execution_steps.last().map(|last| last.as_str()) == Some(trimmed) {
+            return;
+        }
+        if self.execution_steps.len() >= 32 {
+            self.execution_steps.remove(0);
+        }
+        self.execution_steps.push(trimmed.to_string());
+    }
+
+    pub fn format_thought_summary(&self) -> Option<String> {
+        let mut sections = Vec::new();
+        if !self.thought_text.trim().is_empty() {
+            sections.push(self.thought_text.trim().to_string());
+        }
+        if !self.execution_steps.is_empty() {
+            sections.push(self.execution_steps.join("\n"));
+        }
+        if sections.is_empty() {
+            None
+        } else {
+            Some(sections.join("\n\n"))
+        }
+    }
+
+    pub fn to_preview_string(&self) -> String {
+        if !self.reply_text.is_empty() {
+            return self.reply_text.clone();
+        }
+        let mut parts = Vec::new();
+        if !self.thought_text.trim().is_empty() {
+            parts.push(self.thought_text.trim().to_string());
+        }
+        if !self.execution_steps.is_empty() {
+            parts.push(self.execution_steps.join("\n"));
+        }
+        if !parts.is_empty() {
+            return parts.join("\n\n");
+        }
+        self.phase.clone()
+    }
+}
+
+/// 会话维度聚合的文件变更统计（供输入框上方折叠展示及一键回退/保留）
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionFileChange {
+    pub path: PathBuf,
+    pub added_lines: usize,
+    pub removed_lines: usize,
+    pub original_content: Option<String>,
+    pub first_turn_msg_idx: usize,
+}
+
+/// 每次用户输入轮次前的 CLI 会话与工作区快照锚点（用于编辑历史消息后与 CLI 客户端同步回退）
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TurnSyncAnchor {
+    pub user_msg_idx: usize,
+    pub pre_turn_cli_session_id: Option<String>,
+    pub checkpoint_id: Option<String>,
+}
+
 /// 独立的 AI 多会话状态容器
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSession {
@@ -440,6 +523,23 @@ pub struct AgentSession {
     pub draft_prompt: String,
     pub is_busy: bool,
     pub created_order: usize,
+    #[serde(default)]
+    pub cli_session_id: Option<String>,
+    #[serde(default)]
+    pub pending_fork_session: bool,
+    #[serde(default)]
+    pub changed_files: Vec<SessionFileChange>,
+    #[serde(default)]
+    pub turn_anchors: Vec<TurnSyncAnchor>,
+}
+
+/// 按工作区持久化保存的 AI 多会话历史与配置状态
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedAgentHistory {
+    pub active_provider: AgentProviderKind,
+    pub sessions: Vec<AgentSession>,
+    pub active_session_idx: usize,
+    pub next_session_seq: usize,
 }
 
 /// 传入 AI 编辑台的真实 IDE 编辑器与工程上下文

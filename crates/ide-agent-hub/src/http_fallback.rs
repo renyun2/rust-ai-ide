@@ -1,7 +1,7 @@
 use crate::tools::{
     agent_tool_declarations, execute_workspace_tool, first_line_preview, summarize_tool_args,
 };
-use crate::types::{AgentWakeupCallback, AiApiConfig, AiApiFormat};
+use crate::types::{AgentWakeupCallback, AiApiConfig, AiApiFormat, StreamingAgentProgress};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -22,7 +22,7 @@ pub fn execute_curl_llm_streaming(
     cfg: &AiApiConfig,
     system_prompt: &str,
     user_prompt: &str,
-    stream_buf: &Arc<Mutex<Option<String>>>,
+    stream_buf: &Arc<Mutex<Option<StreamingAgentProgress>>>,
     cancel: &Arc<AtomicBool>,
     active_pid: &Arc<Mutex<Option<u32>>>,
     wakeup: Option<&AgentWakeupCallback>,
@@ -141,6 +141,28 @@ pub fn execute_curl_llm_streaming(
                 let data = data.trim();
                 if data != "[DONE]" {
                     if let Ok(v) = serde_json::from_str::<Value>(data) {
+                        let thought_chunk = v["choices"][0]["delta"]["reasoning_content"]
+                            .as_str()
+                            .or_else(|| v["choices"][0]["delta"]["reasoning"].as_str())
+                            .or_else(|| {
+                                if v["type"] == "content_block_delta"
+                                    && v["delta"]["type"] == "thinking_delta"
+                                {
+                                    v["delta"]["thinking"].as_str()
+                                } else {
+                                    None
+                                }
+                            });
+                        if let Some(th) = thought_chunk {
+                            StreamingAgentProgress::update_slot(stream_buf, |p| {
+                                p.phase = "思考中...".to_string();
+                                p.thought_text.push_str(th);
+                            });
+                            if let Some(cb) = wakeup {
+                                cb();
+                            }
+                        }
+
                         let chunk = v["choices"][0]["delta"]["content"]
                             .as_str()
                             .or_else(|| v["choices"][0]["message"]["content"].as_str())
@@ -156,7 +178,11 @@ pub fn execute_curl_llm_streaming(
                             });
                         if let Some(delta) = chunk {
                             assembled.push_str(delta);
-                            *stream_buf.lock() = Some(assembled.clone());
+                            let reply_snapshot = assembled.clone();
+                            StreamingAgentProgress::update_slot(stream_buf, |p| {
+                                p.phase = "正在生成回复...".to_string();
+                                p.reply_text = reply_snapshot;
+                            });
                             if let Some(cb) = wakeup {
                                 cb();
                             }
@@ -260,6 +286,49 @@ fn execute_curl_json_post(
     Ok(v)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_tool_step_with_progress(
+    root: &Path,
+    turn: usize,
+    max_turns: usize,
+    name: &str,
+    args: &Value,
+    ckpt_backups: &mut HashMap<PathBuf, Option<String>>,
+    modified_inbox: &Arc<Mutex<Vec<PathBuf>>>,
+    stream_buf: &Arc<Mutex<Option<StreamingAgentProgress>>>,
+    wakeup: Option<&AgentWakeupCallback>,
+    step_logs: &mut Vec<String>,
+) -> String {
+    let summary = summarize_tool_args(args);
+    let step_desc = format!("⚙ [{}/{}] {}({})", turn + 1, max_turns, name, summary);
+    step_logs.push(step_desc);
+    let live_step = if summary.trim().is_empty() {
+        format!("执行 {name}")
+    } else {
+        format!("{name} {summary}")
+    };
+    StreamingAgentProgress::update_slot(stream_buf, |p| {
+        p.phase = format!("正在执行 `{name}`...");
+        p.push_execution_step(live_step);
+    });
+    if let Some(cb) = wakeup {
+        cb();
+    }
+
+    let out = execute_workspace_tool(root, name, args, ckpt_backups, modified_inbox);
+    let preview = first_line_preview(&out);
+    step_logs.push(format!("  ✓ {name} -> {preview}"));
+    StreamingAgentProgress::update_slot(stream_buf, |p| {
+        p.phase = "正在分析结果...".to_string();
+        p.push_execution_step(format!("✓ {name} -> {preview}"));
+    });
+    if let Some(cb) = wakeup {
+        cb();
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn execute_agent_tool_loop(
     cfg: &AiApiConfig,
     root: &Path,
@@ -267,7 +336,7 @@ pub fn execute_agent_tool_loop(
     user_prompt: &str,
     ckpt_backups: &mut HashMap<PathBuf, Option<String>>,
     modified_inbox: &Arc<Mutex<Vec<PathBuf>>>,
-    stream_buf: &Arc<Mutex<Option<String>>>,
+    stream_buf: &Arc<Mutex<Option<StreamingAgentProgress>>>,
     cancel: &Arc<AtomicBool>,
     active_pid: &Arc<Mutex<Option<u32>>>,
     wakeup: Option<&AgentWakeupCallback>,
@@ -312,6 +381,17 @@ pub fn execute_agent_tool_loop(
                 });
                 let resp = execute_curl_json_post(&url, &hdrs, &body, active_pid)?;
                 let msg = &resp["choices"][0]["message"];
+                if let Some(rc) = msg["reasoning_content"].as_str().or_else(|| msg["reasoning"].as_str()) {
+                    if !rc.trim().is_empty() {
+                        StreamingAgentProgress::update_slot(stream_buf, |p| {
+                            p.phase = "思考中...".to_string();
+                            if !p.thought_text.is_empty() && !p.thought_text.ends_with('\n') {
+                                p.thought_text.push('\n');
+                            }
+                            p.thought_text.push_str(rc.trim());
+                        });
+                    }
+                }
                 let content = msg["content"].as_str().unwrap_or("").to_string();
                 let tool_calls = msg["tool_calls"].as_array().cloned().unwrap_or_default();
 
@@ -327,27 +407,18 @@ pub fn execute_agent_tool_loop(
                     let args: Value =
                         serde_json::from_str(args_str).unwrap_or_else(|_| json!({}));
 
-                    let step_desc = format!(
-                        "⚙ [{}/{}] {}({})",
-                        turn + 1,
+                    let out = run_tool_step_with_progress(
+                        root,
+                        turn,
                         max_turns,
                         name,
-                        summarize_tool_args(&args)
+                        &args,
+                        ckpt_backups,
+                        modified_inbox,
+                        stream_buf,
+                        wakeup,
+                        &mut step_logs,
                     );
-                    step_logs.push(step_desc);
-                    *stream_buf.lock() =
-                        Some(format!("{}\n\n正在执行工具 `{}`...", step_logs.join("\n"), name));
-                    if let Some(cb) = wakeup {
-                        cb();
-                    }
-
-                    let out =
-                        execute_workspace_tool(root, name, &args, ckpt_backups, modified_inbox);
-                    step_logs.push(format!("  ✓ {name} -> {}", first_line_preview(&out)));
-                    *stream_buf.lock() = Some(step_logs.join("\n"));
-                    if let Some(cb) = wakeup {
-                        cb();
-                    }
 
                     msgs.push(json!({
                         "role": "tool",
@@ -402,6 +473,19 @@ pub fn execute_agent_tool_loop(
                 let mut tool_uses = Vec::new();
                 for b in &blocks {
                     match b["type"].as_str() {
+                        Some("thinking") => {
+                            if let Some(th) = b["thinking"].as_str() {
+                                if !th.trim().is_empty() {
+                                    StreamingAgentProgress::update_slot(stream_buf, |p| {
+                                        p.phase = "思考中...".to_string();
+                                        if !p.thought_text.is_empty() && !p.thought_text.ends_with('\n') {
+                                            p.thought_text.push('\n');
+                                        }
+                                        p.thought_text.push_str(th.trim());
+                                    });
+                                }
+                            }
+                        }
                         Some("text") => {
                             if let Some(t) = b["text"].as_str() {
                                 text_parts.push(t.to_string());
@@ -420,20 +504,18 @@ pub fn execute_agent_tool_loop(
                     let id = tu["id"].as_str().unwrap_or("tu_1");
                     let name = tu["name"].as_str().unwrap_or("");
                     let args = &tu["input"];
-                    step_logs.push(format!(
-                        "⚙ [{}/{}] {}({})",
-                        turn + 1,
+                    let out = run_tool_step_with_progress(
+                        root,
+                        turn,
                         max_turns,
                         name,
-                        summarize_tool_args(args)
-                    ));
-                    *stream_buf.lock() = Some(step_logs.join("\n"));
-                    if let Some(cb) = wakeup {
-                        cb();
-                    }
-                    let out =
-                        execute_workspace_tool(root, name, args, ckpt_backups, modified_inbox);
-                    step_logs.push(format!("  ✓ {name} -> {}", first_line_preview(&out)));
+                        args,
+                        ckpt_backups,
+                        modified_inbox,
+                        stream_buf,
+                        wakeup,
+                        &mut step_logs,
+                    );
                     tool_results.push(json!({
                         "type": "tool_result",
                         "tool_use_id": id,
@@ -471,7 +553,17 @@ pub fn execute_agent_tool_loop(
                 let mut text_parts = Vec::new();
                 let mut fn_calls = Vec::new();
                 for p in &parts {
-                    if let Some(t) = p["text"].as_str() {
+                    if p["thought"].as_bool() == Some(true) {
+                        if let Some(th) = p["text"].as_str() {
+                            StreamingAgentProgress::update_slot(stream_buf, |p| {
+                                p.phase = "思考中...".to_string();
+                                if !p.thought_text.is_empty() && !p.thought_text.ends_with('\n') {
+                                    p.thought_text.push('\n');
+                                }
+                                p.thought_text.push_str(th.trim());
+                            });
+                        }
+                    } else if let Some(t) = p["text"].as_str() {
                         text_parts.push(t.to_string());
                     }
                     if p.get("functionCall").is_some() {
@@ -486,20 +578,18 @@ pub fn execute_agent_tool_loop(
                 for fc in fn_calls {
                     let name = fc["name"].as_str().unwrap_or("");
                     let args = &fc["args"];
-                    step_logs.push(format!(
-                        "⚙ [{}/{}] {}({})",
-                        turn + 1,
+                    let out = run_tool_step_with_progress(
+                        root,
+                        turn,
                         max_turns,
                         name,
-                        summarize_tool_args(args)
-                    ));
-                    *stream_buf.lock() = Some(step_logs.join("\n"));
-                    if let Some(cb) = wakeup {
-                        cb();
-                    }
-                    let out =
-                        execute_workspace_tool(root, name, args, ckpt_backups, modified_inbox);
-                    step_logs.push(format!("  ✓ {name} -> {}", first_line_preview(&out)));
+                        args,
+                        ckpt_backups,
+                        modified_inbox,
+                        stream_buf,
+                        wakeup,
+                        &mut step_logs,
+                    );
                     resp_parts.push(json!({
                         "functionResponse": {
                             "name": name,

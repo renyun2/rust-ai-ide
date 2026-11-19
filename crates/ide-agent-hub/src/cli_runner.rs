@@ -3,7 +3,11 @@ use crate::cli_discovery::{
     strip_ansi_basic,
 };
 use crate::tools::resolve_safe_workspace_path;
-use crate::types::{AgentProviderKind, AgentWakeupCallback, AgentWorkbenchMode, ReasoningEffort};
+use crate::types::{
+    AgentProviderKind, AgentWakeupCallback, AgentWorkbenchMode, ReasoningEffort,
+    StreamingAgentProgress,
+};
+use ide_git::{compute_line_diff, DiffLineKind};
 use parking_lot::Mutex;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -32,6 +36,8 @@ pub struct CliRunParams {
     pub fast_mode: bool,
     pub effort: ReasoningEffort,
     pub mode: AgentWorkbenchMode,
+    pub resume_session_id: Option<String>,
+    pub fork_session: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -40,12 +46,15 @@ pub struct CliRunOutput {
     pub thought: Option<String>,
     pub modified_files: Vec<PathBuf>,
     pub resolved_model: String,
+    pub cli_session_id: Option<String>,
+    pub checkpoint_backups: HashMap<PathBuf, Option<String>>,
+    pub file_diff_stats: HashMap<PathBuf, (usize, usize)>,
 }
 
 pub fn execute_cli_once(
     params: &CliRunParams,
     combined_prompt: &str,
-    stream_buf: &Arc<Mutex<Option<String>>>,
+    stream_buf: &Arc<Mutex<Option<StreamingAgentProgress>>>,
     active_pid: &Arc<Mutex<Option<u32>>>,
     modified_inbox: Option<&Arc<Mutex<Vec<PathBuf>>>>,
     wakeup: Option<&AgentWakeupCallback>,
@@ -55,6 +64,10 @@ pub fn execute_cli_once(
     } else {
         HashMap::new()
     };
+    let mut before_dirty_contents: HashMap<PathBuf, Option<String>> = HashMap::new();
+    for p in before_snap.keys() {
+        before_dirty_contents.insert(p.clone(), fs::read_to_string(p).ok());
+    }
 
     let (resolved_model, agy_effort) = match params.kind {
         AgentProviderKind::CursorCli | AgentProviderKind::CursorInlineEngine => (
@@ -89,6 +102,8 @@ pub fn execute_cli_once(
         AgentProviderKind::CursorCli
             | AgentProviderKind::CursorInlineEngine
             | AgentProviderKind::GoogleAntigravityAcp
+            | AgentProviderKind::ClaudeCodeCli
+            | AgentProviderKind::OpenAiCodexCli
     );
 
     let stdout_raw = Arc::new(Mutex::new(String::new()));
@@ -97,6 +112,7 @@ pub fn execute_cli_once(
     let assembled_thought = Arc::new(Mutex::new(String::new()));
     let stream_error = Arc::new(Mutex::new(None::<String>));
     let tool_touched_files = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
+    let captured_session_id = Arc::new(Mutex::new(params.resume_session_id.clone()));
     let auth_blocked = Arc::new(AtomicBool::new(false));
 
     let out_thread = child.stdout.take().map(|out| {
@@ -105,6 +121,7 @@ pub fn execute_cli_once(
         let thought_acc = assembled_thought.clone();
         let err_slot = stream_error.clone();
         let touched = tool_touched_files.clone();
+        let sid_acc = captured_session_id.clone();
         let sbuf = stream_buf.clone();
         let wk = wakeup.cloned();
         let auth_flag = auth_blocked.clone();
@@ -130,6 +147,7 @@ pub fn execute_cli_once(
                 if is_json_stream {
                     let trimmed = clean.trim();
                     if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+                        capture_stream_session_id(kind, &v, &sid_acc);
                         handle_stream_json_event(
                             kind,
                             &root,
@@ -144,7 +162,12 @@ pub fn execute_cli_once(
                 } else {
                     let mut g = reply_acc.lock();
                     g.push_str(&clean);
-                    *sbuf.lock() = Some(g.clone());
+                    let reply_snapshot = g.clone();
+                    drop(g);
+                    update_stream_progress(&sbuf, |p| {
+                        p.phase = "正在生成回复...".to_string();
+                        p.reply_text = reply_snapshot;
+                    });
                 }
                 if let Some(cb) = &wk {
                     cb();
@@ -213,7 +236,8 @@ pub fn execute_cli_once(
         );
     }
 
-    let mut modified_files = tool_touched_files.lock().clone();
+    let mut candidate_files: Vec<PathBuf> = Vec::new();
+    let mut git_changed_files: Vec<PathBuf> = Vec::new();
     if params.mode != AgentWorkbenchMode::Ask {
         let after_snap = capture_git_mtime_snapshot(&params.root);
         for (p, after_t) in &after_snap {
@@ -221,11 +245,48 @@ pub fn execute_cli_once(
                 None => true,
                 Some(before_t) => before_t != after_t,
             };
-            if changed && !modified_files.contains(p) {
-                modified_files.push(p.clone());
+            if changed {
+                git_changed_files.push(p.clone());
+                if !candidate_files.contains(p) {
+                    candidate_files.push(p.clone());
+                }
             }
         }
     }
+    for p in tool_touched_files.lock().iter() {
+        if !candidate_files.contains(p) {
+            candidate_files.push(p.clone());
+        }
+    }
+
+    let mut modified_files = Vec::new();
+    let mut checkpoint_backups: HashMap<PathBuf, Option<String>> = HashMap::new();
+    let mut file_diff_stats: HashMap<PathBuf, (usize, usize)> = HashMap::new();
+
+    for p in candidate_files {
+        let after_content = fs::read_to_string(&p).ok();
+        let baseline = if let Some(prev) = before_dirty_contents.get(&p) {
+            prev.clone()
+        } else {
+            read_git_head_file(&params.root, &p)
+        };
+        let content_changed = match (&baseline, &after_content) {
+            (Some(b), Some(a)) => b != a,
+            (None, Some(_)) => git_changed_files.contains(&p) || before_dirty_contents.contains_key(&p),
+            (Some(_), None) => true,
+            (None, None) => false,
+        };
+        if content_changed || git_changed_files.contains(&p) {
+            let (added, removed) = compute_file_diff_counts(
+                baseline.as_deref().unwrap_or(""),
+                after_content.as_deref().unwrap_or(""),
+            );
+            checkpoint_backups.insert(p.clone(), baseline);
+            file_diff_stats.insert(p.clone(), (added, removed));
+            modified_files.push(p);
+        }
+    }
+
     if let Some(inbox) = modified_inbox {
         if !modified_files.is_empty() {
             let mut guard = inbox.lock();
@@ -244,6 +305,7 @@ pub fn execute_cli_once(
     let reply_str = assembled_reply.lock().trim().to_string();
     let raw_out = stdout_raw.lock().trim().to_string();
     let err_str = stderr_acc.lock().trim().to_string();
+    let cli_session_id = captured_session_id.lock().clone();
     let thought_opt = {
         let t = assembled_thought.lock().trim().to_string();
         if t.is_empty() {
@@ -259,13 +321,19 @@ pub fn execute_cli_once(
             thought: thought_opt,
             modified_files,
             resolved_model,
+            cli_session_id,
+            checkpoint_backups,
+            file_diff_stats,
         })
-    } else if !is_json_stream && !raw_out.is_empty() {
+    } else if !raw_out.is_empty() && (!is_json_stream || !raw_out.trim_start().starts_with('{')) {
         Ok(CliRunOutput {
             reply: raw_out,
             thought: thought_opt,
             modified_files,
             resolved_model,
+            cli_session_id,
+            checkpoint_backups,
+            file_diff_stats,
         })
     } else if !err_str.is_empty() {
         Err(err_str)
@@ -276,6 +344,9 @@ pub fn execute_cli_once(
                 thought: thought_opt,
                 modified_files,
                 resolved_model,
+                cli_session_id,
+                checkpoint_backups,
+                file_diff_stats,
             }),
             Ok(st) => Err(format!("CLI 退出状态: {st}")),
             Err(e) => Err(format!("等待 CLI 进程失败: {e}")),
@@ -283,8 +354,165 @@ pub fn execute_cli_once(
     }
 }
 
+fn capture_stream_session_id(
+    kind: AgentProviderKind,
+    v: &Value,
+    sid_slot: &Arc<Mutex<Option<String>>>,
+) {
+    let extracted = match kind {
+        AgentProviderKind::CursorCli
+        | AgentProviderKind::CursorInlineEngine
+        | AgentProviderKind::ClaudeCodeCli => v["session_id"].as_str(),
+        AgentProviderKind::OpenAiCodexCli => v["thread_id"].as_str().or_else(|| v["session_id"].as_str()),
+        AgentProviderKind::GoogleAntigravityAcp => v["session_id"].as_str(),
+        AgentProviderKind::CustomLlmApi => None,
+    };
+    if let Some(sid) = extracted {
+        let trimmed = sid.trim();
+        if !trimmed.is_empty() {
+            *sid_slot.lock() = Some(trimmed.to_string());
+        }
+    }
+}
+
+fn read_git_head_file(root: &Path, full_path: &Path) -> Option<String> {
+    let rel = full_path
+        .strip_prefix(root)
+        .ok()?
+        .to_string_lossy()
+        .replace('\\', "/");
+    if rel.is_empty() {
+        return None;
+    }
+    let mut cmd = Command::new("git");
+    cmd.args(["show", &format!("HEAD:{rel}")])
+        .current_dir(root)
+        .stdin(Stdio::null());
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let out = cmd.output().ok()?;
+    if out.status.success() {
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        None
+    }
+}
+
+pub(crate) fn compute_file_diff_counts(before: &str, after: &str) -> (usize, usize) {
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    for d in compute_line_diff(before, after) {
+        match d.kind {
+            DiffLineKind::Added => added += 1,
+            DiffLineKind::Removed => removed += 1,
+            DiffLineKind::Context => {}
+        }
+    }
+    (added, removed)
+}
+
 #[allow(clippy::too_many_arguments)]
-fn handle_stream_json_event(
+fn update_stream_progress(
+    sbuf: &Arc<Mutex<Option<StreamingAgentProgress>>>,
+    f: impl FnOnce(&mut StreamingAgentProgress),
+) {
+    StreamingAgentProgress::update_slot(sbuf, f);
+}
+
+fn short_rel_path(root: &Path, raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if let Ok(resolved) = resolve_safe_workspace_path(root, trimmed) {
+        if let Ok(rel) = resolved.strip_prefix(root) {
+            let s = rel.to_string_lossy().replace('\\', "/");
+            if !s.is_empty() {
+                return s;
+            }
+        }
+    }
+    trimmed.replace('\\', "/")
+}
+
+fn first_json_str<'a>(val: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    match val {
+        Value::Object(map) => {
+            for target in keys {
+                if let Some(s) = map.get(*target).and_then(|v| v.as_str()) {
+                    if !s.trim().is_empty() {
+                        return Some(s);
+                    }
+                }
+            }
+            for child in map.values() {
+                if let Some(found) = first_json_str(child, keys) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Value::Array(arr) => arr.iter().find_map(|item| first_json_str(item, keys)),
+        _ => None,
+    }
+}
+
+fn compact_inline_preview(raw: &str, max_chars: usize) -> String {
+    let single = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if single.chars().count() <= max_chars {
+        single
+    } else {
+        let head: String = single.chars().take(max_chars.saturating_sub(1)).collect();
+        format!("{head}…")
+    }
+}
+
+fn format_tool_execution_step(root: &Path, raw_name: &str, payload: &Value) -> String {
+    let lower = raw_name.to_ascii_lowercase();
+    let label = if lower.contains("read") || lower.contains("view") {
+        "读取"
+    } else if lower.contains("edit") || lower.contains("replace") || lower.contains("patch") {
+        "编辑"
+    } else if lower.contains("write") || lower.contains("create") {
+        "写入"
+    } else if lower.contains("grep") || lower.contains("search") || lower.contains("find") {
+        "搜索"
+    } else if lower.contains("glob") || lower.contains("list") || lower == "lstoolcall" {
+        "浏览目录"
+    } else if lower.contains("shell") || lower.contains("bash") || lower.contains("command") || lower.contains("exec") {
+        "运行命令"
+    } else if lower.contains("web") || lower.contains("fetch") {
+        "联网检索"
+    } else if lower.contains("todo") || lower.contains("task") {
+        "更新任务"
+    } else {
+        raw_name
+    };
+
+    let detail = if lower.contains("shell") || lower.contains("bash") || lower.contains("command") || lower.contains("exec") {
+        first_json_str(payload, &["command", "cmd", "script"])
+            .map(|s| compact_inline_preview(s, 54))
+    } else if lower.contains("grep") || lower.contains("search") {
+        first_json_str(payload, &["pattern", "query", "regex", "search_term"])
+            .map(|s| compact_inline_preview(s, 48))
+    } else if let Some(p) = first_json_str(
+        payload,
+        &["path", "file_path", "target_file", "relative_workspace_path", "target_directory", "file"],
+    ) {
+        Some(compact_inline_preview(&short_rel_path(root, p), 56))
+    } else {
+        first_json_str(payload, &["glob_pattern", "pattern", "query", "url"])
+            .map(|s| compact_inline_preview(s, 48))
+    };
+
+    match detail {
+        Some(d) if !d.is_empty() => format!("{label} {d}"),
+        _ => format!("执行 {label}"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn handle_stream_json_event(
     kind: AgentProviderKind,
     root: &Path,
     v: &Value,
@@ -292,7 +520,7 @@ fn handle_stream_json_event(
     thought_acc: &Arc<Mutex<String>>,
     err_slot: &Arc<Mutex<Option<String>>>,
     touched: &Arc<Mutex<Vec<PathBuf>>>,
-    sbuf: &Arc<Mutex<Option<String>>>,
+    sbuf: &Arc<Mutex<Option<StreamingAgentProgress>>>,
 ) {
     match kind {
         AgentProviderKind::CursorCli | AgentProviderKind::CursorInlineEngine => {
@@ -300,15 +528,17 @@ fn handle_stream_json_event(
             let sub = v["subtype"].as_str().unwrap_or("");
             match ty {
                 "thinking" => {
-                    if sub == "delta" {
-                        if let Some(txt) = v["text"].as_str() {
-                            let mut t = thought_acc.lock();
-                            t.push_str(txt);
-                            if reply_acc.lock().is_empty() {
-                                let preview: String =
-                                    t.chars().rev().take(240).collect::<String>().chars().rev().collect();
-                                *sbuf.lock() = Some(format!("💭 思考中...\n{preview}"));
-                            }
+                    if let Some(txt) = v["text"].as_str() {
+                        if !txt.is_empty() && (sub == "delta" || sub.is_empty() || thought_acc.lock().is_empty()) {
+                            let thought_snapshot = {
+                                let mut t = thought_acc.lock();
+                                t.push_str(txt);
+                                t.clone()
+                            };
+                            update_stream_progress(sbuf, |p| {
+                                p.phase = "思考中...".to_string();
+                                p.thought_text = thought_snapshot;
+                            });
                         }
                     }
                 }
@@ -316,28 +546,54 @@ fn handle_stream_json_event(
                     let mut chunk = String::new();
                     if let Some(arr) = v["message"]["content"].as_array() {
                         for item in arr {
-                            if let Some(txt) = item["text"].as_str() {
+                            if item["type"].as_str() == Some("thinking") {
+                                if let Some(th) = item["thinking"].as_str().or_else(|| item["text"].as_str()) {
+                                    let thought_snapshot = {
+                                        let mut t = thought_acc.lock();
+                                        if t.is_empty() || th.len() > t.len() {
+                                            *t = th.to_string();
+                                        }
+                                        t.clone()
+                                    };
+                                    update_stream_progress(sbuf, |p| {
+                                        p.phase = "思考中...".to_string();
+                                        p.thought_text = thought_snapshot;
+                                    });
+                                }
+                            } else if let Some(txt) = item["text"].as_str() {
                                 chunk.push_str(txt);
                             }
                         }
                     }
                     if !chunk.is_empty() {
-                        let mut r = reply_acc.lock();
-                        if v.get("timestamp_ms").is_some() {
-                            r.push_str(&chunk);
-                        } else if chunk.len() >= r.len() {
-                            *r = chunk;
-                        }
-                        *sbuf.lock() = Some(r.clone());
+                        let reply_snapshot = {
+                            let mut r = reply_acc.lock();
+                            if v.get("timestamp_ms").is_some() {
+                                r.push_str(&chunk);
+                            } else if chunk.len() >= r.len() {
+                                *r = chunk;
+                            }
+                            r.clone()
+                        };
+                        update_stream_progress(sbuf, |p| {
+                            p.phase = "正在生成回复...".to_string();
+                            p.reply_text = reply_snapshot;
+                        });
                     }
                 }
                 "tool_call" => {
                     extract_paths_from_json_value(root, &v["tool_call"], touched);
-                    if sub == "started" && reply_acc.lock().is_empty() {
-                        if let Some(obj) = v["tool_call"].as_object() {
-                            if let Some(tool_key) = obj.keys().next() {
-                                *sbuf.lock() = Some(format!("⚙ Cursor 正在执行工具 `{tool_key}`..."));
-                            }
+                    if let Some(obj) = v["tool_call"].as_object() {
+                        if let Some(tool_key) = obj.keys().next() {
+                            let step = format_tool_execution_step(root, tool_key, &v["tool_call"][tool_key]);
+                            update_stream_progress(sbuf, |p| {
+                                p.phase = if sub == "completed" {
+                                    "继续分析中...".to_string()
+                                } else {
+                                    "正在执行工具...".to_string()
+                                };
+                                p.push_execution_step(step);
+                            });
                         }
                     }
                 }
@@ -349,9 +605,17 @@ fn handle_stream_json_event(
                             .unwrap_or("Cursor CLI 返回错误");
                         *err_slot.lock() = Some(msg.to_string());
                     } else if let Some(res_txt) = v["result"].as_str() {
-                        let mut r = reply_acc.lock();
-                        if r.trim().is_empty() && !res_txt.trim().is_empty() {
-                            *r = res_txt.to_string();
+                        let reply_snapshot = {
+                            let mut r = reply_acc.lock();
+                            if r.trim().is_empty() && !res_txt.trim().is_empty() {
+                                *r = res_txt.to_string();
+                            }
+                            r.clone()
+                        };
+                        if !reply_snapshot.is_empty() {
+                            update_stream_progress(sbuf, |p| {
+                                p.reply_text = reply_snapshot;
+                            });
                         }
                     }
                 }
@@ -365,14 +629,42 @@ fn handle_stream_json_event(
                 let step_type = su["step_type"].as_str().unwrap_or("");
                 if step_type == "agent_response" {
                     if let Some(delta) = su["text_delta"].as_str() {
-                        let mut r = reply_acc.lock();
-                        r.push_str(delta);
-                        *sbuf.lock() = Some(r.clone());
+                        let reply_snapshot = {
+                            let mut r = reply_acc.lock();
+                            r.push_str(delta);
+                            r.clone()
+                        };
+                        update_stream_progress(sbuf, |p| {
+                            p.phase = "正在生成回复...".to_string();
+                            p.reply_text = reply_snapshot;
+                        });
+                    }
+                } else if step_type.contains("thought") || step_type.contains("think") || step_type == "planner_response" {
+                    if let Some(delta) = su["text_delta"]
+                        .as_str()
+                        .or_else(|| su["thought"].as_str())
+                        .or_else(|| su["thinking"].as_str())
+                        .or_else(|| su["text"].as_str())
+                    {
+                        let thought_snapshot = {
+                            let mut t = thought_acc.lock();
+                            t.push_str(delta);
+                            t.clone()
+                        };
+                        update_stream_progress(sbuf, |p| {
+                            p.phase = "思考中...".to_string();
+                            p.thought_text = thought_snapshot;
+                        });
                     }
                 } else {
                     extract_paths_from_json_value(root, su, touched);
-                    if reply_acc.lock().is_empty() && !step_type.is_empty() && step_type != "user_input" {
-                        *sbuf.lock() = Some(format!("⚙ Antigravity 正在执行步骤 `{step_type}`..."));
+                    if !step_type.is_empty() && step_type != "user_input" {
+                        let tool_name = su["tool_name"].as_str().unwrap_or(step_type);
+                        let step = format_tool_execution_step(root, tool_name, su);
+                        update_stream_progress(sbuf, |p| {
+                            p.phase = "正在执行步骤...".to_string();
+                            p.push_execution_step(step);
+                        });
                     }
                 }
             } else if ev == "result" {
@@ -382,14 +674,233 @@ fn handle_stream_json_event(
                     let msg = res["error"].as_str().unwrap_or("Antigravity CLI 执行失败");
                     *err_slot.lock() = Some(msg.to_string());
                 } else if let Some(resp_txt) = res["response"].as_str() {
-                    let mut r = reply_acc.lock();
-                    if r.trim().is_empty() && !resp_txt.trim().is_empty() {
-                        *r = resp_txt.to_string();
+                    let reply_snapshot = {
+                        let mut r = reply_acc.lock();
+                        if r.trim().is_empty() && !resp_txt.trim().is_empty() {
+                            *r = resp_txt.to_string();
+                        }
+                        r.clone()
+                    };
+                    if !reply_snapshot.is_empty() {
+                        update_stream_progress(sbuf, |p| {
+                            p.reply_text = reply_snapshot;
+                        });
                     }
                 }
             }
         }
-        _ => {}
+        AgentProviderKind::ClaudeCodeCli => {
+            let ty = v["type"].as_str().unwrap_or("");
+            match ty {
+                "stream_event" => {
+                    let ev = &v["event"];
+                    match ev["type"].as_str().unwrap_or("") {
+                        "content_block_start" => {
+                            let cb = &ev["content_block"];
+                            if cb["type"].as_str() == Some("tool_use") {
+                                let name = cb["name"].as_str().unwrap_or("tool");
+                                let step = format_tool_execution_step(root, name, &cb["input"]);
+                                update_stream_progress(sbuf, |p| {
+                                    p.phase = "正在执行工具...".to_string();
+                                    p.push_execution_step(step);
+                                });
+                            }
+                        }
+                        "content_block_delta" => {
+                            let delta = &ev["delta"];
+                            match delta["type"].as_str().unwrap_or("") {
+                                "thinking_delta" => {
+                                    if let Some(txt) = delta["thinking"].as_str() {
+                                        let thought_snapshot = {
+                                            let mut t = thought_acc.lock();
+                                            t.push_str(txt);
+                                            t.clone()
+                                        };
+                                        update_stream_progress(sbuf, |p| {
+                                            p.phase = "思考中...".to_string();
+                                            p.thought_text = thought_snapshot;
+                                        });
+                                    }
+                                }
+                                "text_delta" => {
+                                    if let Some(txt) = delta["text"].as_str() {
+                                        let reply_snapshot = {
+                                            let mut r = reply_acc.lock();
+                                            r.push_str(txt);
+                                            r.clone()
+                                        };
+                                        update_stream_progress(sbuf, |p| {
+                                            p.phase = "正在生成回复...".to_string();
+                                            p.reply_text = reply_snapshot;
+                                        });
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                "assistant" => {
+                    let mut text_chunk = String::new();
+                    if let Some(arr) = v["message"]["content"].as_array() {
+                        for item in arr {
+                            match item["type"].as_str().unwrap_or("") {
+                                "thinking" => {
+                                    if let Some(th) = item["thinking"].as_str() {
+                                        let thought_snapshot = {
+                                            let mut t = thought_acc.lock();
+                                            if t.is_empty() || th.len() > t.len() {
+                                                *t = th.to_string();
+                                            }
+                                            t.clone()
+                                        };
+                                        update_stream_progress(sbuf, |p| {
+                                            p.phase = "思考中...".to_string();
+                                            p.thought_text = thought_snapshot;
+                                        });
+                                    }
+                                }
+                                "tool_use" => {
+                                    extract_paths_from_json_value(root, &item["input"], touched);
+                                    let name = item["name"].as_str().unwrap_or("tool");
+                                    let step = format_tool_execution_step(root, name, &item["input"]);
+                                    update_stream_progress(sbuf, |p| {
+                                        p.phase = "正在执行工具...".to_string();
+                                        p.push_execution_step(step);
+                                    });
+                                }
+                                "text" => {
+                                    if let Some(txt) = item["text"].as_str() {
+                                        text_chunk.push_str(txt);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    if !text_chunk.is_empty() {
+                        let reply_snapshot = {
+                            let mut r = reply_acc.lock();
+                            if r.is_empty() || text_chunk.len() >= r.len() {
+                                *r = text_chunk;
+                            }
+                            r.clone()
+                        };
+                        update_stream_progress(sbuf, |p| {
+                            p.phase = "正在生成回复...".to_string();
+                            p.reply_text = reply_snapshot;
+                        });
+                    }
+                }
+                "result" => {
+                    if v["is_error"].as_bool() == Some(true) {
+                        let msg = v["result"].as_str().unwrap_or("Claude CLI 返回错误");
+                        *err_slot.lock() = Some(msg.to_string());
+                    } else if let Some(res_txt) = v["result"].as_str() {
+                        let reply_snapshot = {
+                            let mut r = reply_acc.lock();
+                            if r.trim().is_empty() && !res_txt.trim().is_empty() {
+                                *r = res_txt.to_string();
+                            }
+                            r.clone()
+                        };
+                        if !reply_snapshot.is_empty() {
+                            update_stream_progress(sbuf, |p| {
+                                p.reply_text = reply_snapshot;
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        AgentProviderKind::OpenAiCodexCli => {
+            let ty = v["type"].as_str().unwrap_or("");
+            match ty {
+                "turn.started" => {
+                    update_stream_progress(sbuf, |p| {
+                        p.phase = "正在分析任务...".to_string();
+                    });
+                }
+                "item.started" | "item.updated" | "item.completed" => {
+                    let item = &v["item"];
+                    match item["type"].as_str().unwrap_or("") {
+                        "reasoning" => {
+                            if let Some(txt) = item["text"].as_str() {
+                                let thought_snapshot = {
+                                    let mut t = thought_acc.lock();
+                                    if txt.starts_with(t.as_str()) || t.is_empty() {
+                                        *t = txt.to_string();
+                                    } else {
+                                        if !t.is_empty() && !t.ends_with('\n') {
+                                            t.push('\n');
+                                        }
+                                        t.push_str(txt);
+                                    }
+                                    t.clone()
+                                };
+                                update_stream_progress(sbuf, |p| {
+                                    p.phase = "思考中...".to_string();
+                                    p.thought_text = thought_snapshot;
+                                });
+                            }
+                        }
+                        "command_execution" => {
+                            let cmd = item["command"].as_str().unwrap_or("");
+                            let step = if cmd.trim().is_empty() {
+                                "运行终端命令".to_string()
+                            } else {
+                                format!("运行命令 {}", compact_inline_preview(cmd, 54))
+                            };
+                            update_stream_progress(sbuf, |p| {
+                                p.phase = "正在执行命令...".to_string();
+                                p.push_execution_step(step);
+                            });
+                        }
+                        "file_change" => {
+                            extract_paths_from_json_value(root, &item["changes"], touched);
+                            let step = format_tool_execution_step(root, "edit", &item["changes"]);
+                            update_stream_progress(sbuf, |p| {
+                                p.phase = "正在修改文件...".to_string();
+                                p.push_execution_step(step);
+                            });
+                        }
+                        "mcp_tool_call" | "web_search" => {
+                            let name = item["tool"].as_str().unwrap_or("tool");
+                            let step = format_tool_execution_step(root, name, item);
+                            update_stream_progress(sbuf, |p| {
+                                p.phase = "正在执行工具...".to_string();
+                                p.push_execution_step(step);
+                            });
+                        }
+                        "agent_message" => {
+                            if let Some(txt) = item["text"].as_str() {
+                                let reply_snapshot = {
+                                    let mut r = reply_acc.lock();
+                                    if txt.len() >= r.len() || r.is_empty() {
+                                        *r = txt.to_string();
+                                    }
+                                    r.clone()
+                                };
+                                update_stream_progress(sbuf, |p| {
+                                    p.phase = "正在生成回复...".to_string();
+                                    p.reply_text = reply_snapshot;
+                                });
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                "error" => {
+                    if let Some(msg) = v["message"].as_str().or_else(|| v["error"].as_str()) {
+                        *err_slot.lock() = Some(msg.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        AgentProviderKind::CustomLlmApi => {}
     }
 }
 
@@ -489,6 +1000,11 @@ fn spawn_cli_process(
                 args.push("--model".to_string());
                 args.push(resolved_model.to_string());
             }
+            if let Some(sid) = params.resume_session_id.as_deref().filter(|s| !s.trim().is_empty())
+            {
+                args.push("--resume".to_string());
+                args.push(sid.trim().to_string());
+            }
 
             if let Some((node_exe, index_js)) = resolve_cursor_node_entry(&params.bin) {
                 let mut cmd = Command::new(node_exe);
@@ -538,6 +1054,11 @@ fn spawn_cli_process(
                 args.push("--model".to_string());
                 args.push(resolved_model.to_string());
             }
+            if let Some(sid) = params.resume_session_id.as_deref().filter(|s| !s.trim().is_empty())
+            {
+                args.push("--conversation".to_string());
+                args.push(sid.trim().to_string());
+            }
             if let Some(eff) = agy_effort {
                 args.push("--effort".to_string());
                 args.push(eff.to_string());
@@ -560,7 +1081,9 @@ fn spawn_cli_process(
             let mut args = vec![
                 "-p".to_string(),
                 "--output-format".to_string(),
-                "text".to_string(),
+                "stream-json".to_string(),
+                "--verbose".to_string(),
+                "--include-partial-messages".to_string(),
                 "--permission-mode".to_string(),
                 perm_mode.to_string(),
                 "--effort".to_string(),
@@ -573,6 +1096,14 @@ fn spawn_cli_process(
                 args.push("--model".to_string());
                 args.push(resolved_model.to_string());
             }
+            if let Some(sid) = params.resume_session_id.as_deref().filter(|s| !s.trim().is_empty())
+            {
+                args.push("--resume".to_string());
+                args.push(sid.trim().to_string());
+                if params.fork_session {
+                    args.push("--fork-session".to_string());
+                }
+            }
             spawn_generic_piped_cli(&params.bin, &params.root, &args, true)
         }
         AgentProviderKind::OpenAiCodexCli => {
@@ -582,6 +1113,7 @@ fn spawn_cli_process(
             };
             let mut args = vec![
                 "exec".to_string(),
+                "--json".to_string(),
                 "--skip-git-repo-check".to_string(),
                 "-s".to_string(),
                 sandbox.to_string(),
@@ -593,27 +1125,6 @@ fn spawn_cli_process(
                 args.push(resolved_model.to_string());
             }
             args.push("-".to_string());
-            spawn_generic_piped_cli(&params.bin, &params.root, &args, true)
-        }
-        AgentProviderKind::GeminiCli => {
-            let approval = match params.mode {
-                AgentWorkbenchMode::Ask => "plan",
-                AgentWorkbenchMode::Edit => "auto_edit",
-                AgentWorkbenchMode::Agent => "yolo",
-            };
-            let mut args = vec![
-                "--skip-trust".to_string(),
-                "--approval-mode".to_string(),
-                approval.to_string(),
-                "-o".to_string(),
-                "text".to_string(),
-            ];
-            if has_specific_model && !resolved_model.eq_ignore_ascii_case("auto") {
-                args.push("-m".to_string());
-                args.push(resolved_model.to_string());
-            }
-            args.push("-p".to_string());
-            args.push(String::new());
             spawn_generic_piped_cli(&params.bin, &params.root, &args, true)
         }
         AgentProviderKind::CustomLlmApi => {
@@ -641,7 +1152,6 @@ fn spawn_generic_piped_cli(
             let mut cmd = Command::new("cmd");
             cmd.arg("/C").arg(bin).args(args);
             cmd.current_dir(cwd)
-                .env("GEMINI_CLI_TRUST_WORKSPACE", "true")
                 .stdin(stdin_cfg())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -653,7 +1163,6 @@ fn spawn_generic_piped_cli(
     let mut cmd = Command::new(bin);
     cmd.args(args)
         .current_dir(cwd)
-        .env("GEMINI_CLI_TRUST_WORKSPACE", "true")
         .stdin(stdin_cfg())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

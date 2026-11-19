@@ -106,7 +106,10 @@ fn decode_bmp_bytes(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     decode_dib_slice(&bytes[14..], Some(&bytes[pixel_offset..]))
 }
 
-fn decode_dib_slice(header_and_pixels: &[u8], explicit_pixels: Option<&[u8]>) -> Option<(u32, u32, Vec<u8>)> {
+fn decode_dib_slice(
+    header_and_pixels: &[u8],
+    explicit_pixels: Option<&[u8]>,
+) -> Option<(u32, u32, Vec<u8>)> {
     if header_and_pixels.len() < 40 {
         return None;
     }
@@ -118,14 +121,23 @@ fn decode_dib_slice(header_and_pixels: &[u8], explicit_pixels: Option<&[u8]>) ->
     let height_i = i32::from_le_bytes(header_and_pixels[8..12].try_into().ok()?);
     let bpp = u16::from_le_bytes(header_and_pixels[14..16].try_into().ok()?);
     let compression = u32::from_le_bytes(header_and_pixels[16..20].try_into().ok()?);
-    if width_i <= 0 || height_i == 0 || (bpp != 24 && bpp != 32) || (compression != 0 && compression != 3) {
+    if width_i <= 0
+        || height_i == 0
+        || (bpp != 24 && bpp != 32)
+        || (compression != 0 && compression != 3)
+    {
         return None;
     }
     let w = width_i as usize;
     let h = height_i.unsigned_abs() as usize;
     let top_down = height_i < 0;
-    let extra_masks = if compression == 3 && hdr_size == 40 { 12 } else { 0 };
-    let pixels = explicit_pixels.unwrap_or(&header_and_pixels[(hdr_size + extra_masks).min(header_and_pixels.len())..]);
+    let extra_masks = if compression == 3 && hdr_size == 40 {
+        12
+    } else {
+        0
+    };
+    let pixels = explicit_pixels
+        .unwrap_or(&header_and_pixels[(hdr_size + extra_masks).min(header_and_pixels.len())..]);
     let bytes_per_px = (bpp / 8) as usize;
     let stride = ((w * bytes_per_px + 3) / 4) * 4;
     if pixels.len() < stride.saturating_mul(h) {
@@ -144,7 +156,11 @@ fn decode_dib_slice(header_and_pixels: &[u8], explicit_pixels: Option<&[u8]>) ->
             let r = row_bytes[s + 2];
             let a = if bytes_per_px == 4 {
                 let raw_a = row_bytes[s + 3];
-                if raw_a == 0 { 255 } else { raw_a }
+                if raw_a == 0 {
+                    255
+                } else {
+                    raw_a
+                }
             } else {
                 255
             };
@@ -220,7 +236,8 @@ fn decode_with_windows_gdiplus(path: &Path) -> Option<(u32, u32, Vec<u8>)> {
         create_from_file: unsafe extern "system" fn(*const u16, *mut *mut c_void) -> i32,
         get_width: unsafe extern "system" fn(*mut c_void, *mut u32) -> i32,
         get_height: unsafe extern "system" fn(*mut c_void, *mut u32) -> i32,
-        lock_bits: unsafe extern "system" fn(*mut c_void, *const GpRect, u32, i32, *mut BitmapData) -> i32,
+        lock_bits:
+            unsafe extern "system" fn(*mut c_void, *const GpRect, u32, i32, *mut BitmapData) -> i32,
         unlock_bits: unsafe extern "system" fn(*mut c_void, *mut BitmapData) -> i32,
         dispose_image: unsafe extern "system" fn(*mut c_void) -> i32,
     }
@@ -249,8 +266,11 @@ fn decode_with_windows_gdiplus(path: &Path) -> Option<(u32, u32, Vec<u8>)> {
             {
                 return None;
             }
-            let startup: unsafe extern "system" fn(*mut usize, *const GdiplusStartupInput, *mut c_void) -> i32 =
-                std::mem::transmute(startup_p);
+            let startup: unsafe extern "system" fn(
+                *mut usize,
+                *const GdiplusStartupInput,
+                *mut c_void,
+            ) -> i32 = std::mem::transmute(startup_p);
             let mut token: usize = 0;
             let input = GdiplusStartupInput {
                 gdiplus_version: 1,
@@ -302,7 +322,8 @@ fn decode_with_windows_gdiplus(path: &Path) -> Option<(u32, u32, Vec<u8>)> {
             reserved: 0,
         };
         // PixelFormat32bppARGB = 0x0026200A, ImageLockModeRead = 1
-        if (fns.lock_bits)(gp_img, &rect, 1, 0x0026_200A, &mut bdata) != 0 || bdata.scan0.is_null() {
+        if (fns.lock_bits)(gp_img, &rect, 1, 0x0026_200A, &mut bdata) != 0 || bdata.scan0.is_null()
+        {
             let _ = (fns.dispose_image)(gp_img);
             return None;
         }
@@ -478,7 +499,9 @@ pub fn detect_pasted_code_snippet(text: &str) -> Option<(String, String, usize)>
         || (normalized.contains('{') && normalized.contains('}'))
         || normalized.contains("=>")
         || normalized.contains("::")
-        || lines.iter().any(|l| l.starts_with("    ") || l.starts_with('\t'));
+        || lines
+            .iter()
+            .any(|l| l.starts_with("    ") || l.starts_with('\t'));
 
     let should_collapse =
         line_count >= 5 || (line_count >= 3 && (looks_like_code || total_chars >= 160));

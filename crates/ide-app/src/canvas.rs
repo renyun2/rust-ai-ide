@@ -74,6 +74,7 @@ pub enum FontStyle {
     ChatMetaBold,
     ChatCode,
     ChatCodeBold,
+    BadgeMicro,
 }
 
 /// 借鉴 WindUI (`wind-ui-rust`) 的纯 Rust 轻量级高分屏 (HiDPI) 渲染栈：
@@ -153,8 +154,7 @@ impl SurfaceCanvas {
         if pw == self.phys_width && ph == self.phys_height {
             return;
         }
-        self.pixmap =
-            Pixmap::new(pw as u32, ph as u32).expect("Failed to resize tiny-skia Pixmap");
+        self.pixmap = Pixmap::new(pw as u32, ph as u32).expect("Failed to resize tiny-skia Pixmap");
         #[cfg(test)]
         self.present_buf.resize(pw * ph, 0);
         self.phys_width = pw;
@@ -568,20 +568,13 @@ impl SurfaceCanvas {
                 line_join: LineJoin::Round,
                 ..Stroke::default()
             };
-            self.pixmap.stroke_path(&arc_path, &paint, &stroke, xform, None);
+            self.pixmap
+                .stroke_path(&arc_path, &paint, &stroke, xform, None);
         }
     }
 
     /// `tiny-skia` 圆角端点矢量抗锯齿线段绘制
-    pub fn draw_line_aa(
-        &mut self,
-        x0: f32,
-        y0: f32,
-        x1: f32,
-        y1: f32,
-        thickness: f32,
-        color: u32,
-    ) {
+    pub fn draw_line_aa(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, thickness: f32, color: u32) {
         let mut pb = PathBuilder::new();
         pb.move_to(x0 + 0.5, y0 + 0.5);
         pb.line_to(x1 + 0.5, y1 + 0.5);
@@ -653,7 +646,14 @@ impl SurfaceCanvas {
     /// 绘制 IDEA 风格放大镜搜索图标
     pub fn draw_search_icon(&mut self, x: i32, y: i32, color: u32) {
         self.stroke_circle(x + 6, y + 6, 4.8, 1.5, color);
-        self.draw_line_aa((x + 10) as f32, (y + 10) as f32, (x + 14) as f32, (y + 14) as f32, 1.8, color);
+        self.draw_line_aa(
+            (x + 10) as f32,
+            (y + 10) as f32,
+            (x + 14) as f32,
+            (y + 14) as f32,
+            1.8,
+            color,
+        );
     }
 
     /// 绘制 IDEA 顶部三横杠主菜单图标 (Hamburger Menu)
@@ -668,7 +668,14 @@ impl SurfaceCanvas {
         self.fill_circle(x + 2, y + 2, 2, color);
         self.fill_circle(x + 2, y + 11, 2, color);
         self.fill_circle(x + 9, y + 5, 2, color);
-        self.draw_line_aa((x + 2) as f32, (y + 2) as f32, (x + 2) as f32, (y + 11) as f32, 1.6, color);
+        self.draw_line_aa(
+            (x + 2) as f32,
+            (y + 2) as f32,
+            (x + 2) as f32,
+            (y + 11) as f32,
+            1.6,
+            color,
+        );
         let mut pb = PathBuilder::new();
         pb.move_to((x + 2) as f32 + 0.5, (y + 9) as f32 + 0.5);
         pb.quad_to(
@@ -729,15 +736,71 @@ impl SurfaceCanvas {
         let cy = y + 8;
         self.stroke_circle(cx, cy, 3.8, 1.4, color);
         // 头部触角
-        self.draw_line_aa((cx - 2) as f32, (cy - 4) as f32, (cx - 4) as f32, (cy - 6) as f32, 1.3, color);
-        self.draw_line_aa((cx + 2) as f32, (cy - 4) as f32, (cx + 4) as f32, (cy - 6) as f32, 1.3, color);
+        self.draw_line_aa(
+            (cx - 2) as f32,
+            (cy - 4) as f32,
+            (cx - 4) as f32,
+            (cy - 6) as f32,
+            1.3,
+            color,
+        );
+        self.draw_line_aa(
+            (cx + 2) as f32,
+            (cy - 4) as f32,
+            (cx + 4) as f32,
+            (cy - 6) as f32,
+            1.3,
+            color,
+        );
         // 六足
-        self.draw_line_aa((cx - 4) as f32, (cy - 1) as f32, (cx - 7) as f32, (cy - 2) as f32, 1.3, color);
-        self.draw_line_aa((cx + 4) as f32, (cy - 1) as f32, (cx + 7) as f32, (cy - 2) as f32, 1.3, color);
-        self.draw_line_aa((cx - 4) as f32, (cy + 1) as f32, (cx - 7) as f32, (cy + 1) as f32, 1.3, color);
-        self.draw_line_aa((cx + 4) as f32, (cy + 1) as f32, (cx + 7) as f32, (cy + 1) as f32, 1.3, color);
-        self.draw_line_aa((cx - 3) as f32, (cy + 3) as f32, (cx - 6) as f32, (cy + 5) as f32, 1.3, color);
-        self.draw_line_aa((cx + 3) as f32, (cy + 3) as f32, (cx + 6) as f32, (cy + 5) as f32, 1.3, color);
+        self.draw_line_aa(
+            (cx - 4) as f32,
+            (cy - 1) as f32,
+            (cx - 7) as f32,
+            (cy - 2) as f32,
+            1.3,
+            color,
+        );
+        self.draw_line_aa(
+            (cx + 4) as f32,
+            (cy - 1) as f32,
+            (cx + 7) as f32,
+            (cy - 2) as f32,
+            1.3,
+            color,
+        );
+        self.draw_line_aa(
+            (cx - 4) as f32,
+            (cy + 1) as f32,
+            (cx - 7) as f32,
+            (cy + 1) as f32,
+            1.3,
+            color,
+        );
+        self.draw_line_aa(
+            (cx + 4) as f32,
+            (cy + 1) as f32,
+            (cx + 7) as f32,
+            (cy + 1) as f32,
+            1.3,
+            color,
+        );
+        self.draw_line_aa(
+            (cx - 3) as f32,
+            (cy + 3) as f32,
+            (cx - 6) as f32,
+            (cy + 5) as f32,
+            1.3,
+            color,
+        );
+        self.draw_line_aa(
+            (cx + 3) as f32,
+            (cy + 3) as f32,
+            (cx + 6) as f32,
+            (cy + 5) as f32,
+            1.3,
+            color,
+        );
     }
 
     /// 绘制 IDEA 左侧边栏空心线框文件夹图标 (Project)
@@ -759,9 +822,23 @@ impl SurfaceCanvas {
 
     /// 绘制 IDEA 左侧边栏 Commit 图标（垂直线 + 圆点 + 对勾）
     pub fn draw_commit_icon(&mut self, x: i32, y: i32, color: u32) {
-        self.draw_line_aa((x + 4) as f32, (y + 1) as f32, (x + 4) as f32, (y + 5) as f32, 1.5, color);
+        self.draw_line_aa(
+            (x + 4) as f32,
+            (y + 1) as f32,
+            (x + 4) as f32,
+            (y + 5) as f32,
+            1.5,
+            color,
+        );
         self.stroke_circle(x + 4, y + 8, 2.8, 1.5, color);
-        self.draw_line_aa((x + 4) as f32, (y + 11) as f32, (x + 4) as f32, (y + 15) as f32, 1.5, color);
+        self.draw_line_aa(
+            (x + 4) as f32,
+            (y + 11) as f32,
+            (x + 4) as f32,
+            (y + 15) as f32,
+            1.5,
+            color,
+        );
         let fx = x as f32 + 0.5;
         let fy = y as f32 + 0.5;
         let mut pb = PathBuilder::new();
@@ -791,13 +868,9 @@ impl SurfaceCanvas {
 
     /// 绘制 IDEA 终端图标 (`>_` 在圆角框中)
     pub fn draw_terminal_icon(&mut self, x: i32, y: i32, color: u32) {
-        if let Some(frame) = build_rounded_rect_path(
-            (x + 1) as f32 + 0.5,
-            (y + 2) as f32 + 0.5,
-            14.0,
-            11.0,
-            2.0,
-        ) {
+        if let Some(frame) =
+            build_rounded_rect_path((x + 1) as f32 + 0.5, (y + 2) as f32 + 0.5, 14.0, 11.0, 2.0)
+        {
             self.stroke_path_round(&frame, 1.4, color);
         }
         let fx = x as f32 + 0.5;
@@ -809,13 +882,27 @@ impl SurfaceCanvas {
         if let Some(chevron) = pb.finish() {
             self.stroke_path_round(&chevron, 1.5, color);
         }
-        self.draw_line_aa((x + 8) as f32, (y + 10) as f32, (x + 12) as f32, (y + 10) as f32, 1.5, color);
+        self.draw_line_aa(
+            (x + 8) as f32,
+            (y + 10) as f32,
+            (x + 12) as f32,
+            (y + 10) as f32,
+            1.5,
+            color,
+        );
     }
 
     /// 绘制 IDEA Problems 感叹号圆环图标
     pub fn draw_problems_icon(&mut self, x: i32, y: i32, color: u32) {
         self.stroke_circle(x + 8, y + 8, 6.0, 1.4, color);
-        self.draw_line_aa((x + 8) as f32, (y + 4) as f32, (x + 8) as f32, (y + 9) as f32, 1.6, color);
+        self.draw_line_aa(
+            (x + 8) as f32,
+            (y + 4) as f32,
+            (x + 8) as f32,
+            (y + 9) as f32,
+            1.6,
+            color,
+        );
         self.fill_circle(x + 8, y + 11, 1, color);
     }
 
@@ -899,18 +986,35 @@ impl SurfaceCanvas {
 
     /// 绘制 Changes / Diff 双栏对比图标
     pub fn draw_changes_diff_icon(&mut self, x: i32, y: i32, color: u32) {
-        if let Some(frame) = build_rounded_rect_path(
-            (x + 2) as f32 + 0.5,
-            (y + 2) as f32 + 0.5,
-            12.0,
-            11.0,
-            1.5,
-        ) {
+        if let Some(frame) =
+            build_rounded_rect_path((x + 2) as f32 + 0.5, (y + 2) as f32 + 0.5, 12.0, 11.0, 1.5)
+        {
             self.stroke_path_round(&frame, 1.4, color);
         }
-        self.draw_line_aa((x + 8) as f32, (y + 2) as f32, (x + 8) as f32, (y + 13) as f32, 1.2, color);
-        self.draw_line_aa((x + 4) as f32, (y + 6) as f32, (x + 6) as f32, (y + 6) as f32, 1.3, color);
-        self.draw_line_aa((x + 10) as f32, (y + 9) as f32, (x + 12) as f32, (y + 9) as f32, 1.3, color);
+        self.draw_line_aa(
+            (x + 8) as f32,
+            (y + 2) as f32,
+            (x + 8) as f32,
+            (y + 13) as f32,
+            1.2,
+            color,
+        );
+        self.draw_line_aa(
+            (x + 4) as f32,
+            (y + 6) as f32,
+            (x + 6) as f32,
+            (y + 6) as f32,
+            1.3,
+            color,
+        );
+        self.draw_line_aa(
+            (x + 10) as f32,
+            (y + 9) as f32,
+            (x + 12) as f32,
+            (y + 9) as f32,
+            1.3,
+            color,
+        );
     }
 
     /// 绘制主题切换半月/太阳图标
@@ -945,15 +1049,43 @@ impl SurfaceCanvas {
         if let Some(doc) = pb.finish() {
             self.stroke_path_round(&doc, 1.3, color);
         }
-        self.draw_line_aa((x + 7) as f32, (y + 6) as f32, (x + 7) as f32, (y + 10) as f32, 1.3, color);
-        self.draw_line_aa((x + 5) as f32, (y + 8) as f32, (x + 9) as f32, (y + 8) as f32, 1.3, color);
+        self.draw_line_aa(
+            (x + 7) as f32,
+            (y + 6) as f32,
+            (x + 7) as f32,
+            (y + 10) as f32,
+            1.3,
+            color,
+        );
+        self.draw_line_aa(
+            (x + 5) as f32,
+            (y + 8) as f32,
+            (x + 9) as f32,
+            (y + 8) as f32,
+            1.3,
+            color,
+        );
     }
 
     /// 绘制新建文件夹图标
     pub fn draw_new_folder_icon(&mut self, x: i32, y: i32, color: u32) {
         self.draw_folder_outline_icon(x, y, color);
-        self.draw_line_aa((x + 8) as f32, (y + 6) as f32, (x + 8) as f32, (y + 11) as f32, 1.4, color);
-        self.draw_line_aa(x as f32 + 5.5, y as f32 + 8.5, x as f32 + 10.5, y as f32 + 8.5, 1.4, color);
+        self.draw_line_aa(
+            (x + 8) as f32,
+            (y + 6) as f32,
+            (x + 8) as f32,
+            (y + 11) as f32,
+            1.4,
+            color,
+        );
+        self.draw_line_aa(
+            x as f32 + 5.5,
+            y as f32 + 8.5,
+            x as f32 + 10.5,
+            y as f32 + 8.5,
+            1.4,
+            color,
+        );
     }
 
     /// 绘制全部展开图标
@@ -1021,13 +1153,34 @@ impl SurfaceCanvas {
 
     /// 绘制加号 `+`
     pub fn draw_plus_icon(&mut self, x: i32, y: i32, color: u32) {
-        self.draw_line_aa((x + 6) as f32, (y + 2) as f32, (x + 6) as f32, (y + 11) as f32, 1.6, color);
-        self.draw_line_aa(x as f32 + 1.5, y as f32 + 6.5, x as f32 + 10.5, y as f32 + 6.5, 1.6, color);
+        self.draw_line_aa(
+            (x + 6) as f32,
+            (y + 2) as f32,
+            (x + 6) as f32,
+            (y + 11) as f32,
+            1.6,
+            color,
+        );
+        self.draw_line_aa(
+            x as f32 + 1.5,
+            y as f32 + 6.5,
+            x as f32 + 10.5,
+            y as f32 + 6.5,
+            1.6,
+            color,
+        );
     }
 
     /// 绘制向上发送箭头 `↑`
     pub fn draw_send_up_icon(&mut self, x: i32, y: i32, color: u32) {
-        self.draw_line_aa((x + 6) as f32, (y + 2) as f32, (x + 6) as f32, (y + 11) as f32, 1.7, color);
+        self.draw_line_aa(
+            (x + 6) as f32,
+            (y + 2) as f32,
+            (x + 6) as f32,
+            (y + 11) as f32,
+            1.7,
+            color,
+        );
         let fx = x as f32 + 0.5;
         let fy = y as f32 + 0.5;
         let mut pb = PathBuilder::new();
@@ -1048,8 +1201,22 @@ impl SurfaceCanvas {
 
     /// 绘制清空/垃圾桶图标
     pub fn draw_trash_icon(&mut self, x: i32, y: i32, color: u32) {
-        self.draw_line_aa((x + 2) as f32, (y + 3) as f32, (x + 12) as f32, (y + 3) as f32, 1.4, color);
-        self.draw_line_aa((x + 5) as f32, (y + 1) as f32, (x + 9) as f32, (y + 1) as f32, 1.4, color);
+        self.draw_line_aa(
+            (x + 2) as f32,
+            (y + 3) as f32,
+            (x + 12) as f32,
+            (y + 3) as f32,
+            1.4,
+            color,
+        );
+        self.draw_line_aa(
+            (x + 5) as f32,
+            (y + 1) as f32,
+            (x + 9) as f32,
+            (y + 1) as f32,
+            1.4,
+            color,
+        );
         let fx = x as f32 + 0.5;
         let fy = y as f32 + 0.5;
         let mut pb = PathBuilder::new();
@@ -1075,20 +1242,90 @@ impl SurfaceCanvas {
         }
     }
 
+    /// 绘制半选/部分勾选横杠 `—` (IDEA 分组复选框部分选中态)
+    pub fn draw_dash_icon(&mut self, x: i32, y: i32, color: u32) {
+        self.draw_line_aa(
+            (x + 2) as f32,
+            (y + 5) as f32,
+            (x + 9) as f32,
+            (y + 5) as f32,
+            1.8,
+            color,
+        );
+    }
+
+    /// 绘制跳转到源文件图标 `↗` (Jump to Source)
+    pub fn draw_jump_to_source_icon(&mut self, x: i32, y: i32, color: u32) {
+        let fx = x as f32 + 0.5;
+        let fy = y as f32 + 0.5;
+        let mut pb = PathBuilder::new();
+        pb.move_to(fx + 5.0, fy + 2.0);
+        pb.line_to(fx + 1.5, fy + 2.0);
+        pb.line_to(fx + 1.5, fy + 10.5);
+        pb.line_to(fx + 10.0, fy + 10.5);
+        pb.line_to(fx + 10.0, fy + 7.0);
+        if let Some(path) = pb.finish() {
+            self.stroke_path_round(&path, 1.25, color);
+        }
+        let mut arrow = PathBuilder::new();
+        arrow.move_to(fx + 5.5, fy + 6.5);
+        arrow.line_to(fx + 11.0, fy + 1.0);
+        arrow.move_to(fx + 7.5, fy + 1.0);
+        arrow.line_to(fx + 11.0, fy + 1.0);
+        arrow.line_to(fx + 11.0, fy + 4.5);
+        if let Some(path) = arrow.finish() {
+            self.stroke_path_round(&path, 1.35, color);
+        }
+    }
+
+    /// 在工具栏图标右上角绘制数字徽章（如 Git 更改数量）
+    pub fn draw_count_badge(
+        &mut self,
+        anchor_btn: Rect,
+        count: usize,
+        bg: u32,
+        fg: u32,
+        cutout_bg: u32,
+    ) {
+        if count == 0 {
+            return;
+        }
+        let text = if count > 99 {
+            "99+".to_string()
+        } else {
+            count.to_string()
+        };
+        let (tw, th) = self.measure_text(&text, FontStyle::BadgeMicro);
+        let bh = 13;
+        let bw = (tw + 7).clamp(14, 26);
+        let bx = (anchor_btn.x + anchor_btn.w - bw + 3).min(anchor_btn.x + anchor_btn.w + 2);
+        let by = anchor_btn.y - 2;
+        let outer = Rect::new(bx - 1, by - 1, bw + 2, bh + 2);
+        self.fill_rounded_rect(outer, 7, cutout_bg);
+        let badge = Rect::new(bx, by, bw, bh);
+        self.fill_rounded_rect(badge, 6, bg);
+        let tx = badge.x + (badge.w - tw) / 2;
+        let ty = badge.y + (badge.h - th) / 2;
+        self.draw_text_styled(tx, ty, &text, fg, badge.w, FontStyle::BadgeMicro);
+    }
+
     /// 绘制自定义顶部栏最小化图标 `—`
     pub fn draw_window_minimize_icon(&mut self, cx: i32, cy: i32, color: u32) {
-        self.draw_line_aa((cx - 5) as f32, cy as f32, (cx + 5) as f32, cy as f32, 1.3, color);
+        self.draw_line_aa(
+            (cx - 5) as f32,
+            cy as f32,
+            (cx + 5) as f32,
+            cy as f32,
+            1.3,
+            color,
+        );
     }
 
     /// 绘制自定义顶部栏最大化图标 `□`
     pub fn draw_window_maximize_icon(&mut self, cx: i32, cy: i32, color: u32) {
-        if let Some(path) = build_rounded_rect_path(
-            (cx - 5) as f32 + 0.5,
-            (cy - 5) as f32 + 0.5,
-            9.0,
-            9.0,
-            1.0,
-        ) {
+        if let Some(path) =
+            build_rounded_rect_path((cx - 5) as f32 + 0.5, (cy - 5) as f32 + 0.5, 9.0, 9.0, 1.0)
+        {
             let paint = solid_paint(color, 255);
             let stroke = Stroke {
                 width: 1.2,
@@ -1165,8 +1402,22 @@ impl SurfaceCanvas {
                 } else {
                     0x1E1F22
                 };
-                self.draw_line_aa((x + 4) as f32, (y + 5) as f32, (x + 10) as f32, (y + 5) as f32, 1.3, fg);
-                self.draw_line_aa((x + 7) as f32, (y + 5) as f32, (x + 7) as f32, (y + 10) as f32, 1.3, fg);
+                self.draw_line_aa(
+                    (x + 4) as f32,
+                    (y + 5) as f32,
+                    (x + 10) as f32,
+                    (y + 5) as f32,
+                    1.3,
+                    fg,
+                );
+                self.draw_line_aa(
+                    (x + 7) as f32,
+                    (y + 5) as f32,
+                    (x + 7) as f32,
+                    (y + 10) as f32,
+                    1.3,
+                    fg,
+                );
             }
             ide_core::LanguageId::Python => {
                 self.fill_rounded_rect(Rect::new(x + 2, y + 2, 7, 6), 2, 0x3572A5);
@@ -1179,8 +1430,22 @@ impl SurfaceCanvas {
                     0xE5C07B
                 };
                 self.stroke_rounded_rect(Rect::new(x + 2, y + 2, 10, 11), 2, c, 0x2B2D30);
-                self.draw_line_aa((x + 4) as f32, (y + 5) as f32, (x + 10) as f32, (y + 5) as f32, 1.2, c);
-                self.draw_line_aa((x + 4) as f32, (y + 8) as f32, (x + 9) as f32, (y + 8) as f32, 1.2, c);
+                self.draw_line_aa(
+                    (x + 4) as f32,
+                    (y + 5) as f32,
+                    (x + 10) as f32,
+                    (y + 5) as f32,
+                    1.2,
+                    c,
+                );
+                self.draw_line_aa(
+                    (x + 4) as f32,
+                    (y + 8) as f32,
+                    (x + 9) as f32,
+                    (y + 8) as f32,
+                    1.2,
+                    c,
+                );
             }
             ide_core::LanguageId::Markdown => {
                 self.fill_rounded_rect(Rect::new(x + 1, y + 2, 12, 10), 2, 0x42A5F5);
@@ -1229,7 +1494,12 @@ impl SurfaceCanvas {
         let avail_h = (track_rect.h - thumb_h).max(1);
         let thumb_y =
             track_rect.y + ((clamped_offset as f32 / max_scroll as f32) * (avail_h as f32)) as i32;
-        let thumb_rect = Rect::new(track_rect.x + 1, thumb_y, (track_rect.w - 2).max(4), thumb_h);
+        let thumb_rect = Rect::new(
+            track_rect.x + 1,
+            thumb_y,
+            (track_rect.w - 2).max(4),
+            thumb_h,
+        );
         self.fill_rounded_rect(thumb_rect, 3, thumb_color);
         thumb_rect
     }
@@ -1273,13 +1543,7 @@ impl SurfaceCanvas {
     }
 
     /// 在矩形区域内水平+垂直居中绘制文本
-    pub fn draw_text_centered(
-        &mut self,
-        rect: Rect,
-        text: &str,
-        color: u32,
-        style: FontStyle,
-    ) {
+    pub fn draw_text_centered(&mut self, rect: Rect, text: &str, color: u32, style: FontStyle) {
         let (tw, th) = self.measure_text(text, style);
         let tx = rect.x + ((rect.w - tw).max(4)) / 2;
         let ty = rect.y + ((rect.h - th).max(2)) / 2;
@@ -1394,8 +1658,8 @@ impl SurfaceCanvas {
 
         let pw_phys = (px1 - px0).max(1) as f32;
         let ph_phys = (py1 - py0).max(1) as f32;
-        let r_phys = ((radius.saturating_sub(1) as f32) * s)
-            .clamp(0.0, (pw_phys * 0.5).min(ph_phys * 0.5));
+        let r_phys =
+            ((radius.saturating_sub(1) as f32) * s).clamp(0.0, (pw_phys * 0.5).min(ph_phys * 0.5));
         let pw_usize = self.phys_width;
         let out_px = self.pixmap.pixels_mut();
         let iw = img_w as usize;
@@ -1415,8 +1679,8 @@ impl SurfaceCanvas {
                 if r_phys > 0.5 {
                     let dx_edge = ((px_x - px0) as f32 + 0.5 - r_phys)
                         .min((px1 - px_x) as f32 - 0.5 - r_phys);
-                    let dy_edge = ((py - py0) as f32 + 0.5 - r_phys)
-                        .min((py1 - py) as f32 - 0.5 - r_phys);
+                    let dy_edge =
+                        ((py - py0) as f32 + 0.5 - r_phys).min((py1 - py) as f32 - 0.5 - r_phys);
                     if dx_edge < 0.0 && dy_edge < 0.0 {
                         let dist = dx_edge.hypot(dy_edge) - r_phys;
                         corner_cov = (0.5 - dist).clamp(0.0, 1.0);
@@ -1464,7 +1728,9 @@ impl SurfaceCanvas {
                 let a = sa.clamp(0.0, 1.0);
                 let inv = 1.0 - a;
                 let nr = (dst.red() as f32 * inv + sr * a).round().clamp(0.0, 255.0) as u8;
-                let ng = (dst.green() as f32 * inv + sg * a).round().clamp(0.0, 255.0) as u8;
+                let ng = (dst.green() as f32 * inv + sg * a)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
                 let nb = (dst.blue() as f32 * inv + sb * a).round().clamp(0.0, 255.0) as u8;
                 if let Some(p) = PremultipliedColorU8::from_rgba(nr, ng, nb, 255) {
                     *dst = p;
@@ -1542,7 +1808,14 @@ fn build_rounded_rect_path(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Optio
     pb.line_to(right - r, y);
     pb.cubic_to(right - r + c, y, right, y + r - c, right, y + r);
     pb.line_to(right, bottom - r);
-    pb.cubic_to(right, bottom - r + c, right - r + c, bottom, right - r, bottom);
+    pb.cubic_to(
+        right,
+        bottom - r + c,
+        right - r + c,
+        bottom,
+        right - r,
+        bottom,
+    );
     pb.line_to(x + r, bottom);
     pb.cubic_to(x + r - c, bottom, x, bottom - r + c, x, bottom - r);
     pb.line_to(x, y + r);
@@ -1748,8 +2021,8 @@ struct DWriteTextEngine {
 impl DWriteTextEngine {
     fn new(scale_factor: f32) -> Self {
         unsafe {
-            let factory: IDWriteFactory =
-                DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).expect("DWriteCreateFactory failed");
+            let factory: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)
+                .expect("DWriteCreateFactory failed");
             let gdi_interop = factory.GetGdiInterop().expect("GetGdiInterop failed");
             let params = factory
                 .CreateRenderingParams()
@@ -1800,10 +2073,8 @@ impl DWriteTextEngine {
         let mut is_trailing = FALSE;
         let mut is_inside = FALSE;
         let mut ht = DWRITE_HIT_TEST_METRICS::default();
-        if unsafe {
-            layout.HitTestPoint(phys_x, 0.0, &mut is_trailing, &mut is_inside, &mut ht)
-        }
-        .is_err()
+        if unsafe { layout.HitTestPoint(phys_x, 0.0, &mut is_trailing, &mut is_inside, &mut ht) }
+            .is_err()
         {
             return 0;
         }
@@ -1836,6 +2107,7 @@ impl DWriteTextEngine {
             FontStyle::ChatMetaBold => ("Segoe UI", 12.2f32, DWRITE_FONT_WEIGHT_SEMI_BOLD),
             FontStyle::ChatCode => ("Cascadia Mono", 12.6f32, DWRITE_FONT_WEIGHT_NORMAL),
             FontStyle::ChatCodeBold => ("Cascadia Mono", 12.6f32, DWRITE_FONT_WEIGHT_SEMI_BOLD),
+            FontStyle::BadgeMicro => ("Segoe UI", 10.0f32, DWRITE_FONT_WEIGHT_BOLD),
         };
         let size = (base_size * scale).max(9.0);
 
@@ -1857,7 +2129,10 @@ impl DWriteTextEngine {
         unsafe {
             let _ = format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
         }
-        self.state.borrow_mut().formats.insert(style, format.clone());
+        self.state
+            .borrow_mut()
+            .formats
+            .insert(style, format.clone());
         Some(format)
     }
 
@@ -1909,7 +2184,11 @@ impl DWriteTextEngine {
 
     fn ensure_bitmap(&self, w: i32, h: i32) -> Option<(IDWriteBitmapRenderTarget, *mut u32, i32)> {
         let mut st = self.state.borrow_mut();
-        if st.bitmap_target.is_none() || st.bitmap_bits.is_null() || w > st.bitmap_w || h > st.bitmap_h {
+        if st.bitmap_target.is_none()
+            || st.bitmap_bits.is_null()
+            || w > st.bitmap_w
+            || h > st.bitmap_h
+        {
             let nw = w.max(st.bitmap_w).max(64);
             let nh = h.max(st.bitmap_h).max(32);
             let brt = unsafe {
@@ -2110,9 +2389,8 @@ impl DWriteTextEngine {
             let rh = max_y - min_y;
             let mut buf = Vec::with_capacity(rw * rh);
             for row in min_y..max_y {
-                let src_row = unsafe {
-                    std::slice::from_raw_parts(bits.add(row * stride_usize + min_x), rw)
-                };
+                let src_row =
+                    unsafe { std::slice::from_raw_parts(bits.add(row * stride_usize + min_x), rw) };
                 for &px in src_row {
                     buf.push(px & 0x00FFFFFF);
                 }

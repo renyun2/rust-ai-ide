@@ -4,6 +4,10 @@ use crate::image_preview::{
     detect_pasted_code_snippet, is_image_file_path, load_image_for_preview,
     read_windows_clipboard_payload, ClipboardPastePayload, DecodedPreviewImage,
 };
+use crate::persistence::{
+    self, PersistedGlobalSettings, PersistedOpenTab, PersistedProviderPref,
+    PersistedWorkspaceState,
+};
 use crate::text_input::TextInputField;
 use ide_agent_hub::{
     AgentAttachedItem, AgentHub, AgentProviderKind, AgentWorkbenchMode, AiApiFormat,
@@ -26,6 +30,7 @@ use ide_syntax::{
 };
 use ide_terminal::TerminalSession;
 use ide_vfs::{ProjectTreeState, TextBuffer};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -168,7 +173,7 @@ pub enum DragScrollbar {
     GitLogDiff,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RightPanelTab {
     Chat,
     Changes,
@@ -232,7 +237,7 @@ pub enum ContextMenuAction {
     TermClear,
     TermNewTab,
     // IDEA Git 上下文菜单操作
-    GitToggleStage(PathBuf),
+    GitToggleCommitCheck(PathBuf),
     GitShowWorkingDiff(PathBuf),
     GitRollbackFile(PathBuf),
     GitCheckoutRevision(String),
@@ -303,9 +308,7 @@ pub fn write_windows_clipboard_text(text: &str) -> bool {
     use windows::Win32::System::DataExchange::{
         CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
     };
-    use windows::Win32::System::Memory::{
-        GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
-    };
+    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
     const CF_UNICODETEXT: u32 = 13;
 
     let normalized = text.replace("\r\n", "\n").replace('\n', "\r\n");
@@ -347,6 +350,260 @@ pub fn write_windows_clipboard_text(_text: &str) -> bool {
     false
 }
 
+/// Settings 对话框页面，结构对齐 IntelliJ IDEA `Ctrl+Alt+S`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SettingsPage {
+    Appearance,
+    MenusAndToolbars,
+    SystemSettings,
+    EditorGeneral,
+    EditorFont,
+    ColorScheme,
+    CodeStyle,
+    Keymap,
+    Plugins,
+    Git,
+    Debugger,
+    Terminal,
+    Languages,
+    Advanced,
+}
+
+impl SettingsPage {
+    fn title(self, lang: UiLanguage) -> &'static str {
+        match (self, lang) {
+            (Self::Appearance, UiLanguage::ZhCn) => "外观",
+            (Self::Appearance, UiLanguage::EnUs) => "Appearance",
+            (Self::MenusAndToolbars, UiLanguage::ZhCn) => "菜单和工具栏",
+            (Self::MenusAndToolbars, UiLanguage::EnUs) => "Menus and Toolbars",
+            (Self::SystemSettings, UiLanguage::ZhCn) => "系统设置",
+            (Self::SystemSettings, UiLanguage::EnUs) => "System Settings",
+            (Self::EditorGeneral, UiLanguage::ZhCn) => "常规",
+            (Self::EditorGeneral, UiLanguage::EnUs) => "General",
+            (Self::EditorFont, UiLanguage::ZhCn) => "字体",
+            (Self::EditorFont, UiLanguage::EnUs) => "Font",
+            (Self::ColorScheme, UiLanguage::ZhCn) => "配色方案",
+            (Self::ColorScheme, UiLanguage::EnUs) => "Color Scheme",
+            (Self::CodeStyle, UiLanguage::ZhCn) => "代码样式",
+            (Self::CodeStyle, UiLanguage::EnUs) => "Code Style",
+            (Self::Keymap, UiLanguage::ZhCn) => "按键映射",
+            (Self::Keymap, UiLanguage::EnUs) => "Keymap",
+            (Self::Plugins, UiLanguage::ZhCn) => "插件",
+            (Self::Plugins, UiLanguage::EnUs) => "Plugins",
+            (Self::Git, UiLanguage::ZhCn) => "Git",
+            (Self::Git, UiLanguage::EnUs) => "Git",
+            (Self::Debugger, UiLanguage::ZhCn) => "调试器",
+            (Self::Debugger, UiLanguage::EnUs) => "Debugger",
+            (Self::Terminal, UiLanguage::ZhCn) => "终端",
+            (Self::Terminal, UiLanguage::EnUs) => "Terminal",
+            (Self::Languages, UiLanguage::ZhCn) => "语言和框架",
+            (Self::Languages, UiLanguage::EnUs) => "Languages & Frameworks",
+            (Self::Advanced, UiLanguage::ZhCn) => "高级设置",
+            (Self::Advanced, UiLanguage::EnUs) => "Advanced Settings",
+        }
+    }
+
+    fn breadcrumb(self, lang: UiLanguage) -> &'static str {
+        match (self, lang) {
+            (Self::Appearance, UiLanguage::ZhCn) => "外观与行为  /  外观",
+            (Self::Appearance, UiLanguage::EnUs) => "Appearance & Behavior  /  Appearance",
+            (Self::MenusAndToolbars, UiLanguage::ZhCn) => "外观与行为  /  菜单和工具栏",
+            (Self::MenusAndToolbars, UiLanguage::EnUs) => {
+                "Appearance & Behavior  /  Menus and Toolbars"
+            }
+            (Self::SystemSettings, UiLanguage::ZhCn) => "外观与行为  /  系统设置",
+            (Self::SystemSettings, UiLanguage::EnUs) => "Appearance & Behavior  /  System Settings",
+            (Self::EditorGeneral, UiLanguage::ZhCn) => "编辑器  /  常规",
+            (Self::EditorGeneral, UiLanguage::EnUs) => "Editor  /  General",
+            (Self::EditorFont, UiLanguage::ZhCn) => "编辑器  /  字体",
+            (Self::EditorFont, UiLanguage::EnUs) => "Editor  /  Font",
+            (Self::ColorScheme, UiLanguage::ZhCn) => "编辑器  /  配色方案",
+            (Self::ColorScheme, UiLanguage::EnUs) => "Editor  /  Color Scheme",
+            (Self::CodeStyle, UiLanguage::ZhCn) => "编辑器  /  代码样式",
+            (Self::CodeStyle, UiLanguage::EnUs) => "Editor  /  Code Style",
+            (Self::Keymap, UiLanguage::ZhCn) => "按键映射",
+            (Self::Keymap, UiLanguage::EnUs) => "Keymap",
+            (Self::Plugins, UiLanguage::ZhCn) => "插件",
+            (Self::Plugins, UiLanguage::EnUs) => "Plugins",
+            (Self::Git, UiLanguage::ZhCn) => "版本控制  /  Git",
+            (Self::Git, UiLanguage::EnUs) => "Version Control  /  Git",
+            (Self::Debugger, UiLanguage::ZhCn) => "构建、执行、部署  /  调试器",
+            (Self::Debugger, UiLanguage::EnUs) => "Build, Execution, Deployment  /  Debugger",
+            (Self::Terminal, UiLanguage::ZhCn) => "工具  /  终端",
+            (Self::Terminal, UiLanguage::EnUs) => "Tools  /  Terminal",
+            (Self::Languages, UiLanguage::ZhCn) => "语言和框架",
+            (Self::Languages, UiLanguage::EnUs) => "Languages & Frameworks",
+            (Self::Advanced, UiLanguage::ZhCn) => "高级设置",
+            (Self::Advanced, UiLanguage::EnUs) => "Advanced Settings",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SettingsNavItem {
+    page: Option<SettingsPage>,
+    depth: u8,
+    zh: &'static str,
+    en: &'static str,
+    keywords: &'static str,
+}
+
+const SETTINGS_NAV: &[SettingsNavItem] = &[
+    SettingsNavItem {
+        page: None,
+        depth: 0,
+        zh: "外观与行为",
+        en: "Appearance & Behavior",
+        keywords: "appearance behavior 外观 行为",
+    },
+    SettingsNavItem {
+        page: Some(SettingsPage::Appearance),
+        depth: 1,
+        zh: "外观",
+        en: "Appearance",
+        keywords: "appearance theme zoom scale language ui dpi 外观 主题 缩放 语言 字体",
+    },
+    SettingsNavItem {
+        page: Some(SettingsPage::MenusAndToolbars),
+        depth: 1,
+        zh: "菜单和工具栏",
+        en: "Menus and Toolbars",
+        keywords: "menu toolbar 菜单 工具栏",
+    },
+    SettingsNavItem {
+        page: Some(SettingsPage::SystemSettings),
+        depth: 1,
+        zh: "系统设置",
+        en: "System Settings",
+        keywords: "system project workspace recent 系统 项目 工作区 最近打开",
+    },
+    SettingsNavItem {
+        page: None,
+        depth: 0,
+        zh: "编辑器",
+        en: "Editor",
+        keywords: "editor 编辑器",
+    },
+    SettingsNavItem {
+        page: Some(SettingsPage::EditorGeneral),
+        depth: 1,
+        zh: "常规",
+        en: "General",
+        keywords: "editor general indent comment caret 常规 缩进 注释 光标",
+    },
+    SettingsNavItem {
+        page: Some(SettingsPage::EditorFont),
+        depth: 1,
+        zh: "字体",
+        en: "Font",
+        keywords: "font size zoom cascadia yahei 字体 字号 缩放",
+    },
+    SettingsNavItem {
+        page: Some(SettingsPage::ColorScheme),
+        depth: 1,
+        zh: "配色方案",
+        en: "Color Scheme",
+        keywords: "color scheme syntax highlight darcula islands 配色 语法 高亮 颜色",
+    },
+    SettingsNavItem {
+        page: Some(SettingsPage::CodeStyle),
+        depth: 1,
+        zh: "代码样式",
+        en: "Code Style",
+        keywords: "code style indent tab reformat 代码样式 缩进 制表符 格式化",
+    },
+    SettingsNavItem {
+        page: Some(SettingsPage::Keymap),
+        depth: 0,
+        zh: "按键映射",
+        en: "Keymap",
+        keywords: "keymap shortcut key binding 按键 快捷键 intellij",
+    },
+    SettingsNavItem {
+        page: Some(SettingsPage::Plugins),
+        depth: 0,
+        zh: "插件",
+        en: "Plugins",
+        keywords: "plugin extension lsp 插件 扩展",
+    },
+    SettingsNavItem {
+        page: None,
+        depth: 0,
+        zh: "版本控制",
+        en: "Version Control",
+        keywords: "version control vcs 版本控制",
+    },
+    SettingsNavItem {
+        page: Some(SettingsPage::Git),
+        depth: 1,
+        zh: "Git",
+        en: "Git",
+        keywords: "git branch commit push pull checkout 分支 提交 推送 拉取",
+    },
+    SettingsNavItem {
+        page: None,
+        depth: 0,
+        zh: "构建、执行、部署",
+        en: "Build, Execution, Deployment",
+        keywords: "build execution deployment 构建 执行 部署",
+    },
+    SettingsNavItem {
+        page: Some(SettingsPage::Debugger),
+        depth: 1,
+        zh: "调试器",
+        en: "Debugger",
+        keywords: "debug breakpoint dap codelldb 调试 断点",
+    },
+    SettingsNavItem {
+        page: None,
+        depth: 0,
+        zh: "工具",
+        en: "Tools",
+        keywords: "tools 工具",
+    },
+    SettingsNavItem {
+        page: Some(SettingsPage::Terminal),
+        depth: 1,
+        zh: "终端",
+        en: "Terminal",
+        keywords: "terminal shell console pty 终端 控制台",
+    },
+    SettingsNavItem {
+        page: Some(SettingsPage::Languages),
+        depth: 0,
+        zh: "语言和框架",
+        en: "Languages & Frameworks",
+        keywords: "language rust typescript javascript python framework 语言 框架",
+    },
+    SettingsNavItem {
+        page: Some(SettingsPage::Advanced),
+        depth: 0,
+        zh: "高级设置",
+        en: "Advanced Settings",
+        keywords: "advanced dpi scale new ui 高级 缩放",
+    },
+];
+
+struct SettingsFlow {
+    origin_y: i32,
+    view_h: i32,
+    scroll_px: i32,
+    cursor: i32,
+}
+
+impl SettingsFlow {
+    fn place(&mut self, h: i32, gap: i32) -> Option<i32> {
+        let top = self.cursor;
+        self.cursor += h + gap;
+        let sy = self.origin_y + top - self.scroll_px;
+        if sy < self.origin_y || sy + h > self.origin_y + self.view_h {
+            None
+        } else {
+            Some(sy)
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum HitAction {
     // 自定义无边框窗口标题栏控制
@@ -381,15 +638,16 @@ pub enum HitAction {
     SwitchRightPanelTab(RightPanelTab),
     SelectBottomTool(ToolWindowId),
     // Git 面板与 IDEA Git 历史库交互
-    ToggleStageFile(PathBuf),
-    StageAllGitChanges,
-    UnstageAllGitChanges,
+    ToggleCommitFileCheck(PathBuf),
+    ToggleCommitGroupCheck { untracked_group: bool },
+    ToggleCommitGroupCollapse { untracked_group: bool },
+    InspectSelectedGitDiff,
+    RollbackCheckedGitChanges,
     CommitAllGitChanges,
     CommitAndPushGitChanges,
     ToggleGitAmend,
     GenerateAiCommitMessage,
     RollbackGitFile(PathBuf),
-    RollbackAllGitChanges,
     RefreshGitStatus,
     GitFetchAll,
     FocusGitCommitMessageInput,
@@ -445,6 +703,14 @@ pub enum HitAction {
     RejectInlineDiff,
     SendSelectionToAgent,
     RevertLastCheckpoint,
+    ToggleAgentChangedFilesDrawer,
+    KeepAllAgentChangedFiles,
+    RevertAllAgentChangedFiles,
+    RevertSingleAgentChangedFile(PathBuf),
+    StartEditSentUserMessage(usize),
+    CancelEditSentUserMessage,
+    ConfirmEditMessageRewind { revert_files: bool },
+    CancelEditMessageRewindModal,
     FocusAgentChatInput,
     SubmitAgentChatPrompt,
     CancelAgentRequest,
@@ -466,6 +732,9 @@ pub enum HitAction {
     SelectTheme(ThemeKind),
     SetUiLanguage(UiLanguage),
     SetUiScale(u16),
+    SelectSettingsPage(SettingsPage),
+    FocusSettingsSearch,
+    ApplySettings,
     OpenFolderDialog,
     OpenFolderInNewWindowDialog,
     PromptOpenWorkspace(PathBuf),
@@ -495,7 +764,16 @@ pub enum FocusTarget {
     SettingsModal,
     AiConfigModal(usize),
     OpenProjectChoiceModal,
+    EditMessageRewindModal,
     ImagePreviewModal,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingEditMessageRewind {
+    pub msg_idx: usize,
+    pub new_prompt: String,
+    pub dropped_msgs: usize,
+    pub affected_files: Vec<PathBuf>,
 }
 
 pub struct IdeApplicationState {
@@ -523,8 +801,20 @@ pub struct IdeApplicationState {
     pub selected_git_commit_file: usize,
     pub git_log_branch_filter: Option<String>,
     pub git_working_diff_target: Option<PathBuf>,
+    pub selected_git_working_file: Option<PathBuf>,
+    pub git_changes_group_collapsed: bool,
+    pub git_unversioned_group_collapsed: bool,
     pub git_new_branch_from_ref: Option<String>,
     pub modal_scroll: usize,
+    pub settings_page: SettingsPage,
+    pub settings_nav_scroll: usize,
+    pub settings_nav_max_scroll: usize,
+    pub settings_content_max_scroll: usize,
+    pub settings_nav_rect: Rect,
+    pub settings_content_rect: Rect,
+    pub settings_search_rect: Rect,
+    pub settings_search_text_x: i32,
+    pub settings_query_input: TextInputField,
     // 自定义窗口与悬浮态
     pub hover_pos: (i32, i32),
     pub last_hover_hit_idx: Option<usize>,
@@ -582,12 +872,16 @@ pub struct IdeApplicationState {
     pub agent_model_popup_open: bool,
     pub agent_mode_popup_open: bool,
     pub agent_sessions_popup_open: bool,
+    pub agent_changed_files_expanded: bool,
     pub agent_mode: AgentWorkbenchMode,
     pub agent_busy_started_at: Option<Instant>,
     pub agent_provider_pill_rect: Rect,
     pub agent_model_pill_rect: Rect,
     pub agent_mode_pill_rect: Rect,
     pub attach_active_context: bool,
+    pub editing_sent_msg_idx: Option<usize>,
+    pub editing_msg_saved_draft: String,
+    pub pending_edit_rewind: Option<PendingEditMessageRewind>,
     pub context_menu: Option<ContextMenuState>,
     pub context_menu_rect: Rect,
     pub active_overlay_rects: Vec<Rect>,
@@ -654,6 +948,7 @@ pub struct IdeApplicationState {
     pub tree_load_alpha: f32,
     wakeup_enabled: bool,
     wakeup: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub persistence_dir: Option<PathBuf>,
     folder_pick_tx: mpsc::Sender<PathBuf>,
     folder_pick_rx: mpsc::Receiver<PathBuf>,
     workspace_files_cache: Arc<RwLock<Option<Vec<WorkspaceFileEntry>>>>,
@@ -696,10 +991,7 @@ enum AsyncSearchEvent {
     },
 }
 
-fn ensure_search_index(
-    root: &Path,
-    files_cache: &Arc<RwLock<Option<Vec<WorkspaceFileEntry>>>>,
-) {
+fn ensure_search_index(root: &Path, files_cache: &Arc<RwLock<Option<Vec<WorkspaceFileEntry>>>>) {
     if let Ok(guard) = files_cache.read() {
         if guard.is_some() {
             return;
@@ -717,7 +1009,10 @@ fn spawn_search_worker(
     latest_seq: Arc<AtomicU64>,
     indexing_flag: Arc<AtomicBool>,
     wakeup: Option<Arc<dyn Fn() + Send + Sync>>,
-) -> (mpsc::Sender<SearchWorkerCmd>, mpsc::Receiver<AsyncSearchEvent>) {
+) -> (
+    mpsc::Sender<SearchWorkerCmd>,
+    mpsc::Receiver<AsyncSearchEvent>,
+) {
     let (cmd_tx, cmd_rx) = mpsc::channel::<SearchWorkerCmd>();
     let (event_tx, event_rx) = mpsc::channel::<AsyncSearchEvent>();
 
@@ -766,7 +1061,8 @@ fn spawn_search_worker(
                         } else {
                             search_everywhere(&root, &query, max_results)
                         };
-                        let _ = event_tx.send(AsyncSearchEvent::SearchEverywhereReady { seq, items });
+                        let _ =
+                            event_tx.send(AsyncSearchEvent::SearchEverywhereReady { seq, items });
                         if let Some(cb) = &wakeup {
                             cb();
                         }
@@ -877,7 +1173,8 @@ impl IdeApplicationState {
             UiLanguage::ZhCn => "本地",
             UiLanguage::EnUs => "Local",
         };
-        let terminal = TerminalSession::new_with_wakeup(term_title, &workspace_root, wakeup.clone());
+        let terminal =
+            TerminalSession::new_with_wakeup(term_title, &workspace_root, wakeup.clone());
         let agent_hub = AgentHub::new_with_wakeup(&workspace_root, wakeup.clone());
         let api_cfg = agent_hub.api_config.clone();
 
@@ -925,8 +1222,20 @@ impl IdeApplicationState {
             selected_git_commit_file: 0,
             git_log_branch_filter: None,
             git_working_diff_target: None,
+            selected_git_working_file: None,
+            git_changes_group_collapsed: false,
+            git_unversioned_group_collapsed: false,
             git_new_branch_from_ref: None,
             modal_scroll: 0,
+            settings_page: SettingsPage::Appearance,
+            settings_nav_scroll: 0,
+            settings_nav_max_scroll: 0,
+            settings_content_max_scroll: 0,
+            settings_nav_rect: Rect::new(0, 0, 0, 0),
+            settings_content_rect: Rect::new(0, 0, 0, 0),
+            settings_search_rect: Rect::new(0, 0, 0, 0),
+            settings_search_text_x: 0,
+            settings_query_input: TextInputField::single_line(),
             hover_pos: (-1, -1),
             last_hover_hit_idx: None,
             last_hover_splitter: None,
@@ -980,12 +1289,16 @@ impl IdeApplicationState {
             agent_model_popup_open: false,
             agent_mode_popup_open: false,
             agent_sessions_popup_open: false,
+            agent_changed_files_expanded: false,
             agent_mode: agent_hub.normalize_mode_for_active(AgentWorkbenchMode::Agent),
             agent_busy_started_at: None,
             agent_provider_pill_rect: Rect::new(0, 0, 0, 0),
             agent_model_pill_rect: Rect::new(0, 0, 0, 0),
             agent_mode_pill_rect: Rect::new(0, 0, 0, 0),
             attach_active_context: true,
+            editing_sent_msg_idx: None,
+            editing_msg_saved_draft: String::new(),
+            pending_edit_rewind: None,
             context_menu: None,
             context_menu_rect: Rect::new(0, 0, 0, 0),
             active_overlay_rects: Vec::new(),
@@ -1057,6 +1370,7 @@ impl IdeApplicationState {
             tree_load_alpha: if wakeup_enabled { 0.85 } else { 0.0 },
             wakeup_enabled,
             wakeup,
+            persistence_dir: None,
             folder_pick_tx,
             folder_pick_rx,
             workspace_files_cache,
@@ -1068,7 +1382,9 @@ impl IdeApplicationState {
             cached_highlight_lines: (PathBuf::new(), usize::MAX, HashMap::new()),
             cached_chat_rows: AgentChatCache::default(),
             hit_regions: Vec::new(),
-            status_notification: "IDEA Islands UI 就绪 | 真实文档选区拖拽 · 原生 ConPTY VT100 终端 · AI Agent 工具链".to_string(),
+            status_notification:
+                "IDEA Islands UI 就绪 | 真实文档选区拖拽 · 原生 ConPTY VT100 终端 · AI Agent 工具链"
+                    .to_string(),
         };
 
         let first_path = state.active_buffer().path.clone();
@@ -1102,6 +1418,212 @@ impl IdeApplicationState {
             sys_pct,
             ui_pct
         );
+        self.save_global_settings();
+    }
+
+    pub fn restore_from_persistence_dir(&mut self, dir: PathBuf) {
+        self.persistence_dir = Some(dir.clone());
+
+        if let Some(gs) =
+            persistence::load_json::<PersistedGlobalSettings>(&persistence::global_settings_path(&dir))
+        {
+            self.ui_lang = gs.ui_lang;
+            self.ui_scale = gs.ui_scale.clamp(0.85, 2.0);
+            self.theme = IdeaTheme::from_kind(gs.theme_kind);
+            self.settings_page = gs.settings_page;
+            self.left_tool = gs.left_tool;
+            self.left_panel_width = gs.left_panel_width.clamp(160, 560);
+            self.right_agent_open = gs.right_agent_open;
+            self.right_panel_width = gs.right_panel_width.clamp(240, 680);
+            self.right_panel_tab = gs.right_panel_tab;
+            self.bottom_tool = gs.bottom_tool;
+            self.bottom_panel_height = gs.bottom_panel_height.clamp(120, 480);
+            self.window_maximized = gs.window_maximized;
+            if gs.window_width >= 800 && gs.window_height >= 540 {
+                self.last_win_size = (gs.window_width, gs.window_height);
+            }
+            self.attach_active_context = gs.attach_active_context;
+
+            let mut merged_recent = vec![self.workspace_root.clone()];
+            for p in gs.recent_workspaces {
+                let cp = clean_workspace_path(p);
+                if cp.is_dir() && !merged_recent.contains(&cp) {
+                    merged_recent.push(cp);
+                }
+            }
+            merged_recent.truncate(10);
+            self.recent_workspaces = merged_recent;
+
+            for pref in &gs.provider_prefs {
+                if let Some(reg) = self
+                    .agent_hub
+                    .providers
+                    .iter_mut()
+                    .find(|p| p.kind == pref.kind)
+                {
+                    if !pref.active_model.trim().is_empty() {
+                        reg.active_model = pref.active_model.clone();
+                        ide_agent_hub::cli_discovery::push_unique_model(
+                            &mut reg.discovered_models,
+                            &pref.active_model,
+                        );
+                    }
+                    reg.fast_mode = pref.fast_mode;
+                    reg.reasoning_effort = pref.reasoning_effort;
+                }
+            }
+            if let Some(cfg) = gs.ai_api_config {
+                let _ = self.agent_hub.update_api_config(cfg);
+            }
+            self.agent_hub.active_provider = gs.active_provider;
+            self.agent_mode = self.agent_hub.normalize_mode_for_active(gs.agent_mode);
+        }
+
+        let hist_path = persistence::agent_history_path(&dir, &self.workspace_root);
+        self.agent_hub.set_history_file_path(Some(hist_path));
+        self.agent_mode = self.agent_hub.normalize_mode_for_active(self.agent_mode);
+        self.ai_cfg_model.set_text(&self.agent_hub.active_model());
+        let sess_draft = self.agent_hub.active_session().draft_prompt.clone();
+        self.agent_chat_input.set_text(&sess_draft);
+        self.agent_scroll = usize::MAX;
+        self.agent_chat_signature_salt = self.agent_chat_signature_salt.wrapping_add(1);
+
+        self.restore_workspace_state(&dir);
+        self.save_global_settings();
+    }
+
+    pub fn save_global_settings(&self) {
+        let Some(dir) = &self.persistence_dir else {
+            return;
+        };
+        let provider_prefs = self
+            .agent_hub
+            .providers
+            .iter()
+            .map(|p| PersistedProviderPref {
+                kind: p.kind,
+                active_model: p.active_model.clone(),
+                fast_mode: p.fast_mode,
+                reasoning_effort: p.reasoning_effort,
+            })
+            .collect();
+        let (win_w, win_h) = if self.last_win_size.0 >= 800 && self.last_win_size.1 >= 540 {
+            self.last_win_size
+        } else {
+            (1560, 940)
+        };
+        let mut recent = Vec::with_capacity(self.recent_workspaces.len().min(10));
+        for p in &self.recent_workspaces {
+            let cp = clean_workspace_path(p.clone());
+            if !recent.contains(&cp) {
+                recent.push(cp);
+            }
+        }
+        recent.truncate(10);
+        let gs = PersistedGlobalSettings {
+            ui_lang: self.ui_lang,
+            ui_scale: self.ui_scale,
+            theme_kind: self.theme.kind,
+            settings_page: self.settings_page,
+            last_workspace: Some(self.workspace_root.clone()),
+            recent_workspaces: recent,
+            left_tool: self.left_tool,
+            left_panel_width: self.left_panel_width,
+            right_agent_open: self.right_agent_open,
+            right_panel_width: self.right_panel_width,
+            right_panel_tab: self.right_panel_tab,
+            bottom_tool: self.bottom_tool,
+            bottom_panel_height: self.bottom_panel_height,
+            window_maximized: self.window_maximized,
+            window_width: win_w,
+            window_height: win_h,
+            attach_active_context: self.attach_active_context,
+            agent_mode: self.agent_mode,
+            active_provider: self.agent_hub.active_provider,
+            provider_prefs,
+            ai_api_config: Some(self.agent_hub.api_config.clone()),
+        };
+        persistence::save_json(&persistence::global_settings_path(dir), &gs);
+    }
+
+    pub fn save_workspace_state(&self) {
+        let Some(dir) = &self.persistence_dir else {
+            return;
+        };
+        let open_files = self
+            .open_buffers
+            .iter()
+            .filter(|b| b.path.is_file())
+            .map(|b| PersistedOpenTab {
+                path: b.path.clone(),
+                cursor_line: b.cursor_line,
+                cursor_col: b.cursor_col,
+            })
+            .collect();
+        let active_tab_path = self
+            .open_buffers
+            .get(self.active_tab)
+            .filter(|b| b.path.is_file())
+            .map(|b| b.path.clone());
+        let ws = PersistedWorkspaceState {
+            workspace_root: self.workspace_root.clone(),
+            open_files,
+            active_tab_path,
+            scroll_line: self.scroll_line,
+            editor_scroll_x: self.editor_scroll_x,
+            active_run_config: self.active_run_config,
+            git_commit_draft: self.git_commit_input.as_str().to_string(),
+        };
+        persistence::save_json(
+            &persistence::workspace_state_path(dir, &self.workspace_root),
+            &ws,
+        );
+    }
+
+    pub fn restore_workspace_state(&mut self, dir: &Path) {
+        let Some(ws) = persistence::load_json::<PersistedWorkspaceState>(
+            &persistence::workspace_state_path(dir, &self.workspace_root),
+        ) else {
+            return;
+        };
+        let mut restored_buffers = Vec::new();
+        for tab in ws.open_files {
+            if tab.path.is_file() {
+                if let Ok(mut buf) = TextBuffer::open(&tab.path) {
+                    let max_line = buf.line_count().saturating_sub(1);
+                    buf.set_cursor(tab.cursor_line.min(max_line), tab.cursor_col, false);
+                    restored_buffers.push(buf);
+                }
+            }
+        }
+        if !restored_buffers.is_empty() {
+            self.open_buffers = restored_buffers;
+            self.active_tab = ws
+                .active_tab_path
+                .and_then(|ap| self.open_buffers.iter().position(|b| b.path == ap))
+                .unwrap_or(0);
+            self.scroll_line = ws.scroll_line;
+            self.editor_scroll_x = ws.editor_scroll_x;
+            if let Some(active_p) = self.open_buffers.get(self.active_tab).map(|b| b.path.clone()) {
+                self.project_tree.selected_path = Some(active_p);
+            }
+        }
+        if !self.run_configs.is_empty() {
+            self.active_run_config = ws.active_run_config.min(self.run_configs.len() - 1);
+        }
+        if !ws.git_commit_draft.is_empty() {
+            self.git_commit_input.set_text(&ws.git_commit_draft);
+            self.git_engine.commit_message_draft = ws.git_commit_draft;
+        }
+    }
+
+    pub fn save_all_persisted_state(&self) {
+        if self.persistence_dir.is_none() {
+            return;
+        }
+        self.save_global_settings();
+        self.save_workspace_state();
+        self.agent_hub.save_history();
     }
 
     pub fn adapt_panels_for_logical_width(&mut self, log_w: i32) {
@@ -1136,7 +1658,11 @@ impl IdeApplicationState {
             let b = parts[parts.len() - 1].chars().next().unwrap_or('S');
             format!("{a}{b}").to_uppercase()
         } else {
-            let chars: Vec<char> = name.chars().filter(|c| c.is_alphanumeric()).take(2).collect();
+            let chars: Vec<char> = name
+                .chars()
+                .filter(|c| c.is_alphanumeric())
+                .take(2)
+                .collect();
             if chars.is_empty() {
                 "WS".to_string()
             } else {
@@ -1163,7 +1689,10 @@ impl IdeApplicationState {
         self.context_menu = None;
         if FOLDER_PICKER_OPEN.swap(true, Ordering::SeqCst) {
             self.status_notification = self
-                .tr("文件夹选择对话框已打开...", "Folder picker dialog is already open...")
+                .tr(
+                    "文件夹选择对话框已打开...",
+                    "Folder picker dialog is already open...",
+                )
                 .to_string();
             return;
         }
@@ -1171,7 +1700,10 @@ impl IdeApplicationState {
         let tx = self.folder_pick_tx.clone();
         let wakeup = self.wakeup.clone();
         self.status_notification = self
-            .tr("正在打开系统文件夹选择对话框...", "Opening folder picker dialog...")
+            .tr(
+                "正在打开系统文件夹选择对话框...",
+                "Opening folder picker dialog...",
+            )
             .to_string();
         let _ = thread::Builder::new()
             .name("ide-folder-picker".to_string())
@@ -1199,7 +1731,8 @@ impl IdeApplicationState {
         }
         self.recent_workspaces.retain(|p| p != &clean);
         self.recent_workspaces.insert(0, clean.clone());
-        self.recent_workspaces.truncate(6);
+        self.recent_workspaces.truncate(10);
+        self.save_global_settings();
         self.project_popup_open = false;
         self.pending_open_workspace = None;
         if self.focus == FocusTarget::OpenProjectChoiceModal {
@@ -1252,8 +1785,8 @@ impl IdeApplicationState {
             && (now < self.startup_loading_until
                 || !self.git_engine.has_loaded_snapshot
                 || self.is_indexing_workspace.load(Ordering::Acquire));
-        let git_busy =
-            self.git_engine.is_busy() || (self.wakeup_enabled && !self.git_engine.has_loaded_snapshot);
+        let git_busy = self.git_engine.is_busy()
+            || (self.wakeup_enabled && !self.git_engine.has_loaded_snapshot);
         let search_busy = self.search_loading;
         let agent_busy = self.agent_hub.is_busy.load(Ordering::Relaxed);
         startup_busy
@@ -1319,10 +1852,12 @@ impl IdeApplicationState {
             );
             return;
         }
+        self.save_all_persisted_state();
 
         self.recent_workspaces.retain(|p| p != &clean);
         self.recent_workspaces.insert(0, clean.clone());
-        self.recent_workspaces.truncate(6);
+        self.recent_workspaces.truncate(10);
+        self.save_global_settings();
 
         self.workspace_root = clean.clone();
         self.workspace_title_dirty = true;
@@ -1380,6 +1915,9 @@ impl IdeApplicationState {
         self.selected_git_commit_file = 0;
         self.git_log_branch_filter = None;
         self.git_working_diff_target = None;
+        self.selected_git_working_file = None;
+        self.git_changes_group_collapsed = false;
+        self.git_unversioned_group_collapsed = false;
         self.git_new_branch_from_ref = None;
         self.git_log_search_input.clear();
         self.agent_scroll = usize::MAX;
@@ -1398,6 +1936,17 @@ impl IdeApplicationState {
 
         if let Some(first) = self.open_buffers.first().map(|b| b.path.clone()) {
             self.project_tree.selected_path = Some(first);
+        }
+        if let Some(dir) = self.persistence_dir.clone() {
+            let hist_path = persistence::agent_history_path(&dir, &clean);
+            self.agent_hub.set_history_file_path(Some(hist_path));
+            self.agent_mode = self.agent_hub.normalize_mode_for_active(self.agent_mode);
+            self.ai_cfg_model.set_text(&self.agent_hub.active_model());
+            let sess_draft = self.agent_hub.active_session().draft_prompt.clone();
+            self.agent_chat_input.set_text(&sess_draft);
+            self.agent_chat_signature_salt = self.agent_chat_signature_salt.wrapping_add(1);
+            self.restore_workspace_state(&dir);
+            self.save_global_settings();
         }
         self.status_notification = format!(
             "{}: {}",
@@ -1474,12 +2023,7 @@ impl IdeApplicationState {
         &self.cached_structure.as_ref().unwrap().2
     }
 
-    fn ensure_runnables_cached(
-        &mut self,
-        path: &PathBuf,
-        rev: usize,
-        lang: ide_core::LanguageId,
-    ) {
+    fn ensure_runnables_cached(&mut self, path: &PathBuf, rev: usize, lang: ide_core::LanguageId) {
         let needs_rebuild = match &self.cached_runnables {
             Some((p, r, _)) => p != path || *r != rev,
             None => true,
@@ -1515,11 +2059,15 @@ impl IdeApplicationState {
     }
 
     pub fn active_buffer(&self) -> &TextBuffer {
-        &self.open_buffers[self.active_tab.min(self.open_buffers.len().saturating_sub(1))]
+        &self.open_buffers[self
+            .active_tab
+            .min(self.open_buffers.len().saturating_sub(1))]
     }
 
     pub fn active_buffer_mut(&mut self) -> &mut TextBuffer {
-        let idx = self.active_tab.min(self.open_buffers.len().saturating_sub(1));
+        let idx = self
+            .active_tab
+            .min(self.open_buffers.len().saturating_sub(1));
         &mut self.open_buffers[idx]
     }
 
@@ -1537,6 +2085,7 @@ impl IdeApplicationState {
             self.scroll_line = 0;
             self.editor_scroll_x = 0;
             self.status_notification = format!("已打开: {}", path.display());
+            self.save_workspace_state();
         }
     }
 
@@ -1569,6 +2118,7 @@ impl IdeApplicationState {
             self.active_tab = self.open_buffers.len() - 1;
         }
         self.status_notification = format!("已关闭标签页: {}", closed.path.display());
+        self.save_workspace_state();
     }
 
     pub fn set_ui_language(&mut self, lang: UiLanguage) {
@@ -1584,6 +2134,7 @@ impl IdeApplicationState {
             self.tr("界面语言已切换为", "UI language switched to"),
             lang.display_name()
         );
+        self.save_global_settings();
     }
 
     pub fn execute_ide_action(&mut self, action: IdeAction) {
@@ -1642,7 +2193,8 @@ impl IdeApplicationState {
             IdeAction::DeleteSelectedPath => {
                 if let Some(sel) = self.project_tree.selected_path.clone() {
                     if self.project_tree.delete_path(&sel).is_ok() {
-                        self.open_buffers.retain(|b| b.path != sel && !b.path.starts_with(&sel));
+                        self.open_buffers
+                            .retain(|b| b.path != sel && !b.path.starts_with(&sel));
                         if self.open_buffers.is_empty() {
                             self.open_buffers.push(TextBuffer::from_text(
                                 self.workspace_root.join("untitled.rs"),
@@ -1654,20 +2206,16 @@ impl IdeApplicationState {
                         }
                         self.git_engine.request_refresh();
                         self.refresh_workspace_file_index_async();
-                        self.status_notification = format!(
-                            "{}: {}",
-                            self.tr("已删除", "Deleted"),
-                            sel.display()
-                        );
+                        self.status_notification =
+                            format!("{}: {}", self.tr("已删除", "Deleted"), sel.display());
                     }
                 }
             }
             IdeAction::SaveActiveFile => {
                 if self.active_buffer_mut().save().is_ok() {
                     self.git_engine.request_refresh();
-                    self.status_notification = self
-                        .tr("已保存当前文档", "Saved current file")
-                        .to_string();
+                    self.status_notification =
+                        self.tr("已保存当前文档", "Saved current file").to_string();
                 }
             }
             IdeAction::CloseActiveTab => {
@@ -1705,7 +2253,10 @@ impl IdeApplicationState {
             IdeAction::ToggleLineComment => {
                 self.active_buffer_mut().toggle_line_comment();
                 self.status_notification = self
-                    .tr("已切换行注释 (IDEA Ctrl+/)", "Toggled line comment (Ctrl+/)")
+                    .tr(
+                        "已切换行注释 (IDEA Ctrl+/)",
+                        "Toggled line comment (Ctrl+/)",
+                    )
                     .to_string();
             }
             IdeAction::ReformatCode => {
@@ -1800,13 +2351,19 @@ impl IdeApplicationState {
             IdeAction::GitPull => {
                 self.git_engine.request_pull();
                 self.status_notification = self
-                    .tr("正在后台执行 Git Pull...", "Running Git Pull in background...")
+                    .tr(
+                        "正在后台执行 Git Pull...",
+                        "Running Git Pull in background...",
+                    )
                     .to_string();
             }
             IdeAction::GitPush => {
                 self.git_engine.request_push();
                 self.status_notification = self
-                    .tr("正在后台执行 Git Push...", "Running Git Push in background...")
+                    .tr(
+                        "正在后台执行 Git Push...",
+                        "Running Git Push in background...",
+                    )
                     .to_string();
             }
             IdeAction::GitNewBranch => {
@@ -1821,6 +2378,7 @@ impl IdeApplicationState {
                 } else {
                     Some(ToolWindowId::Project)
                 };
+                self.save_global_settings();
             }
             IdeAction::ToggleStructureWindow => {
                 self.left_tool = if self.left_tool == Some(ToolWindowId::Structure) {
@@ -1828,9 +2386,11 @@ impl IdeApplicationState {
                 } else {
                     Some(ToolWindowId::Structure)
                 };
+                self.save_global_settings();
             }
             IdeAction::ToggleAgentHubWindow => {
                 self.right_agent_open = !self.right_agent_open;
+                self.save_global_settings();
             }
             IdeAction::ToggleTerminalWindow => {
                 self.bottom_tool = if self.bottom_tool == Some(ToolWindowId::Terminal) {
@@ -1840,9 +2400,14 @@ impl IdeApplicationState {
                     self.touch_caret_activity();
                     Some(ToolWindowId::Terminal)
                 };
+                self.save_global_settings();
             }
             IdeAction::OpenSettingsModal => {
                 self.focus = FocusTarget::SettingsModal;
+                self.settings_query_input.clear();
+                self.settings_nav_scroll = 0;
+                self.modal_scroll = 0;
+                self.touch_caret_activity();
             }
             IdeAction::SwitchTheme => {
                 let next_kind = self.theme.kind.next();
@@ -1852,6 +2417,7 @@ impl IdeApplicationState {
                     self.tr("已切换主题为", "Switched theme to"),
                     next_kind.display_name()
                 );
+                self.save_global_settings();
             }
             IdeAction::ZoomInUi => {
                 let next = (self.ui_scale + 0.10).min(2.0);
@@ -1899,7 +2465,152 @@ impl IdeApplicationState {
         })
     }
 
+    fn strip_ide_context_tag(raw: &str) -> String {
+        let trimmed = raw.trim_end();
+        if let Some(pos) = trimmed.rfind("  [@") {
+            if trimmed[pos..].ends_with(']') {
+                return trimmed[..pos].to_string();
+            }
+        }
+        raw.to_string()
+    }
+
+    pub fn reload_paths_after_revert(&mut self, paths: &[PathBuf]) {
+        if paths.is_empty() {
+            return;
+        }
+        for path in paths {
+            if path.exists() {
+                if let Ok(content) = std::fs::read_to_string(path) {
+                    if let Some(buf) = self.open_buffers.iter_mut().find(|b| &b.path == path) {
+                        *buf = TextBuffer::from_text(path.clone(), &content);
+                    }
+                }
+            } else {
+                self.open_buffers.retain(|b| &b.path != path);
+            }
+        }
+        if self.open_buffers.is_empty() {
+            self.open_buffers.push(TextBuffer::from_text(
+                self.workspace_root.join("untitled.rs"),
+                "",
+            ));
+        }
+        if self.active_tab >= self.open_buffers.len() {
+            self.active_tab = self.open_buffers.len() - 1;
+        }
+        self.project_tree.rebuild();
+        self.git_engine.request_refresh();
+        self.refresh_workspace_file_index_async();
+    }
+
+    pub fn start_edit_sent_user_message(&mut self, msg_idx: usize) {
+        if !self.agent_hub.active_cli_supports_checkpoint_rewind()
+            || self.agent_hub.is_active_session_busy()
+        {
+            return;
+        }
+        let Some(msg) = self.agent_hub.messages.get(msg_idx) else {
+            return;
+        };
+        if msg.role != "user" {
+            return;
+        }
+        if self.editing_sent_msg_idx.is_none() {
+            self.editing_msg_saved_draft = self.agent_chat_input.as_str().to_string();
+        }
+        let clean = Self::strip_ide_context_tag(&msg.content);
+        self.editing_sent_msg_idx = Some(msg_idx);
+        self.agent_chat_input.set_text(&clean);
+        self.focus = FocusTarget::AgentChatInput;
+        self.touch_caret_activity();
+        self.agent_chat_signature_salt = self.agent_chat_signature_salt.wrapping_add(1);
+    }
+
+    pub fn cancel_edit_sent_user_message(&mut self) {
+        if self.editing_sent_msg_idx.take().is_some() {
+            let draft = std::mem::take(&mut self.editing_msg_saved_draft);
+            self.agent_chat_input.set_text(&draft);
+            self.pending_edit_rewind = None;
+            self.agent_chat_signature_salt = self.agent_chat_signature_salt.wrapping_add(1);
+            if self.focus == FocusTarget::EditMessageRewindModal {
+                self.focus = FocusTarget::AgentChatInput;
+            }
+        }
+    }
+
+    pub fn open_edit_message_rewind_modal(&mut self, msg_idx: usize, new_prompt: String) {
+        let (dropped_msgs, affected_files) = self.agent_hub.count_rewind_impact(msg_idx);
+        self.pending_edit_rewind = Some(PendingEditMessageRewind {
+            msg_idx,
+            new_prompt,
+            dropped_msgs,
+            affected_files,
+        });
+        self.focus = FocusTarget::EditMessageRewindModal;
+    }
+
+    pub fn confirm_edit_message_rewind(&mut self, revert_files: bool) {
+        let Some(pending) = self.pending_edit_rewind.take() else {
+            self.focus = FocusTarget::AgentChatInput;
+            return;
+        };
+        self.editing_sent_msg_idx = None;
+        let restored_draft = std::mem::take(&mut self.editing_msg_saved_draft);
+        self.agent_chat_input.set_text(&restored_draft);
+        self.agent_mode = self.agent_hub.normalize_mode_for_active(self.agent_mode);
+        let ctx = if self.attach_active_context {
+            self.build_active_ide_code_context()
+        } else {
+            None
+        };
+        self.expanded_composer_snippet_id = None;
+        let restored_paths = self.agent_hub.edit_message_and_rewind(
+            pending.msg_idx,
+            pending.new_prompt,
+            revert_files,
+            self.agent_mode,
+            ctx.as_ref(),
+        );
+        self.reload_paths_after_revert(&restored_paths);
+        self.agent_busy_started_at = if self.agent_hub.is_active_session_busy() {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        self.right_agent_open = true;
+        self.right_panel_tab = RightPanelTab::Chat;
+        self.focus = FocusTarget::AgentChatInput;
+        self.agent_scroll = usize::MAX;
+        self.agent_chat_signature_salt = self.agent_chat_signature_salt.wrapping_add(1);
+        self.status_notification = if revert_files && !restored_paths.is_empty() {
+            format!(
+                "已回退 {} 个文件并同步 CLI 重发编辑后的消息",
+                restored_paths.len()
+            )
+        } else {
+            "已保留文件修改并与 CLI 客户端同步重发消息".to_string()
+        };
+    }
+
+    pub fn cancel_edit_message_rewind_modal(&mut self) {
+        if let Some(pending) = self.pending_edit_rewind.take() {
+            self.editing_sent_msg_idx = Some(pending.msg_idx);
+            self.agent_chat_input.set_text(&pending.new_prompt);
+        }
+        self.focus = FocusTarget::AgentChatInput;
+        self.touch_caret_activity();
+    }
+
     pub fn submit_agent_prompt(&mut self, prompt: String) {
+        if let Some(msg_idx) = self.editing_sent_msg_idx {
+            if !prompt.trim().is_empty() {
+                self.open_edit_message_rewind_modal(msg_idx, prompt);
+            } else {
+                self.cancel_edit_sent_user_message();
+            }
+            return;
+        }
         self.agent_mode = self.agent_hub.normalize_mode_for_active(self.agent_mode);
         let ctx = if self.attach_active_context {
             self.build_active_ide_code_context()
@@ -1926,6 +2637,7 @@ impl IdeApplicationState {
     }
 
     pub fn create_new_agent_session(&mut self) {
+        self.cancel_edit_sent_user_message();
         let draft = self.agent_chat_input.as_str().to_string();
         self.agent_hub.active_session_mut().draft_prompt = draft;
         let idx = self.agent_hub.new_session();
@@ -1937,6 +2649,7 @@ impl IdeApplicationState {
         self.expanded_composer_snippet_id = None;
         self.agent_sessions_popup_open = false;
         self.agent_mode_popup_open = false;
+        self.agent_changed_files_expanded = false;
         self.agent_busy_started_at = None;
         self.right_agent_open = true;
         self.right_panel_tab = RightPanelTab::Chat;
@@ -1948,6 +2661,7 @@ impl IdeApplicationState {
     }
 
     pub fn switch_agent_session(&mut self, target_idx: usize) {
+        self.cancel_edit_sent_user_message();
         if target_idx == self.agent_hub.active_session_idx
             || target_idx >= self.agent_hub.sessions.len()
         {
@@ -1968,6 +2682,7 @@ impl IdeApplicationState {
             self.expanded_composer_snippet_id = None;
             self.agent_sessions_popup_open = false;
             self.agent_mode_popup_open = false;
+            self.agent_changed_files_expanded = false;
             self.agent_busy_started_at = if self.agent_hub.is_active_session_busy() {
                 Some(Instant::now())
             } else {
@@ -2061,8 +2776,8 @@ impl IdeApplicationState {
     pub fn handle_os_dropped_file(&mut self, path: PathBuf, lx: i32, ly: i32) {
         self.external_drag_hover = None;
         let is_img = is_image_file_path(&path);
-        let in_agent_zone = (self.right_agent_open && self.right_pane_rect.contains(lx, ly))
-            || is_img;
+        let in_agent_zone =
+            (self.right_agent_open && self.right_pane_rect.contains(lx, ly)) || is_img;
         if in_agent_zone {
             self.attach_path_to_agent(path);
         } else if path.is_file() {
@@ -2206,6 +2921,7 @@ impl IdeApplicationState {
             self.agent_hub.active_provider.short_name(),
             self.agent_hub.active_model()
         );
+        self.save_global_settings();
     }
 
     pub fn apply_chat_patch(&mut self, msg_idx: usize) {
@@ -2217,7 +2933,11 @@ impl IdeApplicationState {
         else {
             return;
         };
-        if let Some(pos) = self.open_buffers.iter().position(|b| b.path == patch.file_path) {
+        if let Some(pos) = self
+            .open_buffers
+            .iter()
+            .position(|b| b.path == patch.file_path)
+        {
             self.active_tab = pos;
         } else {
             self.open_file(patch.file_path.clone());
@@ -2285,7 +3005,11 @@ impl IdeApplicationState {
         else {
             return;
         };
-        if let Some(pos) = self.open_buffers.iter().position(|b| b.path == patch.file_path) {
+        if let Some(pos) = self
+            .open_buffers
+            .iter()
+            .position(|b| b.path == patch.file_path)
+        {
             self.active_tab = pos;
         } else {
             self.open_file(patch.file_path.clone());
@@ -2337,10 +3061,7 @@ impl IdeApplicationState {
             }
         }
 
-        let hover_idx = self
-            .hit_regions
-            .iter()
-            .rposition(|(r, _)| r.contains(x, y));
+        let hover_idx = self.hit_regions.iter().rposition(|(r, _)| r.contains(x, y));
         if hover_idx != self.last_hover_hit_idx {
             self.last_hover_hit_idx = hover_idx;
             changed = true;
@@ -2385,10 +3106,7 @@ impl IdeApplicationState {
                     | FocusTarget::SettingsModal
                     | FocusTarget::AiConfigModal(_)
             )
-            || self
-                .active_overlay_rects
-                .iter()
-                .any(|r| r.contains(x, y))
+            || self.active_overlay_rects.iter().any(|r| r.contains(x, y))
         {
             return None;
         }
@@ -2444,7 +3162,8 @@ impl IdeApplicationState {
             return IdeCursorKind::Default;
         }
 
-        let overlay_hits: &[(Rect, HitAction)] = if self.overlay_hit_start <= self.hit_regions.len() {
+        let overlay_hits: &[(Rect, HitAction)] = if self.overlay_hit_start <= self.hit_regions.len()
+        {
             &self.hit_regions[self.overlay_hit_start..]
         } else {
             &[]
@@ -2462,6 +3181,7 @@ impl IdeApplicationState {
                 | FocusTarget::SettingsModal
                 | FocusTarget::AiConfigModal(_)
                 | FocusTarget::OpenProjectChoiceModal
+                | FocusTarget::EditMessageRewindModal
         );
         if modal_open {
             match self.focus {
@@ -2480,6 +3200,11 @@ impl IdeApplicationState {
                 }
                 FocusTarget::AiConfigModal(_) => {
                     if self.ai_cfg_field_rects.iter().any(|r| r.contains(x, y)) {
+                        return IdeCursorKind::Text;
+                    }
+                }
+                FocusTarget::SettingsModal => {
+                    if self.settings_search_rect.contains(x, y) {
                         return IdeCursorKind::Text;
                     }
                 }
@@ -2620,7 +3345,11 @@ impl IdeApplicationState {
         if let Some(session) = self.agent_hub.inline_edit.take() {
             if session.active && !session.loading && session.error.is_none() {
                 let buf = self.active_buffer_mut();
-                buf.replace_line_range(session.start_line, session.end_line, &session.proposed_code);
+                buf.replace_line_range(
+                    session.start_line,
+                    session.end_line,
+                    &session.proposed_code,
+                );
                 self.focus = FocusTarget::Editor;
                 self.ensure_editor_cursor_visible();
                 self.status_notification = format!(
@@ -2642,32 +3371,19 @@ impl IdeApplicationState {
 
     pub fn revert_last_checkpoint(&mut self) {
         if let Some(ckpt) = self.agent_hub.checkpoints.pop() {
+            let mut restored = Vec::with_capacity(ckpt.file_backups.len());
             for (path, backup) in ckpt.file_backups {
                 match backup {
                     Some(content) => {
                         let _ = std::fs::write(&path, &content);
-                        if let Some(buf) = self.open_buffers.iter_mut().find(|b| b.path == path) {
-                            *buf = TextBuffer::from_text(path, &content);
-                        }
                     }
                     None => {
                         let _ = std::fs::remove_file(&path);
-                        self.open_buffers.retain(|b| b.path != path);
                     }
                 }
+                restored.push(path);
             }
-            if self.open_buffers.is_empty() {
-                self.open_buffers.push(TextBuffer::from_text(
-                    self.workspace_root.join("untitled.rs"),
-                    "",
-                ));
-            }
-            if self.active_tab >= self.open_buffers.len() {
-                self.active_tab = self.open_buffers.len() - 1;
-            }
-            self.project_tree.rebuild();
-            self.git_engine.request_refresh();
-            self.refresh_workspace_file_index_async();
+            self.reload_paths_after_revert(&restored);
             self.status_notification = format!("已回滚至快照 Checkpoint: {}", ckpt.id);
         } else {
             self.status_notification = "当前没有可回滚的 Checkpoint 快照".to_string();
@@ -2794,7 +3510,11 @@ impl IdeApplicationState {
     pub fn ensure_editor_cursor_visible(&mut self) {
         let (cursor_line, cursor_col, line_str) = {
             let buf = self.active_buffer();
-            (buf.cursor_line, buf.cursor_col, buf.line_text(buf.cursor_line))
+            (
+                buf.cursor_line,
+                buf.cursor_col,
+                buf.line_text(buf.cursor_line),
+            )
         };
         let vis = self.editor_visible_lines.max(4);
         if cursor_line < self.scroll_line {
@@ -2835,6 +3555,7 @@ impl IdeApplicationState {
             | FocusTarget::NewFolderModal
             | FocusTarget::NewGitBranchModal
             | FocusTarget::RenamePathModal => Some(&self.modal_text_input),
+            FocusTarget::SettingsModal => Some(&self.settings_query_input),
             FocusTarget::AiConfigModal(0) => Some(&self.ai_cfg_url),
             FocusTarget::AiConfigModal(1) => Some(&self.ai_cfg_key),
             FocusTarget::AiConfigModal(2) => Some(&self.ai_cfg_model),
@@ -2855,6 +3576,7 @@ impl IdeApplicationState {
             | FocusTarget::NewFolderModal
             | FocusTarget::NewGitBranchModal
             | FocusTarget::RenamePathModal => Some(&mut self.modal_text_input),
+            FocusTarget::SettingsModal => Some(&mut self.settings_query_input),
             FocusTarget::AiConfigModal(0) => Some(&mut self.ai_cfg_url),
             FocusTarget::AiConfigModal(1) => Some(&mut self.ai_cfg_key),
             FocusTarget::AiConfigModal(2) => Some(&mut self.ai_cfg_model),
@@ -2877,6 +3599,23 @@ impl IdeApplicationState {
             }
             FocusTarget::GitLogSearchInput => {
                 self.git_log_scroll = 0;
+            }
+            FocusTarget::SettingsModal => {
+                self.settings_nav_scroll = 0;
+                let query = self.settings_query_input.as_str().trim();
+                if query.is_empty() {
+                    return;
+                }
+                if let Some(page) = self
+                    .visible_settings_nav()
+                    .into_iter()
+                    .find_map(|item| item.page)
+                {
+                    if self.settings_page != page {
+                        self.settings_page = page;
+                        self.modal_scroll = 0;
+                    }
+                }
             }
             _ => {}
         }
@@ -3098,8 +3837,8 @@ impl IdeApplicationState {
         let line_h = self.terminal_line_h.max(16);
         let top_y = self.terminal_content_rect.y + 8;
         let rel_y = (y - top_y).clamp(0, (self.terminal_content_rect.h - 12).max(0));
-        let line_idx =
-            (self.terminal_scroll_anchor_line + (rel_y / line_h) as usize).min(snap.lines.len() - 1);
+        let line_idx = (self.terminal_scroll_anchor_line + (rel_y / line_h) as usize)
+            .min(snap.lines.len() - 1);
         let line_str = snap.lines[line_idx].raw_text();
         let rel_x = (x - (self.terminal_content_rect.x + 12)).max(0);
         let col = canvas.measure_caret_col_in_line(&line_str, rel_x, FontStyle::CodeMono);
@@ -3110,12 +3849,7 @@ impl IdeApplicationState {
         self.mouse_drag_target = None;
     }
 
-    pub fn handle_input_mouse_drag(
-        &mut self,
-        x: i32,
-        y: i32,
-        canvas: &SurfaceCanvas,
-    ) -> bool {
+    pub fn handle_input_mouse_drag(&mut self, x: i32, y: i32, canvas: &SurfaceCanvas) -> bool {
         let Some(target) = self.mouse_drag_target else {
             return false;
         };
@@ -3166,27 +3900,33 @@ impl IdeApplicationState {
             }
             FocusTarget::CtrlKPrompt => {
                 let start_x = self.ctrl_k_input_box_rect.x + 28;
-                let idx = self
-                    .ctrl_k_input
-                    .hit_test_singleline(canvas, x, start_x, FontStyle::UiSmall);
+                let idx =
+                    self.ctrl_k_input
+                        .hit_test_singleline(canvas, x, start_x, FontStyle::UiSmall);
                 self.ctrl_k_input.set_cursor_at(idx, true);
                 self.touch_caret_activity();
                 return true;
             }
             FocusTarget::GitCommitInput => {
                 let start_x = self.git_commit_input_box_rect.x + 8;
-                let idx = self
-                    .git_commit_input
-                    .hit_test_singleline(canvas, x, start_x, FontStyle::UiSmall);
+                let idx = self.git_commit_input.hit_test_singleline(
+                    canvas,
+                    x,
+                    start_x,
+                    FontStyle::UiSmall,
+                );
                 self.git_commit_input.set_cursor_at(idx, true);
                 self.touch_caret_activity();
                 return true;
             }
             FocusTarget::GitLogSearchInput => {
                 let start_x = self.git_log_search_rect.x + 22;
-                let idx = self
-                    .git_log_search_input
-                    .hit_test_singleline(canvas, x, start_x, FontStyle::UiSmall);
+                let idx = self.git_log_search_input.hit_test_singleline(
+                    canvas,
+                    x,
+                    start_x,
+                    FontStyle::UiSmall,
+                );
                 self.git_log_search_input.set_cursor_at(idx, true);
                 self.touch_caret_activity();
                 return true;
@@ -3237,17 +3977,44 @@ impl IdeApplicationState {
                 self.touch_caret_activity();
                 return true;
             }
+            FocusTarget::SettingsModal => {
+                let idx = self.settings_query_input.hit_test_singleline(
+                    canvas,
+                    x,
+                    self.settings_search_text_x,
+                    FontStyle::UiRegular,
+                );
+                self.settings_query_input.set_cursor_at(idx, true);
+                self.touch_caret_activity();
+                return true;
+            }
             _ => {}
         }
         false
     }
 
-    pub fn handle_input_double_click(
-        &mut self,
-        x: i32,
-        y: i32,
-        canvas: &SurfaceCanvas,
-    ) -> bool {
+    pub fn handle_input_double_click(&mut self, x: i32, y: i32, canvas: &SurfaceCanvas) -> bool {
+        if self.left_tool == Some(ToolWindowId::Commit) && self.left_pane_rect.contains(x, y) {
+            if let Some((row_rect, path, _)) = self
+                .git_change_row_rects
+                .iter()
+                .find(|(r, _, _)| r.contains(x, y))
+                .cloned()
+            {
+                if x < row_rect.x + row_rect.w - 86 {
+                    self.selected_git_working_file = Some(path.clone());
+                    self.git_working_diff_target = Some(path.clone());
+                    self.git_diff_scroll = 0;
+                    self.bottom_tool = Some(ToolWindowId::GitLog);
+                    self.status_notification = format!(
+                        "{}: {}",
+                        self.tr("正在查看工作区文件 Diff", "Inspecting working tree diff"),
+                        path.display()
+                    );
+                    return true;
+                }
+            }
+        }
         match self.focus {
             FocusTarget::Editor if self.editor_code_rect.contains(x, y) => {
                 if let Some((line, col)) = self.hit_test_editor(x, y, canvas) {
@@ -3340,16 +4107,22 @@ impl IdeApplicationState {
                 self.touch_caret_activity();
                 true
             }
+            FocusTarget::SettingsModal if self.settings_search_rect.contains(x, y) => {
+                let idx = self.settings_query_input.hit_test_singleline(
+                    canvas,
+                    x,
+                    self.settings_search_text_x,
+                    FontStyle::UiRegular,
+                );
+                self.settings_query_input.select_word_at(idx);
+                self.touch_caret_activity();
+                true
+            }
             _ => false,
         }
     }
 
-    pub fn handle_input_triple_click(
-        &mut self,
-        x: i32,
-        y: i32,
-        canvas: &SurfaceCanvas,
-    ) -> bool {
+    pub fn handle_input_triple_click(&mut self, x: i32, y: i32, canvas: &SurfaceCanvas) -> bool {
         match self.focus {
             FocusTarget::Editor if self.editor_code_rect.contains(x, y) => {
                 if let Some((line, _)) = self.hit_test_editor(x, y, canvas) {
@@ -3397,7 +4170,8 @@ impl IdeApplicationState {
             | FocusTarget::NewFolderModal
             | FocusTarget::NewGitBranchModal
             | FocusTarget::RenamePathModal
-            | FocusTarget::AiConfigModal(_) => self.select_all_at_focus(),
+            | FocusTarget::AiConfigModal(_)
+            | FocusTarget::SettingsModal => self.select_all_at_focus(),
             _ => false,
         }
     }
@@ -3409,20 +4183,31 @@ impl IdeApplicationState {
     }
 
     /// 二维平滑滚轮滚动：支持垂直加速滚动与代码编辑器水平滚动 (`Shift+滚轮` 或触控板横向滑动)
-    pub fn handle_mouse_wheel_2d(
-        &mut self,
-        x: i32,
-        y: i32,
-        lines_delta: i32,
-        horiz_px_delta: i32,
-    ) {
+    pub fn handle_mouse_wheel_2d(&mut self, x: i32, y: i32, lines_delta: i32, horiz_px_delta: i32) {
         if lines_delta == 0 && horiz_px_delta == 0 {
             return;
         }
         match self.focus {
-            FocusTarget::SettingsModal
-            | FocusTarget::SearchEverywhereModal
-            | FocusTarget::FindInFilesModal => {
+            FocusTarget::SettingsModal => {
+                if self.settings_nav_rect.h > 0 && self.settings_nav_rect.contains(x, y) {
+                    if lines_delta < 0 {
+                        self.settings_nav_scroll = self
+                            .settings_nav_scroll
+                            .saturating_sub((-lines_delta) as usize);
+                    } else if lines_delta > 0 {
+                        self.settings_nav_scroll = (self.settings_nav_scroll
+                            + lines_delta as usize)
+                            .min(self.settings_nav_max_scroll);
+                    }
+                } else if lines_delta < 0 {
+                    self.modal_scroll = self.modal_scroll.saturating_sub((-lines_delta) as usize);
+                } else if lines_delta > 0 {
+                    self.modal_scroll = (self.modal_scroll + lines_delta as usize)
+                        .min(self.settings_content_max_scroll);
+                }
+                return;
+            }
+            FocusTarget::SearchEverywhereModal | FocusTarget::FindInFilesModal => {
                 if lines_delta < 0 {
                     self.modal_scroll = self.modal_scroll.saturating_sub((-lines_delta) as usize);
                 } else if lines_delta > 0 {
@@ -3437,8 +4222,9 @@ impl IdeApplicationState {
             if self.left_tool == Some(ToolWindowId::Commit) {
                 let max_s = (self.git_engine.changed_files.len() + 4).saturating_sub(4);
                 if lines_delta < 0 {
-                    self.git_changes_scroll =
-                        self.git_changes_scroll.saturating_sub((-lines_delta) as usize);
+                    self.git_changes_scroll = self
+                        .git_changes_scroll
+                        .saturating_sub((-lines_delta) as usize);
                 } else if lines_delta > 0 {
                     self.git_changes_scroll =
                         (self.git_changes_scroll + lines_delta as usize).min(max_s);
@@ -3480,8 +4266,9 @@ impl IdeApplicationState {
                     }
                 } else if self.git_log_files_rect.contains(x, y) {
                     if lines_delta < 0 {
-                        self.git_files_scroll =
-                            self.git_files_scroll.saturating_sub((-lines_delta) as usize);
+                        self.git_files_scroll = self
+                            .git_files_scroll
+                            .saturating_sub((-lines_delta) as usize);
                     } else if lines_delta > 0 {
                         self.git_files_scroll =
                             (self.git_files_scroll + lines_delta as usize).min(120);
@@ -3618,6 +4405,45 @@ impl IdeApplicationState {
 
     pub fn end_scrollbar_drag(&mut self) {
         self.active_scrollbar_drag = None;
+    }
+
+    pub fn submit_git_commit(&mut self, push_after: bool) {
+        let msg = self.git_commit_input.as_str().trim().to_string();
+        if msg.is_empty() {
+            self.focus = FocusTarget::GitCommitInput;
+            self.touch_caret_activity();
+            self.status_notification = self
+                .tr(
+                    "请先输入 Git Commit 提交说明",
+                    "Please enter a Git commit message",
+                )
+                .to_string();
+            return;
+        }
+        let checked = self.git_engine.checked_commit_files();
+        if checked.is_empty() && !self.git_amend_commit {
+            self.status_notification = self
+                .tr(
+                    "请先勾选需要提交的文件",
+                    "Please check at least one file to commit",
+                )
+                .to_string();
+            return;
+        }
+        let count = checked.len();
+        self.git_engine
+            .request_commit_selected_files(&msg, self.git_amend_commit, push_after, checked);
+        self.status_notification = if push_after {
+            format!(
+                "{} ({count})...",
+                self.tr("正在后台提交并推送勾选的 Git 变更", "Committing and pushing selected changes")
+            )
+        } else {
+            format!(
+                "{} ({count})...",
+                self.tr("正在后台提交勾选的 Git 变更", "Committing selected changes")
+            )
+        };
     }
 
     /// 检测鼠标按下位置是否命中左右或底部面板的可拖拽分割线
@@ -3878,38 +4704,97 @@ impl IdeApplicationState {
                     }
                 }
             }
-            HitAction::ToggleStageFile(path) => {
-                self.git_engine.request_toggle_stage_file(&path);
+            HitAction::ToggleCommitFileCheck(path) => {
+                let checked = self.git_engine.toggle_commit_file_checked(&path);
+                self.selected_git_working_file = Some(path.clone());
+                let fname = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("file");
+                self.status_notification = if checked {
+                    format!(
+                        "{}: {fname}",
+                        self.tr("已勾选纳入提交", "Included in commit")
+                    )
+                } else {
+                    format!(
+                        "{}: {fname}",
+                        self.tr("已取消勾选", "Excluded from commit")
+                    )
+                };
             }
-            HitAction::StageAllGitChanges => {
-                self.git_engine.request_stage_all();
-                self.status_notification =
-                    self.tr("正在后台暂存全部变更...", "Staging all changes...").to_string();
+            HitAction::ToggleCommitGroupCheck { untracked_group } => {
+                let (checked, total) = self.git_engine.checked_counts(untracked_group);
+                let next = checked < total;
+                self.git_engine.set_group_checked(untracked_group, next);
             }
-            HitAction::UnstageAllGitChanges => {
-                self.git_engine.request_unstage_all();
-                self.status_notification = self
-                    .tr("正在后台取消全部暂存...", "Unstaging all changes...")
-                    .to_string();
+            HitAction::ToggleCommitGroupCollapse { untracked_group } => {
+                if untracked_group {
+                    self.git_unversioned_group_collapsed = !self.git_unversioned_group_collapsed;
+                } else {
+                    self.git_changes_group_collapsed = !self.git_changes_group_collapsed;
+                }
+            }
+            HitAction::InspectSelectedGitDiff => {
+                let target = self
+                    .selected_git_working_file
+                    .clone()
+                    .filter(|p| self.git_engine.changed_files.iter().any(|c| &c.path == p))
+                    .or_else(|| self.git_engine.checked_commit_files().into_iter().next())
+                    .or_else(|| {
+                        self.git_engine
+                            .changed_files
+                            .first()
+                            .map(|c| c.path.clone())
+                    });
+                if let Some(path) = target {
+                    self.selected_git_working_file = Some(path.clone());
+                    self.git_working_diff_target = Some(path.clone());
+                    self.git_diff_scroll = 0;
+                    self.bottom_tool = Some(ToolWindowId::GitLog);
+                    self.status_notification = format!(
+                        "{}: {}",
+                        self.tr("正在查看工作区文件 Diff", "Inspecting working tree diff"),
+                        path.display()
+                    );
+                } else {
+                    self.status_notification = self
+                        .tr("当前工作区没有可对比的变更文件", "No changed files to diff")
+                        .to_string();
+                }
+            }
+            HitAction::RollbackCheckedGitChanges => {
+                let targets = self.git_engine.checked_commit_files();
+                if targets.is_empty() {
+                    if let Some(sel) = self
+                        .selected_git_working_file
+                        .clone()
+                        .filter(|p| self.git_engine.changed_files.iter().any(|c| &c.path == p))
+                    {
+                        self.git_engine.request_rollback_file(&sel);
+                        self.status_notification = format!("正在回滚 {}...", sel.display());
+                    } else {
+                        self.status_notification = self
+                            .tr(
+                                "请先勾选或选中需要回滚的文件",
+                                "Select or check files to rollback first",
+                            )
+                            .to_string();
+                    }
+                } else {
+                    let cnt = targets.len();
+                    self.git_engine.request_rollback_files(targets);
+                    self.status_notification = format!(
+                        "{} ({cnt})...",
+                        self.tr("正在回滚已勾选的变更文件", "Rolling back checked files")
+                    );
+                }
             }
             HitAction::CommitAllGitChanges => {
-                let msg = self.git_commit_input.as_str().to_string();
-                self.git_engine
-                    .request_commit_with_options(&msg, self.git_amend_commit, false);
-                self.status_notification = self
-                    .tr("正在后台提交 Git 变更...", "Committing Git changes...")
-                    .to_string();
+                self.submit_git_commit(false);
             }
             HitAction::CommitAndPushGitChanges => {
-                let msg = self.git_commit_input.as_str().to_string();
-                self.git_engine
-                    .request_commit_with_options(&msg, self.git_amend_commit, true);
-                self.status_notification = self
-                    .tr(
-                        "正在后台提交并推送 Git 变更...",
-                        "Committing and pushing Git changes...",
-                    )
-                    .to_string();
+                self.submit_git_commit(true);
             }
             HitAction::ToggleGitAmend => {
                 self.git_amend_commit = !self.git_amend_commit;
@@ -3935,17 +4820,12 @@ impl IdeApplicationState {
             }
             HitAction::GenerateAiCommitMessage => {
                 self.git_engine.request_ai_commit_diff();
-                self.status_notification = "正在后台分析 Git Diff 并生成 Commit 信息...".to_string();
+                self.status_notification =
+                    "正在后台分析 Git Diff 并生成 Commit 信息...".to_string();
             }
             HitAction::RollbackGitFile(path) => {
                 self.git_engine.request_rollback_file(&path);
                 self.status_notification = format!("正在回滚 {}...", path.display());
-            }
-            HitAction::RollbackAllGitChanges => {
-                self.git_engine.request_rollback_all();
-                self.status_notification = self
-                    .tr("正在回滚工作区全部未提交变更...", "Rolling back all changes...")
-                    .to_string();
             }
             HitAction::RefreshGitStatus => {
                 self.git_engine.request_refresh();
@@ -3972,10 +4852,10 @@ impl IdeApplicationState {
                 self.touch_caret_activity();
             }
             HitAction::InspectGitWorkingFileDiff(path) => {
+                self.selected_git_working_file = Some(path.clone());
                 self.git_working_diff_target = Some(path.clone());
                 self.git_diff_scroll = 0;
                 self.bottom_tool = Some(ToolWindowId::GitLog);
-                self.open_file(path.clone());
                 self.status_notification = format!(
                     "{}: {}",
                     self.tr("正在查看工作区文件 Diff", "Inspecting working tree diff"),
@@ -4039,10 +4919,12 @@ impl IdeApplicationState {
                 }
             }
             HitAction::GitCreateBranchAtSelectedCommit => {
-                let target = self
-                    .selected_git_commit_hash
-                    .clone()
-                    .or_else(|| self.git_engine.recent_commits.first().map(|c| c.hash.clone()));
+                let target = self.selected_git_commit_hash.clone().or_else(|| {
+                    self.git_engine
+                        .recent_commits
+                        .first()
+                        .map(|c| c.hash.clone())
+                });
                 self.git_new_branch_from_ref = target.clone();
                 let default_name = match &target {
                     Some(h) => format!("branch-from-{h}"),
@@ -4106,6 +4988,7 @@ impl IdeApplicationState {
                     self.agent_hub.active_model(),
                     self.agent_mode.label()
                 );
+                self.save_global_settings();
             }
             HitAction::ToggleAgentProviderPopup => {
                 self.agent_provider_popup_open = !self.agent_provider_popup_open;
@@ -4143,6 +5026,7 @@ impl IdeApplicationState {
                     normalized.label(),
                     self.agent_hub.mode_cli_flag_for_active(normalized)
                 );
+                self.save_global_settings();
             }
             HitAction::SelectAgentModel(model) => {
                 self.agent_hub.select_model_for_active(model.clone());
@@ -4154,6 +5038,7 @@ impl IdeApplicationState {
                     "✓ 已切换 `{}` 模型为: {model}",
                     self.agent_hub.active_provider.short_name()
                 );
+                self.save_global_settings();
             }
             HitAction::ToggleAgentFastMode => {
                 let _ = self.agent_hub.toggle_fast_mode_for_active();
@@ -4175,6 +5060,7 @@ impl IdeApplicationState {
                     self.agent_hub.active_provider.short_name(),
                     self.agent_hub.active_model()
                 );
+                self.save_global_settings();
             }
             HitAction::CycleAgentReasoningEffort => {
                 let _ = self.agent_hub.cycle_reasoning_effort_for_active();
@@ -4193,6 +5079,7 @@ impl IdeApplicationState {
                     eff,
                     self.agent_hub.active_model()
                 );
+                self.save_global_settings();
             }
             HitAction::RefreshLocalCliAgents => {
                 self.agent_hub.refresh_local_cli_agents();
@@ -4209,6 +5096,7 @@ impl IdeApplicationState {
                     "↻ 已同步本机 {avail_cnt} 个 CLI 引擎，当前 `{}` 共自动发现 {models_cnt} 个模型",
                     self.agent_hub.active_provider.short_name()
                 );
+                self.save_global_settings();
             }
             HitAction::ToggleAttachActiveContext => {
                 self.attach_active_context = !self.attach_active_context;
@@ -4217,6 +5105,7 @@ impl IdeApplicationState {
                 } else {
                     "已关闭自动附加文件上下文".to_string()
                 };
+                self.save_global_settings();
             }
             HitAction::AttachActiveFileToAgent => {
                 let fname = self
@@ -4228,13 +5117,17 @@ impl IdeApplicationState {
                     .to_string();
                 let current = self.agent_chat_input.as_str().to_string();
                 if !current.contains(&fname) {
-                    let prefix = if !current.is_empty() && !current.ends_with(' ') && !current.ends_with('\n') {
+                    let prefix = if !current.is_empty()
+                        && !current.ends_with(' ')
+                        && !current.ends_with('\n')
+                    {
                         " "
                     } else {
                         ""
                     };
                     self.agent_chat_input.move_end(false);
-                    self.agent_chat_input.insert_str(&format!("{prefix}@{fname} "));
+                    self.agent_chat_input
+                        .insert_str(&format!("{prefix}@{fname} "));
                 }
                 self.attach_active_context = true;
                 self.focus = FocusTarget::AgentChatInput;
@@ -4354,12 +5247,9 @@ impl IdeApplicationState {
             HitAction::FocusCtrlKPrompt => {
                 self.focus = FocusTarget::CtrlKPrompt;
                 let start_x = self.ctrl_k_input_box_rect.x + 28;
-                let idx = self.ctrl_k_input.hit_test_singleline(
-                    canvas,
-                    x,
-                    start_x,
-                    FontStyle::UiSmall,
-                );
+                let idx =
+                    self.ctrl_k_input
+                        .hit_test_singleline(canvas, x, start_x, FontStyle::UiSmall);
                 self.ctrl_k_input.set_cursor_at(idx, shift);
                 self.mouse_drag_target = Some(FocusTarget::CtrlKPrompt);
                 self.touch_caret_activity();
@@ -4370,6 +5260,48 @@ impl IdeApplicationState {
                 self.execute_ide_action(IdeAction::SendSelectionToAgent)
             }
             HitAction::RevertLastCheckpoint => self.revert_last_checkpoint(),
+            HitAction::ToggleAgentChangedFilesDrawer => {
+                self.agent_changed_files_expanded = !self.agent_changed_files_expanded;
+            }
+            HitAction::KeepAllAgentChangedFiles => {
+                self.agent_hub.keep_all_session_changed_files();
+                self.agent_changed_files_expanded = false;
+                self.status_notification =
+                    self.tr("已保留本轮全部文件更改", "Kept all changed files")
+                        .to_string();
+            }
+            HitAction::RevertAllAgentChangedFiles => {
+                let restored = self.agent_hub.revert_all_session_changed_files();
+                self.reload_paths_after_revert(&restored);
+                self.agent_changed_files_expanded = false;
+                self.status_notification = format!(
+                    "{} ({})",
+                    self.tr("已回退全部文件更改", "Reverted all changed files"),
+                    restored.len()
+                );
+            }
+            HitAction::RevertSingleAgentChangedFile(path) => {
+                if self.agent_hub.revert_session_changed_file(&path) {
+                    self.reload_paths_after_revert(&[path.clone()]);
+                    self.status_notification = format!(
+                        "{}: {}",
+                        self.tr("已回退文件", "Reverted file"),
+                        path.file_name().and_then(|n| n.to_str()).unwrap_or("file")
+                    );
+                }
+            }
+            HitAction::StartEditSentUserMessage(msg_idx) => {
+                self.start_edit_sent_user_message(msg_idx);
+            }
+            HitAction::CancelEditSentUserMessage => {
+                self.cancel_edit_sent_user_message();
+            }
+            HitAction::ConfirmEditMessageRewind { revert_files } => {
+                self.confirm_edit_message_rewind(revert_files);
+            }
+            HitAction::CancelEditMessageRewindModal => {
+                self.cancel_edit_message_rewind_modal();
+            }
             HitAction::FocusAgentChatInput => {
                 self.focus = FocusTarget::AgentChatInput;
                 let r = self.agent_input_text_rect;
@@ -4455,7 +5387,11 @@ impl IdeApplicationState {
                 let path = self.active_buffer().path.clone();
                 let added = self.dap_engine.toggle_breakpoint(&path, line);
                 self.status_notification = if added {
-                    format!("已在 {}:{} 添加红点断点 (Ctrl+F8)", path.display(), line + 1)
+                    format!(
+                        "已在 {}:{} 添加红点断点 (Ctrl+F8)",
+                        path.display(),
+                        line + 1
+                    )
                 } else {
                     format!("已移除 {}:{} 的断点", path.display(), line + 1)
                 };
@@ -4475,12 +5411,35 @@ impl IdeApplicationState {
                     self.tr("已应用主题", "Applied theme"),
                     kind.display_name()
                 );
+                self.save_global_settings();
             }
             HitAction::SetUiLanguage(lang) => {
                 self.set_ui_language(lang);
             }
             HitAction::SetUiScale(pct) => {
                 self.set_ui_scale((pct as f32 / 100.0).clamp(0.85, 2.0));
+            }
+            HitAction::SelectSettingsPage(page) => {
+                if self.settings_page != page {
+                    self.settings_page = page;
+                    self.modal_scroll = 0;
+                    self.save_global_settings();
+                }
+            }
+            HitAction::FocusSettingsSearch => {
+                let idx = self.settings_query_input.hit_test_singleline(
+                    canvas,
+                    x,
+                    self.settings_search_text_x,
+                    FontStyle::UiRegular,
+                );
+                self.settings_query_input.set_cursor_at(idx, shift);
+                self.mouse_drag_target = Some(FocusTarget::SettingsModal);
+                self.touch_caret_activity();
+            }
+            HitAction::ApplySettings => {
+                self.save_all_persisted_state();
+                self.status_notification = self.tr("设置已应用", "Settings applied").to_string();
             }
             HitAction::OpenFolderDialog => {
                 self.request_open_folder_dialog_with_mode(FolderPickMode::AskUser);
@@ -4536,17 +5495,21 @@ impl IdeApplicationState {
         self.project_popup_open = false;
         self.more_menu_popup_open = false;
 
-        let item = |label: &str, shortcut: &str, action: ContextMenuAction, sep: bool| {
-            ContextMenuItem {
+        let item =
+            |label: &str, shortcut: &str, action: ContextMenuAction, sep: bool| ContextMenuItem {
                 label: label.to_string(),
                 shortcut: shortcut.to_string(),
                 action,
                 separator_before: sep,
-            }
-        };
+            };
 
         // 1. 编辑器标签页右键菜单
-        if let Some((_, tab_idx)) = self.tab_rects.iter().find(|(r, _)| r.contains(x, y)).copied() {
+        if let Some((_, tab_idx)) = self
+            .tab_rects
+            .iter()
+            .find(|(r, _)| r.contains(x, y))
+            .copied()
+        {
             let mut items = vec![
                 item(
                     self.tr("关闭当前标签页", "Close Tab"),
@@ -4692,9 +5655,9 @@ impl IdeApplicationState {
             return;
         }
 
-        // 2.5 左侧 Git 提交面板右键菜单
+        // 2.5 左侧 Git 提交面板右键菜单 (IDEA 风格操作)
         if self.left_tool == Some(ToolWindowId::Commit) && self.left_pane_rect.contains(x, y) {
-            if let Some((_, path, staged)) = self
+            if let Some((_, path, is_checked)) = self
                 .git_change_row_rects
                 .iter()
                 .find(|(r, _, _)| r.contains(x, y))
@@ -4702,13 +5665,13 @@ impl IdeApplicationState {
             {
                 let items = vec![
                     item(
-                        if staged {
-                            self.tr("取消暂存文件 (Unstage)", "Unstage File")
+                        if is_checked {
+                            self.tr("取消勾选 (Exclude from Commit)", "Exclude from Commit")
                         } else {
-                            self.tr("暂存文件 (Stage)", "Stage File")
+                            self.tr("勾选纳入提交 (Include in Commit)", "Include in Commit")
                         },
                         "Space",
-                        ContextMenuAction::GitToggleStage(path.clone()),
+                        ContextMenuAction::GitToggleCommitCheck(path.clone()),
                         false,
                     ),
                     item(
@@ -4857,7 +5820,11 @@ impl IdeApplicationState {
         }
 
         // 4. 各类输入框右键菜单
-        let input_target_opt = if self.agent_hub.inline_edit.as_ref().is_some_and(|s| s.active)
+        let input_target_opt = if self
+            .agent_hub
+            .inline_edit
+            .as_ref()
+            .is_some_and(|s| s.active)
             && self.ctrl_k_input_box_rect.contains(x, y)
         {
             Some(FocusTarget::CtrlKPrompt)
@@ -4884,6 +5851,10 @@ impl IdeApplicationState {
         ) && self.prompt_modal_input_rect.contains(x, y)
         {
             Some(self.focus)
+        } else if self.focus == FocusTarget::SettingsModal
+            && self.settings_search_rect.contains(x, y)
+        {
+            Some(FocusTarget::SettingsModal)
         } else {
             None
         };
@@ -5124,8 +6095,7 @@ impl IdeApplicationState {
             ContextMenuAction::TreeCopyPath(path) | ContextMenuAction::TabCopyPath(path) => {
                 let s = path.display().to_string();
                 write_windows_clipboard_text(&s);
-                self.status_notification =
-                    format!("{}: {s}", self.tr("已复制路径", "Copied path"));
+                self.status_notification = format!("{}: {s}", self.tr("已复制路径", "Copied path"));
             }
             ContextMenuAction::TreeExpandAll => {
                 self.project_tree.expand_all();
@@ -5146,9 +6116,8 @@ impl IdeApplicationState {
                     self.open_buffers.clear();
                     self.open_buffers.push(kept);
                     self.active_tab = 0;
-                    self.status_notification = self
-                        .tr("已关闭其他标签页", "Closed other tabs")
-                        .to_string();
+                    self.status_notification =
+                        self.tr("已关闭其他标签页", "Closed other tabs").to_string();
                 }
             }
             ContextMenuAction::TermCopy => {
@@ -5181,8 +6150,24 @@ impl IdeApplicationState {
                 self.bottom_tool = Some(ToolWindowId::Terminal);
                 self.focus = FocusTarget::TerminalInput;
             }
-            ContextMenuAction::GitToggleStage(path) => {
-                self.git_engine.request_toggle_stage_file(&path);
+            ContextMenuAction::GitToggleCommitCheck(path) => {
+                let checked = self.git_engine.toggle_commit_file_checked(&path);
+                self.selected_git_working_file = Some(path.clone());
+                let fname = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("file");
+                self.status_notification = if checked {
+                    format!(
+                        "{}: {fname}",
+                        self.tr("已勾选纳入提交", "Included in commit")
+                    )
+                } else {
+                    format!(
+                        "{}: {fname}",
+                        self.tr("已取消勾选", "Excluded from commit")
+                    )
+                };
             }
             ContextMenuAction::GitShowWorkingDiff(path) => {
                 self.git_working_diff_target = Some(path.clone());
@@ -5200,7 +6185,8 @@ impl IdeApplicationState {
             }
             ContextMenuAction::GitNewBranchFromCommit(rev) => {
                 self.git_new_branch_from_ref = Some(rev.clone());
-                self.modal_text_input.set_text(&format!("branch-from-{rev}"));
+                self.modal_text_input
+                    .set_text(&format!("branch-from-{rev}"));
                 self.modal_text_input.select_all();
                 self.focus = FocusTarget::NewGitBranchModal;
                 self.touch_caret_activity();
@@ -5232,7 +6218,10 @@ impl IdeApplicationState {
                         .to_string();
                 } else {
                     self.status_notification = self
-                        .tr("请先拖选要复制的对话文本", "Select text in chat stream first")
+                        .tr(
+                            "请先拖选要复制的对话文本",
+                            "Select text in chat stream first",
+                        )
                         .to_string();
                 }
             }
@@ -5241,7 +6230,10 @@ impl IdeApplicationState {
                 if !all.is_empty() {
                     write_windows_clipboard_text(&all);
                     self.status_notification = self
-                        .tr("已复制全部 AI 对话内容到剪贴板", "Copied entire AI conversation")
+                        .tr(
+                            "已复制全部 AI 对话内容到剪贴板",
+                            "Copied entire AI conversation",
+                        )
                         .to_string();
                 }
             }
@@ -5448,7 +6440,12 @@ impl IdeApplicationState {
                 DragSplitter::BottomPanel => {
                     let sy = body_y + upper_h - 1;
                     canvas.fill_rect(
-                        Rect::new(left_stripe_w + 4, sy, w - left_stripe_w - right_stripe_w - 8, 2),
+                        Rect::new(
+                            left_stripe_w + 4,
+                            sy,
+                            w - left_stripe_w - right_stripe_w - 8,
+                            2,
+                        ),
                         t.accent_blue,
                     );
                 }
@@ -5478,7 +6475,10 @@ impl IdeApplicationState {
             canvas.draw_text_styled(
                 px + 28,
                 py + 5,
-                self.tr("正在加载工作区索引与 Git 状态...", "Loading workspace index & Git..."),
+                self.tr(
+                    "正在加载工作区索引与 Git 状态...",
+                    "Loading workspace index & Git...",
+                ),
                 txt_color,
                 pill_w - 36,
                 FontStyle::UiSmall,
@@ -5538,6 +6538,9 @@ impl IdeApplicationState {
             }
             FocusTarget::OpenProjectChoiceModal => {
                 self.render_open_project_choice_modal(canvas, w, h);
+            }
+            FocusTarget::EditMessageRewindModal => {
+                self.render_edit_message_rewind_modal(canvas, w, h);
             }
             FocusTarget::ImagePreviewModal => {
                 self.render_image_preview_modal(canvas, w, h);
@@ -5653,8 +6656,10 @@ impl IdeApplicationState {
             min_rect.y + cap_h / 2,
             t.text_secondary,
         );
-        self.hit_regions
-            .push((min_rect, HitAction::WindowControl(WindowControlCmd::Minimize)));
+        self.hit_regions.push((
+            min_rect,
+            HitAction::WindowControl(WindowControlCmd::Minimize),
+        ));
 
         if max_rect.contains(hx, hy) {
             canvas.fill_rect(max_rect, t.panel_bg);
@@ -5684,10 +6689,16 @@ impl IdeApplicationState {
         canvas.draw_window_close_icon(
             close_rect.x + cap_w / 2,
             close_rect.y + cap_h / 2,
-            if close_hovered { 0xFFFFFF } else { t.text_secondary },
+            if close_hovered {
+                0xFFFFFF
+            } else {
+                t.text_secondary
+            },
         );
-        self.hit_regions
-            .push((close_rect, HitAction::WindowControl(WindowControlCmd::Close)));
+        self.hit_regions.push((
+            close_rect,
+            HitAction::WindowControl(WindowControlCmd::Close),
+        ));
 
         // 5. IDEA 运行工具区：[运行配置 ▾] [▷] [🐞] [⋮] [🔍] [⚙]（紧邻窗口控制按钮左侧）
         let cfg_fallback = self.tr("当前文件", "Current File");
@@ -5777,10 +6788,7 @@ impl IdeApplicationState {
         ));
 
         // 垂直分割线分隔 IDE 工具栏与系统窗口控制区
-        canvas.fill_rect(
-            Rect::new(min_rect.x - 4, 9, 1, 20),
-            t.border_color,
-        );
+        canvas.fill_rect(Rect::new(min_rect.x - 4, 9, 1, 20), t.border_color);
     }
 
     fn render_expanded_menu_strip(&mut self, canvas: &mut SurfaceCanvas) {
@@ -5813,7 +6821,11 @@ impl IdeApplicationState {
                 canvas.fill_rounded_rect(
                     item_rect,
                     5,
-                    if active { t.popup_hover_bg } else { t.panel_header_bg },
+                    if active {
+                        t.popup_hover_bg
+                    } else {
+                        t.panel_header_bg
+                    },
                 );
             }
             canvas.draw_text_centered(
@@ -5863,12 +6875,22 @@ impl IdeApplicationState {
             let iy = btn.y + 7;
             match id {
                 ToolWindowId::Project => canvas.draw_folder_outline_icon(ix, iy, icon_color),
-                ToolWindowId::Commit => canvas.draw_commit_icon(ix, iy, icon_color),
+                ToolWindowId::Commit => {
+                    canvas.draw_commit_icon(ix, iy, icon_color);
+                    let chg_cnt = self.git_engine.changed_files.len();
+                    if chg_cnt > 0 {
+                        let badge_cutout = if active || hovered {
+                            t.panel_bg
+                        } else {
+                            t.tool_stripe_bg
+                        };
+                        canvas.draw_count_badge(btn, chg_cnt, t.accent_blue, 0xFFFFFF, badge_cutout);
+                    }
+                }
                 ToolWindowId::Structure => canvas.draw_structure_icon(ix, iy, icon_color),
                 _ => {}
             }
-            self.hit_regions
-                .push((btn, HitAction::ToggleLeftTool(id)));
+            self.hit_regions.push((btn, HitAction::ToggleLeftTool(id)));
         }
 
         // 左下角工具窗矢量图标：终端 / Git Log / Problems / Debug
@@ -5989,7 +7011,11 @@ impl IdeApplicationState {
         canvas.draw_theme_icon(
             theme_btn.x + 8,
             theme_btn.y + 7,
-            if theme_hov { t.text_primary } else { t.text_muted },
+            if theme_hov {
+                t.text_primary
+            } else {
+                t.text_muted
+            },
         );
         self.hit_regions.push((
             theme_btn,
@@ -6005,7 +7031,11 @@ impl IdeApplicationState {
         canvas.draw_gear_icon(
             set_btn.x + 9,
             set_btn.y + 8,
-            if set_hov { t.text_primary } else { t.text_muted },
+            if set_hov {
+                t.text_primary
+            } else {
+                t.text_muted
+            },
         );
         self.hit_regions.push((
             set_btn,
@@ -6235,7 +7265,7 @@ impl IdeApplicationState {
                 );
             }
             ToolWindowId::Commit => {
-                // 顶部右侧 IDEA Git 动作图标栏：[⎇ 分支] [↻ 刷新] [↶ 全部回滚] [日志]
+                // 顶部右侧 IDEA Commit 工具栏：[历史库 Log] [↻ 刷新] [⇄ Diff] [↶ 回滚勾选项]
                 let btn_y = rect.y + 5;
                 let title_end = rect.x + 12 + title_w + 18;
                 let rb_all_btn = Rect::new(rect.x + rect.w - 32, btn_y, 24, 22);
@@ -6246,9 +7276,19 @@ impl IdeApplicationState {
                 }
                 canvas.draw_rollback_icon(rb_all_btn.x + 5, btn_y + 4, t.breakpoint_red);
                 self.hit_regions
-                    .push((rb_all_btn, HitAction::RollbackAllGitChanges));
+                    .push((rb_all_btn, HitAction::RollbackCheckedGitChanges));
 
-                let ref_btn = Rect::new(rb_all_btn.x - 28, btn_y, 24, 22);
+                let diff_hdr_btn = Rect::new(rb_all_btn.x - 28, btn_y, 24, 22);
+                if diff_hdr_btn.contains(hx, hy) {
+                    canvas.fill_rounded_rect(diff_hdr_btn, 4, t.popup_hover_bg);
+                } else {
+                    canvas.fill_rounded_rect(diff_hdr_btn, 4, t.window_bg);
+                }
+                canvas.draw_changes_diff_icon(diff_hdr_btn.x + 4, btn_y + 3, t.accent_blue);
+                self.hit_regions
+                    .push((diff_hdr_btn, HitAction::InspectSelectedGitDiff));
+
+                let ref_btn = Rect::new(diff_hdr_btn.x - 28, btn_y, 24, 22);
                 if ref_btn.contains(hx, hy) {
                     canvas.fill_rounded_rect(ref_btn, 4, t.popup_hover_bg);
                 } else {
@@ -6260,18 +7300,26 @@ impl IdeApplicationState {
 
                 let log_btn = Rect::new(ref_btn.x - 52, btn_y, 48, 22);
                 if log_btn.x >= title_end {
-                    let log_hov = log_btn.contains(hx, hy)
-                        || self.bottom_tool == Some(ToolWindowId::GitLog);
+                    let log_hov =
+                        log_btn.contains(hx, hy) || self.bottom_tool == Some(ToolWindowId::GitLog);
                     canvas.stroke_rounded_rect(
                         log_btn,
                         4,
-                        if log_hov { t.accent_blue } else { t.border_color },
+                        if log_hov {
+                            t.accent_blue
+                        } else {
+                            t.border_color
+                        },
                         t.window_bg,
                     );
                     canvas.draw_text_centered(
                         log_btn,
                         self.tr("历史库", "Log"),
-                        if log_hov { t.accent_blue } else { t.text_secondary },
+                        if log_hov {
+                            t.accent_blue
+                        } else {
+                            t.text_secondary
+                        },
                         FontStyle::UiSmall,
                     );
                     self.hit_regions
@@ -6284,7 +7332,7 @@ impl IdeApplicationState {
                 );
                 let mut y = rect.y + 37;
 
-                // 1. 当前分支胶囊与 Ahead/Behind 指示器 + 快捷 Pull / Push / Fetch 按钮
+                // 1. 当前分支胶囊与 Ahead/Behind 指示器 + 快捷 Fetch / Pull / Push 按钮
                 let branch_name = self.git_engine.current_branch.clone();
                 let (ahead, behind) = self.git_engine.ahead_behind;
                 let ab_suffix = if ahead > 0 || behind > 0 {
@@ -6317,8 +7365,8 @@ impl IdeApplicationState {
                     .push((br_pill, HitAction::ToggleGitBranchPopup));
                 y += 28;
 
-                let gap = 4;
-                let bw = ((rect.w - 16 - gap * 3) / 4).max(42);
+                let gap = 5;
+                let bw = ((rect.w - 16 - gap * 2) / 3).max(52);
                 let mut gx = rect.x + 8;
 
                 let fetch_btn = Rect::new(gx, y, bw, 23);
@@ -6353,13 +7401,11 @@ impl IdeApplicationState {
                     t.window_bg,
                 );
                 canvas.draw_text_centered(pull_btn, "↓ Pull", t.syn_function, FontStyle::UiSmall);
-                self.hit_regions.push((
-                    pull_btn,
-                    HitAction::ExecuteIdeAction(IdeAction::GitPull),
-                ));
+                self.hit_regions
+                    .push((pull_btn, HitAction::ExecuteIdeAction(IdeAction::GitPull)));
                 gx += bw + gap;
 
-                let push_btn = Rect::new(gx, y, bw, 23);
+                let push_btn = Rect::new(gx, y, (rect.x + rect.w - 8 - gx).max(bw), 23);
                 canvas.stroke_rounded_rect(
                     push_btn,
                     5,
@@ -6371,81 +7417,77 @@ impl IdeApplicationState {
                     t.window_bg,
                 );
                 canvas.draw_text_centered(push_btn, "↑ Push", t.run_green, FontStyle::UiSmall);
-                self.hit_regions.push((
-                    push_btn,
-                    HitAction::ExecuteIdeAction(IdeAction::GitPush),
-                ));
-                gx += bw + gap;
-
-                let stage_btn = Rect::new(gx, y, (rect.x + rect.w - 8 - gx).max(bw), 23);
-                let all_staged = !self.git_engine.changed_files.is_empty()
-                    && self.git_engine.changed_files.iter().all(|f| f.staged);
-                canvas.stroke_rounded_rect(
-                    stage_btn,
-                    5,
-                    if stage_btn.contains(hx, hy) {
-                        t.accent_blue
-                    } else {
-                        t.border_color
-                    },
-                    t.window_bg,
-                );
-                canvas.draw_text_centered(
-                    stage_btn,
-                    if all_staged {
-                        self.tr("- 取消", "- Unstage")
-                    } else {
-                        self.tr("+ 暂存", "+ Stage")
-                    },
-                    t.text_primary,
-                    FontStyle::UiSmall,
-                );
-                self.hit_regions.push((
-                    stage_btn,
-                    if all_staged {
-                        HitAction::UnstageAllGitChanges
-                    } else {
-                        HitAction::StageAllGitChanges
-                    },
-                ));
+                self.hit_regions
+                    .push((push_btn, HitAction::ExecuteIdeAction(IdeAction::GitPush)));
                 y += 28;
 
-                // 2. IDEA 分组变更树：已暂存 (Staged Changes) + 未暂存更改 (Changes)
+                // 2. IDEA 风格 Changelist 树：Changes (已跟踪变更) + Unversioned Files (未跟踪文件)
+                //    勾选/取消勾选仅维护待提交清单，不触发 git add / git reset 暂存！
                 let changed_snapshot = self.git_engine.changed_files.clone();
-                let staged_cnt = changed_snapshot.iter().filter(|f| f.staged).count();
-                let unstaged_cnt = changed_snapshot.len().saturating_sub(staged_cnt);
+                let tracked_files: Vec<ide_git::GitChangedFile> = changed_snapshot
+                    .iter()
+                    .filter(|f| f.status != ide_git::GitFileStatusKind::Untracked)
+                    .cloned()
+                    .collect();
+                let untracked_files: Vec<ide_git::GitChangedFile> = changed_snapshot
+                    .iter()
+                    .filter(|f| f.status == ide_git::GitFileStatusKind::Untracked)
+                    .cloned()
+                    .collect();
 
                 #[derive(Clone)]
                 enum CommitTreeRow {
                     SectionHeader {
                         title: String,
-                        is_staged_sec: bool,
+                        untracked_group: bool,
+                        collapsed: bool,
+                        checked_cnt: usize,
+                        total_cnt: usize,
                     },
                     FileEntry(ide_git::GitChangedFile),
                 }
 
-                let mut tree_rows: Vec<CommitTreeRow> = Vec::with_capacity(changed_snapshot.len() + 2);
-                if staged_cnt > 0 {
+                let mut tree_rows: Vec<CommitTreeRow> =
+                    Vec::with_capacity(changed_snapshot.len() + 2);
+                if !tracked_files.is_empty() || untracked_files.is_empty() {
+                    let (c_chk, c_tot) = self.git_engine.checked_counts(false);
                     tree_rows.push(CommitTreeRow::SectionHeader {
                         title: format!(
-                            "▼ {} ({staged_cnt})",
-                            self.tr("已暂存更改 Staged", "Staged Changes")
+                            "{} ({}/{})",
+                            self.tr("更改 Changes", "Changes"),
+                            c_chk,
+                            c_tot
                         ),
-                        is_staged_sec: true,
+                        untracked_group: false,
+                        collapsed: self.git_changes_group_collapsed,
+                        checked_cnt: c_chk,
+                        total_cnt: c_tot,
                     });
-                    for ch in changed_snapshot.iter().filter(|f| f.staged) {
-                        tree_rows.push(CommitTreeRow::FileEntry(ch.clone()));
+                    if !self.git_changes_group_collapsed {
+                        for ch in tracked_files {
+                            tree_rows.push(CommitTreeRow::FileEntry(ch));
+                        }
                     }
                 }
-                tree_rows.push(CommitTreeRow::SectionHeader {
-                    title: format!(
-                        "▼ {} ({unstaged_cnt})",
-                        self.tr("更改 Changes", "Changes")
-                    ),
-                    is_staged_sec: false,
-                });
-                for ch in changed_snapshot.iter().filter(|f| !f.staged) {
-                    tree_rows.push(CommitTreeRow::FileEntry(ch.clone()));
+                if !untracked_files.is_empty() {
+                    let (u_chk, u_tot) = self.git_engine.checked_counts(true);
+                    tree_rows.push(CommitTreeRow::SectionHeader {
+                        title: format!(
+                            "{} ({}/{})",
+                            self.tr("未跟踪 Unversioned", "Unversioned Files"),
+                            u_chk,
+                            u_tot
+                        ),
+                        untracked_group: true,
+                        collapsed: self.git_unversioned_group_collapsed,
+                        checked_cnt: u_chk,
+                        total_cnt: u_tot,
+                    });
+                    if !self.git_unversioned_group_collapsed {
+                        for ch in untracked_files {
+                            tree_rows.push(CommitTreeRow::FileEntry(ch));
+                        }
+                    }
                 }
 
                 let list_top = y;
@@ -6481,7 +7523,6 @@ impl IdeApplicationState {
                         rect.w - 40,
                         FontStyle::UiSmall,
                     );
-                    // 极克制的轻量占位骨架条，柔和呼吸不闪烁
                     let shimmer = 0.35 + 0.25 * (phase * 0.65).sin().abs();
                     let sk_bg = blend_rgb(t.panel_bg, t.panel_header_bg, shimmer);
                     for row_i in 0..3 {
@@ -6512,53 +7553,84 @@ impl IdeApplicationState {
                         match row_item {
                             CommitTreeRow::SectionHeader {
                                 title,
-                                is_staged_sec,
+                                untracked_group,
+                                collapsed,
+                                checked_cnt,
+                                total_cnt,
                             } => {
                                 let hdr_rect = Rect::new(rect.x + 6, y, rect.w - 18, row_h - 1);
                                 canvas.fill_rounded_rect(hdr_rect, 4, t.panel_header_bg);
+
+                                // 折叠三角 `▼` / `▶`
+                                let chev_rect = Rect::new(rect.x + 8, y, 16, row_h - 1);
                                 canvas.draw_text_styled(
-                                    rect.x + 10,
+                                    rect.x + 9,
                                     y + 2,
-                                    &title,
-                                    t.text_secondary,
-                                    rect.w - 76,
-                                    FontStyle::UiBold,
-                                );
-                                let sec_btn = Rect::new(rect.x + rect.w - 64, y + 2, 50, row_h - 5);
-                                let sec_hov = sec_btn.contains(hx, hy);
-                                canvas.stroke_rounded_rect(
-                                    sec_btn,
-                                    3,
-                                    if sec_hov { t.accent_blue } else { t.border_color },
-                                    t.window_bg,
-                                );
-                                canvas.draw_text_centered(
-                                    sec_btn,
-                                    if is_staged_sec {
-                                        self.tr("- 全退", "- All")
-                                    } else {
-                                        self.tr("+ 全选", "+ All")
-                                    },
-                                    if sec_hov { t.accent_blue } else { t.text_muted },
+                                    if collapsed { "▶" } else { "▼" },
+                                    t.text_muted,
+                                    14,
                                     FontStyle::UiSmall,
                                 );
                                 self.hit_regions.push((
-                                    sec_btn,
-                                    if is_staged_sec {
-                                        HitAction::UnstageAllGitChanges
-                                    } else {
-                                        HitAction::StageAllGitChanges
-                                    },
+                                    chev_rect,
+                                    HitAction::ToggleCommitGroupCollapse { untracked_group },
+                                ));
+
+                                // 分组主复选框：[✓] 全选 / [—] 部分选中 / [ ] 未选
+                                let grp_chk = Rect::new(rect.x + 25, y + 3, 15, 15);
+                                if total_cnt > 0 && checked_cnt == total_cnt {
+                                    canvas.fill_rounded_rect(grp_chk, 3, t.accent_blue);
+                                    canvas.draw_check_icon(grp_chk.x + 2, grp_chk.y + 3, 0xFFFFFF);
+                                } else if checked_cnt > 0 {
+                                    canvas.fill_rounded_rect(grp_chk, 3, t.accent_blue);
+                                    canvas.draw_dash_icon(grp_chk.x + 2, grp_chk.y + 2, 0xFFFFFF);
+                                } else {
+                                    canvas.stroke_rounded_rect(
+                                        grp_chk,
+                                        3,
+                                        t.border_color,
+                                        t.window_bg,
+                                    );
+                                }
+                                let grp_chk_hit = Rect::new(rect.x + 23, y, 22, row_h - 1);
+                                self.hit_regions.push((
+                                    grp_chk_hit,
+                                    HitAction::ToggleCommitGroupCheck { untracked_group },
+                                ));
+
+                                canvas.draw_text_styled(
+                                    rect.x + 45,
+                                    y + 2,
+                                    &title,
+                                    t.text_secondary,
+                                    rect.w - 64,
+                                    FontStyle::UiBold,
+                                );
+                                let hdr_title_hit = Rect::new(
+                                    rect.x + 45,
+                                    y,
+                                    (rect.w - 60).max(40),
+                                    row_h - 1,
+                                );
+                                self.hit_regions.push((
+                                    hdr_title_hit,
+                                    HitAction::ToggleCommitGroupCheck { untracked_group },
                                 ));
                             }
                             CommitTreeRow::FileEntry(ch) => {
                                 let full_row = Rect::new(rect.x + 6, y, rect.w - 18, row_h - 1);
-                                let is_diff_selected = self
-                                    .git_working_diff_target
+                                let is_checked =
+                                    self.git_engine.is_file_checked_for_commit(&ch.path);
+                                let is_selected = self
+                                    .selected_git_working_file
                                     .as_ref()
-                                    .is_some_and(|p| p == &ch.path);
+                                    .is_some_and(|p| p == &ch.path)
+                                    || self
+                                        .git_working_diff_target
+                                        .as_ref()
+                                        .is_some_and(|p| p == &ch.path);
                                 let row_hov = full_row.contains(hx, hy);
-                                if is_diff_selected {
+                                if is_selected {
                                     canvas.fill_rounded_rect(full_row, 4, t.editor_selection_bg);
                                 } else if row_hov {
                                     canvas.fill_rounded_rect(full_row, 4, t.panel_header_bg);
@@ -6566,14 +7638,18 @@ impl IdeApplicationState {
                                 self.git_change_row_rects.push((
                                     full_row,
                                     ch.path.clone(),
-                                    ch.staged,
+                                    is_checked,
                                 ));
 
                                 // 1) IDEA 复选框 [✓] / [ ]
-                                let chk_rect = Rect::new(rect.x + 10, y + 3, 15, 15);
-                                if ch.staged {
+                                let chk_rect = Rect::new(rect.x + 14, y + 3, 15, 15);
+                                if is_checked {
                                     canvas.fill_rounded_rect(chk_rect, 3, t.accent_blue);
-                                    canvas.draw_check_icon(chk_rect.x + 2, chk_rect.y + 3, 0xFFFFFF);
+                                    canvas.draw_check_icon(
+                                        chk_rect.x + 2,
+                                        chk_rect.y + 3,
+                                        0xFFFFFF,
+                                    );
                                 } else {
                                     canvas.stroke_rounded_rect(
                                         chk_rect,
@@ -6582,13 +7658,10 @@ impl IdeApplicationState {
                                         t.window_bg,
                                     );
                                 }
-                                let chk_hit = Rect::new(rect.x + 8, y, 22, row_h - 1);
-                                self.hit_regions
-                                    .push((chk_hit, HitAction::ToggleStageFile(ch.path.clone())));
 
                                 // 2) 文件类型图标 + 文件名 + 相对目录
                                 let lang = ide_core::LanguageId::from_path(&ch.path);
-                                canvas.draw_file_type_icon(rect.x + 30, y + 4, lang);
+                                canvas.draw_file_type_icon(rect.x + 34, y + 4, lang);
 
                                 let fname = ch
                                     .path
@@ -6608,11 +7681,10 @@ impl IdeApplicationState {
                                     ide_git::GitFileStatusKind::Deleted => t.breakpoint_red,
                                     ide_git::GitFileStatusKind::Modified => t.syn_function,
                                 };
-                                let right_actions_w = 66;
-                                let text_avail_w =
-                                    (rect.w - 48 - right_actions_w - 10).max(40);
+                                let right_actions_w = 88;
+                                let text_avail_w = (rect.w - 52 - right_actions_w - 10).max(40);
                                 let next_x = canvas.draw_text_styled(
-                                    rect.x + 48,
+                                    rect.x + 52,
                                     y + 2,
                                     fname,
                                     status_color,
@@ -6631,19 +7703,21 @@ impl IdeApplicationState {
                                         FontStyle::UiSmall,
                                     );
                                 }
-                                let file_click_rect = Rect::new(
-                                    rect.x + 30,
+
+                                // 点击复选框或文件名行直接勾选/取消勾选（不直接暂存或提交）
+                                let row_check_rect = Rect::new(
+                                    rect.x + 8,
                                     y,
-                                    (rect.w - 36 - right_actions_w).max(40),
+                                    (rect.w - 16 - right_actions_w).max(50),
                                     row_h - 1,
                                 );
                                 self.hit_regions.push((
-                                    file_click_rect,
-                                    HitAction::InspectGitWorkingFileDiff(ch.path.clone()),
+                                    row_check_rect,
+                                    HitAction::ToggleCommitFileCheck(ch.path.clone()),
                                 ));
 
-                                // 3) 状态徽章 (M / A / D / U) + Diff 按钮 + 回滚按钮
-                                let badge_x = rect.x + rect.w - right_actions_w - 2;
+                                // 3) 右侧操作区：状态徽章 (M / A / D / U) + Diff + 打开文件 + 回滚
+                                let badge_x = rect.x + rect.w - right_actions_w - 4;
                                 canvas.draw_text_styled(
                                     badge_x,
                                     y + 2,
@@ -6653,7 +7727,7 @@ impl IdeApplicationState {
                                     FontStyle::CodeMonoBold,
                                 );
 
-                                let diff_btn = Rect::new(badge_x + 15, y + 2, 24, row_h - 5);
+                                let diff_btn = Rect::new(badge_x + 15, y + 2, 22, row_h - 5);
                                 canvas.stroke_rounded_rect(
                                     diff_btn,
                                     3,
@@ -6665,7 +7739,7 @@ impl IdeApplicationState {
                                     t.window_bg,
                                 );
                                 canvas.draw_changes_diff_icon(
-                                    diff_btn.x + 4,
+                                    diff_btn.x + 3,
                                     diff_btn.y + 2,
                                     t.accent_blue,
                                 );
@@ -6674,7 +7748,26 @@ impl IdeApplicationState {
                                     HitAction::InspectGitWorkingFileDiff(ch.path.clone()),
                                 ));
 
-                                let rb_btn = Rect::new(badge_x + 41, y + 2, 22, row_h - 5);
+                                let open_btn = Rect::new(badge_x + 39, y + 2, 22, row_h - 5);
+                                canvas.stroke_rounded_rect(
+                                    open_btn,
+                                    3,
+                                    if open_btn.contains(hx, hy) {
+                                        t.accent_blue
+                                    } else {
+                                        t.border_color
+                                    },
+                                    t.window_bg,
+                                );
+                                canvas.draw_jump_to_source_icon(
+                                    open_btn.x + 5,
+                                    open_btn.y + 3,
+                                    t.text_secondary,
+                                );
+                                self.hit_regions
+                                    .push((open_btn, HitAction::OpenFile(ch.path.clone())));
+
+                                let rb_btn = Rect::new(badge_x + 63, y + 2, 22, row_h - 5);
                                 canvas.stroke_rounded_rect(
                                     rb_btn,
                                     3,
@@ -6690,10 +7783,8 @@ impl IdeApplicationState {
                                     rb_btn.y + 2,
                                     t.breakpoint_red,
                                 );
-                                self.hit_regions.push((
-                                    rb_btn,
-                                    HitAction::RollbackGitFile(ch.path.clone()),
-                                ));
+                                self.hit_regions
+                                    .push((rb_btn, HitAction::RollbackGitFile(ch.path.clone())));
                             }
                         }
                         y += row_h;
@@ -6714,7 +7805,7 @@ impl IdeApplicationState {
                     t.border_color,
                 );
 
-                // 3. 底部 IDEA Commit 选项栏：[✓ 修正提交 Amend]  +  [✦ AI 生成提交信息]
+                // 3. 底部 IDEA Commit 选项栏：[✓ Amend]  +  已选 N/M  +  [✦ AI 生成]
                 let opt_y = commit_box_y;
                 let amend_chk = Rect::new(rect.x + 10, opt_y + 4, 15, 15);
                 if self.git_amend_commit {
@@ -6723,23 +7814,39 @@ impl IdeApplicationState {
                 } else {
                     canvas.stroke_rounded_rect(amend_chk, 3, t.border_color, t.window_bg);
                 }
-                let amend_hit = Rect::new(rect.x + 8, opt_y + 1, 96, 22);
+                let amend_hit = Rect::new(rect.x + 8, opt_y + 1, 78, 22);
                 canvas.draw_text_styled(
                     rect.x + 29,
                     opt_y + 3,
-                    self.tr("修正 Amend", "Amend"),
+                    self.tr("修正", "Amend"),
                     if self.git_amend_commit {
                         t.accent_blue
                     } else {
                         t.text_secondary
                     },
-                    76,
+                    56,
                     FontStyle::UiSmall,
                 );
                 self.hit_regions
                     .push((amend_hit, HitAction::ToggleGitAmend));
 
-                let ai_msg_w = 88;
+                let checked_total = self.git_engine.total_checked_count();
+                let changed_total = self.git_engine.changed_files.len();
+                let sel_label = format!("{checked_total}/{changed_total}");
+                canvas.draw_text_styled(
+                    rect.x + 88,
+                    opt_y + 3,
+                    &sel_label,
+                    if checked_total > 0 {
+                        t.accent_blue
+                    } else {
+                        t.text_muted
+                    },
+                    48,
+                    FontStyle::UiSmall,
+                );
+
+                let ai_msg_w = 82;
                 let ai_msg_btn = Rect::new(rect.x + rect.w - ai_msg_w - 8, opt_y + 1, ai_msg_w, 22);
                 canvas.stroke_rounded_rect(ai_msg_btn, 4, t.accent_blue, t.window_bg);
                 canvas.draw_ai_sparkle_icon(ai_msg_btn.x + 5, ai_msg_btn.y + 3, t.accent_blue);
@@ -6754,7 +7861,7 @@ impl IdeApplicationState {
                 self.hit_regions
                     .push((ai_msg_btn, HitAction::GenerateAiCommitMessage));
 
-                // 4. Commit Message 输入框 + 双按钮：[提交 Commit]  [提交并推送 Commit & Push…]
+                // 4. Commit Message 输入框 + 双按钮：[提交 Commit (N)]  [提交并推送…]
                 let msg_box = Rect::new(rect.x + 8, commit_box_y + 26, rect.w - 16, 46);
                 self.git_commit_input_box_rect = msg_box;
                 if self.focus != FocusTarget::GitCommitInput
@@ -6801,15 +7908,31 @@ impl IdeApplicationState {
                 let btn_row_y = commit_box_y + 78;
                 let half_w = ((rect.w - 22) / 2).max(60);
                 let commit_btn = Rect::new(rect.x + 8, btn_row_y, half_w - 6, 28);
-                canvas.fill_rounded_rect(commit_btn, 6, t.accent_blue);
+                let can_commit = checked_total > 0 || self.git_amend_commit;
+                canvas.fill_rounded_rect(
+                    commit_btn,
+                    6,
+                    if can_commit {
+                        t.accent_blue
+                    } else {
+                        t.panel_header_bg
+                    },
+                );
+                let commit_btn_label = if self.git_amend_commit {
+                    if checked_total > 0 {
+                        format!("{} ({checked_total})", self.tr("修正提交", "Amend"))
+                    } else {
+                        self.tr("修正提交", "Amend").to_string()
+                    }
+                } else if checked_total > 0 {
+                    format!("{} ({checked_total})", self.tr("提交", "Commit"))
+                } else {
+                    self.tr("提交 Commit", "Commit").to_string()
+                };
                 canvas.draw_text_centered(
                     commit_btn,
-                    if self.git_amend_commit {
-                        self.tr("修正提交", "Amend")
-                    } else {
-                        self.tr("提交 Commit", "Commit")
-                    },
-                    0xFFFFFF,
+                    &commit_btn_label,
+                    if can_commit { 0xFFFFFF } else { t.text_muted },
                     FontStyle::UiBold,
                 );
                 self.hit_regions
@@ -6821,13 +7944,27 @@ impl IdeApplicationState {
                 canvas.stroke_rounded_rect(
                     cp_btn,
                     6,
-                    t.accent_blue,
-                    if cp_hov { t.popup_hover_bg } else { t.window_bg },
+                    if can_commit {
+                        t.accent_blue
+                    } else {
+                        t.border_color
+                    },
+                    if cp_hov && can_commit {
+                        t.popup_hover_bg
+                    } else {
+                        t.window_bg
+                    },
                 );
                 canvas.draw_text_centered(
                     cp_btn,
                     self.tr("提交并推送…", "Commit & Push…"),
-                    if cp_hov { 0xFFFFFF } else { t.accent_blue },
+                    if !can_commit {
+                        t.text_muted
+                    } else if cp_hov {
+                        0xFFFFFF
+                    } else {
+                        t.accent_blue
+                    },
                     FontStyle::UiBold,
                 );
                 self.hit_regions
@@ -6978,8 +8115,7 @@ impl IdeApplicationState {
                 tab_w - 46,
                 font_style,
             );
-            self.hit_regions
-                .push((tab_rect, HitAction::SelectTab(idx)));
+            self.hit_regions.push((tab_rect, HitAction::SelectTab(idx)));
 
             if open_snapshot.len() > 1 {
                 let close_rect = Rect::new(tab_x + tab_w - 22, rect.y + 9, 16, 16);
@@ -7013,7 +8149,11 @@ impl IdeApplicationState {
             ctrl_k_btn,
             5,
             t.accent_blue,
-            if ctrl_k_hov { t.popup_hover_bg } else { t.panel_bg },
+            if ctrl_k_hov {
+                t.popup_hover_bg
+            } else {
+                t.panel_bg
+            },
         );
         canvas.draw_ai_sparkle_icon(ctrl_k_btn.x + 7, ctrl_k_btn.y + 4, t.accent_blue);
         canvas.draw_text_styled(
@@ -7027,18 +8167,21 @@ impl IdeApplicationState {
         self.hit_regions
             .push((ctrl_k_btn, HitAction::TriggerCtrlKInlineEdit));
 
-        let send_btn = Rect::new(
-            rect.x + rect.w - send_btn_w - 8,
-            rect.y + 5,
-            send_btn_w,
-            24,
-        );
+        let send_btn = Rect::new(rect.x + rect.w - send_btn_w - 8, rect.y + 5, send_btn_w, 24);
         let send_hov = send_btn.contains(hx, hy);
         canvas.stroke_rounded_rect(
             send_btn,
             5,
-            if send_hov { t.accent_blue } else { t.border_color },
-            if send_hov { t.popup_hover_bg } else { t.panel_bg },
+            if send_hov {
+                t.accent_blue
+            } else {
+                t.border_color
+            },
+            if send_hov {
+                t.popup_hover_bg
+            } else {
+                t.panel_bg
+            },
         );
         canvas.draw_text_centered(
             send_btn,
@@ -7145,8 +8288,16 @@ impl IdeApplicationState {
                 canvas.stroke_rounded_rect(
                     accept_btn,
                     5,
-                    if can_accept { t.run_green } else { t.border_color },
-                    if can_accept { t.diff_added_bg } else { t.window_bg },
+                    if can_accept {
+                        t.run_green
+                    } else {
+                        t.border_color
+                    },
+                    if can_accept {
+                        t.diff_added_bg
+                    } else {
+                        t.window_bg
+                    },
                 );
                 canvas.draw_text_centered(
                     accept_btn,
@@ -7155,7 +8306,11 @@ impl IdeApplicationState {
                     } else {
                         self.tr("✓ 接受 (Tab)", "✓ Accept (Tab)")
                     },
-                    if can_accept { t.diff_added_fg } else { t.text_muted },
+                    if can_accept {
+                        t.diff_added_fg
+                    } else {
+                        t.text_muted
+                    },
                     FontStyle::UiBold,
                 );
                 if can_accept {
@@ -7254,7 +8409,9 @@ impl IdeApplicationState {
         let pad_digits = line_digits.max(4);
         let sample_lineno = "8".repeat(pad_digits);
         let (sample_w, _) = canvas.measure_text(&sample_lineno, FontStyle::CodeMono);
-        let lineno_col_w = (sample_w + 10).max(char_w * (pad_digits as i32) + 8).max(46);
+        let lineno_col_w = (sample_w + 10)
+            .max(char_w * (pad_digits as i32) + 8)
+            .max(46);
         let gutter_w = (8 + lineno_col_w + 26).max(76);
 
         let code_area_h = (rect.y + rect.h - code_top_y - 4).max(24);
@@ -7313,12 +8470,7 @@ impl IdeApplicationState {
 
             if line_idx == cursor_line {
                 canvas.fill_rect(
-                    Rect::new(
-                        rect.x + gutter_w + 1,
-                        row_y,
-                        rect.w - gutter_w - 12,
-                        line_h,
-                    ),
+                    Rect::new(rect.x + gutter_w + 1, row_y, rect.w - gutter_w - 12, line_h),
                     t.editor_current_line_bg,
                 );
             }
@@ -7373,20 +8525,24 @@ impl IdeApplicationState {
                 }
             }
 
-            let code_row = Rect::new(
-                rect.x + gutter_w + 1,
-                row_y,
-                rect.w - gutter_w - 12,
-                line_h,
-            );
-            self.hit_regions.push((code_row, HitAction::ClickEditorLine));
+            let code_row = Rect::new(rect.x + gutter_w + 1, row_y, rect.w - gutter_w - 12, line_h);
+            self.hit_regions
+                .push((code_row, HitAction::ClickEditorLine));
 
             // 字符级选区高亮渲染
             if let Some(((sl, sc), (el, ec))) = sel_range {
                 if line_idx >= sl && line_idx <= el {
                     let line_chars = line_str.chars().count();
-                    let col_start = if line_idx == sl { sc.min(line_chars) } else { 0 };
-                    let col_end = if line_idx == el { ec.min(line_chars) } else { line_chars };
+                    let col_start = if line_idx == sl {
+                        sc.min(line_chars)
+                    } else {
+                        0
+                    };
+                    let col_end = if line_idx == el {
+                        ec.min(line_chars)
+                    } else {
+                        line_chars
+                    };
                     let p0: String = line_str.chars().take(col_start).collect();
                     let p1: String = line_str.chars().take(col_end).collect();
                     let (w0, _) = canvas.measure_text(&p0, FontStyle::CodeMono);
@@ -7435,7 +8591,10 @@ impl IdeApplicationState {
                 if self.caret_visible && caret_x >= code_body_rect.x && caret_x < right_limit - 1 {
                     canvas.fill_rect(Rect::new(caret_x, row_y + 3, 2, 17), t.accent_blue);
                 }
-                self.ime_spot = (caret_x.clamp(code_body_rect.x, right_limit - 2), row_y + line_h);
+                self.ime_spot = (
+                    caret_x.clamp(code_body_rect.x, right_limit - 2),
+                    row_y + line_h,
+                );
             }
         }
 
@@ -7543,8 +8702,7 @@ impl IdeApplicationState {
                 canvas.fill_rounded_rect(plus_btn, 4, t.popup_hover_bg);
             }
             canvas.draw_plus_icon(plus_btn.x + 5, plus_btn.y + 5, t.text_secondary);
-            self.hit_regions
-                .push((plus_btn, HitAction::NewTerminalTab));
+            self.hit_regions.push((plus_btn, HitAction::NewTerminalTab));
             tx += 26;
 
             canvas.draw_chevron_down(tx + 2, rect.y + 13, t.text_muted);
@@ -7583,7 +8741,14 @@ impl IdeApplicationState {
                 ToolWindowId::GitLog => self.tr("Git 提交日志", "Git Log"),
                 _ => self.tr("面板", "Panel"),
             };
-            canvas.draw_text_styled(tx, rect.y + 7, label, t.text_primary, 130, FontStyle::UiBold);
+            canvas.draw_text_styled(
+                tx,
+                rect.y + 7,
+                label,
+                t.text_primary,
+                130,
+                FontStyle::UiBold,
+            );
         }
 
         // 右侧底部工具快捷切换按钮
@@ -7615,8 +8780,7 @@ impl IdeApplicationState {
                 },
                 FontStyle::UiSmall,
             );
-            self.hit_regions
-                .push((b, HitAction::SelectBottomTool(id)));
+            self.hit_regions.push((b, HitAction::SelectBottomTool(id)));
             rx += 62;
         }
 
@@ -7683,7 +8847,11 @@ impl IdeApplicationState {
                         if idx >= sl && idx <= el {
                             let char_len = raw.chars().count();
                             let c0 = if idx == sl { sc.min(char_len) } else { 0 };
-                            let c1 = if idx == el { ec.min(char_len) } else { char_len };
+                            let c1 = if idx == el {
+                                ec.min(char_len)
+                            } else {
+                                char_len
+                            };
                             let p0: String = raw.chars().take(c0).collect();
                             let p1: String = raw.chars().take(c1).collect();
                             let x0 = (text_left + canvas.measure_text(&p0, FontStyle::CodeMono).0)
@@ -7829,7 +8997,12 @@ impl IdeApplicationState {
                 self.git_log_diff_scroll_info = ScrollTrackInfo::default();
 
                 // 顶部 IDEA Git Log 工具栏：[搜索框] [分支过滤状态] [Fetch/Pull/Push/Refresh] [Checkout/New Branch/Cherry-Pick/Revert/Copy Hash]
-                let tb_rect = Rect::new(content_rect.x + 6, content_rect.y + 4, content_rect.w - 12, 28);
+                let tb_rect = Rect::new(
+                    content_rect.x + 6,
+                    content_rect.y + 4,
+                    content_rect.w - 12,
+                    28,
+                );
                 canvas.fill_rounded_rect(tb_rect, 5, t.panel_bg);
 
                 let search_w = (content_rect.w / 4).clamp(170, 290);
@@ -7883,22 +9056,55 @@ impl IdeApplicationState {
                     .push((search_box, HitAction::FocusGitLogSearchInput));
 
                 if !self.git_log_search_input.is_empty() {
-                    let clr_s = Rect::new(search_box.x + search_box.w - 18, search_box.y + 4, 15, 16);
+                    let clr_s =
+                        Rect::new(search_box.x + search_box.w - 18, search_box.y + 4, 15, 16);
                     canvas.draw_text_centered(clr_s, "×", t.text_muted, FontStyle::UiSmall);
                     self.hit_regions.push((clr_s, HitAction::ClearGitLogSearch));
                 }
 
                 let mut bx = search_box.x + search_box.w + 8;
                 let tool_btns: Vec<(&str, u32, HitAction)> = vec![
-                    (self.tr("↻ 刷新", "↻ Refresh"), t.text_secondary, HitAction::RefreshGitStatus),
+                    (
+                        self.tr("↻ 刷新", "↻ Refresh"),
+                        t.text_secondary,
+                        HitAction::RefreshGitStatus,
+                    ),
                     ("Fetch", t.text_secondary, HitAction::GitFetchAll),
-                    ("↓ Pull", t.syn_function, HitAction::ExecuteIdeAction(IdeAction::GitPull)),
-                    ("↑ Push", t.run_green, HitAction::ExecuteIdeAction(IdeAction::GitPush)),
-                    (self.tr("检出", "Checkout"), t.accent_blue, HitAction::GitCheckoutSelectedCommit),
-                    (self.tr("新建分支", "Branch"), t.syn_type, HitAction::GitCreateBranchAtSelectedCommit),
-                    ("Cherry-Pick", t.warning_yellow, HitAction::GitCherryPickSelectedCommit),
-                    ("Revert", t.breakpoint_red, HitAction::GitRevertSelectedCommit),
-                    (self.tr("复制Hash", "Copy Hash"), t.text_muted, HitAction::GitCopySelectedCommitHash),
+                    (
+                        "↓ Pull",
+                        t.syn_function,
+                        HitAction::ExecuteIdeAction(IdeAction::GitPull),
+                    ),
+                    (
+                        "↑ Push",
+                        t.run_green,
+                        HitAction::ExecuteIdeAction(IdeAction::GitPush),
+                    ),
+                    (
+                        self.tr("检出", "Checkout"),
+                        t.accent_blue,
+                        HitAction::GitCheckoutSelectedCommit,
+                    ),
+                    (
+                        self.tr("新建分支", "Branch"),
+                        t.syn_type,
+                        HitAction::GitCreateBranchAtSelectedCommit,
+                    ),
+                    (
+                        "Cherry-Pick",
+                        t.warning_yellow,
+                        HitAction::GitCherryPickSelectedCommit,
+                    ),
+                    (
+                        "Revert",
+                        t.breakpoint_red,
+                        HitAction::GitRevertSelectedCommit,
+                    ),
+                    (
+                        self.tr("复制Hash", "Copy Hash"),
+                        t.text_muted,
+                        HitAction::GitCopySelectedCommitHash,
+                    ),
                 ];
                 for (lbl, fg, act) in tool_btns {
                     let (lw, _) = canvas.measure_text(lbl, FontStyle::UiSmall);
@@ -8085,7 +9291,12 @@ impl IdeApplicationState {
 
                 // ===== 中列：Commit Graph & 提交历史表 =====
                 canvas.stroke_rounded_rect(commits_rect, 5, t.border_color, t.editor_bg);
-                let col_hdr = Rect::new(commits_rect.x + 1, commits_rect.y + 1, commits_rect.w - 2, 22);
+                let col_hdr = Rect::new(
+                    commits_rect.x + 1,
+                    commits_rect.y + 1,
+                    commits_rect.w - 2,
+                    22,
+                );
                 canvas.fill_rect(col_hdr, t.panel_header_bg);
                 canvas.draw_text_styled(
                     commits_rect.x + 10,
@@ -8113,7 +9324,8 @@ impl IdeApplicationState {
                     .filter(|c| {
                         if let Some(ref bf) = branch_filter {
                             let ref_match = c.refs.iter().any(|r| {
-                                let clean = r.trim_start_matches("HEAD -> ").trim_start_matches("tag: ");
+                                let clean =
+                                    r.trim_start_matches("HEAD -> ").trim_start_matches("tag: ");
                                 clean == bf || clean.ends_with(bf)
                             });
                             if !ref_match && bf != &self.git_engine.current_branch {
@@ -8166,7 +9378,10 @@ impl IdeApplicationState {
                     canvas.draw_text_styled(
                         commits_rect.x + 34,
                         list_top + 10,
-                        self.tr("正在加载 Git 提交历史与分支拓扑...", "Loading Git commit history..."),
+                        self.tr(
+                            "正在加载 Git 提交历史与分支拓扑...",
+                            "Loading Git commit history...",
+                        ),
                         t.text_secondary,
                         commits_rect.w - 46,
                         FontStyle::UiRegular,
@@ -8175,10 +9390,7 @@ impl IdeApplicationState {
                     canvas.draw_text_styled(
                         commits_rect.x + 14,
                         list_top + 10,
-                        self.tr(
-                            "暂无匹配的 Git 提交记录",
-                            "No matching Git commits found",
-                        ),
+                        self.tr("暂无匹配的 Git 提交记录", "No matching Git commits found"),
                         t.text_muted,
                         commits_rect.w - 28,
                         FontStyle::UiRegular,
@@ -8201,12 +9413,8 @@ impl IdeApplicationState {
                         .skip(self.git_log_scroll)
                         .take(c_vis)
                     {
-                        let row = Rect::new(
-                            commits_rect.x + 3,
-                            cy,
-                            commits_rect.w - 14,
-                            c_row_h - 1,
-                        );
+                        let row =
+                            Rect::new(commits_rect.x + 3, cy, commits_rect.w - 14, c_row_h - 1);
                         let is_sel = self
                             .selected_git_commit_hash
                             .as_ref()
@@ -8217,8 +9425,11 @@ impl IdeApplicationState {
                         } else if hov {
                             canvas.fill_rounded_rect(row, 4, t.panel_header_bg);
                         }
-                        self.git_commit_row_rects
-                            .push((row, entry.hash.clone(), entry.subject.clone()));
+                        self.git_commit_row_rects.push((
+                            row,
+                            entry.hash.clone(),
+                            entry.subject.clone(),
+                        ));
 
                         // 绘制 Git Commit Graph 泳道竖线 + 合并分叉斜线 + 提交节点圆点
                         let lane = entry.graph_lane.min(4);
@@ -8248,7 +9459,8 @@ impl IdeApplicationState {
 
                         let meta_w = 166;
                         let mut text_x = graph_left + 44;
-                        let subj_limit = (commits_rect.x + commits_rect.w - meta_w - 8).max(text_x + 40);
+                        let subj_limit =
+                            (commits_rect.x + commits_rect.w - meta_w - 8).max(text_x + 40);
 
                         // Ref 徽章 (分支 / Tag)
                         for rf in entry.refs.iter().take(2) {
@@ -8264,7 +9476,9 @@ impl IdeApplicationState {
                             } else {
                                 t.panel_header_bg
                             };
-                            let short_rf = rf.trim_start_matches("HEAD -> ").trim_start_matches("tag: ");
+                            let short_rf = rf
+                                .trim_start_matches("HEAD -> ")
+                                .trim_start_matches("tag: ");
                             let (rw, _) = canvas.measure_text(short_rf, FontStyle::UiSmall);
                             let bw = (rw + 10).min(110);
                             if text_x + bw + 20 >= subj_limit {
@@ -8281,7 +9495,11 @@ impl IdeApplicationState {
                                 text_x,
                                 cy + 3,
                                 &entry.subject,
-                                if is_sel || hov { 0xFFFFFF } else { t.text_primary },
+                                if is_sel || hov {
+                                    0xFFFFFF
+                                } else {
+                                    t.text_primary
+                                },
                                 subj_limit - text_x,
                                 if is_sel {
                                     FontStyle::UiBold
@@ -8306,12 +9524,7 @@ impl IdeApplicationState {
                     }
                 }
 
-                let c_track = Rect::new(
-                    commits_rect.x + commits_rect.w - 8,
-                    list_top,
-                    6,
-                    list_h,
-                );
+                let c_track = Rect::new(commits_rect.x + commits_rect.w - 8, list_top, 6, list_h);
                 self.git_log_commits_scroll_info = ScrollTrackInfo {
                     track: c_track,
                     visible: c_vis,
@@ -8333,7 +9546,8 @@ impl IdeApplicationState {
                         .file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or("file");
-                    let hdr = Rect::new(detail_rect.x + 2, detail_rect.y + 2, detail_rect.w - 4, 24);
+                    let hdr =
+                        Rect::new(detail_rect.x + 2, detail_rect.y + 2, detail_rect.w - 4, 24);
                     canvas.fill_rect(hdr, t.panel_header_bg);
                     canvas.draw_text_styled(
                         hdr.x + 8,
@@ -8386,7 +9600,8 @@ impl IdeApplicationState {
                             }
                             ide_git::DiffLineKind::Context => (t.editor_bg, t.text_secondary, " "),
                         };
-                        canvas.fill_rect(Rect::new(diff_box.x, dy, diff_box.w - 10, d_row_h - 1), bg);
+                        canvas
+                            .fill_rect(Rect::new(diff_box.x, dy, diff_box.w - 10, d_row_h - 1), bg);
                         let lno = dl
                             .new_lineno
                             .or(dl.old_lineno)
@@ -8402,12 +9617,8 @@ impl IdeApplicationState {
                         );
                         dy += d_row_h;
                     }
-                    let d_track = Rect::new(
-                        detail_rect.x + detail_rect.w - 8,
-                        diff_box.y,
-                        6,
-                        diff_box.h,
-                    );
+                    let d_track =
+                        Rect::new(detail_rect.x + detail_rect.w - 8, diff_box.y, 6, diff_box.h);
                     self.git_log_diff_scroll_info = ScrollTrackInfo {
                         track: d_track,
                         visible: d_vis,
@@ -8424,7 +9635,12 @@ impl IdeApplicationState {
                     if let Some(detail) = self.git_engine.commit_details.get(&sel_hash).cloned() {
                         // 1) 上部提交元数据卡
                         let meta_h = 56;
-                        let meta_rect = Rect::new(detail_rect.x + 4, detail_rect.y + 4, detail_rect.w - 8, meta_h);
+                        let meta_rect = Rect::new(
+                            detail_rect.x + 4,
+                            detail_rect.y + 4,
+                            detail_rect.w - 8,
+                            meta_h,
+                        );
                         canvas.fill_rounded_rect(meta_rect, 4, t.panel_header_bg);
                         canvas.draw_text_styled(
                             meta_rect.x + 8,
@@ -8452,7 +9668,15 @@ impl IdeApplicationState {
                                 if detail.parents.is_empty() {
                                     String::new()
                                 } else {
-                                    format!("· Parent: {}", detail.parents.join(", ").chars().take(18).collect::<String>())
+                                    format!(
+                                        "· Parent: {}",
+                                        detail
+                                            .parents
+                                            .join(", ")
+                                            .chars()
+                                            .take(18)
+                                            .collect::<String>()
+                                    )
                                 }
                             ),
                             t.text_muted,
@@ -8464,7 +9688,8 @@ impl IdeApplicationState {
                         let files_top = detail_rect.y + meta_h + 8;
                         let rem_h = (detail_rect.h - meta_h - 14).max(40);
                         let files_h = (rem_h * 38 / 100).clamp(44, 140);
-                        let files_box = Rect::new(detail_rect.x + 4, files_top, detail_rect.w - 8, files_h);
+                        let files_box =
+                            Rect::new(detail_rect.x + 4, files_top, detail_rect.w - 8, files_h);
                         self.git_log_files_rect = files_box;
                         canvas.stroke_rounded_rect(files_box, 4, t.border_color, t.editor_bg);
 
@@ -8522,7 +9747,8 @@ impl IdeApplicationState {
                         // 3) 下部所选文件 Diff 预览区
                         let diff_top = files_top + files_h + 4;
                         let diff_h = (detail_rect.y + detail_rect.h - diff_top - 4).max(24);
-                        let diff_box = Rect::new(detail_rect.x + 4, diff_top, detail_rect.w - 8, diff_h);
+                        let diff_box =
+                            Rect::new(detail_rect.x + 4, diff_top, detail_rect.w - 8, diff_h);
                         self.git_log_diff_rect = diff_box;
                         canvas.stroke_rounded_rect(diff_box, 4, t.border_color, t.editor_bg);
 
@@ -8612,7 +9838,10 @@ impl IdeApplicationState {
                     canvas.draw_text_styled(
                         detail_rect.x + 12,
                         detail_rect.y + 12,
-                        self.tr("点击任意提交记录查看变更文件与 Diff", "Select a commit to inspect changed files & diff"),
+                        self.tr(
+                            "点击任意提交记录查看变更文件与 Diff",
+                            "Select a commit to inspect changed files & diff",
+                        ),
                         t.text_muted,
                         detail_rect.w - 24,
                         FontStyle::UiSmall,
@@ -8852,7 +10081,10 @@ impl IdeApplicationState {
                 HitAction::ExecuteIdeAction(IdeAction::GitPull),
             ),
             (
-                self.tr("推送提交... (Ctrl+Shift+K)", "Push Commits... (Ctrl+Shift+K)"),
+                self.tr(
+                    "推送提交... (Ctrl+Shift+K)",
+                    "Push Commits... (Ctrl+Shift+K)",
+                ),
                 HitAction::ExecuteIdeAction(IdeAction::GitPush),
             ),
         ];
@@ -8862,7 +10094,11 @@ impl IdeApplicationState {
             canvas.fill_rounded_rect(
                 row,
                 5,
-                if hovered { t.popup_hover_bg } else { t.window_bg },
+                if hovered {
+                    t.popup_hover_bg
+                } else {
+                    t.window_bg
+                },
             );
             canvas.draw_text_styled(
                 row.x + 10,
@@ -8884,7 +10120,10 @@ impl IdeApplicationState {
         canvas.draw_text_styled(
             popup_rect.x + 12,
             y,
-            self.tr("本地分支 (点击切换 / 右侧合并或删除)", "Local Branches (Click to checkout)"),
+            self.tr(
+                "本地分支 (点击切换 / 右侧合并或删除)",
+                "Local Branches (Click to checkout)",
+            ),
             t.text_muted,
             popup_w - 24,
             FontStyle::UiSmall,
@@ -8936,7 +10175,11 @@ impl IdeApplicationState {
                 canvas.draw_text_centered(
                     merge_btn,
                     self.tr("合并", "Merge"),
-                    if mhov { t.accent_blue } else { t.text_secondary },
+                    if mhov {
+                        t.accent_blue
+                    } else {
+                        t.text_secondary
+                    },
                     FontStyle::UiSmall,
                 );
                 self.hit_regions
@@ -8947,7 +10190,11 @@ impl IdeApplicationState {
                 canvas.stroke_rounded_rect(
                     del_btn,
                     4,
-                    if dhov { t.breakpoint_red } else { t.border_color },
+                    if dhov {
+                        t.breakpoint_red
+                    } else {
+                        t.border_color
+                    },
                     t.window_bg,
                 );
                 canvas.draw_text_centered(
@@ -9024,7 +10271,11 @@ impl IdeApplicationState {
         canvas.fill_rounded_shadow(popup_rect, 8);
         canvas.stroke_rounded_rect(popup_rect, 8, t.border_color, t.popup_bg);
 
-        let title = format!("{} ({})", self.workspace_name(), self.tr("工作区", "Workspace"));
+        let title = format!(
+            "{} ({})",
+            self.workspace_name(),
+            self.tr("工作区", "Workspace")
+        );
         canvas.draw_text_styled(
             popup_x + 12,
             popup_y + 8,
@@ -9044,10 +10295,7 @@ impl IdeApplicationState {
         );
 
         let mut y = popup_y + 50;
-        canvas.fill_rect(
-            Rect::new(popup_x + 10, y, popup_w - 20, 1),
-            t.border_color,
-        );
+        canvas.fill_rect(Rect::new(popup_x + 10, y, popup_w - 20, 1), t.border_color);
         y += 6;
 
         let quick_actions = [
@@ -9113,7 +10361,10 @@ impl IdeApplicationState {
             canvas.draw_text_styled(
                 popup_x + 12,
                 y,
-                self.tr("最近打开的工作区 (点击切换或在新窗口开启)", "Recent Workspaces"),
+                self.tr(
+                    "最近打开的工作区 (点击切换或在新窗口开启)",
+                    "Recent Workspaces",
+                ),
                 t.text_muted,
                 popup_w - 24,
                 FontStyle::UiSmall,
@@ -9153,8 +10404,16 @@ impl IdeApplicationState {
                 canvas.stroke_rounded_rect(
                     nw_btn,
                     4,
-                    if nw_hov { t.accent_blue } else { t.border_color },
-                    if nw_hov { t.popup_hover_bg } else { t.window_bg },
+                    if nw_hov {
+                        t.accent_blue
+                    } else {
+                        t.border_color
+                    },
+                    if nw_hov {
+                        t.popup_hover_bg
+                    } else {
+                        t.window_bg
+                    },
                 );
                 canvas.draw_text_centered(
                     nw_btn,
@@ -9291,8 +10550,15 @@ impl IdeApplicationState {
         canvas.draw_text_styled(
             run_row.x + 26,
             y + 4,
-            self.tr("运行当前配置 (Shift+F10)", "Run Active Configuration (Shift+F10)"),
-            if run_hovered { 0xFFFFFF } else { t.text_primary },
+            self.tr(
+                "运行当前配置 (Shift+F10)",
+                "Run Active Configuration (Shift+F10)",
+            ),
+            if run_hovered {
+                0xFFFFFF
+            } else {
+                t.text_primary
+            },
             popup_w - 36,
             FontStyle::UiRegular,
         );
@@ -9308,8 +10574,15 @@ impl IdeApplicationState {
         canvas.draw_text_styled(
             dbg_row.x + 26,
             y + 4,
-            self.tr("调试当前配置 (Shift+F9)", "Debug Active Configuration (Shift+F9)"),
-            if dbg_hovered { 0xFFFFFF } else { t.text_primary },
+            self.tr(
+                "调试当前配置 (Shift+F9)",
+                "Debug Active Configuration (Shift+F9)",
+            ),
+            if dbg_hovered {
+                0xFFFFFF
+            } else {
+                t.text_primary
+            },
             popup_w - 36,
             FontStyle::UiRegular,
         );
@@ -9497,7 +10770,10 @@ impl IdeApplicationState {
             canvas.draw_text_styled(
                 mx + 34,
                 ry + 4,
-                self.tr("正在后台索引工作区文件...", "Indexing workspace files in background..."),
+                self.tr(
+                    "正在后台索引工作区文件...",
+                    "Indexing workspace files in background...",
+                ),
                 t.text_muted,
                 mw - 54,
                 FontStyle::UiRegular,
@@ -9512,8 +10788,8 @@ impl IdeApplicationState {
                 break;
             }
             let row = Rect::new(mx + 12, ry, mw - 30, 24);
-            let hovered = row.contains(hx, hy)
-                && !matches!(item, SearchEverywhereItem::AgentCommand { .. });
+            let hovered =
+                row.contains(hx, hy) && !matches!(item, SearchEverywhereItem::AgentCommand { .. });
             canvas.fill_rounded_rect(
                 row,
                 4,
@@ -9537,8 +10813,7 @@ impl IdeApplicationState {
                         mw - 42,
                         FontStyle::UiRegular,
                     );
-                    self.hit_regions
-                        .push((row, HitAction::OpenFile(full_path)));
+                    self.hit_regions.push((row, HitAction::OpenFile(full_path)));
                 }
                 SearchEverywhereItem::Action {
                     action,
@@ -9660,7 +10935,10 @@ impl IdeApplicationState {
             canvas.draw_text_styled(
                 mx + 34,
                 ry + 4,
-                self.tr("正在后台执行 Ripgrep 全文检索...", "Running Ripgrep search in background..."),
+                self.tr(
+                    "正在后台执行 Ripgrep 全文检索...",
+                    "Running Ripgrep search in background...",
+                ),
                 t.text_muted,
                 mw - 54,
                 FontStyle::UiRegular,
@@ -9693,8 +10971,7 @@ impl IdeApplicationState {
                 mw - 42,
                 FontStyle::CodeMono,
             );
-            self.hit_regions
-                .push((row, HitAction::OpenFile(hit.path)));
+            self.hit_regions.push((row, HitAction::OpenFile(hit.path)));
             ry += 26;
         }
         canvas.draw_vertical_scrollbar(
@@ -9777,7 +11054,11 @@ impl IdeApplicationState {
             cancel_btn,
             6,
             t.border_color,
-            if cancel_hov { t.panel_header_bg } else { t.window_bg },
+            if cancel_hov {
+                t.panel_header_bg
+            } else {
+                t.window_bg
+            },
         );
         canvas.draw_text_centered(
             cancel_btn,
@@ -9793,8 +11074,16 @@ impl IdeApplicationState {
         canvas.stroke_rounded_rect(
             this_btn,
             6,
-            if this_hov { t.accent_blue } else { t.border_color },
-            if this_hov { t.popup_hover_bg } else { t.editor_bg },
+            if this_hov {
+                t.accent_blue
+            } else {
+                t.border_color
+            },
+            if this_hov {
+                t.popup_hover_bg
+            } else {
+                t.editor_bg
+            },
         );
         canvas.draw_text_centered(
             this_btn,
@@ -9815,6 +11104,199 @@ impl IdeApplicationState {
         );
         self.hit_regions
             .push((new_btn, HitAction::ConfirmOpenPendingInNewWindow));
+    }
+
+    fn render_edit_message_rewind_modal(&mut self, canvas: &mut SurfaceCanvas, w: i32, h: i32) {
+        let Some(pending) = self.pending_edit_rewind.clone() else {
+            self.focus = FocusTarget::AgentChatInput;
+            return;
+        };
+        let t = self.theme;
+        let (hx, hy) = self.hover_pos;
+        let has_files = !pending.affected_files.is_empty();
+        let mw = 540.min(w - 40);
+        let mh = if has_files { 198 } else { 158 };
+        let mx = (w - mw) / 2;
+        let my = (h - mh) / 3;
+        let modal = Rect::new(mx, my, mw, mh);
+        self.active_overlay_rects.push(modal);
+
+        canvas.fill_rounded_shadow(modal, 8);
+        canvas.stroke_rounded_rect(modal, 8, t.accent_blue, t.popup_bg);
+
+        let header = Rect::new(mx + 2, my + 2, mw - 4, 34);
+        canvas.fill_rounded_rect(header, 6, t.panel_header_bg);
+        canvas.draw_text_styled(
+            mx + 16,
+            my + 9,
+            self.tr(
+                "编辑已发送消息并同步 CLI 客户端",
+                "Edit Sent Message & Sync CLI",
+            ),
+            t.text_primary,
+            mw - 32,
+            FontStyle::UiBold,
+        );
+
+        let cli_name = self.agent_hub.active_provider.compact_name();
+        let summary_line = match self.ui_lang {
+            UiLanguage::ZhCn => format!(
+                "将替换此消息之后的 {} 条对话，并与 {} 客户端会话同步状态。",
+                pending.dropped_msgs, cli_name
+            ),
+            UiLanguage::EnUs => format!(
+                "This replaces {} subsequent message(s) and syncs the {} CLI session.",
+                pending.dropped_msgs, cli_name
+            ),
+        };
+        canvas.draw_text_styled(
+            mx + 16,
+            my + 48,
+            &summary_line,
+            t.text_primary,
+            mw - 32,
+            FontStyle::UiRegular,
+        );
+
+        let preview_one_line: String = pending
+            .new_prompt
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(56)
+            .collect();
+        canvas.draw_text_styled(
+            mx + 16,
+            my + 72,
+            &format!("› {preview_one_line}"),
+            t.text_muted,
+            mw - 32,
+            FontStyle::ChatMeta,
+        );
+
+        if has_files {
+            let names: Vec<String> = pending
+                .affected_files
+                .iter()
+                .take(3)
+                .map(|p| {
+                    p.strip_prefix(&self.workspace_root)
+                        .unwrap_or(p)
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                })
+                .collect();
+            let extra = pending.affected_files.len().saturating_sub(names.len());
+            let files_str = if extra > 0 {
+                format!("{} (+{})", names.join(", "), extra)
+            } else {
+                names.join(", ")
+            };
+            canvas.draw_text_styled(
+                mx + 16,
+                my + 98,
+                &format!(
+                    "{}: {files_str}",
+                    self.tr("涉及工作区文件修改", "Modified workspace files")
+                ),
+                t.accent_blue,
+                mw - 32,
+                FontStyle::ChatMeta,
+            );
+            canvas.draw_text_styled(
+                mx + 16,
+                my + 118,
+                self.tr(
+                    "请选择回退这些文件修改后再发送，或保留当前磁盘修改继续发送：",
+                    "Choose whether to revert file changes or keep them before resending:",
+                ),
+                t.text_secondary,
+                mw - 32,
+                FontStyle::UiSmall,
+            );
+        }
+
+        let btn_y = my + mh - 42;
+        let cancel_btn = Rect::new(mx + mw - 102, btn_y, 86, 28);
+        let cancel_hov = cancel_btn.contains(hx, hy);
+        canvas.stroke_rounded_rect(
+            cancel_btn,
+            6,
+            t.border_color,
+            if cancel_hov {
+                t.panel_header_bg
+            } else {
+                t.window_bg
+            },
+        );
+        canvas.draw_text_centered(
+            cancel_btn,
+            self.tr("取消 (Esc)", "Cancel"),
+            t.text_secondary,
+            FontStyle::UiSmall,
+        );
+        self.hit_regions
+            .push((cancel_btn, HitAction::CancelEditMessageRewindModal));
+
+        if has_files {
+            let keep_btn = Rect::new(cancel_btn.x - 134, btn_y, 126, 28);
+            let keep_hov = keep_btn.contains(hx, hy);
+            canvas.stroke_rounded_rect(
+                keep_btn,
+                6,
+                if keep_hov {
+                    t.accent_blue
+                } else {
+                    t.border_color
+                },
+                if keep_hov {
+                    t.popup_hover_bg
+                } else {
+                    t.editor_bg
+                },
+            );
+            canvas.draw_text_centered(
+                keep_btn,
+                self.tr("保留文件并重发", "Keep & Resend"),
+                if keep_hov { 0xFFFFFF } else { t.text_primary },
+                FontStyle::UiSmall,
+            );
+            self.hit_regions.push((
+                keep_btn,
+                HitAction::ConfirmEditMessageRewind {
+                    revert_files: false,
+                },
+            ));
+
+            let rev_btn = Rect::new(keep_btn.x - 152, btn_y, 144, 28);
+            canvas.fill_rounded_rect(rev_btn, 6, t.accent_blue);
+            canvas.draw_text_centered(
+                rev_btn,
+                self.tr("回退更改并重发 (Enter)", "Revert & Resend"),
+                0xFFFFFF,
+                FontStyle::UiBold,
+            );
+            self.hit_regions.push((
+                rev_btn,
+                HitAction::ConfirmEditMessageRewind { revert_files: true },
+            ));
+        } else {
+            let ok_btn = Rect::new(cancel_btn.x - 152, btn_y, 144, 28);
+            canvas.fill_rounded_rect(ok_btn, 6, t.accent_blue);
+            canvas.draw_text_centered(
+                ok_btn,
+                self.tr("同步并重发 (Enter)", "Sync & Resend"),
+                0xFFFFFF,
+                FontStyle::UiBold,
+            );
+            self.hit_regions.push((
+                ok_btn,
+                HitAction::ConfirmEditMessageRewind {
+                    revert_files: false,
+                },
+            ));
+        }
     }
 
     fn render_input_prompt_modal(&mut self, canvas: &mut SurfaceCanvas, w: i32, h: i32) {
@@ -9840,7 +11322,10 @@ impl IdeApplicationState {
                         self.project_tree.active_target_dir().display()
                     ),
                 },
-                self.tr("按 Enter 确认创建，按 Esc 关闭弹窗", "Press Enter to create, Esc to cancel"),
+                self.tr(
+                    "按 Enter 确认创建，按 Esc 关闭弹窗",
+                    "Press Enter to create, Esc to cancel",
+                ),
             ),
             FocusTarget::NewFolderModal => (
                 match self.ui_lang {
@@ -9853,7 +11338,10 @@ impl IdeApplicationState {
                         self.project_tree.active_target_dir().display()
                     ),
                 },
-                self.tr("按 Enter 确认创建，按 Esc 关闭弹窗", "Press Enter to create, Esc to cancel"),
+                self.tr(
+                    "按 Enter 确认创建，按 Esc 关闭弹窗",
+                    "Press Enter to create, Esc to cancel",
+                ),
             ),
             FocusTarget::NewGitBranchModal => (
                 self.tr(
@@ -9861,7 +11349,10 @@ impl IdeApplicationState {
                     "Create & Checkout New Git Branch (Enter to create)",
                 )
                 .to_string(),
-                self.tr("按 Enter 确认创建，按 Esc 关闭弹窗", "Press Enter to create, Esc to cancel"),
+                self.tr(
+                    "按 Enter 确认创建，按 Esc 关闭弹窗",
+                    "Press Enter to create, Esc to cancel",
+                ),
             ),
             FocusTarget::RenamePathModal => (
                 match self.ui_lang {
@@ -9882,11 +11373,17 @@ impl IdeApplicationState {
                             .unwrap_or("")
                     ),
                 },
-                self.tr("按 Enter 确认重命名，按 Esc 关闭弹窗", "Press Enter to rename, Esc to cancel"),
+                self.tr(
+                    "按 Enter 确认重命名，按 Esc 关闭弹窗",
+                    "Press Enter to rename, Esc to cancel",
+                ),
             ),
             _ => (
                 String::new(),
-                self.tr("按 Enter 确认，按 Esc 关闭弹窗", "Press Enter to confirm, Esc to cancel"),
+                self.tr(
+                    "按 Enter 确认，按 Esc 关闭弹窗",
+                    "Press Enter to confirm, Esc to cancel",
+                ),
             ),
         };
 
@@ -9929,184 +11426,271 @@ impl IdeApplicationState {
         );
     }
 
-    fn render_settings_modal(&mut self, canvas: &mut SurfaceCanvas, w: i32, h: i32) {
-        let t = self.theme;
-        let (hx, hy) = self.hover_pos;
-        let mw = 740.min(w - 40);
-        let mh = 540.min(h - 40);
-        let mx = (w - mw) / 2;
-        let my = (h - mh) / 4;
-        let modal = Rect::new(mx, my, mw, mh);
-        self.active_overlay_rects.push(modal);
-
-        canvas.stroke_rounded_rect(modal, 8, t.accent_blue, t.popup_bg);
-        canvas.draw_text_styled(
-            mx + 16,
-            my + 12,
-            self.tr(
-                "设置 — 界面语言、DPI 缩放、外观主题与 IntelliJ IDEA 快捷键 (Ctrl+Alt+S)",
-                "Settings — Language, DPI Scale, Theme & IntelliJ IDEA Keymap (Ctrl+Alt+S)",
-            ),
-            t.text_primary,
-            mw - 100,
-            FontStyle::UiBold,
-        );
-
-        let close_btn = Rect::new(mx + mw - 72, my + 8, 58, 24);
-        let close_hov = close_btn.contains(hx, hy);
-        canvas.stroke_rounded_rect(
-            close_btn,
-            5,
-            if close_hov { t.accent_blue } else { t.border_color },
-            if close_hov { t.popup_hover_bg } else { t.window_bg },
-        );
-        canvas.draw_text_centered(
-            close_btn,
-            self.tr("关闭", "Close"),
-            if close_hov { 0xFFFFFF } else { t.text_primary },
-            FontStyle::UiSmall,
-        );
-        self.hit_regions
-            .push((close_btn, HitAction::CloseModalOrPopup));
-
-        // 1. UI Language
-        canvas.draw_text_styled(
-            mx + 16,
-            my + 42,
-            self.tr(
-                "1. 界面语言 / UI Language (点击即刻切换):",
-                "1. UI Language (Click to switch immediately):",
-            ),
-            t.syn_function,
-            mw - 32,
-            FontStyle::UiBold,
-        );
-
-        let mut lx = mx + 16;
-        for &lang in UiLanguage::all() {
-            let btn = Rect::new(lx, my + 65, 200, 28);
-            let active = self.ui_lang == lang;
-            let hov = !active && btn.contains(hx, hy);
-            canvas.stroke_rounded_rect(
-                btn,
-                6,
-                if active || hov { t.accent_blue } else { t.border_color },
-                if active {
-                    t.popup_hover_bg
-                } else if hov {
-                    t.panel_header_bg
-                } else {
-                    t.editor_bg
-                },
-            );
-            canvas.draw_text_centered(
-                btn,
-                lang.display_name(),
-                if active || hov { 0xFFFFFF } else { t.text_primary },
-                if active {
-                    FontStyle::UiBold
-                } else {
-                    FontStyle::UiRegular
-                },
-            );
-            self.hit_regions.push((btn, HitAction::SetUiLanguage(lang)));
-            lx += 212;
+    fn visible_settings_nav(&self) -> Vec<SettingsNavItem> {
+        let query = self
+            .settings_query_input
+            .as_str()
+            .trim()
+            .to_ascii_lowercase();
+        if query.is_empty() {
+            return SETTINGS_NAV.to_vec();
         }
-
-        // 2. IDE Theme
-        canvas.draw_text_styled(
-            mx + 16,
-            my + 102,
-            self.tr(
-                "2. 外观主题 / IDE Theme (点击即刻切换配色):",
-                "2. IDE Theme (Click to switch color scheme):",
-            ),
-            t.syn_function,
-            mw - 32,
-            FontStyle::UiBold,
-        );
-
-        let mut tx = mx + 16;
-        for &kind in ThemeKind::all() {
-            let btn = Rect::new(tx, my + 125, 215, 28);
-            let active = self.theme.kind == kind;
-            let hov = !active && btn.contains(hx, hy);
-            canvas.stroke_rounded_rect(
-                btn,
-                6,
-                if active || hov { t.accent_blue } else { t.border_color },
-                if active {
-                    t.popup_hover_bg
-                } else if hov {
-                    t.panel_header_bg
-                } else {
-                    t.editor_bg
-                },
-            );
-            canvas.draw_text_centered(
-                btn,
-                kind.display_name(),
-                if active || hov { 0xFFFFFF } else { t.text_primary },
-                if active {
-                    FontStyle::UiBold
-                } else {
-                    FontStyle::UiRegular
-                },
-            );
-            self.hit_regions.push((btn, HitAction::SelectTheme(kind)));
-            tx += 225;
+        let mut out = Vec::new();
+        let mut index = 0;
+        while index < SETTINGS_NAV.len() {
+            let item = SETTINGS_NAV[index];
+            if item.page.is_none() {
+                let mut end = index + 1;
+                while end < SETTINGS_NAV.len() && SETTINGS_NAV[end].depth > item.depth {
+                    end += 1;
+                }
+                let group_hit = self.settings_nav_matches(&item, &query);
+                let mut children = Vec::new();
+                for child in &SETTINGS_NAV[index + 1..end] {
+                    if group_hit || self.settings_nav_matches(child, &query) {
+                        children.push(*child);
+                    }
+                }
+                if group_hit || !children.is_empty() {
+                    out.push(item);
+                    out.extend(children);
+                }
+                index = end;
+            } else {
+                if self.settings_nav_matches(&item, &query) {
+                    out.push(item);
+                }
+                index += 1;
+            }
         }
+        out
+    }
 
-        // 3. System DPI & UI Font Zoom
-        let sys_dpi_pct = (self.system_dpi_scale * 100.0).round() as i32;
-        let eff_dpi_pct = (self.effective_scale() * 100.0).round() as i32;
-        let cur_ui_pct = (self.ui_scale * 100.0).round() as u16;
-        let dpi_header = match self.ui_lang {
-            UiLanguage::ZhCn => format!(
-                "3. 界面与字体缩放 (自动适配系统 DPI {sys_dpi_pct}% · 当前总缩放 {eff_dpi_pct}% · Ctrl+= / Ctrl+- / Ctrl+0):"
-            ),
-            UiLanguage::EnUs => format!(
-                "3. UI & Font Scale (Auto System DPI {sys_dpi_pct}% · Effective {eff_dpi_pct}% · Ctrl+= / Ctrl+- / Ctrl+0):"
-            ),
+    fn settings_nav_matches(&self, item: &SettingsNavItem, query: &str) -> bool {
+        let label = match self.ui_lang {
+            UiLanguage::ZhCn => item.zh,
+            UiLanguage::EnUs => item.en,
         };
-        canvas.draw_text_styled(
-            mx + 16,
-            my + 162,
-            &dpi_header,
-            t.syn_function,
-            mw - 32,
-            FontStyle::UiBold,
-        );
+        label.to_ascii_lowercase().contains(query)
+            || item.keywords.to_ascii_lowercase().contains(query)
+    }
 
-        let scale_presets: [(u16, &str); 5] = [
+    fn settings_row_fg(&self, hot: bool) -> u32 {
+        if hot && self.theme.kind != ThemeKind::IslandsLight {
+            0xFFFFFF
+        } else {
+            self.theme.text_primary
+        }
+    }
+
+    fn settings_note(
+        &mut self,
+        canvas: &mut SurfaceCanvas,
+        flow: &mut SettingsFlow,
+        x: i32,
+        w: i32,
+        text: &str,
+    ) {
+        if let Some(y) = flow.place(18, 6) {
+            canvas.draw_text_styled(x, y, text, self.theme.text_muted, w, FontStyle::UiSmall);
+        }
+    }
+
+    fn settings_section(
+        &mut self,
+        canvas: &mut SurfaceCanvas,
+        flow: &mut SettingsFlow,
+        x: i32,
+        w: i32,
+        text: &str,
+    ) {
+        flow.cursor += 6;
+        if let Some(y) = flow.place(22, 6) {
+            canvas.draw_text_styled(x, y, text, self.theme.text_primary, w, FontStyle::UiBold);
+        }
+    }
+
+    fn settings_kv(
+        &mut self,
+        canvas: &mut SurfaceCanvas,
+        flow: &mut SettingsFlow,
+        x: i32,
+        w: i32,
+        label: &str,
+        value: &str,
+    ) {
+        if let Some(y) = flow.place(26, 2) {
+            let t = self.theme;
+            canvas.draw_text_styled(x, y + 3, label, t.text_primary, 210, FontStyle::UiRegular);
+            canvas.draw_text_styled(
+                x + 218,
+                y + 4,
+                value,
+                t.text_secondary,
+                (w - 218).max(48),
+                FontStyle::UiSmall,
+            );
+        }
+    }
+
+    fn settings_status(
+        &mut self,
+        canvas: &mut SurfaceCanvas,
+        flow: &mut SettingsFlow,
+        x: i32,
+        w: i32,
+        label: &str,
+        on: bool,
+    ) {
+        if let Some(y) = flow.place(28, 3) {
+            let t = self.theme;
+            canvas.draw_text_styled(
+                x,
+                y + 4,
+                label,
+                t.text_primary,
+                (w - 96).max(40),
+                FontStyle::UiRegular,
+            );
+            let badge = if on {
+                self.tr("已启用", "On")
+            } else {
+                self.tr("未检测到", "Not found")
+            };
+            let (bw, _) = canvas.measure_text(badge, FontStyle::UiSmall);
+            let badge_w = bw + 16;
+            let rect = Rect::new(x + w - badge_w, y + 2, badge_w, 22);
+            canvas.fill_rounded_rect(rect, 6, if on { t.diff_added_bg } else { t.editor_bg });
+            canvas.draw_text_centered(
+                rect,
+                badge,
+                if on { t.diff_added_fg } else { t.text_muted },
+                FontStyle::UiSmall,
+            );
+        }
+    }
+
+    fn draw_settings_button(
+        &mut self,
+        canvas: &mut SurfaceCanvas,
+        rect: Rect,
+        label: &str,
+        primary: bool,
+        hx: i32,
+        hy: i32,
+        action: HitAction,
+    ) {
+        let t = self.theme;
+        let hot = rect.contains(hx, hy);
+        if primary {
+            canvas.fill_rounded_rect(rect, 6, t.accent_blue);
+            canvas.draw_text_centered(rect, label, 0xFFFFFF, FontStyle::UiBold);
+        } else {
+            let fill = if hot { t.popup_hover_bg } else { t.editor_bg };
+            let border = if hot { t.accent_blue } else { t.border_color };
+            canvas.stroke_rounded_rect(rect, 6, border, fill);
+            canvas.draw_text_centered(rect, label, self.settings_row_fg(hot), FontStyle::UiRegular);
+        }
+        self.hit_regions.push((rect, action));
+    }
+
+    fn draw_settings_theme_cards(
+        &mut self,
+        canvas: &mut SurfaceCanvas,
+        x: i32,
+        y: i32,
+        w: i32,
+        hx: i32,
+        hy: i32,
+    ) {
+        let kinds = ThemeKind::all();
+        let gap = 10;
+        let count = kinds.len() as i32;
+        let card_w = ((w - gap * (count - 1)) / count).max(1);
+        let mut cx = x;
+        for &kind in kinds {
+            let theme = IdeaTheme::from_kind(kind);
+            let card = Rect::new(cx, y, card_w, 86);
+            let active = self.theme.kind == kind;
+            let hot = card.contains(hx, hy);
+            let border = if active || hot {
+                self.theme.accent_blue
+            } else {
+                self.theme.border_color
+            };
+            canvas.stroke_rounded_rect(card, 8, border, theme.editor_bg);
+            canvas.fill_rect(Rect::new(cx + 1, y + 1, card_w - 2, 16), theme.panel_bg);
+            canvas.fill_rounded_rect(Rect::new(cx + 12, y + 26, 26, 4), 2, theme.syn_keyword);
+            canvas.fill_rounded_rect(Rect::new(cx + 42, y + 26, 34, 4), 2, theme.syn_function);
+            canvas.fill_rounded_rect(Rect::new(cx + 20, y + 36, 18, 4), 2, theme.syn_keyword);
+            canvas.fill_rounded_rect(Rect::new(cx + 42, y + 36, 40, 4), 2, theme.syn_string);
+            canvas.fill_rounded_rect(Rect::new(cx + 20, y + 46, 46, 4), 2, theme.syn_comment);
+            let name = match kind {
+                ThemeKind::IslandsDark => "Islands Dark",
+                ThemeKind::DarculaClassic => "Darcula",
+                ThemeKind::IslandsLight => "Light",
+            };
+            canvas.draw_text_styled(
+                cx + 12,
+                y + 60,
+                name,
+                theme.text_primary,
+                card_w - 36,
+                FontStyle::UiSmall,
+            );
+            if active {
+                canvas.draw_check_icon(cx + card_w - 22, y + 62, theme.accent_blue);
+            }
+            self.hit_regions.push((card, HitAction::SelectTheme(kind)));
+            cx += card_w + gap;
+        }
+    }
+
+    fn draw_settings_scale(
+        &mut self,
+        canvas: &mut SurfaceCanvas,
+        x: i32,
+        y: i32,
+        w: i32,
+        hx: i32,
+        hy: i32,
+    ) {
+        let presets: [(u16, &str); 5] = [
             (90, "90%"),
-            (100, self.tr("100% (标准 DPI)", "100% (Default)")),
+            (100, "100%"),
             (110, "110%"),
             (125, "125%"),
             (150, "150%"),
         ];
-        let mut sx = mx + 16;
-        for (pct, label) in scale_presets {
-            let bw = if pct == 100 { 142 } else { 112 };
-            let btn = Rect::new(sx, my + 185, bw, 28);
-            let active = (cur_ui_pct as i32 - pct as i32).abs() <= 3;
-            let hov = !active && btn.contains(hx, hy);
-            canvas.stroke_rounded_rect(
-                btn,
-                6,
-                if active || hov { t.accent_blue } else { t.border_color },
-                if active {
-                    t.popup_hover_bg
-                } else if hov {
-                    t.panel_header_bg
-                } else {
-                    t.editor_bg
-                },
-            );
+        let current = (self.ui_scale * 100.0).round() as i32;
+        let seg_w = ((w - 32) / 5).clamp(40, 108);
+        let mut sx = x;
+        for (pct, label) in presets {
+            let btn = Rect::new(sx, y, seg_w, 30);
+            let active = (current - pct as i32).abs() <= 3;
+            let hot = btn.contains(hx, hy);
+            let fill = if active {
+                self.theme.accent_blue
+            } else if hot {
+                self.theme.popup_hover_bg
+            } else {
+                self.theme.editor_bg
+            };
+            let border = if active || hot {
+                self.theme.accent_blue
+            } else {
+                self.theme.border_color
+            };
+            canvas.stroke_rounded_rect(btn, 6, border, fill);
+            let fg = if active {
+                0xFFFFFF
+            } else {
+                self.settings_row_fg(hot)
+            };
             canvas.draw_text_centered(
                 btn,
                 label,
-                if active || hov { 0xFFFFFF } else { t.text_primary },
+                fg,
                 if active {
                     FontStyle::UiBold
                 } else {
@@ -10114,66 +11698,1059 @@ impl IdeApplicationState {
                 },
             );
             self.hit_regions.push((btn, HitAction::SetUiScale(pct)));
-            sx += bw + 10;
+            sx += seg_w + 8;
         }
+    }
 
-        // 4. Keymap Reference
+    fn draw_settings_languages(
+        &mut self,
+        canvas: &mut SurfaceCanvas,
+        x: i32,
+        y: i32,
+        w: i32,
+        hx: i32,
+        hy: i32,
+    ) {
+        let mut ly = y;
+        let row_w = w.min(460);
+        for &lang in UiLanguage::all() {
+            let row = Rect::new(x, ly, row_w, 32);
+            let active = self.ui_lang == lang;
+            let hot = row.contains(hx, hy);
+            if active {
+                canvas.fill_rounded_rect(row, 6, self.theme.editor_selection_bg);
+            } else if hot {
+                canvas.fill_rounded_rect(row, 6, self.theme.panel_header_bg);
+            }
+            let ring = Rect::new(x + 10, ly + 8, 16, 16);
+            canvas.stroke_rounded_rect(
+                ring,
+                8,
+                if active {
+                    self.theme.accent_blue
+                } else {
+                    self.theme.border_color
+                },
+                self.theme.editor_bg,
+            );
+            if active {
+                canvas.fill_circle(x + 18, ly + 16, 4, self.theme.accent_blue);
+            }
+            canvas.draw_text_styled(
+                x + 36,
+                ly + 6,
+                lang.display_name(),
+                self.settings_row_fg(active || hot),
+                row_w - 48,
+                if active {
+                    FontStyle::UiBold
+                } else {
+                    FontStyle::UiRegular
+                },
+            );
+            self.hit_regions.push((row, HitAction::SetUiLanguage(lang)));
+            ly += 36;
+        }
+    }
+
+    fn draw_settings_action_row(
+        &mut self,
+        canvas: &mut SurfaceCanvas,
+        x: i32,
+        y: i32,
+        w: i32,
+        action: IdeAction,
+        hx: i32,
+        hy: i32,
+        clickable: bool,
+    ) {
+        let t = self.theme;
+        let row = Rect::new(x, y, w, 26);
+        let hot = clickable && row.contains(hx, hy);
+        if hot {
+            canvas.fill_rounded_rect(row, 5, t.popup_hover_bg);
+        }
+        let fg = self.settings_row_fg(hot);
         canvas.draw_text_styled(
-            mx + 16,
-            my + 222,
-            self.tr(
-                "4. IntelliJ IDEA 快捷键清单 (滚轮可上下滚动，点击可直接执行):",
-                "4. IntelliJ IDEA Keymap Reference (Scroll to browse, click to execute):",
+            x + 8,
+            y + 3,
+            action.title_i18n(self.ui_lang),
+            fg,
+            (w - 156).max(40),
+            FontStyle::UiRegular,
+        );
+        let shortcut = action.shortcut_label();
+        if !shortcut.is_empty() {
+            let (sw, _) = canvas.measure_text(shortcut, FontStyle::CodeMono);
+            canvas.draw_text_styled(
+                x + w - sw - 10,
+                y + 4,
+                shortcut,
+                if hot { fg } else { t.syn_keyword },
+                sw + 4,
+                FontStyle::CodeMono,
+            );
+        }
+        if clickable {
+            self.hit_regions
+                .push((row, HitAction::ExecuteIdeAction(action)));
+        }
+    }
+
+    fn render_settings_appearance(
+        &mut self,
+        canvas: &mut SurfaceCanvas,
+        flow: &mut SettingsFlow,
+        x: i32,
+        w: i32,
+        hx: i32,
+        hy: i32,
+    ) {
+        let intro = self.tr(
+            "主题、界面缩放和显示语言。更改立即生效。",
+            "Theme, zoom, and UI language. Changes apply immediately.",
+        );
+        self.settings_note(canvas, flow, x, w, intro);
+        let theme_title = self.tr("主题", "Theme");
+        self.settings_section(canvas, flow, x, w, theme_title);
+        if let Some(y) = flow.place(86, 8) {
+            self.draw_settings_theme_cards(canvas, x, y, w, hx, hy);
+        }
+        let scheme = self.theme.kind.display_name();
+        let scheme_note = match self.ui_lang {
+            UiLanguage::ZhCn => format!("当前方案：{scheme}"),
+            UiLanguage::EnUs => format!("Current scheme: {scheme}"),
+        };
+        self.settings_note(canvas, flow, x, w, &scheme_note);
+
+        let zoom_title = self.tr("缩放", "Zoom");
+        self.settings_section(canvas, flow, x, w, zoom_title);
+        if let Some(y) = flow.place(30, 8) {
+            self.draw_settings_scale(canvas, x, y, w, hx, hy);
+        }
+        let sys = (self.system_dpi_scale * 100.0).round() as i32;
+        let ui = (self.ui_scale * 100.0).round() as i32;
+        let eff = (self.effective_scale() * 100.0).round() as i32;
+        let zoom_note = match self.ui_lang {
+            UiLanguage::ZhCn => format!(
+                "系统 DPI {sys}%  ×  界面 {ui}%  =  有效缩放 {eff}%     Ctrl+=   Ctrl+-   Ctrl+0"
             ),
-            t.syn_function,
-            mw - 32,
+            UiLanguage::EnUs => format!(
+                "System DPI {sys}%  ×  UI {ui}%  =  effective {eff}%     Ctrl+=   Ctrl+-   Ctrl+0"
+            ),
+        };
+        self.settings_note(canvas, flow, x, w, &zoom_note);
+
+        let lang_title = self.tr("语言和区域", "Language and Region");
+        self.settings_section(canvas, flow, x, w, lang_title);
+        if let Some(y) = flow.place(68, 4) {
+            self.draw_settings_languages(canvas, x, y, w, hx, hy);
+        }
+    }
+
+    fn render_settings_menus(
+        &mut self,
+        canvas: &mut SurfaceCanvas,
+        flow: &mut SettingsFlow,
+        x: i32,
+        w: i32,
+        hx: i32,
+        hy: i32,
+    ) {
+        let intro = self.tr(
+            "主菜单与 IntelliJ IDEA 对齐。要执行命令，请打开「按键映射」。",
+            "Main menu matches IntelliJ IDEA. Run a command from Keymap.",
+        );
+        self.settings_note(canvas, flow, x, w, intro);
+        for cat in MainMenuCategory::all() {
+            let title = cat.label_i18n(self.ui_lang).to_string();
+            self.settings_section(canvas, flow, x, w, &title);
+            for entry in cat.entries() {
+                let MenuEntry::Action(action) = entry else {
+                    continue;
+                };
+                if let Some(y) = flow.place(26, 2) {
+                    self.draw_settings_action_row(canvas, x, y, w, action, hx, hy, false);
+                }
+            }
+        }
+    }
+
+    fn render_settings_system(
+        &mut self,
+        canvas: &mut SurfaceCanvas,
+        flow: &mut SettingsFlow,
+        x: i32,
+        w: i32,
+        hx: i32,
+        hy: i32,
+    ) {
+        let intro = self.tr(
+            "当前项目与最近打开的工作区。",
+            "Current project and recently opened workspaces.",
+        );
+        self.settings_note(canvas, flow, x, w, intro);
+        let project_title = self.tr("项目", "Project");
+        self.settings_section(canvas, flow, x, w, project_title);
+        let root = self.workspace_root.display().to_string();
+        let path_label = self.tr("项目路径", "Project path");
+        self.settings_kv(canvas, flow, x, w, path_label, &root);
+        let recent_title = self.tr("最近的项目", "Recent Projects");
+        self.settings_section(canvas, flow, x, w, recent_title);
+        let current = self.workspace_root.clone();
+        let recent: Vec<_> = self.recent_workspaces.iter().take(6).cloned().collect();
+        let mut any = false;
+        for path in recent {
+            if path == current {
+                continue;
+            }
+            any = true;
+            if let Some(y) = flow.place(26, 2) {
+                let row = Rect::new(x, y, w, 26);
+                let hot = row.contains(hx, hy);
+                if hot {
+                    canvas.fill_rounded_rect(row, 5, self.theme.popup_hover_bg);
+                }
+                let text = path.display().to_string();
+                canvas.draw_text_styled(
+                    x + 8,
+                    y + 3,
+                    &text,
+                    self.settings_row_fg(hot),
+                    w - 16,
+                    FontStyle::UiSmall,
+                );
+                self.hit_regions
+                    .push((row, HitAction::PromptOpenWorkspace(path)));
+            }
+        }
+        if !any {
+            let empty = self.tr("没有其他最近的项目", "No other recent projects");
+            self.settings_note(canvas, flow, x, w, empty);
+        }
+        let lang_title = self.tr("语言和区域", "Language and Region");
+        self.settings_section(canvas, flow, x, w, lang_title);
+        if let Some(y) = flow.place(68, 4) {
+            self.draw_settings_languages(canvas, x, y, w, hx, hy);
+        }
+    }
+
+    fn render_settings_editor_general(
+        &mut self,
+        canvas: &mut SurfaceCanvas,
+        flow: &mut SettingsFlow,
+        x: i32,
+        w: i32,
+        hx: i32,
+        hy: i32,
+    ) {
+        let intro = self.tr(
+            "编辑器行为与 IntelliJ IDEA 快捷键保持一致。",
+            "Editor behavior follows the IntelliJ IDEA keymap.",
+        );
+        self.settings_note(canvas, flow, x, w, intro);
+        let title = self.tr("编辑器", "Editor");
+        self.settings_section(canvas, flow, x, w, title);
+        let rows = [
+            (self.tr("显示行号", "Show line numbers"), true),
+            (self.tr("高亮当前行", "Highlight current line"), true),
+            (self.tr("回车自动缩进", "Auto-indent on Enter"), true),
+            (self.tr("Tab 插入 4 个空格", "Tab inserts 4 spaces"), true),
+        ];
+        for (label, on) in rows {
+            self.settings_status(canvas, flow, x, w, label, on);
+        }
+        let keys = self.tr("快捷键", "Shortcuts");
+        self.settings_section(canvas, flow, x, w, keys);
+        for action in [
+            IdeAction::ToggleLineComment,
+            IdeAction::DuplicateLine,
+            IdeAction::DeleteLine,
+            IdeAction::ReformatCode,
+            IdeAction::UndoEdit,
+            IdeAction::RedoEdit,
+        ] {
+            if let Some(y) = flow.place(26, 2) {
+                self.draw_settings_action_row(canvas, x, y, w, action, hx, hy, true);
+            }
+        }
+    }
+
+    fn render_settings_font(
+        &mut self,
+        canvas: &mut SurfaceCanvas,
+        flow: &mut SettingsFlow,
+        x: i32,
+        w: i32,
+        hx: i32,
+        hy: i32,
+    ) {
+        let intro = self.tr(
+            "界面与编辑器共用同一缩放，和 IDEA 的 Zoom 一致。",
+            "UI and editor share one zoom, matching IDEA Zoom.",
+        );
+        self.settings_note(canvas, flow, x, w, intro);
+        let font_title = self.tr("字体", "Font");
+        self.settings_section(canvas, flow, x, w, font_title);
+        let ui_font = self.tr("界面字体", "UI font");
+        self.settings_kv(canvas, flow, x, w, ui_font, "Microsoft YaHei UI");
+        let editor_font = self.tr("编辑器字体", "Editor font");
+        self.settings_kv(canvas, flow, x, w, editor_font, "Cascadia Mono");
+        let zoom_title = self.tr("字号缩放", "Font zoom");
+        self.settings_section(canvas, flow, x, w, zoom_title);
+        if let Some(y) = flow.place(30, 8) {
+            self.draw_settings_scale(canvas, x, y, w, hx, hy);
+        }
+    }
+
+    fn render_settings_scheme(
+        &mut self,
+        canvas: &mut SurfaceCanvas,
+        flow: &mut SettingsFlow,
+        x: i32,
+        w: i32,
+        hx: i32,
+        hy: i32,
+    ) {
+        let intro = self.tr(
+            "编辑器配色与界面主题联动，预览使用当前方案。",
+            "Editor colors follow the UI theme. The preview uses the current scheme.",
+        );
+        self.settings_note(canvas, flow, x, w, intro);
+        let title = self.tr("配色方案", "Color Scheme");
+        self.settings_section(canvas, flow, x, w, title);
+        if let Some(y) = flow.place(86, 8) {
+            self.draw_settings_theme_cards(canvas, x, y, w, hx, hy);
+        }
+        if let Some(y) = flow.place(78, 10) {
+            let t = self.theme;
+            let preview = Rect::new(x, y, w.min(520), 78);
+            canvas.stroke_rounded_rect(preview, 6, t.border_color, t.editor_bg);
+            let x1 = canvas.draw_text_styled(
+                x + 14,
+                y + 10,
+                "fn ",
+                t.syn_keyword,
+                36,
+                FontStyle::CodeMono,
+            );
+            let x2 = canvas.draw_text_styled(
+                x1,
+                y + 10,
+                "main",
+                t.syn_function,
+                64,
+                FontStyle::CodeMono,
+            );
+            canvas.draw_text_styled(x2, y + 10, "() {", t.text_primary, 48, FontStyle::CodeMono);
+            let x3 = canvas.draw_text_styled(
+                x + 30,
+                y + 30,
+                "let ",
+                t.syn_keyword,
+                40,
+                FontStyle::CodeMono,
+            );
+            let x4 = canvas.draw_text_styled(
+                x3,
+                y + 30,
+                "theme",
+                t.syn_field_or_property,
+                70,
+                FontStyle::CodeMono,
+            );
+            let x5 =
+                canvas.draw_text_styled(x4, y + 30, " = ", t.text_primary, 28, FontStyle::CodeMono);
+            canvas.draw_text_styled(
+                x5,
+                y + 30,
+                "\"islands\"",
+                t.syn_string,
+                110,
+                FontStyle::CodeMono,
+            );
+            canvas.draw_text_styled(
+                x + 30,
+                y + 50,
+                "// Color Scheme",
+                t.syn_comment,
+                220,
+                FontStyle::CodeMono,
+            );
+        }
+        if let Some(y) = flow.place(24, 4) {
+            let t = self.theme;
+            let chips = [
+                (self.tr("关键字", "Keyword"), t.syn_keyword),
+                (self.tr("函数", "Function"), t.syn_function),
+                (self.tr("字符串", "String"), t.syn_string),
+                (self.tr("注释", "Comment"), t.syn_comment),
+                (self.tr("类型", "Type"), t.syn_type),
+            ];
+            let mut cx = x;
+            for (name, color) in chips {
+                canvas.stroke_rounded_rect(Rect::new(cx, y + 4, 14, 14), 3, t.border_color, color);
+                canvas.draw_text_styled(
+                    cx + 18,
+                    y + 2,
+                    name,
+                    t.text_secondary,
+                    70,
+                    FontStyle::UiSmall,
+                );
+                cx += 96;
+            }
+        }
+    }
+
+    fn render_settings_codestyle(
+        &mut self,
+        canvas: &mut SurfaceCanvas,
+        flow: &mut SettingsFlow,
+        x: i32,
+        w: i32,
+        hx: i32,
+        hy: i32,
+    ) {
+        let intro = self.tr(
+            "Rust、TypeScript、JavaScript 与 Python 使用同一套缩进。",
+            "Rust, TypeScript, JavaScript, and Python share one indent.",
+        );
+        self.settings_note(canvas, flow, x, w, intro);
+        let title = self.tr("缩进", "Tabs and Indents");
+        self.settings_section(canvas, flow, x, w, title);
+        let tab = self.tr("制表符宽度", "Tab size");
+        self.settings_kv(canvas, flow, x, w, tab, "4");
+        let indent = self.tr("缩进", "Indent");
+        self.settings_kv(canvas, flow, x, w, indent, "4");
+        let use_tab = self.tr("使用制表符", "Use tab character");
+        self.settings_kv(
+            canvas,
+            flow,
+            x,
+            w,
+            use_tab,
+            self.tr("关（空格）", "Off (spaces)"),
+        );
+        let fmt = self.tr("重新格式化代码", "Reformat Code");
+        self.settings_section(canvas, flow, x, w, fmt);
+        let fmt_note = self.tr(
+            "Ctrl+Alt+L 去除行尾空白，并保证文件以换行结束。",
+            "Ctrl+Alt+L trims trailing whitespace and keeps a final newline.",
+        );
+        self.settings_note(canvas, flow, x, w, fmt_note);
+        if let Some(y) = flow.place(26, 2) {
+            self.draw_settings_action_row(canvas, x, y, w, IdeAction::ReformatCode, hx, hy, true);
+        }
+    }
+
+    fn render_settings_keymap(
+        &mut self,
+        canvas: &mut SurfaceCanvas,
+        flow: &mut SettingsFlow,
+        x: i32,
+        w: i32,
+        hx: i32,
+        hy: i32,
+    ) {
+        let intro = self.tr(
+            "当前方案为 IntelliJ IDEA。点击条目会直接执行。",
+            "Active keymap: IntelliJ IDEA. Click an entry to run it.",
+        );
+        self.settings_note(canvas, flow, x, w, intro);
+        if let Some(y) = flow.place(32, 10) {
+            let label = self.tr("按键映射", "Keymap");
+            canvas.draw_text_styled(
+                x,
+                y + 6,
+                label,
+                self.theme.text_primary,
+                120,
+                FontStyle::UiRegular,
+            );
+            let box_r = Rect::new(x + 128, y, (w - 128).min(360), 30);
+            canvas.stroke_rounded_rect(box_r, 6, self.theme.border_color, self.theme.editor_bg);
+            canvas.draw_text_styled(
+                box_r.x + 10,
+                box_r.y + 6,
+                "IntelliJ IDEA",
+                self.theme.text_primary,
+                box_r.w - 20,
+                FontStyle::UiRegular,
+            );
+        }
+        let mut seen = Vec::new();
+        for cat in MainMenuCategory::all() {
+            let mut actions = Vec::new();
+            for entry in cat.entries() {
+                let MenuEntry::Action(action) = entry else {
+                    continue;
+                };
+                if !seen.contains(&action) {
+                    seen.push(action);
+                    actions.push(action);
+                }
+            }
+            if actions.is_empty() {
+                continue;
+            }
+            let title = cat.label_i18n(self.ui_lang).to_string();
+            self.settings_section(canvas, flow, x, w, &title);
+            for action in actions {
+                if let Some(y) = flow.place(26, 2) {
+                    self.draw_settings_action_row(canvas, x, y, w, action, hx, hy, true);
+                }
+            }
+        }
+        let mut rest = Vec::new();
+        for &action in IdeAction::all() {
+            if !seen.contains(&action) {
+                seen.push(action);
+                rest.push(action);
+            }
+        }
+        if !rest.is_empty() {
+            let other = self.tr("其他", "Other");
+            self.settings_section(canvas, flow, x, w, other);
+            for action in rest {
+                if let Some(y) = flow.place(26, 2) {
+                    self.draw_settings_action_row(canvas, x, y, w, action, hx, hy, true);
+                }
+            }
+        }
+    }
+
+    fn render_settings_plugins(
+        &mut self,
+        canvas: &mut SurfaceCanvas,
+        flow: &mut SettingsFlow,
+        x: i32,
+        w: i32,
+    ) {
+        let intro = self.tr(
+            "已捆绑的语言服务与工具窗口。",
+            "Bundled language servers and tool windows.",
+        );
+        self.settings_note(canvas, flow, x, w, intro);
+        let installed = self.tr("已安装", "Installed");
+        self.settings_section(canvas, flow, x, w, installed);
+        let servers: Vec<(String, bool)> = self
+            .lsp_hub
+            .servers
+            .iter()
+            .map(|server| {
+                (
+                    format!(
+                        "{}   {}",
+                        server.language.display_name(),
+                        server.binary_name
+                    ),
+                    server.resolved_path.is_some(),
+                )
+            })
+            .collect();
+        for (label, ready) in &servers {
+            self.settings_status(canvas, flow, x, w, label, *ready);
+        }
+        let bundled = self.tr("已捆绑", "Bundled");
+        self.settings_section(canvas, flow, x, w, bundled);
+        let items = [
+            self.tr("Git 集成", "Git Integration"),
+            self.tr("终端 (ConPTY)", "Terminal (ConPTY)"),
+            self.tr(
+                "调试器 (codelldb / js-debug / debugpy)",
+                "Debugger (codelldb / js-debug / debugpy)",
+            ),
+            self.tr("中文语言包", "Chinese Language Pack"),
+        ];
+        for label in items {
+            self.settings_status(canvas, flow, x, w, label, true);
+        }
+    }
+
+    fn render_settings_git(
+        &mut self,
+        canvas: &mut SurfaceCanvas,
+        flow: &mut SettingsFlow,
+        x: i32,
+        w: i32,
+        hx: i32,
+        hy: i32,
+    ) {
+        let intro = self.tr(
+            "Git 工具窗口与快捷键对齐 IntelliJ IDEA。",
+            "Git tool window and shortcuts follow IntelliJ IDEA.",
+        );
+        self.settings_note(canvas, flow, x, w, intro);
+        let branch = if self.git_engine.current_branch.is_empty() {
+            self.tr("（无）", "(none)").to_string()
+        } else {
+            self.git_engine.current_branch.clone()
+        };
+        let branch_label = self.tr("当前分支", "Current branch");
+        self.settings_kv(canvas, flow, x, w, branch_label, &branch);
+        let title = self.tr("操作", "Actions");
+        self.settings_section(canvas, flow, x, w, title);
+        for action in [
+            IdeAction::GitCommitPopup,
+            IdeAction::GitPull,
+            IdeAction::GitPush,
+            IdeAction::GitNewBranch,
+            IdeAction::RevertLastCheckpoint,
+        ] {
+            if let Some(y) = flow.place(26, 2) {
+                self.draw_settings_action_row(canvas, x, y, w, action, hx, hy, true);
+            }
+        }
+    }
+
+    fn render_settings_debugger(
+        &mut self,
+        canvas: &mut SurfaceCanvas,
+        flow: &mut SettingsFlow,
+        x: i32,
+        w: i32,
+        hx: i32,
+        hy: i32,
+    ) {
+        let intro = self.tr(
+            "Rust 使用 codelldb，TypeScript / JavaScript 使用 js-debug，Python 使用 debugpy。",
+            "Rust uses codelldb, TypeScript / JavaScript uses js-debug, Python uses debugpy.",
+        );
+        self.settings_note(canvas, flow, x, w, intro);
+        let adapter_label = self.tr("调试器", "Debugger");
+        let adapter = self.dap_engine.active_adapter.clone();
+        self.settings_kv(canvas, flow, x, w, adapter_label, &adapter);
+        let bp_count: usize = self
+            .dap_engine
+            .breakpoints
+            .iter()
+            .map(|(_, lines)| lines.len())
+            .sum();
+        let bp_label = self.tr("断点", "Breakpoints");
+        let bp_value = bp_count.to_string();
+        self.settings_kv(canvas, flow, x, w, bp_label, &bp_value);
+        let title = self.tr("操作", "Actions");
+        self.settings_section(canvas, flow, x, w, title);
+        for action in [
+            IdeAction::RunActiveConfig,
+            IdeAction::DebugActiveConfig,
+            IdeAction::ToggleBreakpoint,
+        ] {
+            if let Some(y) = flow.place(26, 2) {
+                self.draw_settings_action_row(canvas, x, y, w, action, hx, hy, true);
+            }
+        }
+    }
+
+    fn render_settings_terminal_page(
+        &mut self,
+        canvas: &mut SurfaceCanvas,
+        flow: &mut SettingsFlow,
+        x: i32,
+        w: i32,
+        hx: i32,
+        hy: i32,
+    ) {
+        let intro = self.tr(
+            "内嵌终端使用 ConPTY。Alt+F12 打开或关闭终端窗口。",
+            "The embedded terminal uses ConPTY. Alt+F12 shows or hides it.",
+        );
+        self.settings_note(canvas, flow, x, w, intro);
+        let shell = self.tr("Shell", "Shell");
+        self.settings_kv(canvas, flow, x, w, shell, "ConPTY");
+        let tabs = self.terminal.tabs.len().to_string();
+        let tabs_label = self.tr("标签页", "Tabs");
+        self.settings_kv(canvas, flow, x, w, tabs_label, &tabs);
+        let title = self
+            .terminal
+            .tabs
+            .get(self.terminal.active_tab)
+            .map(|tab| tab.title.clone())
+            .unwrap_or_default();
+        let active = self.tr("当前标签", "Active tab");
+        self.settings_kv(canvas, flow, x, w, active, &title);
+        if let Some(y) = flow.place(26, 2) {
+            self.draw_settings_action_row(
+                canvas,
+                x,
+                y,
+                w,
+                IdeAction::ToggleTerminalWindow,
+                hx,
+                hy,
+                true,
+            );
+        }
+    }
+
+    fn render_settings_languages_page(
+        &mut self,
+        canvas: &mut SurfaceCanvas,
+        flow: &mut SettingsFlow,
+        x: i32,
+        w: i32,
+    ) {
+        let intro = self.tr(
+            "首发语言与 IDEA 一样走 Language Server 和调试适配器。",
+            "First-tier languages use a language server and a debug adapter, as in IDEA.",
+        );
+        self.settings_note(canvas, flow, x, w, intro);
+        let rows = [
+            ("Rust", "rust-analyzer", "codelldb"),
+            ("TypeScript", "vtsls", "js-debug"),
+            ("JavaScript", "vtsls", "js-debug"),
+            ("Python", "pyright-langserver", "debugpy"),
+            (
+                "JSON / TOML / Markdown",
+                self.tr("内置语法", "Built-in syntax"),
+                "—",
+            ),
+        ];
+        for (lang, lsp, dap) in rows {
+            let title = lang.to_string();
+            self.settings_section(canvas, flow, x, w, &title);
+            let lsp_label = self.tr("语言服务", "Language server");
+            self.settings_kv(canvas, flow, x, w, lsp_label, lsp);
+            let dap_label = self.tr("调试器", "Debugger");
+            self.settings_kv(canvas, flow, x, w, dap_label, dap);
+        }
+    }
+
+    fn render_settings_advanced(
+        &mut self,
+        canvas: &mut SurfaceCanvas,
+        flow: &mut SettingsFlow,
+        x: i32,
+        w: i32,
+    ) {
+        let intro = self.tr(
+            "这些值对应当前窗口。主题、缩放和语言在「外观」中修改。",
+            "These values describe this window. Change theme, zoom, and language under Appearance.",
+        );
+        self.settings_note(canvas, flow, x, w, intro);
+        let ui = format!("{}%", (self.ui_scale * 100.0).round() as i32);
+        let sys = format!("{}%", (self.system_dpi_scale * 100.0).round() as i32);
+        let eff = format!("{}%", (self.effective_scale() * 100.0).round() as i32);
+        let ui_label = self.tr("界面缩放", "UI zoom");
+        self.settings_kv(canvas, flow, x, w, ui_label, &ui);
+        let dpi_label = self.tr("系统 DPI", "System DPI");
+        self.settings_kv(canvas, flow, x, w, dpi_label, &sys);
+        let eff_label = self.tr("有效缩放", "Effective scale");
+        self.settings_kv(canvas, flow, x, w, eff_label, &eff);
+        let theme_label = self.tr("主题", "Theme");
+        self.settings_kv(
+            canvas,
+            flow,
+            x,
+            w,
+            theme_label,
+            self.theme.kind.display_name(),
+        );
+        let lang_label = self.tr("语言", "Language");
+        self.settings_kv(canvas, flow, x, w, lang_label, self.ui_lang.display_name());
+        let map_label = self.tr("按键映射", "Keymap");
+        self.settings_kv(canvas, flow, x, w, map_label, "IntelliJ IDEA");
+        let ui_mode = self.tr("界面", "UI");
+        self.settings_kv(canvas, flow, x, w, ui_mode, "New UI / Islands");
+    }
+
+    /// IntelliJ IDEA Settings (`Ctrl+Alt+S`)：左侧树、搜索、右侧页面、确定 / 应用 / 取消。
+    fn render_settings_modal(&mut self, canvas: &mut SurfaceCanvas, w: i32, h: i32) {
+        let t = self.theme;
+        let (hx, hy) = self.hover_pos;
+        let mw = (w - 36).clamp(560, 1080).min(w - 8);
+        let mh = (h - 28).clamp(420, 760).min(h - 8);
+        let mx = (w - mw) / 2;
+        let my = ((h - mh) / 2).max(8);
+        let modal = Rect::new(mx, my, mw, mh);
+
+        canvas.fill_rect_alpha(Rect::new(0, 0, w, h), 0x000000, 88);
+        self.active_overlay_rects.push(Rect::new(0, 0, w, h));
+        self.active_overlay_rects.push(modal);
+        canvas.fill_rounded_shadow(modal, 10);
+        canvas.stroke_rounded_rect(modal, 10, t.border_color, t.panel_bg);
+
+        canvas.draw_text_styled(
+            mx + 20,
+            my + 14,
+            self.tr("设置", "Settings"),
+            t.text_primary,
+            mw - 80,
+            FontStyle::UiBold,
+        );
+        let close = Rect::new(mx + mw - 42, my + 10, 26, 26);
+        let close_hot = close.contains(hx, hy);
+        if close_hot {
+            canvas.fill_rounded_rect(close, 6, t.popup_hover_bg);
+        }
+        canvas.draw_window_close_icon(
+            close.x + 13,
+            close.y + 13,
+            if close_hot {
+                t.text_primary
+            } else {
+                t.text_secondary
+            },
+        );
+        self.hit_regions.push((close, HitAction::CloseModalOrPopup));
+
+        let search = Rect::new(mx + 16, my + 46, mw - 32, 32);
+        self.settings_search_rect = search;
+        canvas.stroke_rounded_rect(search, 6, t.accent_blue, t.editor_bg);
+        canvas.draw_search_icon(search.x + 10, search.y + 8, t.text_muted);
+        self.settings_search_text_x = search.x + 32;
+        let field = Rect::new(search.x + 30, search.y, (search.w - 40).max(40), search.h);
+        let placeholder = match self.ui_lang {
+            UiLanguage::ZhCn => "搜索设置",
+            UiLanguage::EnUs => "Search settings",
+        };
+        let ime = self.settings_query_input.render_singleline(
+            canvas,
+            field,
+            2,
+            search.y + 6,
+            placeholder,
+            true,
+            self.caret_visible,
+            t.text_primary,
+            t.text_muted,
+            t.editor_selection_bg,
+            t.accent_blue,
+            FontStyle::UiRegular,
+        );
+        self.ime_spot = ime;
+        self.hit_regions
+            .push((search, HitAction::FocusSettingsSearch));
+
+        canvas.fill_rect(Rect::new(mx + 1, my + 90, mw - 2, 1), t.border_color);
+
+        let nav_w = if mw >= 900 { 252 } else { 200 };
+        let body_top = my + 91;
+        let footer_h = 52;
+        let body_h = (mh - 91 - footer_h).max(80);
+        let nav_rect = Rect::new(mx, body_top, nav_w, body_h);
+        self.settings_nav_rect = nav_rect;
+        self.settings_content_rect = Rect::new(mx + nav_w, body_top, mw - nav_w, body_h);
+        canvas.fill_rect(Rect::new(mx + nav_w, body_top, 1, body_h), t.border_color);
+
+        let nav = self.visible_settings_nav();
+        let query_active = !self.settings_query_input.as_str().trim().is_empty();
+        if query_active {
+            let pages: Vec<SettingsPage> = nav.iter().filter_map(|item| item.page).collect();
+            if let Some(first) = pages.first().copied() {
+                if !pages.contains(&self.settings_page) {
+                    self.settings_page = first;
+                    self.modal_scroll = 0;
+                }
+            }
+        }
+        let page = self.settings_page;
+
+        let row_h = 28;
+        let nav_visible = (nav_rect.h / row_h).max(1) as usize;
+        self.settings_nav_max_scroll = nav.len().saturating_sub(nav_visible);
+        if self.settings_nav_scroll > self.settings_nav_max_scroll {
+            self.settings_nav_scroll = self.settings_nav_max_scroll;
+        }
+        if nav.is_empty() {
+            canvas.draw_text_styled(
+                nav_rect.x + 16,
+                nav_rect.y + 16,
+                self.tr("没有匹配的设置", "No settings found"),
+                t.text_muted,
+                nav_rect.w - 28,
+                FontStyle::UiSmall,
+            );
+        } else {
+            let mut y = nav_rect.y + 8;
+            for item in nav.iter().skip(self.settings_nav_scroll).take(nav_visible) {
+                let row = Rect::new(nav_rect.x + 6, y, nav_rect.w - 20, 24);
+                let selected = item.page == Some(page);
+                let hot = item.page.is_some() && row.contains(hx, hy);
+                if selected {
+                    canvas.fill_rounded_rect(row, 6, t.editor_selection_bg);
+                } else if hot {
+                    canvas.fill_rounded_rect(row, 6, t.panel_header_bg);
+                }
+                let indent = item.depth as i32 * 14;
+                if item.page.is_none() {
+                    canvas.draw_chevron_down(row.x + 6 + indent, y + 8, t.text_muted);
+                }
+                let label = match self.ui_lang {
+                    UiLanguage::ZhCn => item.zh,
+                    UiLanguage::EnUs => item.en,
+                };
+                let fg = if item.page.is_none() {
+                    t.text_secondary
+                } else {
+                    self.settings_row_fg(selected || hot)
+                };
+                canvas.draw_text_styled(
+                    row.x + 22 + indent,
+                    y + 3,
+                    label,
+                    fg,
+                    row.w - 28 - indent,
+                    if item.page.is_none() || selected {
+                        FontStyle::UiBold
+                    } else {
+                        FontStyle::UiRegular
+                    },
+                );
+                if let Some(target) = item.page {
+                    self.hit_regions
+                        .push((row, HitAction::SelectSettingsPage(target)));
+                }
+                y += row_h;
+            }
+        }
+        canvas.draw_vertical_scrollbar(
+            Rect::new(
+                nav_rect.x + nav_rect.w - 10,
+                nav_rect.y + 6,
+                6,
+                nav_rect.h - 12,
+            ),
+            self.settings_nav_scroll,
+            nav_visible,
+            nav.len(),
+            t.border_color,
+        );
+
+        let content_x = mx + nav_w + 20;
+        let content_w = (mw - nav_w - 40).max(120);
+        canvas.draw_text_styled(
+            content_x,
+            body_top + 12,
+            page.breadcrumb(self.ui_lang),
+            t.text_muted,
+            content_w,
+            FontStyle::UiSmall,
+        );
+        canvas.draw_text_styled(
+            content_x,
+            body_top + 30,
+            page.title(self.ui_lang),
+            t.text_primary,
+            content_w,
             FontStyle::UiBold,
         );
 
-        let all_actions = IdeAction::all();
-        let max_rows = ((mh - 256) / 26).max(4) as usize;
-        let max_s = all_actions.len().saturating_sub(max_rows);
-        if self.modal_scroll > max_s {
-            self.modal_scroll = max_s;
+        let view_y = body_top + 56;
+        let view_h = (body_h - 56).max(40);
+        if self.modal_scroll > self.settings_content_max_scroll {
+            self.modal_scroll = self.settings_content_max_scroll;
         }
-        let mut ky = my + 246;
-        for &act in all_actions.iter().skip(self.modal_scroll).take(max_rows) {
-            if ky + 25 > my + mh - 10 {
-                break;
+        let mut flow = SettingsFlow {
+            origin_y: view_y,
+            view_h,
+            scroll_px: self.modal_scroll as i32 * 28,
+            cursor: 0,
+        };
+        let no_hits = query_active && nav.iter().all(|item| item.page.is_none());
+        if no_hits {
+            let empty = self.tr("没有匹配的设置", "No settings found");
+            self.settings_note(canvas, &mut flow, content_x, content_w, empty);
+        } else {
+            match page {
+                SettingsPage::Appearance => {
+                    self.render_settings_appearance(canvas, &mut flow, content_x, content_w, hx, hy)
+                }
+                SettingsPage::MenusAndToolbars => {
+                    self.render_settings_menus(canvas, &mut flow, content_x, content_w, hx, hy)
+                }
+                SettingsPage::SystemSettings => {
+                    self.render_settings_system(canvas, &mut flow, content_x, content_w, hx, hy)
+                }
+                SettingsPage::EditorGeneral => self.render_settings_editor_general(
+                    canvas, &mut flow, content_x, content_w, hx, hy,
+                ),
+                SettingsPage::EditorFont => {
+                    self.render_settings_font(canvas, &mut flow, content_x, content_w, hx, hy)
+                }
+                SettingsPage::ColorScheme => {
+                    self.render_settings_scheme(canvas, &mut flow, content_x, content_w, hx, hy)
+                }
+                SettingsPage::CodeStyle => {
+                    self.render_settings_codestyle(canvas, &mut flow, content_x, content_w, hx, hy)
+                }
+                SettingsPage::Keymap => {
+                    self.render_settings_keymap(canvas, &mut flow, content_x, content_w, hx, hy)
+                }
+                SettingsPage::Plugins => {
+                    self.render_settings_plugins(canvas, &mut flow, content_x, content_w)
+                }
+                SettingsPage::Git => {
+                    self.render_settings_git(canvas, &mut flow, content_x, content_w, hx, hy)
+                }
+                SettingsPage::Debugger => {
+                    self.render_settings_debugger(canvas, &mut flow, content_x, content_w, hx, hy)
+                }
+                SettingsPage::Terminal => self
+                    .render_settings_terminal_page(canvas, &mut flow, content_x, content_w, hx, hy),
+                SettingsPage::Languages => {
+                    self.render_settings_languages_page(canvas, &mut flow, content_x, content_w)
+                }
+                SettingsPage::Advanced => {
+                    self.render_settings_advanced(canvas, &mut flow, content_x, content_w)
+                }
             }
-            let row = Rect::new(mx + 16, ky, mw - 38, 24);
-            let hov = row.contains(hx, hy);
-            canvas.fill_rounded_rect(
-                row,
-                4,
-                if hov { t.popup_hover_bg } else { t.editor_bg },
-            );
-            canvas.draw_text_styled(
-                mx + 24,
-                ky + 2,
-                act.title_i18n(self.ui_lang),
-                if hov { 0xFFFFFF } else { t.text_primary },
-                mw - 180,
-                FontStyle::UiRegular,
-            );
-            canvas.draw_text_styled(
-                mx + mw - 150,
-                ky + 3,
-                act.shortcut_label(),
-                if hov { 0xE2E8F0 } else { t.syn_keyword },
-                120,
-                FontStyle::CodeMonoBold,
-            );
-            self.hit_regions
-                .push((row, HitAction::ExecuteIdeAction(act)));
-            ky += 26;
+        }
+        let total_rows = ((flow.cursor.max(1) + 27) / 28) as usize;
+        let visible_rows = (view_h / 28).max(1) as usize;
+        self.settings_content_max_scroll = total_rows.saturating_sub(visible_rows);
+        if self.modal_scroll > self.settings_content_max_scroll {
+            self.modal_scroll = self.settings_content_max_scroll;
         }
         canvas.draw_vertical_scrollbar(
-            Rect::new(mx + mw - 16, my + 246, 6, (mh - 256).max(40)),
+            Rect::new(mx + mw - 14, view_y, 6, view_h),
             self.modal_scroll,
-            max_rows,
-            all_actions.len(),
+            visible_rows,
+            total_rows.max(1),
             t.border_color,
+        );
+
+        let footer_y = my + mh - footer_h;
+        canvas.fill_rect(Rect::new(mx + 1, footer_y, mw - 2, 1), t.border_color);
+        let ok = Rect::new(mx + mw - 92, footer_y + 11, 76, 30);
+        let apply = Rect::new(ok.x - 84, footer_y + 11, 76, 30);
+        let cancel = Rect::new(apply.x - 84, footer_y + 11, 76, 30);
+        let hint = self.tr("更改立即生效", "Changes apply immediately");
+        canvas.draw_text_styled(
+            mx + 16,
+            footer_y + 16,
+            hint,
+            t.text_muted,
+            (cancel.x - mx - 24).max(40),
+            FontStyle::UiSmall,
+        );
+        self.draw_settings_button(
+            canvas,
+            cancel,
+            self.tr("取消", "Cancel"),
+            false,
+            hx,
+            hy,
+            HitAction::CloseModalOrPopup,
+        );
+        self.draw_settings_button(
+            canvas,
+            apply,
+            self.tr("应用", "Apply"),
+            false,
+            hx,
+            hy,
+            HitAction::ApplySettings,
+        );
+        self.draw_settings_button(
+            canvas,
+            ok,
+            self.tr("确定", "OK"),
+            true,
+            hx,
+            hy,
+            HitAction::CloseModalOrPopup,
         );
     }
 }
@@ -10196,16 +12773,25 @@ mod tests {
         // 1. 编辑器文本区与终端内容区 -> I-beam Text
         let ed_cx = state.editor_code_rect.x + state.editor_code_rect.w / 2;
         let ed_cy = state.editor_code_rect.y + state.editor_code_rect.h / 2;
-        assert_eq!(state.cursor_kind_at(ed_cx, ed_cy, w, h), IdeCursorKind::Text);
+        assert_eq!(
+            state.cursor_kind_at(ed_cx, ed_cy, w, h),
+            IdeCursorKind::Text
+        );
 
         let tm_cx = state.terminal_content_rect.x + state.terminal_content_rect.w / 2;
         let tm_cy = state.terminal_content_rect.y + state.terminal_content_rect.h / 2;
-        assert_eq!(state.cursor_kind_at(tm_cx, tm_cy, w, h), IdeCursorKind::Text);
+        assert_eq!(
+            state.cursor_kind_at(tm_cx, tm_cy, w, h),
+            IdeCursorKind::Text
+        );
 
         // 2. 右侧 AI 对话输入框 -> Text
         let ai_cx = state.agent_input_text_rect.x + 20;
         let ai_cy = state.agent_input_text_rect.y + 10;
-        assert_eq!(state.cursor_kind_at(ai_cx, ai_cy, w, h), IdeCursorKind::Text);
+        assert_eq!(
+            state.cursor_kind_at(ai_cx, ai_cy, w, h),
+            IdeCursorKind::Text
+        );
 
         // 3. 左右分割线 -> EwResize；底部分割线 -> NsResize
         let left_split_x = 42 + state.left_panel_width;
@@ -10253,7 +12839,10 @@ mod tests {
         state.render(&mut canvas);
         let in_cx = state.search_modal_input_rect.x + 30;
         let in_cy = state.search_modal_input_rect.y + 15;
-        assert_eq!(state.cursor_kind_at(in_cx, in_cy, w, h), IdeCursorKind::Text);
+        assert_eq!(
+            state.cursor_kind_at(in_cx, in_cy, w, h),
+            IdeCursorKind::Text
+        );
         // 模态框标题栏空白处不穿透底层面板 -> Default
         assert_eq!(
             state.cursor_kind_at(in_cx, state.search_modal_input_rect.y - 20, w, h),
@@ -10290,7 +12879,9 @@ mod tests {
         assert_eq!(state.cached_highlight_lines.1, initial_rev);
 
         // 修改缓冲区后 revision 递增，下次渲染自动失效并重建缓存
-        state.active_buffer_mut().insert_str_at_cursor("\npub fn cache_probe_fn() {}\n");
+        state
+            .active_buffer_mut()
+            .insert_str_at_cursor("\npub fn cache_probe_fn() {}\n");
         let new_rev = state.active_buffer().revision();
         assert!(new_rev > initial_rev);
 
@@ -10333,8 +12924,7 @@ mod tests {
         )
         .expect("write Cargo.toml");
         let main_rs = src_dir.join("main.rs");
-        std::fs::write(&main_rs, "fn main() { println!(\"hello\"); }\n")
-            .expect("write main.rs");
+        std::fs::write(&main_rs, "fn main() { println!(\"hello\"); }\n").expect("write main.rs");
 
         let mut state = IdeApplicationState::new(PathBuf::from("."));
         let initial_root = state.workspace_root.clone();
@@ -10403,6 +12993,56 @@ mod tests {
             .hit_regions
             .iter()
             .any(|(_, a)| matches!(a, HitAction::ExecuteIdeAction(IdeAction::OpenFolder))));
+    }
+
+    #[test]
+    fn settings_dialog_follows_idea_navigation() {
+        let mut state = IdeApplicationState::new(PathBuf::from("."));
+        let mut canvas = SurfaceCanvas::new(1440, 900);
+        state.execute_ide_action(IdeAction::OpenSettingsModal);
+        assert_eq!(state.settings_page, SettingsPage::Appearance);
+        assert_eq!(state.focus, FocusTarget::SettingsModal);
+        state.render(&mut canvas);
+
+        assert!(state.hit_regions.iter().any(|(_, action)| {
+            matches!(action, HitAction::SelectSettingsPage(SettingsPage::Keymap))
+        }));
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, action)| matches!(action, HitAction::SelectTheme(_))));
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, action)| matches!(action, HitAction::SetUiScale(100))));
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, action)| matches!(action, HitAction::ApplySettings)));
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, action)| matches!(action, HitAction::CloseModalOrPopup)));
+
+        state.settings_query_input.set_text("终端");
+        state.on_active_input_mutated();
+        assert_eq!(state.settings_page, SettingsPage::Terminal);
+        state.render(&mut canvas);
+        assert!(state.hit_regions.iter().any(|(_, action)| {
+            matches!(
+                action,
+                HitAction::SelectSettingsPage(SettingsPage::Terminal)
+            )
+        }));
+        assert!(!state.hit_regions.iter().any(|(_, action)| {
+            matches!(action, HitAction::SelectSettingsPage(SettingsPage::Keymap))
+        }));
+        assert!(state.hit_regions.iter().any(|(_, action)| {
+            matches!(
+                action,
+                HitAction::ExecuteIdeAction(IdeAction::ToggleTerminalWindow)
+            )
+        }));
     }
 
     #[test]
@@ -10529,7 +13169,10 @@ mod tests {
             .first()
             .map(|c| c.hash.clone())
         {
-            assert_eq!(state.selected_git_commit_hash.as_deref(), Some(first_hash.as_str()));
+            assert_eq!(
+                state.selected_git_commit_hash.as_deref(),
+                Some(first_hash.as_str())
+            );
             assert!(state.git_engine.commit_details.contains_key(&first_hash));
         }
 
@@ -10541,6 +13184,78 @@ mod tests {
             .hit_regions
             .iter()
             .any(|(_, a)| matches!(a, HitAction::CreateNewGitBranchPrompt)));
+    }
+
+    #[test]
+    fn left_git_stripe_badge_and_idea_checkbox_toggle_without_staging() {
+        let mut state = IdeApplicationState::new(PathBuf::from("."));
+        let mut canvas = SurfaceCanvas::new(1560, 940);
+        state.left_tool = Some(ToolWindowId::Commit);
+        state.git_engine.has_loaded_snapshot = true;
+        state.git_engine.changed_files = vec![
+            ide_git::GitChangedFile {
+                path: state.workspace_root.join("src/main.rs"),
+                status: ide_git::GitFileStatusKind::Modified,
+                staged: false,
+            },
+            ide_git::GitChangedFile {
+                path: state.workspace_root.join("notes.txt"),
+                status: ide_git::GitFileStatusKind::Untracked,
+                staged: false,
+            },
+        ];
+        state
+            .git_engine
+            .commit_checked_files
+            .insert(state.workspace_root.join("src/main.rs"));
+
+        // Capture pixels with 2 changed files vs 0 changed files to verify left stripe badge renders
+        state.render(&mut canvas);
+        let badge_region_with_changes: Vec<u32> = canvas.pixels()[..1560 * 140].to_vec();
+
+        // IDEA actions & row operations are registered; clicking file row toggles check without staging
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::ToggleCommitFileCheck(_))));
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::InspectGitWorkingFileDiff(_))));
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::RollbackGitFile(_))));
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::InspectSelectedGitDiff)));
+
+        // Clicking notes.txt hit region checks it without modifying git `staged`
+        let notes_path = state.workspace_root.join("notes.txt");
+        let notes_rect = state
+            .hit_regions
+            .iter()
+            .find_map(|(r, a)| match a {
+                HitAction::ToggleCommitFileCheck(p) if p == &notes_path => Some(*r),
+                _ => None,
+            })
+            .expect("notes.txt check hit region");
+        state.handle_mouse_click_with_mods(notes_rect.x + 10, notes_rect.y + 8, false, &canvas);
+        assert!(state.git_engine.is_file_checked_for_commit(&notes_path));
+        assert!(state.git_engine.changed_files.iter().all(|f| !f.staged));
+
+        // Clicking again unchecks it
+        state.handle_mouse_click_with_mods(notes_rect.x + 10, notes_rect.y + 8, false, &canvas);
+        assert!(!state.git_engine.is_file_checked_for_commit(&notes_path));
+
+        // With 0 changed files, the left stripe badge disappears
+        state.git_engine.changed_files.clear();
+        state.render(&mut canvas);
+        assert_ne!(
+            badge_region_with_changes,
+            canvas.pixels()[..1560 * 140].to_vec()
+        );
     }
 
     #[test]
@@ -10640,10 +13355,9 @@ mod tests {
             .hit_regions
             .iter()
             .any(|(_, a)| matches!(a, HitAction::CopyAgentCodeBlock(code) if code.contains("verify_agent_ui"))));
-        assert!(state
-            .hit_regions
-            .iter()
-            .any(|(_, a)| matches!(a, HitAction::OpenFileAtLine(p, _) if p.ends_with("Cargo.toml"))));
+        assert!(state.hit_regions.iter().any(
+            |(_, a)| matches!(a, HitAction::OpenFileAtLine(p, _) if p.ends_with("Cargo.toml"))
+        ));
 
         // 点击 Fast Mode 与 思考深度胶囊切换状态
         if let Some((rect, _)) = state
@@ -10678,12 +13392,17 @@ mod tests {
         // 对话流全选与复制选区 + 右键菜单动作
         state.focus = FocusTarget::AgentChatStream;
         assert!(state.select_all_at_focus());
-        let copied = state.copy_focused_selection().expect("chat stream selection");
+        let copied = state
+            .copy_focused_selection()
+            .expect("chat stream selection");
         assert!(copied.contains("Cargo.toml:3") || copied.contains("verify_agent_ui"));
 
         let chat_rect = state.agent_chat_area_rect;
         state.open_context_menu_at(chat_rect.x + 12, chat_rect.y + 12, &canvas);
-        let menu = state.context_menu.as_ref().expect("agent chat context menu");
+        let menu = state
+            .context_menu
+            .as_ref()
+            .expect("agent chat context menu");
         assert!(menu
             .items
             .iter()
@@ -10739,7 +13458,9 @@ mod tests {
         assert!(state.finish_ide_drag_at(drop_x, drop_y));
 
         assert_eq!(state.agent_hub.active_session().attached_items.len(), 2);
-        assert!(state.image_preview_cache.contains_key(&clean_workspace_path(png_path.clone())));
+        assert!(state
+            .image_preview_cache
+            .contains_key(&clean_workspace_path(png_path.clone())));
 
         state.render(&mut canvas);
         assert!(state
@@ -10772,10 +13493,9 @@ mod tests {
                 line_count: lc,
             });
         state.render(&mut canvas);
-        assert!(state
-            .hit_regions
-            .iter()
-            .any(|(_, a)| matches!(a, HitAction::ToggleComposerPastedSnippet(id) if id == "test-snip-1")));
+        assert!(state.hit_regions.iter().any(
+            |(_, a)| matches!(a, HitAction::ToggleComposerPastedSnippet(id) if id == "test-snip-1")
+        ));
 
         state.expanded_composer_snippet_id = Some("test-snip-1".to_string());
         state.render(&mut canvas);
@@ -10793,11 +13513,10 @@ mod tests {
             .rows
             .iter()
             .any(|r| matches!(r, crate::agent_panel::CachedChatRow::UserFilesRow { .. })));
-        assert!(state
-            .cached_chat_rows
-            .rows
-            .iter()
-            .any(|r| matches!(r, crate::agent_panel::CachedChatRow::CodeBlockCollapsedSummary { .. })));
+        assert!(state.cached_chat_rows.rows.iter().any(|r| matches!(
+            r,
+            crate::agent_panel::CachedChatRow::CodeBlockCollapsedSummary { .. }
+        )));
 
         // 向上滚动至顶部消息，直接点击展开折叠的代码块，确认语法高亮行渲染出来
         state.agent_scroll = 0;
@@ -10884,11 +13603,19 @@ mod tests {
         let (codex_row, _) = state
             .hit_regions
             .iter()
-            .find(|(_, a)| matches!(a, HitAction::SelectAgentProvider(AgentProviderKind::OpenAiCodexCli)))
+            .find(|(_, a)| {
+                matches!(
+                    a,
+                    HitAction::SelectAgentProvider(AgentProviderKind::OpenAiCodexCli)
+                )
+            })
             .cloned()
             .expect("Codex CLI provider option");
         state.handle_mouse_click_with_mods(codex_row.x + 6, codex_row.y + 6, false, &canvas);
-        assert_eq!(state.agent_hub.active_provider, AgentProviderKind::OpenAiCodexCli);
+        assert_eq!(
+            state.agent_hub.active_provider,
+            AgentProviderKind::OpenAiCodexCli
+        );
         assert_eq!(state.agent_mode, AgentWorkbenchMode::Agent);
 
         state.render(&mut canvas);
@@ -10921,26 +13648,32 @@ mod tests {
 
         // 3. 验证用户气泡、行内代码胶囊与助手 Markdown 排版可正确构建行缓存与选中文本
         state.agent_mode_popup_open = false;
-        state.agent_hub.messages.push(ide_agent_hub::AgentChatMessage {
-            role: "user".to_string(),
-            agent: AgentProviderKind::CursorCli,
-            content: "后台短剧编辑，提审方 appid 默认改为 `wxae3b81ca05d7b0e0`".to_string(),
-            thought: None,
-            checkpoint_id: None,
-            patch: None,
-            modified_files: Vec::new(),
-            attachments: Vec::new(),
-        });
-        state.agent_hub.messages.push(ide_agent_hub::AgentChatMessage {
-            role: "assistant".to_string(),
-            agent: AgentProviderKind::CursorCli,
-            content: "请重新导入 `Cargo.toml` 查看 **配置项**。".to_string(),
-            thought: Some("Checked appid field".to_string()),
-            checkpoint_id: None,
-            patch: None,
-            modified_files: Vec::new(),
-            attachments: Vec::new(),
-        });
+        state
+            .agent_hub
+            .messages
+            .push(ide_agent_hub::AgentChatMessage {
+                role: "user".to_string(),
+                agent: AgentProviderKind::CursorCli,
+                content: "后台短剧编辑，提审方 appid 默认改为 `wxae3b81ca05d7b0e0`".to_string(),
+                thought: None,
+                checkpoint_id: None,
+                patch: None,
+                modified_files: Vec::new(),
+                attachments: Vec::new(),
+            });
+        state
+            .agent_hub
+            .messages
+            .push(ide_agent_hub::AgentChatMessage {
+                role: "assistant".to_string(),
+                agent: AgentProviderKind::CursorCli,
+                content: "请重新导入 `Cargo.toml` 查看 **配置项**。".to_string(),
+                thought: Some("Checked appid field".to_string()),
+                checkpoint_id: None,
+                patch: None,
+                modified_files: Vec::new(),
+                attachments: Vec::new(),
+            });
         state.render(&mut canvas);
         assert!(state
             .cached_chat_rows
@@ -10965,5 +13698,286 @@ mod tests {
             }
             _ => false,
         }));
+    }
+
+    #[test]
+    fn busy_streaming_shows_small_thought_and_execution_rows() {
+        let mut state = IdeApplicationState::new(PathBuf::from("."));
+        let mut canvas = SurfaceCanvas::new(1280, 820);
+        state.right_agent_open = true;
+        state.right_panel_tab = RightPanelTab::Chat;
+
+        let mut prog = ide_agent_hub::StreamingAgentProgress::with_phase("正在执行工具...");
+        prog.thought_text = "The user wants to default the appid field in drama edit.".to_string();
+        prog.reply_text = "我先看看编辑页现在怎么填这个字段。".to_string();
+        prog.push_execution_step("读取 crates/ide-app/src/agent_panel.rs");
+        prog.push_execution_step("搜索 BusyIndicator");
+        state.agent_hub.set_active_streaming_progress(Some(prog.clone()));
+
+        state.render(&mut canvas);
+        let rows = &state.cached_chat_rows.rows;
+        let thought_row = rows
+            .iter()
+            .find(|r| matches!(r, crate::agent_panel::CachedChatRow::LiveThoughtLine(t) if t.contains("appid")))
+            .expect("small live thought row should be rendered while busy");
+        let step_row = rows
+            .iter()
+            .find(|r| matches!(r, crate::agent_panel::CachedChatRow::LiveStepLine(s) if s.contains("搜索 BusyIndicator")))
+            .expect("small live execution step row should be rendered while busy");
+        let reply_row = rows
+            .iter()
+            .find(|r| matches!(r, crate::agent_panel::CachedChatRow::StreamingLine { text, .. } if text.contains("编辑页")))
+            .expect("streaming reply row should be rendered alongside thought and steps");
+        assert!(rows
+            .iter()
+            .any(|r| matches!(r, crate::agent_panel::CachedChatRow::BusyIndicator)));
+        assert!(thought_row.row_height() < reply_row.row_height());
+        assert!(step_row.row_height() < reply_row.row_height());
+
+        // 追加新的执行步骤时应使行缓存失效并刷新展示
+        prog.push_execution_step("运行命令 cargo test");
+        state.agent_hub.set_active_streaming_progress(Some(prog));
+        state.render(&mut canvas);
+        assert!(state.cached_chat_rows.rows.iter().any(|r| matches!(
+            r,
+            crate::agent_panel::CachedChatRow::LiveStepLine(s) if s.contains("运行命令 cargo test")
+        )));
+    }
+
+    #[test]
+    fn cursor_changed_files_drawer_and_edit_rewind_modal_respect_cli_support() {
+        let mut state = IdeApplicationState::new(PathBuf::from("."));
+        let mut canvas = SurfaceCanvas::new(1440, 900);
+        state.right_agent_open = true;
+        state.right_panel_tab = RightPanelTab::Chat;
+        state.agent_hub.active_provider = AgentProviderKind::CursorCli;
+        state
+            .agent_hub
+            .set_provider_capabilities(AgentProviderKind::CursorCli, true, true, true);
+
+        let changed_path = state.workspace_root.join("Cargo.toml");
+        let user_msg_idx = state.agent_hub.messages.len();
+        state.agent_hub.messages.push(ide_agent_hub::AgentChatMessage {
+            role: "user".to_string(),
+            agent: AgentProviderKind::CursorCli,
+            content: "修改 Cargo.toml  [@main.rs:L1]".to_string(),
+            thought: None,
+            checkpoint_id: None,
+            patch: None,
+            modified_files: Vec::new(),
+            attachments: Vec::new(),
+        });
+        state.agent_hub.messages.push(ide_agent_hub::AgentChatMessage {
+            role: "assistant".to_string(),
+            agent: AgentProviderKind::CursorCli,
+            content: "已更新依赖配置。".to_string(),
+            thought: None,
+            checkpoint_id: None,
+            patch: None,
+            modified_files: vec![changed_path.clone()],
+            attachments: Vec::new(),
+        });
+        state
+            .agent_hub
+            .active_session_mut()
+            .changed_files
+            .push(ide_agent_hub::SessionFileChange {
+                path: changed_path.clone(),
+                added_lines: 4,
+                removed_lines: 1,
+                original_content: Some("orig".to_string()),
+                first_turn_msg_idx: user_msg_idx,
+            });
+
+        // 1. 默认折叠在输入框上方，支持编辑已发送消息，且不在气泡中重复显示 ModifiedFileChip
+        assert!(!state.agent_changed_files_expanded);
+        state.render(&mut canvas);
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::ToggleAgentChangedFilesDrawer)));
+        assert!(state.hit_regions.iter().any(
+            |(_, a)| matches!(a, HitAction::StartEditSentUserMessage(idx) if *idx == user_msg_idx)
+        ));
+        assert!(!state
+            .cached_chat_rows
+            .rows
+            .iter()
+            .any(|r| matches!(r, crate::agent_panel::CachedChatRow::ModifiedFileChip { .. })));
+        assert!(!state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::RevertSingleAgentChangedFile(_))));
+
+        // 2. 点击折叠条展开文件更改明细
+        let (toggle_r, _) = state
+            .hit_regions
+            .iter()
+            .find(|(_, a)| matches!(a, HitAction::ToggleAgentChangedFilesDrawer))
+            .cloned()
+            .expect("changed files drawer toggle");
+        state.handle_mouse_click_with_mods(toggle_r.x + 6, toggle_r.y + 6, false, &canvas);
+        assert!(state.agent_changed_files_expanded);
+        state.render(&mut canvas);
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::RevertSingleAgentChangedFile(_))));
+
+        // 3. 点击编辑已发送消息 -> 提交后弹出“回退/保留并同步 CLI”弹窗
+        let (edit_r, _) = state
+            .hit_regions
+            .iter()
+            .find(|(_, a)| matches!(a, HitAction::StartEditSentUserMessage(idx) if *idx == user_msg_idx))
+            .cloned()
+            .expect("edit sent user message button");
+        state.handle_mouse_click_with_mods(edit_r.x + 4, edit_r.y + 4, false, &canvas);
+        assert_eq!(state.editing_sent_msg_idx, Some(user_msg_idx));
+        assert_eq!(state.agent_chat_input.as_str(), "修改 Cargo.toml");
+
+        state.submit_agent_prompt("改为仅检查 Cargo.toml".to_string());
+        assert_eq!(state.focus, FocusTarget::EditMessageRewindModal);
+        state.render(&mut canvas);
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::ConfirmEditMessageRewind { revert_files: true })));
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::ConfirmEditMessageRewind { revert_files: false })));
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::CancelEditMessageRewindModal)));
+
+        // 点击取消保留当前编辑内容回到输入框
+        let (cancel_r, _) = state
+            .hit_regions
+            .iter()
+            .find(|(_, a)| matches!(a, HitAction::CancelEditMessageRewindModal))
+            .cloned()
+            .expect("cancel edit rewind modal");
+        state.handle_mouse_click_with_mods(cancel_r.x + 6, cancel_r.y + 6, false, &canvas);
+        assert_eq!(state.focus, FocusTarget::AgentChatInput);
+        assert_eq!(state.editing_sent_msg_idx, Some(user_msg_idx));
+        assert_eq!(state.agent_chat_input.as_str(), "改为仅检查 Cargo.toml");
+        state.cancel_edit_sent_user_message();
+
+        // 4. 若当前 CLI 不支持回退（如 Codex），则不显示文件折叠更改与编辑回退按钮
+        state.agent_hub.active_provider = AgentProviderKind::OpenAiCodexCli;
+        state
+            .agent_hub
+            .set_provider_capabilities(AgentProviderKind::OpenAiCodexCli, true, true, false);
+        state.render(&mut canvas);
+        assert!(!state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::ToggleAgentChangedFilesDrawer)));
+        assert!(!state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::StartEditSentUserMessage(_))));
+    }
+
+    #[test]
+    fn persistence_restores_projects_tabs_settings_and_ai_history_across_restart() {
+        let base_tmp = std::env::temp_dir().join(format!(
+            "rust_ai_ide_persist_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let persist_dir = base_tmp.join("appdata");
+        let ws1 = base_tmp.join("proj_alpha");
+        let ws2 = base_tmp.join("proj_beta");
+        std::fs::create_dir_all(ws1.join("src")).unwrap();
+        std::fs::create_dir_all(ws2.join("src")).unwrap();
+        let ws1_cargo = ws1.join("Cargo.toml");
+        let ws1_lib = ws1.join("src").join("lib.rs");
+        let ws2_main = ws2.join("src").join("main.rs");
+        std::fs::write(&ws1_cargo, "[package]\nname = \"alpha\"\n").unwrap();
+        std::fs::write(&ws1_lib, "pub fn a() {}\npub fn b() {}\npub fn c() {}\n").unwrap();
+        std::fs::write(&ws2_main, "fn main() {}\n").unwrap();
+
+        let mut state1 = IdeApplicationState::new(ws1.clone());
+        state1.restore_from_persistence_dir(persist_dir.clone());
+        state1.set_ui_language(UiLanguage::EnUs);
+        state1.set_ui_scale(1.25);
+        state1.theme = IdeaTheme::from_kind(ThemeKind::IslandsLight);
+        state1.attach_active_context = false;
+        state1.left_panel_width = 290;
+        state1.agent_mode = AgentWorkbenchMode::Ask;
+        state1.open_file(ws1_lib.clone());
+        state1.active_buffer_mut().set_cursor(2, 4, false);
+        state1.scroll_line = 1;
+        state1.agent_hub.messages.push(ide_agent_hub::AgentChatMessage {
+            role: "user".to_string(),
+            agent: AgentProviderKind::CursorCli,
+            content: "alpha session question".to_string(),
+            thought: None,
+            checkpoint_id: None,
+            patch: None,
+            modified_files: Vec::new(),
+            attachments: Vec::new(),
+        });
+        state1.agent_hub.active_session_mut().draft_prompt = "alpha draft".to_string();
+        state1.save_all_persisted_state();
+
+        // 切换到第二个项目并保存独立对话历史与打开标签
+        state1.switch_workspace(ws2.clone());
+        state1.open_file(ws2_main.clone());
+        state1.agent_hub.messages.push(ide_agent_hub::AgentChatMessage {
+            role: "user".to_string(),
+            agent: AgentProviderKind::CursorCli,
+            content: "beta session question".to_string(),
+            thought: None,
+            checkpoint_id: None,
+            patch: None,
+            modified_files: Vec::new(),
+            attachments: Vec::new(),
+        });
+        state1.save_all_persisted_state();
+
+        // 模拟应用重启：先读取全局设置恢复最后打开的项目、UI 设置、布局和最近项目列表
+        let saved_gs: PersistedGlobalSettings =
+            persistence::load_json(&persistence::global_settings_path(&persist_dir))
+                .expect("global settings saved");
+        assert_eq!(saved_gs.ui_lang, UiLanguage::EnUs);
+        assert!((saved_gs.ui_scale - 1.25).abs() < 0.01);
+        assert_eq!(saved_gs.theme_kind, ThemeKind::IslandsLight);
+        assert_eq!(saved_gs.last_workspace, Some(clean_workspace_path(ws2.clone())));
+        assert!(saved_gs
+            .recent_workspaces
+            .contains(&clean_workspace_path(ws1.clone())));
+
+        let mut restarted = IdeApplicationState::new(saved_gs.last_workspace.clone().unwrap());
+        restarted.restore_from_persistence_dir(persist_dir.clone());
+        assert_eq!(restarted.ui_lang, UiLanguage::EnUs);
+        assert!((restarted.ui_scale - 1.25).abs() < 0.01);
+        assert_eq!(restarted.theme.kind, ThemeKind::IslandsLight);
+        assert!(!restarted.attach_active_context);
+        assert_eq!(restarted.left_panel_width, 290);
+        assert_eq!(restarted.agent_mode, AgentWorkbenchMode::Ask);
+        assert!(restarted
+            .agent_hub
+            .messages
+            .iter()
+            .any(|m| m.content == "beta session question"));
+
+        // 切回 alpha 项目应恢复 alpha 的打开文件、光标行列、草稿与 AI 对话历史
+        restarted.switch_workspace(ws1.clone());
+        assert!(restarted
+            .agent_hub
+            .messages
+            .iter()
+            .any(|m| m.content == "alpha session question"));
+        assert_eq!(restarted.agent_chat_input.as_str(), "alpha draft");
+        assert_eq!(restarted.active_buffer().path, clean_workspace_path(ws1_lib));
+        assert_eq!(restarted.active_buffer().cursor_line, 2);
+        assert_eq!(restarted.active_buffer().cursor_col, 4);
+
+        let _ = std::fs::remove_dir_all(&base_tmp);
     }
 }

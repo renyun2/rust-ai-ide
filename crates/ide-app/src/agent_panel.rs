@@ -3,24 +3,37 @@ use crate::ide_state::{
     blend_rgb, write_windows_clipboard_text, FocusTarget, HitAction, IdeApplicationState,
     RightPanelTab, ScrollTrackInfo,
 };
-use ide_agent_hub::{detect_workspace_file_references, AgentAttachedItem, AgentWorkbenchMode};
+use ide_agent_hub::{
+    detect_workspace_file_references, AgentAttachedItem, AgentWorkbenchMode, StreamingAgentProgress,
+};
 use ide_core::{LanguageId, ThemeKind, UiLanguage};
 use ide_git::DiffLineKind;
 use ide_syntax::{highlight_line, TokenKind};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 
 pub(crate) const AGENT_INPUT_FONT: FontStyle = FontStyle::ChatBody;
 pub(crate) const AGENT_INPUT_LINE_H: i32 = 20;
+
+fn stream_progress_signature(prog: Option<&StreamingAgentProgress>) -> u64 {
+    let Some(p) = prog else {
+        return 0;
+    };
+    let mut h = DefaultHasher::new();
+    p.phase.hash(&mut h);
+    p.thought_text.hash(&mut h);
+    p.execution_steps.hash(&mut h);
+    p.reply_text.hash(&mut h);
+    h.finish()
+}
 
 #[derive(Debug, Clone)]
 pub(crate) enum ChatSpanKind {
     Plain,
     Bold,
     InlineCode,
-    FileLink {
-        path: PathBuf,
-        line: Option<usize>,
-    },
+    FileLink { path: PathBuf, line: Option<usize> },
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +111,8 @@ pub(crate) enum CachedChatRow {
         path: PathBuf,
         display: String,
     },
+    LiveThoughtLine(String),
+    LiveStepLine(String),
     StreamingLine {
         text: String,
         spans: Vec<ChatTextSpan>,
@@ -127,7 +142,7 @@ impl CachedChatRow {
             Self::UserFilesRow { .. } => 26,
             Self::UserImageCard { .. } => 86,
             Self::ThoughtToggle { .. } => 22,
-            Self::ThoughtLine(_) => 19,
+            Self::ThoughtLine(_) | Self::LiveThoughtLine(_) | Self::LiveStepLine(_) => 19,
             Self::CodeBlockHeader { .. } => 26,
             Self::CodeBlockCollapsedSummary { .. } => 24,
             Self::CodeBlockLine { .. } => 19,
@@ -147,6 +162,8 @@ impl CachedChatRow {
             Self::UserLine { text, .. }
             | Self::AgentLine { text, .. }
             | Self::ThoughtLine(text)
+            | Self::LiveThoughtLine(text)
+            | Self::LiveStepLine(text)
             | Self::StreamingLine { text, .. }
             | Self::CodeBlockLine { text, .. } => Some(text.as_str()),
             Self::PatchDiffLine { text, .. } => Some(text.as_str()),
@@ -721,8 +738,7 @@ fn measure_user_bubble_width(
             FontStyle::ChatBody
         };
         let eff_wrap = (max_content_w - pill_reserve).max(60);
-        for (seg_s, seg_e, seg_txt) in
-            wrap_chat_line_segments(canvas, &clean, eff_wrap, base_style)
+        for (seg_s, seg_e, seg_txt) in wrap_chat_line_segments(canvas, &clean, eff_wrap, base_style)
         {
             let spans = project_and_merge_spans(root, &seg_txt, seg_s, seg_e, &raw_spans);
             let w = measure_chat_spans_x(canvas, &seg_txt, &spans, line_bold, usize::MAX);
@@ -949,7 +965,9 @@ impl IdeApplicationState {
             char_len
         };
         if c1 > c0 {
-            let (w0, w1) = if !spans.is_empty() || matches!(style, FontStyle::ChatBody | FontStyle::ChatBodyBold) {
+            let (w0, w1) = if !spans.is_empty()
+                || matches!(style, FontStyle::ChatBody | FontStyle::ChatBodyBold)
+            {
                 (
                     measure_chat_spans_x(canvas, text, spans, default_bold, c0),
                     measure_chat_spans_x(canvas, text, spans, default_bold, c1),
@@ -1055,7 +1073,14 @@ impl IdeApplicationState {
                         base_style
                     };
                     let (cw, _) = canvas.measure_text(&chunk, st);
-                    canvas.draw_text_styled(cur_x, text_y, &chunk, base_color, right_edge - cur_x, st);
+                    canvas.draw_text_styled(
+                        cur_x,
+                        text_y,
+                        &chunk,
+                        base_color,
+                        right_edge - cur_x,
+                        st,
+                    );
                     cur_x += cw;
                 }
                 ChatSpanKind::Bold => {
@@ -1074,12 +1099,7 @@ impl IdeApplicationState {
                     let (cw, _) = canvas.measure_text(&chunk, FontStyle::ChatCode);
                     let pill_w = (cw + 8).min((right_edge - cur_x - 2).max(10));
                     let pill_h = (code_h + 3).min(row_rect.h - 2);
-                    let pill_rect = Rect::new(
-                        cur_x + 2,
-                        text_y + code_y_off - 1,
-                        pill_w,
-                        pill_h,
-                    );
+                    let pill_rect = Rect::new(cur_x + 2, text_y + code_y_off - 1, pill_w, pill_h);
                     canvas.stroke_rounded_rect(pill_rect, 4, inline_pill_border, inline_pill_bg);
                     canvas.draw_text_styled(
                         pill_rect.x + 4,
@@ -1209,11 +1229,7 @@ impl IdeApplicationState {
 
         // 顶部简洁头部底带
         let top_hdr = Rect::new(rect.x + 1, rect.y + 1, rect.w - 2, 32);
-        canvas.fill_rounded_rect(
-            top_hdr,
-            7,
-            blend_rgb(panel_surface, t.panel_bg, 0.55),
-        );
+        canvas.fill_rounded_rect(top_hdr, 7, blend_rgb(panel_surface, t.panel_bg, 0.55));
 
         let is_chat = self.right_panel_tab == RightPanelTab::Chat;
         let chg_cnt = self.git_engine.changed_files.len();
@@ -1235,9 +1251,17 @@ impl IdeApplicationState {
             tab1.x + 23,
             tab1.y + 2,
             self.tr("AI 助手", "AI Chat"),
-            if is_chat { t.text_primary } else { t.text_muted },
+            if is_chat {
+                t.text_primary
+            } else {
+                t.text_muted
+            },
             58,
-            if is_chat { FontStyle::ChatMetaBold } else { FontStyle::ChatMeta },
+            if is_chat {
+                FontStyle::ChatMetaBold
+            } else {
+                FontStyle::ChatMeta
+            },
         );
         self.hit_regions
             .push((tab1, HitAction::SwitchRightPanelTab(RightPanelTab::Chat)));
@@ -1249,20 +1273,30 @@ impl IdeApplicationState {
         canvas.draw_changes_diff_icon(
             tab2.x + 6,
             tab2.y + 2,
-            if !is_chat { t.text_primary } else { t.text_muted },
+            if !is_chat {
+                t.text_primary
+            } else {
+                t.text_muted
+            },
         );
         canvas.draw_text_styled(
             tab2.x + 24,
             tab2.y + 2,
             &format!("{} ({chg_cnt})", self.tr("更改", "Changes")),
-            if !is_chat { t.text_primary } else { t.text_muted },
+            if !is_chat {
+                t.text_primary
+            } else {
+                t.text_muted
+            },
             76,
-            if !is_chat { FontStyle::ChatMetaBold } else { FontStyle::ChatMeta },
+            if !is_chat {
+                FontStyle::ChatMetaBold
+            } else {
+                FontStyle::ChatMeta
+            },
         );
-        self.hit_regions.push((
-            tab2,
-            HitAction::SwitchRightPanelTab(RightPanelTab::Changes),
-        ));
+        self.hit_regions
+            .push((tab2, HitAction::SwitchRightPanelTab(RightPanelTab::Changes)));
 
         // 右上角克制扁平动作按钮（默认无边框，悬停亮起）：[✦ 改写] [↻] [清空] [↶]
         let btn_hover_bg = blend_rgb(t.panel_bg, t.text_primary, 0.08);
@@ -1273,7 +1307,11 @@ impl IdeApplicationState {
         canvas.draw_rollback_icon(
             rb_btn.x + 4,
             rb_btn.y + 4,
-            if rb_btn.contains(hx, hy) { t.warning_yellow } else { t.text_muted },
+            if rb_btn.contains(hx, hy) {
+                t.warning_yellow
+            } else {
+                t.text_muted
+            },
         );
         self.hit_regions
             .push((rb_btn, HitAction::RevertLastCheckpoint));
@@ -1285,7 +1323,11 @@ impl IdeApplicationState {
         canvas.draw_trash_icon(
             clr_btn.x + 4,
             clr_btn.y + 4,
-            if clr_btn.contains(hx, hy) { t.text_primary } else { t.text_muted },
+            if clr_btn.contains(hx, hy) {
+                t.text_primary
+            } else {
+                t.text_muted
+            },
         );
         self.hit_regions.push((clr_btn, HitAction::ClearAgentChat));
 
@@ -1323,7 +1365,11 @@ impl IdeApplicationState {
                 ck_btn.x + 20,
                 ck_btn.y + 3,
                 self.tr("改写", "Edit"),
-                if ck_hov { t.text_primary } else { t.text_secondary },
+                if ck_hov {
+                    t.text_primary
+                } else {
+                    t.text_secondary
+                },
                 30,
                 FontStyle::ChatMeta,
             );
@@ -1368,7 +1414,8 @@ impl IdeApplicationState {
         let ref_btn = Rect::new(rect.x + rect.w - 36, header_y - 2, 26, 22);
         canvas.fill_rounded_rect(ref_btn, 4, t.window_bg);
         canvas.draw_refresh_icon(ref_btn.x + 6, ref_btn.y + 4, t.text_secondary);
-        self.hit_regions.push((ref_btn, HitAction::RefreshGitStatus));
+        self.hit_regions
+            .push((ref_btn, HitAction::RefreshGitStatus));
 
         let list_top = header_y + 24;
         let list_h = (rect.y + rect.h - list_top - 8).max(24);
@@ -1476,7 +1523,11 @@ impl IdeApplicationState {
         canvas.draw_text_centered(
             new_btn,
             self.tr("+ 新会话", "+ New"),
-            if new_hov { t.text_primary } else { t.accent_blue },
+            if new_hov {
+                t.text_primary
+            } else {
+                t.accent_blue
+            },
             FontStyle::ChatMetaBold,
         );
         self.hit_regions.push((new_btn, HitAction::NewAgentSession));
@@ -1488,7 +1539,11 @@ impl IdeApplicationState {
         canvas.draw_text_centered(
             all_btn,
             &format!("▾ {sessions_cnt}"),
-            if all_hov { t.text_primary } else { t.text_muted },
+            if all_hov {
+                t.text_primary
+            } else {
+                t.text_muted
+            },
             FontStyle::ChatMeta,
         );
         self.hit_regions
@@ -1558,7 +1613,11 @@ impl IdeApplicationState {
                 &title,
                 if is_cur { t.text_primary } else { t.text_muted },
                 (tab_rect.w - 32).max(16),
-                if is_cur { FontStyle::ChatMetaBold } else { FontStyle::ChatMeta },
+                if is_cur {
+                    FontStyle::ChatMetaBold
+                } else {
+                    FontStyle::ChatMeta
+                },
             );
             self.hit_regions
                 .push((tab_rect, HitAction::SelectAgentSession(idx)));
@@ -1595,16 +1654,22 @@ impl IdeApplicationState {
         } else {
             0
         };
-        let expanded_snip = self.expanded_composer_snippet_id.as_ref().and_then(|eid| {
-            pasted_snippets.iter().find(|s| &s.id == eid).cloned()
-        });
+        let expanded_snip = self
+            .expanded_composer_snippet_id
+            .as_ref()
+            .and_then(|eid| pasted_snippets.iter().find(|s| &s.id == eid).cloned());
         let drawer_h = if let Some(ref snip) = expanded_snip {
             let vis = snip.line_count.clamp(2, 5) as i32;
             24 + vis * 16 + 6
         } else {
             0
         };
-        let composer_h = 125 + tray_h + drawer_h;
+        let edit_banner_h = if self.editing_sent_msg_idx.is_some() {
+            24
+        } else {
+            0
+        };
+        let composer_h = 125 + tray_h + drawer_h + edit_banner_h;
         let composer_rect = Rect::new(
             rect.x + 10,
             rect.y + rect.h - composer_h - 10,
@@ -1612,9 +1677,31 @@ impl IdeApplicationState {
             composer_h,
         );
 
+        let supports_rewind = self.agent_hub.active_cli_supports_checkpoint_rewind();
+        let session_changed_files = if supports_rewind {
+            self.agent_hub.active_session_changed_files().to_vec()
+        } else {
+            Vec::new()
+        };
+        let files_drawer_h = if !session_changed_files.is_empty() {
+            if self.agent_changed_files_expanded {
+                let vis_rows = session_changed_files.len().min(5) as i32;
+                28 + vis_rows * 22 + 4
+            } else {
+                26
+            }
+        } else {
+            0
+        };
+        let chat_bottom_limit = if files_drawer_h > 0 {
+            composer_rect.y - files_drawer_h - 6
+        } else {
+            composer_rect.y
+        };
+
         // 2. 中部可滚动对话区（去掉多余常驻快捷方块，保持充足阅读空间）
         let chat_top = sess_bar_y + sess_bar_h + 6;
-        let chat_h = (composer_rect.y - chat_top - 8).max(40);
+        let chat_h = (chat_bottom_limit - chat_top - 8).max(40);
         let chat_area = Rect::new(rect.x + 8, chat_top, rect.w - 16, chat_h);
         self.agent_chat_area_rect = chat_area;
         let wrap_w = (chat_area.w - 28).max(80);
@@ -1623,8 +1710,8 @@ impl IdeApplicationState {
             .push((chat_area, HitAction::FocusAgentChatStream));
 
         let is_busy = self.agent_hub.is_active_session_busy();
-        let stream_preview = self.agent_hub.streaming_preview();
-        let stream_len = stream_preview.as_ref().map(|s| s.len()).unwrap_or(0);
+        let stream_progress = self.agent_hub.streaming_progress();
+        let stream_sig = stream_progress_signature(stream_progress.as_ref());
         let msg_count = self.agent_hub.messages.len();
         let session_id = self.agent_hub.active_session().id.clone();
 
@@ -1633,7 +1720,12 @@ impl IdeApplicationState {
             .agent_hub
             .messages
             .iter()
-            .flat_map(|m| m.attachments.iter().filter(|a| a.is_image).map(|a| a.path.clone()))
+            .flat_map(|m| {
+                m.attachments
+                    .iter()
+                    .filter(|a| a.is_image)
+                    .map(|a| a.path.clone())
+            })
             .collect();
         for img_p in image_paths {
             let _ = self.get_or_load_image_preview(&img_p);
@@ -1654,7 +1746,13 @@ impl IdeApplicationState {
                 let att_bit = (m.attachments.len() as u64).wrapping_mul(977);
                 p_bit ^ mf_bit ^ att_bit
             })
-            .fold(self.agent_chat_signature_salt, |acc, x| acc.wrapping_add(x));
+            .fold(
+                self.agent_chat_signature_salt
+                    ^ (u64::from(supports_rewind) << 40)
+                    ^ (self.editing_sent_msg_idx.unwrap_or(usize::MAX) as u64)
+                        .wrapping_mul(2654435761),
+                |acc, x| acc.wrapping_add(x),
+            );
         let scale_bits = canvas.scale_factor.to_bits();
 
         if msg_count == 0 && !is_busy {
@@ -1686,9 +1784,19 @@ impl IdeApplicationState {
                 applied_sig,
                 scale_bits,
                 is_busy,
-                stream_preview,
-                stream_len,
+                stream_progress,
+                stream_sig,
             );
+        }
+
+        if files_drawer_h > 0 {
+            let drawer_rect = Rect::new(
+                composer_rect.x,
+                composer_rect.y - files_drawer_h - 6,
+                composer_rect.w,
+                files_drawer_h,
+            );
+            self.render_agent_changed_files_bar(canvas, drawer_rect, &session_changed_files);
         }
 
         // 3. 绘制美观的底部 Composer 卡片（含附件托盘、图片直接缩略图预览、可折叠粘贴代码预览）
@@ -1700,6 +1808,7 @@ impl IdeApplicationState {
             expanded_snip.as_ref(),
             tray_h,
             drawer_h,
+            edit_banner_h,
             is_busy,
         );
 
@@ -1779,15 +1888,39 @@ impl IdeApplicationState {
 
         let starters: [(&'static str, &'static str, &'static str); 4] = match self.ui_lang {
             UiLanguage::ZhCn => [
-                ("✦ 解释当前代码", "分析核心流程", "请解释当前光标所在代码块的功能与关键逻辑"),
-                ("⚡ 生成单元测试", "覆盖边界条件", "请为当前函数生成 #[test] 单元测试补丁"),
-                ("🛡 安全错误处理", "清理 unwrap()", "请将当前代码中的 unwrap() 替换为安全的 expect()/错误处理"),
+                (
+                    "✦ 解释当前代码",
+                    "分析核心流程",
+                    "请解释当前光标所在代码块的功能与关键逻辑",
+                ),
+                (
+                    "⚡ 生成单元测试",
+                    "覆盖边界条件",
+                    "请为当前函数生成 #[test] 单元测试补丁",
+                ),
+                (
+                    "🛡 安全错误处理",
+                    "清理 unwrap()",
+                    "请将当前代码中的 unwrap() 替换为安全的 expect()/错误处理",
+                ),
                 ("🛠 检查工作区编译", "cargo check", "/check"),
             ],
             UiLanguage::EnUs => [
-                ("✦ Explain Code", "Trace logic", "Please explain the functionality and key logic of the code around cursor"),
-                ("⚡ Unit Tests", "Add #[test]", "Please generate a #[test] unit test patch for the current function"),
-                ("🛡 Safe Errors", "Fix unwrap()", "Please replace unwrap() calls with safe expect()/error handling"),
+                (
+                    "✦ Explain Code",
+                    "Trace logic",
+                    "Please explain the functionality and key logic of the code around cursor",
+                ),
+                (
+                    "⚡ Unit Tests",
+                    "Add #[test]",
+                    "Please generate a #[test] unit test patch for the current function",
+                ),
+                (
+                    "🛡 Safe Errors",
+                    "Fix unwrap()",
+                    "Please replace unwrap() calls with safe expect()/error handling",
+                ),
                 ("🛠 Workspace Check", "cargo check", "/check"),
             ],
         };
@@ -1810,8 +1943,16 @@ impl IdeApplicationState {
                 canvas.stroke_rounded_rect(
                     tile,
                     8,
-                    if hov { t.accent_blue } else { blend_rgb(t.border_color, t.panel_bg, 0.45) },
-                    if hov { t.popup_hover_bg } else { blend_rgb(t.panel_bg, t.editor_bg, 0.4) },
+                    if hov {
+                        t.accent_blue
+                    } else {
+                        blend_rgb(t.border_color, t.panel_bg, 0.45)
+                    },
+                    if hov {
+                        t.popup_hover_bg
+                    } else {
+                        blend_rgb(t.panel_bg, t.editor_bg, 0.4)
+                    },
                 );
                 canvas.draw_text_styled(
                     tile.x + 10,
@@ -1859,13 +2000,12 @@ impl IdeApplicationState {
         applied_sig: u64,
         scale_bits: u32,
         is_busy: bool,
-        stream_preview: Option<String>,
-        stream_len: usize,
+        stream_progress: Option<StreamingAgentProgress>,
+        stream_sig: u64,
     ) {
         let t = self.theme;
         let (hx, hy) = self.hover_pos;
-        let stream_sig = (stream_len as u64).wrapping_mul(104_729);
-        let combined_sig = applied_sig ^ stream_sig;
+        let combined_sig = applied_sig ^ stream_sig.wrapping_mul(104_729);
 
         let cache_key_match = self.cached_chat_rows.session_id == session_id
             && self.cached_chat_rows.msg_count == msg_count
@@ -1875,7 +2015,8 @@ impl IdeApplicationState {
             && self.cached_chat_rows.is_busy == is_busy;
 
         if !cache_key_match {
-            let user_max_content_w = ((wrap_w as f32 * 0.80) as i32).clamp(110, (wrap_w - 24).max(110));
+            let user_max_content_w =
+                ((wrap_w as f32 * 0.80) as i32).clamp(110, (wrap_w - 24).max(110));
             let mut rebuilt: Vec<CachedChatRow> = Vec::with_capacity(msg_count * 7 + 6);
             for (msg_idx, msg) in self.agent_hub.messages.iter().enumerate() {
                 if msg.role == "user" {
@@ -1929,8 +2070,13 @@ impl IdeApplicationState {
                                 .get(&msg_idx)
                                 .copied()
                                 .unwrap_or(false);
-                            let one_line: String =
-                                thought.lines().next().unwrap_or("").chars().take(48).collect();
+                            let one_line: String = thought
+                                .lines()
+                                .next()
+                                .unwrap_or("")
+                                .chars()
+                                .take(48)
+                                .collect();
                             rebuilt.push(CachedChatRow::ThoughtToggle {
                                 msg_idx,
                                 preview: one_line,
@@ -1961,10 +2107,10 @@ impl IdeApplicationState {
                         &self.collapsed_code_blocks,
                         &mut rebuilt,
                     );
-                    if !msg.modified_files.is_empty() {
-                        rebuilt.push(CachedChatRow::ModifiedFilesHeader(
-                            msg.modified_files.len(),
-                        ));
+                    if !msg.modified_files.is_empty()
+                        && !self.agent_hub.active_cli_supports_checkpoint_rewind()
+                    {
+                        rebuilt.push(CachedChatRow::ModifiedFilesHeader(msg.modified_files.len()));
                         for path in &msg.modified_files {
                             let rel = path
                                 .strip_prefix(&self.workspace_root)
@@ -1997,38 +2143,87 @@ impl IdeApplicationState {
                 rebuilt.push(CachedChatRow::Spacer);
             }
 
-            if let Some(stream_txt) = stream_preview {
-                if !stream_txt.trim().is_empty() {
-                    rebuilt.push(CachedChatRow::AgentHeader {
-                        msg_idx: usize::MAX,
-                        agent_name: self.agent_hub.active_provider.compact_name().to_string(),
-                    });
-                    for raw_l in stream_txt.lines() {
-                        if raw_l.trim().is_empty() {
-                            rebuilt.push(CachedChatRow::ParaSpacer {
-                                is_user: false,
-                                bubble_w: 0,
-                            });
-                            continue;
+            if is_busy || stream_progress.is_some() {
+                rebuilt.push(CachedChatRow::AgentHeader {
+                    msg_idx: usize::MAX,
+                    agent_name: self.agent_hub.active_provider.compact_name().to_string(),
+                });
+                if let Some(prog) = stream_progress {
+                    if !prog.thought_text.trim().is_empty() {
+                        let mut thought_lines = Vec::new();
+                        for raw_tl in prog.thought_text.trim().lines() {
+                            if raw_tl.trim().is_empty() {
+                                continue;
+                            }
+                            for (_, _, tl) in wrap_chat_line_segments(
+                                canvas,
+                                raw_tl.trim(),
+                                (wrap_w - 22).max(60),
+                                FontStyle::ChatMeta,
+                            ) {
+                                thought_lines.push(tl);
+                            }
                         }
-                        let (clean_l, _, raw_spans) = parse_markdown_inline_line(raw_l);
-                        for (seg_s, seg_e, seg_txt) in wrap_chat_line_segments(
+                        let start = thought_lines.len().saturating_sub(6);
+                        for tl in thought_lines.into_iter().skip(start) {
+                            rebuilt.push(CachedChatRow::LiveThoughtLine(tl));
+                        }
+                    }
+
+                    if !prog.reply_text.trim().is_empty() {
+                        for raw_l in prog.reply_text.lines() {
+                            if raw_l.trim().is_empty() {
+                                rebuilt.push(CachedChatRow::ParaSpacer {
+                                    is_user: false,
+                                    bubble_w: 0,
+                                });
+                                continue;
+                            }
+                            let (clean_l, _, raw_spans) = parse_markdown_inline_line(raw_l);
+                            for (seg_s, seg_e, seg_txt) in wrap_chat_line_segments(
+                                canvas,
+                                &clean_l,
+                                (wrap_w - 14).max(60),
+                                FontStyle::ChatBody,
+                            ) {
+                                let spans = project_and_merge_spans(
+                                    &self.workspace_root,
+                                    &seg_txt,
+                                    seg_s,
+                                    seg_e,
+                                    &raw_spans,
+                                );
+                                rebuilt.push(CachedChatRow::StreamingLine {
+                                    text: seg_txt,
+                                    spans,
+                                });
+                            }
+                        }
+                    }
+
+                    if !prog.execution_steps.is_empty() {
+                        let skip_steps = prog.execution_steps.len().saturating_sub(6);
+                        for step in prog.execution_steps.iter().skip(skip_steps) {
+                            for (_, _, seg) in wrap_chat_line_segments(
+                                canvas,
+                                step,
+                                (wrap_w - 22).max(60),
+                                FontStyle::ChatMeta,
+                            ) {
+                                rebuilt.push(CachedChatRow::LiveStepLine(seg));
+                            }
+                        }
+                    } else if prog.thought_text.trim().is_empty()
+                        && prog.reply_text.trim().is_empty()
+                        && !prog.phase.trim().is_empty()
+                    {
+                        for (_, _, seg) in wrap_chat_line_segments(
                             canvas,
-                            &clean_l,
-                            (wrap_w - 14).max(60),
-                            FontStyle::ChatBody,
+                            prog.phase.trim(),
+                            (wrap_w - 22).max(60),
+                            FontStyle::ChatMeta,
                         ) {
-                            let spans = project_and_merge_spans(
-                                &self.workspace_root,
-                                &seg_txt,
-                                seg_s,
-                                seg_e,
-                                &raw_spans,
-                            );
-                            rebuilt.push(CachedChatRow::StreamingLine {
-                                text: seg_txt,
-                                spans,
-                            });
+                            rebuilt.push(CachedChatRow::LiveStepLine(seg));
                         }
                     }
                 }
@@ -2037,6 +2232,10 @@ impl IdeApplicationState {
                 rebuilt.push(CachedChatRow::BusyIndicator);
             }
 
+            let prev_max_s = self
+                .cached_chat_rows
+                .max_scroll_row_for_height(chat_area.h - 4);
+            let was_at_bottom = self.agent_scroll == usize::MAX || self.agent_scroll >= prev_max_s;
             let mut cache = AgentChatCache {
                 session_id: session_id.to_string(),
                 msg_count,
@@ -2050,10 +2249,15 @@ impl IdeApplicationState {
             };
             cache.recompute_offsets();
             self.cached_chat_rows = cache;
+            if was_at_bottom {
+                self.agent_scroll = usize::MAX;
+            }
         }
 
         let total_rows = self.cached_chat_rows.rows.len();
-        let max_s = self.cached_chat_rows.max_scroll_row_for_height(chat_area.h - 4);
+        let max_s = self
+            .cached_chat_rows
+            .max_scroll_row_for_height(chat_area.h - 4);
         if self.agent_scroll == usize::MAX || self.agent_scroll > max_s {
             self.agent_scroll = max_s;
         }
@@ -2111,10 +2315,23 @@ impl IdeApplicationState {
                         yw + 4,
                         FontStyle::ChatMeta,
                     );
-                    let copy_btn = Rect::new((right_edge_x - *bubble_w).max(row_rect.x), cy + 2, 34, 17);
+                    let show_edit = self.agent_hub.active_cli_supports_checkpoint_rewind()
+                        && !self.agent_hub.is_active_session_busy();
+                    let is_editing_this =
+                        show_edit && self.editing_sent_msg_idx == Some(*msg_idx);
+                    let edit_w = if is_editing_this { 46 } else { 34 };
+                    let total_btn_w = if show_edit { 34 + 4 + edit_w } else { 34 };
+                    let bubble_left = (right_edge_x - *bubble_w).max(row_rect.x);
+                    let btns_x = bubble_left.min(lbl_x - total_btn_w - 6).max(row_rect.x);
+
+                    let copy_btn = Rect::new(btns_x, cy + 2, 34, 17);
                     let chov = copy_btn.contains(hx, hy);
                     if chov {
-                        canvas.fill_rounded_rect(copy_btn, 4, blend_rgb(t.panel_bg, t.text_primary, 0.08));
+                        canvas.fill_rounded_rect(
+                            copy_btn,
+                            4,
+                            blend_rgb(t.panel_bg, t.text_primary, 0.08),
+                        );
                     }
                     canvas.draw_text_centered(
                         copy_btn,
@@ -2128,6 +2345,46 @@ impl IdeApplicationState {
                     );
                     self.hit_regions
                         .push((copy_btn, HitAction::CopyAgentMessage(*msg_idx)));
+
+                    if show_edit {
+                        let edit_btn = Rect::new(copy_btn.x + 38, cy + 2, edit_w, 17);
+                        if edit_btn.x + edit_btn.w <= lbl_x - 4 {
+                            let ehov = edit_btn.contains(hx, hy);
+                            if is_editing_this {
+                                canvas.fill_rounded_rect(
+                                    edit_btn,
+                                    4,
+                                    blend_rgb(t.panel_bg, t.accent_blue, 0.22),
+                                );
+                            } else if ehov {
+                                canvas.fill_rounded_rect(
+                                    edit_btn,
+                                    4,
+                                    blend_rgb(t.panel_bg, t.text_primary, 0.08),
+                                );
+                            }
+                            canvas.draw_text_centered(
+                                edit_btn,
+                                if is_editing_this {
+                                    self.tr("编辑中", "Editing")
+                                } else {
+                                    self.tr("编辑", "Edit")
+                                },
+                                if is_editing_this {
+                                    t.accent_blue
+                                } else if ehov {
+                                    t.text_primary
+                                } else {
+                                    blend_rgb(t.editor_bg, t.text_muted, 0.55)
+                                },
+                                FontStyle::ChatMeta,
+                            );
+                            if !is_editing_this {
+                                self.hit_regions
+                                    .push((edit_btn, HitAction::StartEditSentUserMessage(*msg_idx)));
+                            }
+                        }
+                    }
                 }
                 CachedChatRow::UserBubbleTop { bubble_w } => {
                     let bx = (right_edge_x - *bubble_w).max(row_rect.x);
@@ -2189,10 +2446,18 @@ impl IdeApplicationState {
                         canvas.stroke_rounded_rect(
                             chip,
                             4,
-                            if hov { t.accent_blue } else { user_bubble_border },
+                            if hov {
+                                t.accent_blue
+                            } else {
+                                user_bubble_border
+                            },
                             t.editor_bg,
                         );
-                        canvas.draw_file_type_icon(chip.x + 5, chip.y + 3, LanguageId::from_path(path));
+                        canvas.draw_file_type_icon(
+                            chip.x + 5,
+                            chip.y + 3,
+                            LanguageId::from_path(path),
+                        );
                         canvas.draw_text_styled(
                             chip.x + 21,
                             chip.y + 2,
@@ -2217,7 +2482,11 @@ impl IdeApplicationState {
                         canvas.stroke_rounded_rect(
                             card,
                             6,
-                            if hov { t.accent_blue } else { user_bubble_border },
+                            if hov {
+                                t.accent_blue
+                            } else {
+                                user_bubble_border
+                            },
                             t.editor_bg,
                         );
                         let thumb_rect = Rect::new(card.x + 6, card.y + 4, 68, card.h - 8);
@@ -2233,7 +2502,12 @@ impl IdeApplicationState {
                             );
                         } else {
                             canvas.stroke_rounded_rect(thumb_rect, 5, t.border_color, t.panel_bg);
-                            canvas.draw_text_centered(thumb_rect, "IMG", t.text_muted, FontStyle::ChatMeta);
+                            canvas.draw_text_centered(
+                                thumb_rect,
+                                "IMG",
+                                t.text_muted,
+                                FontStyle::ChatMeta,
+                            );
                         }
                         let info_x = thumb_rect.x + thumb_rect.w + 10;
                         let info_w = (card.x + card.w - info_x - 8).max(40);
@@ -2296,7 +2570,11 @@ impl IdeApplicationState {
                         let copy_btn = Rect::new(row_rect.x + row_rect.w - 38, cy + 3, 34, 17);
                         let chov = copy_btn.contains(hx, hy);
                         if chov {
-                            canvas.fill_rounded_rect(copy_btn, 4, blend_rgb(t.panel_bg, t.text_primary, 0.08));
+                            canvas.fill_rounded_rect(
+                                copy_btn,
+                                4,
+                                blend_rgb(t.panel_bg, t.text_primary, 0.08),
+                            );
                         }
                         canvas.draw_text_centered(
                             copy_btn,
@@ -2316,7 +2594,11 @@ impl IdeApplicationState {
                     let pill = Rect::new(row_rect.x + 2, cy + 1, row_rect.w - 4, 20);
                     let hov = pill.contains(hx, hy);
                     if hov {
-                        canvas.fill_rounded_rect(pill, 4, blend_rgb(t.panel_bg, t.text_primary, 0.05));
+                        canvas.fill_rounded_rect(
+                            pill,
+                            4,
+                            blend_rgb(t.panel_bg, t.text_primary, 0.05),
+                        );
                     }
                     let glyph = if *expanded { "▾" } else { "▸" };
                     let lbl = if *expanded {
@@ -2395,7 +2677,11 @@ impl IdeApplicationState {
                         hdr.x + 10,
                         hdr.y + 4,
                         &format!("{arrow}  {lang} · {line_count} {}", self.tr("行", "lines")),
-                        if col_hov { t.text_primary } else { t.text_secondary },
+                        if col_hov {
+                            t.text_primary
+                        } else {
+                            t.text_secondary
+                        },
                         hdr.w - 116,
                         FontStyle::ChatCodeBold,
                     );
@@ -2419,7 +2705,11 @@ impl IdeApplicationState {
                     let copy_btn = Rect::new(hdr.x + hdr.w - 60, hdr.y + 3, 54, 18);
                     let chov = copy_btn.contains(hx, hy);
                     if chov {
-                        canvas.fill_rounded_rect(copy_btn, 4, blend_rgb(t.panel_bg, t.text_primary, 0.1));
+                        canvas.fill_rounded_rect(
+                            copy_btn,
+                            4,
+                            blend_rgb(t.panel_bg, t.text_primary, 0.1),
+                        );
                     }
                     canvas.draw_text_centered(
                         copy_btn,
@@ -2441,7 +2731,11 @@ impl IdeApplicationState {
                     canvas.stroke_rounded_rect(
                         srect,
                         5,
-                        if hov { t.accent_blue } else { blend_rgb(t.border_color, t.panel_bg, 0.45) },
+                        if hov {
+                            t.accent_blue
+                        } else {
+                            blend_rgb(t.border_color, t.panel_bg, 0.45)
+                        },
                         code_block_bg,
                     );
                     let fold_lbl = match self.ui_lang {
@@ -2456,8 +2750,10 @@ impl IdeApplicationState {
                         srect.w - 18,
                         FontStyle::ChatCode,
                     );
-                    self.hit_regions
-                        .push((srect, HitAction::ToggleCodeBlockCollapse(*msg_idx, *blk_idx)));
+                    self.hit_regions.push((
+                        srect,
+                        HitAction::ToggleCodeBlockCollapse(*msg_idx, *blk_idx),
+                    ));
                 }
                 CachedChatRow::CodeBlockLine { text, lang } => {
                     let crect = Rect::new(row_rect.x + 2, cy, row_rect.w - 4, row_h);
@@ -2496,7 +2792,11 @@ impl IdeApplicationState {
                     canvas.stroke_rounded_rect(
                         chip,
                         5,
-                        if hov { t.accent_blue } else { blend_rgb(t.border_color, t.panel_bg, 0.45) },
+                        if hov {
+                            t.accent_blue
+                        } else {
+                            blend_rgb(t.border_color, t.panel_bg, 0.45)
+                        },
                         if hov { t.popup_hover_bg } else { code_block_bg },
                     );
                     let lang = LanguageId::from_path(path);
@@ -2519,6 +2819,48 @@ impl IdeApplicationState {
                     );
                     self.hit_regions
                         .push((chip, HitAction::OpenFileAtLine(path.clone(), None)));
+                }
+                CachedChatRow::LiveThoughtLine(txt) => {
+                    canvas.fill_rect(
+                        Rect::new(row_rect.x + 8, cy, 1, row_h),
+                        blend_rgb(t.border_color, t.panel_bg, 0.40),
+                    );
+                    self.draw_chat_line_with_spans_and_selection(
+                        canvas,
+                        row_rect,
+                        row_rect.x + 16,
+                        cy + 1,
+                        *global_row_idx,
+                        txt,
+                        &[],
+                        false,
+                        t.text_muted,
+                        wrap_w - 16,
+                        FontStyle::ChatMeta,
+                    );
+                }
+                CachedChatRow::LiveStepLine(txt) => {
+                    canvas.draw_text_styled(
+                        row_rect.x + 4,
+                        cy + 1,
+                        "›",
+                        t.text_muted,
+                        10,
+                        FontStyle::ChatMeta,
+                    );
+                    self.draw_chat_line_with_spans_and_selection(
+                        canvas,
+                        row_rect,
+                        row_rect.x + 16,
+                        cy + 1,
+                        *global_row_idx,
+                        txt,
+                        &[],
+                        false,
+                        blend_rgb(t.text_muted, t.text_secondary, 0.35),
+                        wrap_w - 16,
+                        FontStyle::ChatMeta,
+                    );
                 }
                 CachedChatRow::StreamingLine { text, spans } => {
                     self.draw_chat_line_with_spans_and_selection(
@@ -2636,10 +2978,8 @@ impl IdeApplicationState {
                     } else {
                         format!("{elapsed_secs}s")
                     };
-                    let busy_lbl = format!(
-                        "{}  {elapsed_str}",
-                        self.tr("处理中...", "Processing...")
-                    );
+                    let busy_lbl =
+                        format!("{}  {elapsed_str}", self.tr("处理中...", "Processing..."));
                     canvas.draw_text_styled(
                         row_rect.x + 22,
                         cy + 5,
@@ -2669,6 +3009,200 @@ impl IdeApplicationState {
         );
     }
 
+    fn render_agent_changed_files_bar(
+        &mut self,
+        canvas: &mut SurfaceCanvas,
+        rect: Rect,
+        changed_files: &[ide_agent_hub::SessionFileChange],
+    ) {
+        let t = self.theme;
+        let (hx, hy) = self.hover_pos;
+        let bar_bg = if t.kind == ThemeKind::IslandsLight {
+            blend_rgb(t.panel_bg, t.editor_bg, 0.45)
+        } else {
+            blend_rgb(t.editor_bg, t.panel_bg, 0.30)
+        };
+        let border = blend_rgb(t.border_color, t.panel_bg, 0.45);
+        canvas.stroke_rounded_rect(rect, 7, border, bar_bg);
+
+        let total_add: usize = changed_files.iter().map(|f| f.added_lines).sum();
+        let total_del: usize = changed_files.iter().map(|f| f.removed_lines).sum();
+        let arrow = if self.agent_changed_files_expanded {
+            "▾"
+        } else {
+            "▸"
+        };
+        let title = match self.ui_lang {
+            UiLanguage::ZhCn => format!("{arrow}  已更改 {} 个文件", changed_files.len()),
+            UiLanguage::EnUs => format!("{arrow}  {} files changed", changed_files.len()),
+        };
+
+        let hdr_rect = Rect::new(rect.x, rect.y, rect.w, 26);
+        let revert_btn = Rect::new(rect.x + rect.w - 50, rect.y + 4, 44, 18);
+        let keep_btn = Rect::new(revert_btn.x - 46, rect.y + 4, 42, 18);
+        let toggle_rect = Rect::new(
+            hdr_rect.x + 2,
+            hdr_rect.y + 1,
+            (keep_btn.x - hdr_rect.x - 6).max(40),
+            24,
+        );
+        if toggle_rect.contains(hx, hy) {
+            canvas.fill_rounded_rect(
+                toggle_rect,
+                5,
+                blend_rgb(bar_bg, t.text_primary, 0.05),
+            );
+        }
+        let (tw, _) = canvas.measure_text(&title, FontStyle::ChatMetaBold);
+        canvas.draw_text_styled(
+            toggle_rect.x + 8,
+            toggle_rect.y + 4,
+            &title,
+            t.text_primary,
+            (toggle_rect.w - 12).max(24),
+            FontStyle::ChatMetaBold,
+        );
+        let mut sx = toggle_rect.x + 8 + tw + 8;
+        if total_add > 0 && sx + 28 < keep_btn.x {
+            let add_s = format!("+{total_add}");
+            let (aw, _) = canvas.measure_text(&add_s, FontStyle::ChatMeta);
+            canvas.draw_text_styled(
+                sx,
+                toggle_rect.y + 4,
+                &add_s,
+                t.run_green,
+                aw + 4,
+                FontStyle::ChatMeta,
+            );
+            sx += aw + 6;
+        }
+        if total_del > 0 && sx + 28 < keep_btn.x {
+            let del_s = format!("-{total_del}");
+            let (dw, _) = canvas.measure_text(&del_s, FontStyle::ChatMeta);
+            canvas.draw_text_styled(
+                sx,
+                toggle_rect.y + 4,
+                &del_s,
+                t.breakpoint_red,
+                dw + 4,
+                FontStyle::ChatMeta,
+            );
+        }
+        self.hit_regions
+            .push((toggle_rect, HitAction::ToggleAgentChangedFilesDrawer));
+
+        let keep_hov = keep_btn.contains(hx, hy);
+        canvas.fill_rounded_rect(
+            keep_btn,
+            4,
+            if keep_hov {
+                blend_rgb(bar_bg, t.text_primary, 0.09)
+            } else {
+                blend_rgb(bar_bg, t.text_primary, 0.04)
+            },
+        );
+        canvas.draw_text_centered(
+            keep_btn,
+            self.tr("保留", "Keep"),
+            if keep_hov { t.text_primary } else { t.text_secondary },
+            FontStyle::ChatMeta,
+        );
+        self.hit_regions
+            .push((keep_btn, HitAction::KeepAllAgentChangedFiles));
+
+        let rev_hov = revert_btn.contains(hx, hy);
+        canvas.fill_rounded_rect(
+            revert_btn,
+            4,
+            if rev_hov {
+                blend_rgb(bar_bg, t.breakpoint_red, 0.18)
+            } else {
+                blend_rgb(bar_bg, t.text_primary, 0.04)
+            },
+        );
+        canvas.draw_text_centered(
+            revert_btn,
+            self.tr("回退", "Revert"),
+            if rev_hov {
+                t.breakpoint_red
+            } else {
+                t.text_muted
+            },
+            FontStyle::ChatMeta,
+        );
+        self.hit_regions
+            .push((revert_btn, HitAction::RevertAllAgentChangedFiles));
+
+        if !self.agent_changed_files_expanded {
+            return;
+        }
+
+        canvas.fill_rect(
+            Rect::new(rect.x + 8, rect.y + 27, rect.w - 16, 1),
+            blend_rgb(border, bar_bg, 0.55),
+        );
+        let mut ry = rect.y + 29;
+        for ch in changed_files.iter().take(5) {
+            if ry + 20 > rect.y + rect.h - 2 {
+                break;
+            }
+            let row_r = Rect::new(rect.x + 6, ry, rect.w - 12, 20);
+            let rev_one = Rect::new(row_r.x + row_r.w - 22, ry + 1, 20, 18);
+            let rhov = rev_one.contains(hx, hy);
+            let open_r = Rect::new(row_r.x, ry, (rev_one.x - row_r.x - 4).max(40), 20);
+            if open_r.contains(hx, hy) {
+                canvas.fill_rounded_rect(open_r, 4, blend_rgb(bar_bg, t.text_primary, 0.06));
+            }
+            canvas.draw_file_type_icon(
+                open_r.x + 4,
+                ry + 3,
+                LanguageId::from_path(&ch.path),
+            );
+            let rel = ch
+                .path
+                .strip_prefix(&self.workspace_root)
+                .unwrap_or(&ch.path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let diff_txt = format!("+{} -{}", ch.added_lines, ch.removed_lines);
+            let (df_w, _) = canvas.measure_text(&diff_txt, FontStyle::ChatMeta);
+            let name_max_w = (open_r.w - df_w - 34).max(32);
+            canvas.draw_text_styled(
+                open_r.x + 22,
+                ry + 2,
+                &rel,
+                t.text_secondary,
+                name_max_w,
+                FontStyle::ChatMeta,
+            );
+            let add_str = format!("+{}", ch.added_lines);
+            let del_str = format!("-{}", ch.removed_lines);
+            let (aw, _) = canvas.measure_text(&add_str, FontStyle::ChatMeta);
+            let (dw, _) = canvas.measure_text(&del_str, FontStyle::ChatMeta);
+            let del_x = rev_one.x - dw - 6;
+            let add_x = del_x - aw - 5;
+            if add_x > open_r.x + 30 {
+                canvas.draw_text_styled(add_x, ry + 2, &add_str, t.run_green, aw + 2, FontStyle::ChatMeta);
+                canvas.draw_text_styled(del_x, ry + 2, &del_str, t.breakpoint_red, dw + 2, FontStyle::ChatMeta);
+            }
+            self.hit_regions
+                .push((open_r, HitAction::OpenFileAtLine(ch.path.clone(), None)));
+
+            if rhov {
+                canvas.fill_rounded_rect(rev_one, 4, blend_rgb(bar_bg, t.breakpoint_red, 0.16));
+            }
+            canvas.draw_text_centered(
+                rev_one,
+                "↶",
+                if rhov { t.breakpoint_red } else { t.text_muted },
+                FontStyle::ChatMeta,
+            );
+            self.hit_regions
+                .push((rev_one, HitAction::RevertSingleAgentChangedFile(ch.path.clone())));
+            ry += 22;
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn render_agent_composer(
         &mut self,
@@ -2679,6 +3213,7 @@ impl IdeApplicationState {
         expanded_snip: Option<&ide_agent_hub::PastedCodeSnippet>,
         tray_h: i32,
         drawer_h: i32,
+        edit_banner_h: i32,
         is_busy: bool,
     ) {
         let t = self.theme;
@@ -2689,13 +3224,50 @@ impl IdeApplicationState {
         } else {
             blend_rgb(t.editor_bg, t.panel_bg, 0.14)
         };
-        let composer_border = if is_focused {
-            blend_rgb(t.border_color, t.accent_blue, 0.55)
+        let composer_border = if self.editing_sent_msg_idx.is_some() || is_focused {
+            blend_rgb(t.border_color, t.accent_blue, 0.65)
         } else {
             blend_rgb(t.border_color, t.panel_bg, 0.35)
         };
         let hover_pill_bg = blend_rgb(composer_bg, t.text_primary, 0.08);
         canvas.stroke_rounded_rect(composer_rect, 10, composer_border, composer_bg);
+
+        if let Some(edit_idx) = self.editing_sent_msg_idx {
+            let banner = Rect::new(composer_rect.x + 6, composer_rect.y + 4, composer_rect.w - 12, 20);
+            canvas.fill_rounded_rect(banner, 5, blend_rgb(composer_bg, t.accent_blue, 0.16));
+            let banner_txt = match self.ui_lang {
+                UiLanguage::ZhCn => format!(
+                    "✎ 正在编辑已发送消息 #{} · Enter 确认修改，Esc 取消",
+                    edit_idx + 1
+                ),
+                UiLanguage::EnUs => format!(
+                    "✎ Editing sent message #{} · Enter to review rewind, Esc to cancel",
+                    edit_idx + 1
+                ),
+            };
+            canvas.draw_text_styled(
+                banner.x + 8,
+                banner.y + 2,
+                &banner_txt,
+                t.accent_blue,
+                (banner.w - 54).max(40),
+                FontStyle::ChatMeta,
+            );
+            let cancel_r = Rect::new(banner.x + banner.w - 42, banner.y + 1, 38, 18);
+            let chov = cancel_r.contains(hx, hy);
+            if chov {
+                canvas.fill_rounded_rect(cancel_r, 4, hover_pill_bg);
+            }
+            canvas.draw_text_centered(
+                cancel_r,
+                self.tr("取消", "Cancel"),
+                if chov { t.text_primary } else { t.text_secondary },
+                FontStyle::ChatMeta,
+            );
+            self.hit_regions
+                .push((cancel_r, HitAction::CancelEditSentUserMessage));
+        }
+        let inner_top = composer_rect.y + edit_banner_h;
 
         // 1. Composer 顶部精简上下文与推理选项行：[@file]   [⚡ Fast] [High]
         let active_buf = self.active_buffer();
@@ -2710,7 +3282,7 @@ impl IdeApplicationState {
             self.tr("+ 关联文件", "+ Attach file").to_string()
         };
         let (cw, _) = canvas.measure_text(&ctx_text, FontStyle::ChatMeta);
-        let ctx_pill = Rect::new(composer_rect.x + 10, composer_rect.y + 6, cw + 12, 18);
+        let ctx_pill = Rect::new(composer_rect.x + 10, inner_top + 6, cw + 12, 18);
         let ctx_hov = ctx_pill.contains(hx, hy);
         canvas.fill_rounded_rect(
             ctx_pill,
@@ -2745,7 +3317,7 @@ impl IdeApplicationState {
             };
             let (ew, _) = canvas.measure_text(eff_txt, FontStyle::ChatMeta);
             let ew_pill = ew + 14;
-            let eff_pill = Rect::new(opt_rx - ew_pill, composer_rect.y + 6, ew_pill, 18);
+            let eff_pill = Rect::new(opt_rx - ew_pill, inner_top + 6, ew_pill, 18);
             if eff_pill.x > ctx_pill.x + ctx_pill.w + 6 {
                 let ehov = eff_pill.contains(hx, hy);
                 if ehov {
@@ -2754,7 +3326,11 @@ impl IdeApplicationState {
                 canvas.draw_text_centered(
                     eff_pill,
                     eff_txt,
-                    if ehov { t.text_primary } else { t.text_secondary },
+                    if ehov {
+                        t.text_primary
+                    } else {
+                        t.text_secondary
+                    },
                     FontStyle::ChatMeta,
                 );
                 self.hit_regions
@@ -2771,7 +3347,7 @@ impl IdeApplicationState {
             };
             let (fw, _) = canvas.measure_text(fast_txt, FontStyle::ChatMeta);
             let fw_pill = fw + 12;
-            let fast_pill = Rect::new(opt_rx - fw_pill, composer_rect.y + 6, fw_pill, 18);
+            let fast_pill = Rect::new(opt_rx - fw_pill, inner_top + 6, fw_pill, 18);
             if fast_pill.x > ctx_pill.x + ctx_pill.w + 6 {
                 let fhov = fast_pill.contains(hx, hy);
                 if is_fast {
@@ -2801,7 +3377,7 @@ impl IdeApplicationState {
         }
 
         // 2. 附件与折叠代码托盘（拖拽的图片直接缩略图预览 + 文件芯片 + 折叠粘贴代码芯片）
-        let mut cursor_y = composer_rect.y + 30;
+        let mut cursor_y = inner_top + 30;
         if tray_h > 0 {
             let mut tx = composer_rect.x + 10;
             let max_tx = composer_rect.x + composer_rect.w - 10;
@@ -2852,13 +3428,19 @@ impl IdeApplicationState {
                     if rm_hov { t.breakpoint_red } else { t.panel_bg },
                 );
                 canvas.draw_text_centered(rm_btn, "×", 0xFFFFFF, FontStyle::ChatMeta);
-                self.hit_regions
-                    .push((rm_btn, HitAction::RemoveComposerAttachment(item.path.clone())));
+                self.hit_regions.push((
+                    rm_btn,
+                    HitAction::RemoveComposerAttachment(item.path.clone()),
+                ));
 
                 tx += card_w + 6;
             }
 
-            let chip_y = if tray_h > 30 { cursor_y + 14 } else { cursor_y + 2 };
+            let chip_y = if tray_h > 30 {
+                cursor_y + 14
+            } else {
+                cursor_y + 2
+            };
             for item in attached_items.iter().filter(|a| !a.is_image) {
                 let (nw, _) = canvas.measure_text(&item.display_name, FontStyle::ChatMeta);
                 let cw_chip = (nw + 38).clamp(64, 150);
@@ -2873,7 +3455,11 @@ impl IdeApplicationState {
                     if hov { t.accent_blue } else { t.border_color },
                     t.panel_bg,
                 );
-                canvas.draw_file_type_icon(chip.x + 5, chip.y + 4, LanguageId::from_path(&item.path));
+                canvas.draw_file_type_icon(
+                    chip.x + 5,
+                    chip.y + 4,
+                    LanguageId::from_path(&item.path),
+                );
                 canvas.draw_text_styled(
                     chip.x + 21,
                     chip.y + 3,
@@ -2888,7 +3474,11 @@ impl IdeApplicationState {
                 canvas.draw_text_centered(
                     rm,
                     "×",
-                    if rm.contains(hx, hy) { t.breakpoint_red } else { t.text_muted },
+                    if rm.contains(hx, hy) {
+                        t.breakpoint_red
+                    } else {
+                        t.text_muted
+                    },
                     FontStyle::ChatMeta,
                 );
                 self.hit_regions
@@ -2921,13 +3511,19 @@ impl IdeApplicationState {
                     chip.w - 24,
                     FontStyle::ChatMeta,
                 );
-                self.hit_regions
-                    .push((chip, HitAction::ToggleComposerPastedSnippet(snip.id.clone())));
+                self.hit_regions.push((
+                    chip,
+                    HitAction::ToggleComposerPastedSnippet(snip.id.clone()),
+                ));
                 let rm = Rect::new(chip.x + chip.w - 16, chip.y + 3, 14, 16);
                 canvas.draw_text_centered(
                     rm,
                     "×",
-                    if rm.contains(hx, hy) { t.breakpoint_red } else { t.text_muted },
+                    if rm.contains(hx, hy) {
+                        t.breakpoint_red
+                    } else {
+                        t.text_muted
+                    },
                     FontStyle::ChatMeta,
                 );
                 self.hit_regions
@@ -2949,7 +3545,10 @@ impl IdeApplicationState {
             canvas.draw_text_styled(
                 drect.x + 8,
                 drect.y + 3,
-                &format!("</> {} · {} 行（发送时默认折叠展示）", snip.title, snip.line_count),
+                &format!(
+                    "</> {} · {} 行（发送时默认折叠展示）",
+                    snip.title, snip.line_count
+                ),
                 t.syn_function,
                 drect.w - 32,
                 FontStyle::ChatMeta,
@@ -3063,7 +3662,11 @@ impl IdeApplicationState {
             agent_pill.x + 15,
             agent_pill.y + 3,
             agent_short,
-            if agent_hov { t.text_primary } else { t.text_secondary },
+            if agent_hov {
+                t.text_primary
+            } else {
+                t.text_secondary
+            },
             aw + 4,
             FontStyle::ChatMeta,
         );
@@ -3100,7 +3703,11 @@ impl IdeApplicationState {
                 model_pill.x + 7,
                 model_pill.y + 3,
                 short_model,
-                if model_hov { t.text_primary } else { t.text_secondary },
+                if model_hov {
+                    t.text_primary
+                } else {
+                    t.text_secondary
+                },
                 mw_pill - 18,
                 FontStyle::ChatMeta,
             );
@@ -3132,13 +3739,21 @@ impl IdeApplicationState {
             mode_pill.x + 6,
             mode_pill.y + 5,
             mode_icon_kind,
-            if mode_hov { t.text_primary } else { mode_accent },
+            if mode_hov {
+                t.text_primary
+            } else {
+                mode_accent
+            },
         );
         canvas.draw_text_styled(
             mode_pill.x + 20,
             mode_pill.y + 3,
             mode_label,
-            if mode_hov { t.text_primary } else { mode_accent },
+            if mode_hov {
+                t.text_primary
+            } else {
+                mode_accent
+            },
             mw + 4,
             FontStyle::ChatMetaBold,
         );
@@ -3174,15 +3789,27 @@ impl IdeApplicationState {
                 send_btn,
                 6,
                 if has_text {
-                    if send_hov { blend_rgb(t.accent_blue, 0xFFFFFF, 0.15) } else { t.accent_blue }
+                    if send_hov {
+                        blend_rgb(t.accent_blue, 0xFFFFFF, 0.15)
+                    } else {
+                        t.accent_blue
+                    }
                 } else {
-                    blend_rgb(composer_bg, t.text_primary, if send_hov { 0.16 } else { 0.10 })
+                    blend_rgb(
+                        composer_bg,
+                        t.text_primary,
+                        if send_hov { 0.16 } else { 0.10 },
+                    )
                 },
             );
             canvas.draw_send_up_icon(
                 send_btn.x + 5,
                 send_btn.y + 5,
-                if has_text || send_hov { 0xFFFFFF } else { t.text_secondary },
+                if has_text || send_hov {
+                    0xFFFFFF
+                } else {
+                    t.text_secondary
+                },
             );
             self.hit_regions
                 .push((send_btn, HitAction::SubmitAgentChatPrompt));
@@ -3195,7 +3822,11 @@ impl IdeApplicationState {
         canvas.draw_plus_icon(
             attach_btn.x + 5,
             attach_btn.y + 5,
-            if attach_hov { t.text_primary } else { t.text_muted },
+            if attach_hov {
+                t.text_primary
+            } else {
+                t.text_muted
+            },
         );
         self.hit_regions
             .push((attach_btn, HitAction::AttachActiveFileToAgent));
@@ -3262,7 +3893,11 @@ impl IdeApplicationState {
                 &title,
                 if is_cur { 0xFFFFFF } else { t.text_primary },
                 row.w - 86,
-                if is_cur { FontStyle::UiBold } else { FontStyle::UiRegular },
+                if is_cur {
+                    FontStyle::UiBold
+                } else {
+                    FontStyle::UiRegular
+                },
             );
             canvas.draw_text_styled(
                 row.x + row.w - 62,
@@ -3309,7 +3944,12 @@ impl IdeApplicationState {
         self.hit_regions.push((new_row, HitAction::NewAgentSession));
     }
 
-    pub(crate) fn render_image_preview_modal(&mut self, canvas: &mut SurfaceCanvas, w: i32, h: i32) {
+    pub(crate) fn render_image_preview_modal(
+        &mut self,
+        canvas: &mut SurfaceCanvas,
+        w: i32,
+        h: i32,
+    ) {
         let Some(img_path) = self.active_image_preview.clone() else {
             return;
         };
@@ -3407,10 +4047,7 @@ impl IdeApplicationState {
             return;
         };
         let t = self.theme;
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("file");
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
         let over_agent = self.right_agent_open && self.right_pane_rect.contains(cx, cy);
         let label = if over_agent {
             format!("📎 附加 `{name}`")
@@ -3424,7 +4061,11 @@ impl IdeApplicationState {
             pill,
             6,
             t.accent_blue,
-            if over_agent { t.popup_hover_bg } else { t.popup_bg },
+            if over_agent {
+                t.popup_hover_bg
+            } else {
+                t.popup_bg
+            },
         );
         canvas.draw_text_centered(pill, &label, 0xFFFFFF, FontStyle::UiSmall);
     }
@@ -3436,7 +4077,8 @@ impl IdeApplicationState {
         let pw = 372.min((self.right_pane_rect.w - 16).max(260));
         let ph = 42 + (providers.len() as i32) * 28;
         let px = (self.right_pane_rect.x + 12).min(
-            (self.right_pane_rect.x + self.right_pane_rect.w - pw - 10).max(self.right_pane_rect.x + 10),
+            (self.right_pane_rect.x + self.right_pane_rect.w - pw - 10)
+                .max(self.right_pane_rect.x + 10),
         );
         let py = if self.agent_provider_pill_rect.h > 0 {
             (self.agent_provider_pill_rect.y - ph - 6).max(46)
@@ -3468,13 +4110,21 @@ impl IdeApplicationState {
         canvas.stroke_rounded_rect(
             hub_pill,
             4,
-            if hub_hov { t.accent_blue } else { t.border_color },
+            if hub_hov {
+                t.accent_blue
+            } else {
+                t.border_color
+            },
             t.window_bg,
         );
         canvas.draw_text_centered(
             hub_pill,
             self.tr("总览", "Hub"),
-            if hub_hov { t.accent_blue } else { t.text_secondary },
+            if hub_hov {
+                t.accent_blue
+            } else {
+                t.text_secondary
+            },
             FontStyle::ChatMeta,
         );
         self.hit_regions
@@ -3485,13 +4135,21 @@ impl IdeApplicationState {
         canvas.stroke_rounded_rect(
             sync_pill,
             4,
-            if sync_hov { t.accent_blue } else { t.border_color },
+            if sync_hov {
+                t.accent_blue
+            } else {
+                t.border_color
+            },
             t.window_bg,
         );
         canvas.draw_text_centered(
             sync_pill,
             self.tr("↻ 刷新", "↻ Sync"),
-            if sync_hov { t.accent_blue } else { t.text_secondary },
+            if sync_hov {
+                t.accent_blue
+            } else {
+                t.text_secondary
+            },
             FontStyle::ChatMeta,
         );
         self.hit_regions
@@ -3528,7 +4186,11 @@ impl IdeApplicationState {
                 reg.kind.display_name(),
                 if sel { 0xFFFFFF } else { t.text_primary },
                 pw - 148,
-                if sel { FontStyle::ChatBodyBold } else { FontStyle::ChatBody },
+                if sel {
+                    FontStyle::ChatBodyBold
+                } else {
+                    FontStyle::ChatBody
+                },
             );
             let badge_txt = if reg.available {
                 reg.active_model
@@ -3603,7 +4265,10 @@ impl IdeApplicationState {
         canvas.draw_text_styled(
             px + 12,
             py + 24,
-            &format!("{}: {resolved_model}", self.tr("实际调用 ID", "Resolved ID")),
+            &format!(
+                "{}: {resolved_model}",
+                self.tr("实际调用 ID", "Resolved ID")
+            ),
             t.syn_function,
             pw - 24,
             FontStyle::ChatCode,
@@ -3613,13 +4278,21 @@ impl IdeApplicationState {
         canvas.stroke_rounded_rect(
             sync_pill,
             4,
-            if sync_hov { t.accent_blue } else { t.border_color },
+            if sync_hov {
+                t.accent_blue
+            } else {
+                t.border_color
+            },
             t.window_bg,
         );
         canvas.draw_text_centered(
             sync_pill,
             self.tr("↻ 同步", "↻ Sync"),
-            if sync_hov { t.accent_blue } else { t.text_secondary },
+            if sync_hov {
+                t.accent_blue
+            } else {
+                t.text_secondary
+            },
             FontStyle::ChatMeta,
         );
         self.hit_regions
@@ -3647,10 +4320,13 @@ impl IdeApplicationState {
                 &format!("{prefix}{m}"),
                 if sel { 0xFFFFFF } else { t.text_primary },
                 pw - 28,
-                if sel { FontStyle::ChatCodeBold } else { FontStyle::ChatCode },
+                if sel {
+                    FontStyle::ChatCodeBold
+                } else {
+                    FontStyle::ChatCode
+                },
             );
-            self.hit_regions
-                .push((row, HitAction::SelectAgentModel(m)));
+            self.hit_regions.push((row, HitAction::SelectAgentModel(m)));
             ry += 25;
         }
     }
@@ -3758,7 +4434,11 @@ impl IdeApplicationState {
             canvas.draw_text_centered(
                 badge_rect,
                 flag_txt,
-                if sel { t.text_primary } else { t.text_secondary },
+                if sel {
+                    t.text_primary
+                } else {
+                    t.text_secondary
+                },
                 FontStyle::ChatCode,
             );
 
@@ -3846,13 +4526,21 @@ impl IdeApplicationState {
         canvas.stroke_rounded_rect(
             sync_btn,
             5,
-            if sync_hov { t.accent_blue } else { t.border_color },
+            if sync_hov {
+                t.accent_blue
+            } else {
+                t.border_color
+            },
             t.window_bg,
         );
         canvas.draw_text_centered(
             sync_btn,
             self.tr("↻ 重新扫描", "↻ Rescan"),
-            if sync_hov { t.accent_blue } else { t.text_primary },
+            if sync_hov {
+                t.accent_blue
+            } else {
+                t.text_primary
+            },
             FontStyle::UiSmall,
         );
         self.hit_regions
@@ -3867,7 +4555,11 @@ impl IdeApplicationState {
             canvas.stroke_rounded_rect(
                 row,
                 6,
-                if sel || hov { t.accent_blue } else { t.border_color },
+                if sel || hov {
+                    t.accent_blue
+                } else {
+                    t.border_color
+                },
                 if sel { t.popup_hover_bg } else { t.editor_bg },
             );
             canvas.fill_circle(
@@ -3886,7 +4578,11 @@ impl IdeApplicationState {
                 reg.kind.display_name(),
                 if sel { 0xFFFFFF } else { t.text_primary },
                 180,
-                if sel { FontStyle::UiBold } else { FontStyle::UiRegular },
+                if sel {
+                    FontStyle::UiBold
+                } else {
+                    FontStyle::UiRegular
+                },
             );
             canvas.draw_text_styled(
                 row.x + 210,

@@ -8,7 +8,8 @@ pub mod types;
 
 pub use acp::AcpProtocol;
 pub use cli_discovery::{
-    discover_local_cli_registrations, normalize_cursor_base_model, resolve_agy_model_and_effort,
+    discover_local_cli_registrations, normalize_cursor_base_model,
+    parse_cli_rewind_capabilities, probe_cli_rewind_capabilities, resolve_agy_model_and_effort,
     resolve_cursor_model_id,
 };
 pub use cli_runner::{detect_workspace_file_references, parse_path_and_line_token};
@@ -17,5 +18,6 @@ pub use tools::{extract_enclosing_block, extract_first_fenced_code_block, load_w
 pub use types::{
     AgentAttachedItem, AgentChatMessage, AgentProviderKind, AgentRegistration, AgentSession,
     AgentWakeupCallback, AgentWorkbenchMode, AiApiConfig, AiApiFormat, IdeCodeContext,
-    InlineEditSession, PastedCodeSnippet, ProposedFilePatch, ReasoningEffort, WorkspaceCheckpoint,
+    InlineEditSession, PastedCodeSnippet, PersistedAgentHistory, ProposedFilePatch,
+    ReasoningEffort, SessionFileChange, StreamingAgentProgress, TurnSyncAnchor, WorkspaceCheckpoint,
 };

@@ -1,10 +1,10 @@
 use crate::acp::execute_acp_stdio_session;
 use crate::cli_discovery::{
-    discover_local_cli_registrations, probe_agy_cli_models, probe_cursor_cli_list_models,
-    probe_gemini_cli_list_models, push_unique_model, resolve_agy_model_and_effort,
+    discover_local_cli_registrations, probe_agy_cli_models, probe_cli_rewind_capabilities,
+    probe_cursor_cli_list_models, push_unique_model, resolve_agy_model_and_effort,
     resolve_cursor_model_id,
 };
-use crate::cli_runner::{execute_cli_once, CliRunParams};
+use crate::cli_runner::{compute_file_diff_counts, execute_cli_once, CliRunParams};
 use crate::http_fallback::{execute_agent_tool_loop, execute_curl_llm_streaming};
 use crate::tools::{
     extract_enclosing_block, extract_first_fenced_code_block, load_workspace_agent_rules,
@@ -13,7 +13,8 @@ use crate::tools::{
 use crate::types::{
     AgentAttachedItem, AgentChatMessage, AgentProviderKind, AgentRegistration, AgentSession,
     AgentWakeupCallback, AgentWorkbenchMode, AiApiConfig, IdeCodeContext, InlineEditSession,
-    PastedCodeSnippet, ReasoningEffort, WorkspaceCheckpoint,
+    PastedCodeSnippet, PersistedAgentHistory, ReasoningEffort, SessionFileChange,
+    StreamingAgentProgress, TurnSyncAnchor, WorkspaceCheckpoint,
 };
 use ide_core::LanguageId;
 use ide_search::find_in_files;
@@ -53,6 +54,16 @@ struct DiscoveredModelUpdate {
     kind: AgentProviderKind,
     display_models: Vec<String>,
     exact_catalog: Vec<String>,
+    supports_session_resume: Option<bool>,
+    supports_checkpoint_rewind: Option<bool>,
+}
+
+struct CliTurnSyncUpdate {
+    session_id: String,
+    user_msg_idx: usize,
+    cli_session_id: Option<String>,
+    checkpoint_backups: HashMap<PathBuf, Option<String>>,
+    file_diff_stats: HashMap<PathBuf, (usize, usize)>,
 }
 
 pub struct AgentHub {
@@ -70,14 +81,16 @@ pub struct AgentHub {
     pub is_busy: Arc<AtomicBool>,
     cancel_requested: Arc<AtomicBool>,
     active_child_pid: Arc<Mutex<Option<u32>>>,
-    streaming_text: Arc<Mutex<Option<String>>>,
+    streaming_text: Arc<Mutex<Option<StreamingAgentProgress>>>,
     streaming_session_id: Arc<Mutex<Option<String>>>,
     async_inbox: Arc<Mutex<Vec<(String, AgentChatMessage)>>>,
     async_checkpoints_inbox: Arc<Mutex<Vec<(String, WorkspaceCheckpoint)>>>,
+    async_cli_sync_inbox: Arc<Mutex<Vec<CliTurnSyncUpdate>>>,
     modified_files_inbox: Arc<Mutex<Vec<PathBuf>>>,
     async_inline_result: Arc<Mutex<Option<(PendingInlineMeta, Result<String, String>)>>>,
     async_commit_msg: Arc<Mutex<Option<Result<String, String>>>>,
     async_discovered_models: Arc<Mutex<Vec<DiscoveredModelUpdate>>>,
+    history_file_path: Option<PathBuf>,
     wakeup: Option<AgentWakeupCallback>,
 }
 
@@ -111,7 +124,7 @@ impl AgentHub {
             .map(|p| format!("{} [{}]", p.kind.short_name(), p.active_model))
             .collect();
         let route_summary = if detected_summary.is_empty() {
-            "未检测到本地 CLI（请安装 cursor-agent / agy / claude / codex / gemini CLI）"
+            "未检测到本地 CLI（请安装 cursor-agent / agy / claude / codex CLI）"
                 .to_string()
         } else {
             format!("已自动发现本地 CLI 与模型：{}", detected_summary.join(" · "))
@@ -149,6 +162,10 @@ impl AgentHub {
             draft_prompt: String::new(),
             is_busy: false,
             created_order: 1,
+            cli_session_id: None,
+            pending_fork_session: false,
+            changed_files: Vec::new(),
+            turn_anchors: Vec::new(),
         };
 
         let hub = Self {
@@ -170,16 +187,101 @@ impl AgentHub {
             streaming_session_id: Arc::new(Mutex::new(None)),
             async_inbox: Arc::new(Mutex::new(Vec::new())),
             async_checkpoints_inbox: Arc::new(Mutex::new(Vec::new())),
+            async_cli_sync_inbox: Arc::new(Mutex::new(Vec::new())),
             modified_files_inbox: Arc::new(Mutex::new(Vec::new())),
             async_inline_result: Arc::new(Mutex::new(None)),
             async_commit_msg: Arc::new(Mutex::new(None)),
             async_discovered_models: Arc::new(Mutex::new(Vec::new())),
+            history_file_path: None,
             wakeup,
         };
         if hub.wakeup.is_some() {
             hub.spawn_async_cli_model_probe();
         }
         hub
+    }
+
+    pub fn set_history_file_path(&mut self, path: Option<PathBuf>) {
+        self.history_file_path = path.clone();
+        if let Some(p) = path {
+            if let Ok(raw) = fs::read_to_string(&p) {
+                if let Ok(hist) = serde_json::from_str::<PersistedAgentHistory>(&raw) {
+                    if !hist.sessions.is_empty() {
+                        self.import_history(hist);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn export_history(&self) -> PersistedAgentHistory {
+        let mut sessions = self.sessions.clone();
+        let active_idx = self.active_session_idx.min(sessions.len().saturating_sub(1));
+        if let Some(s) = sessions.get_mut(active_idx) {
+            s.messages = self.messages.clone();
+            s.checkpoints = self.checkpoints.clone();
+            s.provider = self.active_provider;
+            s.active_model = self.active_model();
+            s.fast_mode = self.active_fast_mode();
+            s.reasoning_effort = self.active_reasoning_effort();
+        }
+        for s in &mut sessions {
+            s.is_busy = false;
+        }
+        PersistedAgentHistory {
+            active_provider: self.active_provider,
+            sessions,
+            active_session_idx: active_idx,
+            next_session_seq: self.next_session_seq,
+        }
+    }
+
+    pub fn save_history(&self) {
+        let Some(path) = &self.history_file_path else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(&self.export_history()) {
+            let _ = fs::write(path, json);
+        }
+    }
+
+    pub fn import_history(&mut self, mut hist: PersistedAgentHistory) {
+        if hist.sessions.is_empty() {
+            return;
+        }
+        for s in &mut hist.sessions {
+            s.is_busy = false;
+        }
+        let target_idx = hist.active_session_idx.min(hist.sessions.len() - 1);
+        self.sessions = hist.sessions;
+        self.next_session_seq = hist.next_session_seq.max(self.sessions.len() + 1);
+        self.active_session_idx = target_idx;
+        let s = &self.sessions[target_idx];
+        self.messages = s.messages.clone();
+        self.checkpoints = s.checkpoints.clone();
+        self.active_provider = if s.provider != AgentProviderKind::CustomLlmApi
+            || hist.active_provider == AgentProviderKind::CustomLlmApi
+        {
+            s.provider
+        } else {
+            hist.active_provider
+        };
+        let prov = self.active_provider;
+        let model = s.active_model.clone();
+        let fast = s.fast_mode;
+        let effort = s.reasoning_effort;
+        if let Some(reg) = self.providers.iter_mut().find(|p| p.kind == prov) {
+            if !model.is_empty() {
+                reg.active_model = model.clone();
+                push_unique_model(&mut reg.discovered_models, model);
+            }
+            reg.fast_mode = fast;
+            reg.reasoning_effort = effort;
+        }
+        self.update_registration_status(prov);
     }
 
     pub fn set_wakeup(&mut self, wakeup: Option<AgentWakeupCallback>) {
@@ -249,6 +351,38 @@ impl AgentHub {
 
     pub fn supports_reasoning_effort(&self) -> bool {
         self.effective_provider_kind().supports_reasoning_effort()
+    }
+
+    pub fn active_cli_supports_session_resume(&self) -> bool {
+        if self.active_provider == AgentProviderKind::CustomLlmApi {
+            return false;
+        }
+        self.active_registration()
+            .map(|r| r.available && r.supports_session_resume)
+            .unwrap_or(false)
+    }
+
+    pub fn active_cli_supports_checkpoint_rewind(&self) -> bool {
+        if self.active_provider == AgentProviderKind::CustomLlmApi {
+            return false;
+        }
+        self.active_registration()
+            .map(|r| r.available && r.supports_checkpoint_rewind)
+            .unwrap_or(false)
+    }
+
+    pub fn set_provider_capabilities(
+        &mut self,
+        kind: AgentProviderKind,
+        available: bool,
+        supports_session_resume: bool,
+        supports_checkpoint_rewind: bool,
+    ) {
+        if let Some(reg) = self.providers.iter_mut().find(|p| p.kind == kind) {
+            reg.available = available;
+            reg.supports_session_resume = supports_session_resume;
+            reg.supports_checkpoint_rewind = supports_checkpoint_rewind;
+        }
     }
 
     pub fn supported_modes_for_active(&self) -> &'static [AgentWorkbenchMode] {
@@ -407,65 +541,33 @@ impl AgentHub {
     }
 
     fn spawn_async_cli_model_probe(&self) {
-        let cursor_bin = self
+        let bins: Vec<(AgentProviderKind, PathBuf)> = self
             .providers
             .iter()
-            .find(|p| p.kind == AgentProviderKind::CursorCli)
-            .and_then(|p| p.binary_path.clone());
-        let agy_bin = self
-            .providers
-            .iter()
-            .find(|p| p.kind == AgentProviderKind::GoogleAntigravityAcp)
-            .and_then(|p| p.binary_path.clone());
-        let gemini_bin = self
-            .providers
-            .iter()
-            .find(|p| p.kind == AgentProviderKind::GeminiCli)
-            .and_then(|p| p.binary_path.clone());
+            .filter_map(|p| p.binary_path.clone().map(|b| (p.kind, b)))
+            .collect();
 
-        if let Some(bin) = cursor_bin {
+        for (kind, bin) in bins {
             let slot = self.async_discovered_models.clone();
             let wakeup = self.wakeup.clone();
             thread::spawn(move || {
-                if let Some((base_models, exact_models)) = probe_cursor_cli_list_models(&bin) {
-                    slot.lock().push(DiscoveredModelUpdate {
-                        kind: AgentProviderKind::CursorCli,
-                        display_models: base_models,
-                        exact_catalog: exact_models,
-                    });
-                    if let Some(cb) = wakeup {
-                        cb();
+                let (display_models, exact_catalog) = match kind {
+                    AgentProviderKind::CursorCli => probe_cursor_cli_list_models(&bin)
+                        .unwrap_or_default(),
+                    AgentProviderKind::GoogleAntigravityAcp => {
+                        let m = probe_agy_cli_models(&bin).unwrap_or_default();
+                        (m.clone(), m)
                     }
-                }
-            });
-        }
-
-        if let Some(bin) = agy_bin {
-            let slot = self.async_discovered_models.clone();
-            let wakeup = self.wakeup.clone();
-            thread::spawn(move || {
-                if let Some(models) = probe_agy_cli_models(&bin) {
+                    _ => (Vec::new(), Vec::new()),
+                };
+                let caps = probe_cli_rewind_capabilities(kind, &bin);
+                if !display_models.is_empty() || !exact_catalog.is_empty() || caps.is_some() {
                     slot.lock().push(DiscoveredModelUpdate {
-                        kind: AgentProviderKind::GoogleAntigravityAcp,
-                        display_models: models.clone(),
-                        exact_catalog: models,
-                    });
-                    if let Some(cb) = wakeup {
-                        cb();
-                    }
-                }
-            });
-        }
-
-        if let Some(bin) = gemini_bin {
-            let slot = self.async_discovered_models.clone();
-            let wakeup = self.wakeup.clone();
-            thread::spawn(move || {
-                if let Some(models) = probe_gemini_cli_list_models(&bin) {
-                    slot.lock().push(DiscoveredModelUpdate {
-                        kind: AgentProviderKind::GeminiCli,
-                        display_models: models.clone(),
-                        exact_catalog: models,
+                        kind,
+                        display_models,
+                        exact_catalog,
+                        supports_session_resume: caps.map(|c| c.0),
+                        supports_checkpoint_rewind: caps.map(|c| c.1),
                     });
                     if let Some(cb) = wakeup {
                         cb();
@@ -562,10 +664,15 @@ impl AgentHub {
             draft_prompt: String::new(),
             is_busy: false,
             created_order: seq,
+            cli_session_id: None,
+            pending_fork_session: false,
+            changed_files: Vec::new(),
+            turn_anchors: Vec::new(),
         };
         self.sessions.push(sess);
         let new_idx = self.sessions.len() - 1;
         self.sync_session_in(new_idx);
+        self.save_history();
         new_idx
     }
 
@@ -575,6 +682,7 @@ impl AgentHub {
         }
         self.sync_active_session_out();
         self.sync_session_in(target_idx);
+        self.save_history();
         true
     }
 
@@ -595,6 +703,7 @@ impl AgentHub {
             s.pasted_snippets.clear();
             s.draft_prompt.clear();
             s.is_busy = false;
+            self.save_history();
             return true;
         }
         self.sync_active_session_out();
@@ -605,6 +714,7 @@ impl AgentHub {
             self.active_session_idx.min(self.sessions.len() - 1)
         };
         self.sync_session_in(next_idx);
+        self.save_history();
         true
     }
 
@@ -616,6 +726,7 @@ impl AgentHub {
         let s = self.active_session_mut();
         s.title = t;
         s.custom_title = true;
+        self.save_history();
     }
 
     pub fn attach_item_to_active_session(&mut self, item: AgentAttachedItem) {
@@ -651,11 +762,31 @@ impl AgentHub {
         self.streaming_session_id.lock().as_deref() == Some(active_id)
     }
 
-    pub fn streaming_preview(&self) -> Option<String> {
+    pub fn streaming_progress(&self) -> Option<StreamingAgentProgress> {
         if !self.is_active_session_busy() {
             return None;
         }
         self.streaming_text.lock().clone()
+    }
+
+    pub fn set_active_streaming_progress(&mut self, progress: Option<StreamingAgentProgress>) {
+        let sid = self.active_session().id.clone();
+        match progress {
+            Some(p) => {
+                *self.streaming_session_id.lock() = Some(sid);
+                *self.streaming_text.lock() = Some(p);
+                self.is_busy.store(true, Ordering::SeqCst);
+            }
+            None => {
+                *self.streaming_session_id.lock() = None;
+                *self.streaming_text.lock() = None;
+                self.is_busy.store(false, Ordering::SeqCst);
+            }
+        }
+    }
+
+    pub fn streaming_preview(&self) -> Option<String> {
+        self.streaming_progress().map(|p| p.to_preview_string())
     }
 
     pub fn cancel_active_request(&mut self) {
@@ -680,17 +811,29 @@ impl AgentHub {
         }
         let target_sid = self.streaming_session_id.lock().take();
         self.is_busy.store(false, Ordering::SeqCst);
-        let partial = self.streaming_text.lock().take().unwrap_or_default();
-        let content = if partial.trim().is_empty() {
-            "⏹ 已取消当前 AI 请求。".to_string()
-        } else {
-            format!("{}\n\n[⏹ 已手动停止生成]", partial.trim_end())
+        let partial = self.streaming_text.lock().take();
+        let (content, thought) = match partial {
+            Some(prog) => {
+                let c = if prog.reply_text.trim().is_empty() {
+                    "⏹ 已取消当前 AI 请求。".to_string()
+                } else {
+                    format!("{}\n\n[⏹ 已手动停止生成]", prog.reply_text.trim_end())
+                };
+                let t = prog
+                    .format_thought_summary()
+                    .unwrap_or_else(|| "Request cancelled by user.".to_string());
+                (c, Some(t))
+            }
+            None => (
+                "⏹ 已取消当前 AI 请求。".to_string(),
+                Some("Request cancelled by user.".to_string()),
+            ),
         };
         let msg = AgentChatMessage {
             role: "assistant".to_string(),
             agent: self.active_provider,
             content,
-            thought: Some("Request cancelled by user.".to_string()),
+            thought,
             checkpoint_id: None,
             patch: None,
             modified_files: Vec::new(),
@@ -706,6 +849,7 @@ impl AgentHub {
             }
         }
         self.active_session_mut().is_busy = false;
+        self.save_history();
         if let Some(cb) = &self.wakeup {
             cb();
         }
@@ -737,6 +881,12 @@ impl AgentHub {
                 if !upd.exact_catalog.is_empty() {
                     reg.exact_model_catalog = upd.exact_catalog;
                 }
+                if let Some(res) = upd.supports_session_resume {
+                    reg.supports_session_resume = res;
+                }
+                if let Some(rw) = upd.supports_checkpoint_rewind {
+                    reg.supports_checkpoint_rewind = rw;
+                }
                 if reg.active_model.is_empty() {
                     if let Some(first) = reg.discovered_models.first() {
                         reg.active_model = first.clone();
@@ -749,6 +899,7 @@ impl AgentHub {
                 self.update_registration_status(upd.kind);
             }
         }
+        let mut history_dirty = false;
         let active_id = self.active_session().id.clone();
         {
             let mut ck_inbox = self.async_checkpoints_inbox.lock();
@@ -759,6 +910,7 @@ impl AgentHub {
                     sess.checkpoints.push(ckpt);
                 }
                 changed = true;
+                history_dirty = true;
             }
         }
         {
@@ -770,9 +922,260 @@ impl AgentHub {
                     sess.messages.push(msg);
                 }
                 changed = true;
+                history_dirty = true;
             }
         }
+        {
+            let syncs: Vec<CliTurnSyncUpdate> = self.async_cli_sync_inbox.lock().drain(..).collect();
+            for sync in syncs {
+                self.apply_cli_turn_sync_update(sync, &active_id);
+                changed = true;
+                history_dirty = true;
+            }
+        }
+        if history_dirty {
+            self.save_history();
+        }
         changed
+    }
+
+    fn apply_cli_turn_sync_update(&mut self, sync: CliTurnSyncUpdate, active_id: &str) {
+        let target_is_active = sync.session_id == active_id;
+        let ckpt_id = if !sync.checkpoint_backups.is_empty() {
+            let id = format!("ckpt-{}", &Uuid::new_v4().to_string()[..8]);
+            let ckpt = WorkspaceCheckpoint {
+                id: id.clone(),
+                label: format!("CLI turn {} ({} files)", sync.user_msg_idx + 1, sync.checkpoint_backups.len()),
+                file_backups: sync.checkpoint_backups.clone(),
+            };
+            if target_is_active {
+                self.checkpoints.push(ckpt);
+            } else if let Some(sess) = self.sessions.iter_mut().find(|s| s.id == sync.session_id) {
+                sess.checkpoints.push(ckpt);
+            }
+            Some(id)
+        } else {
+            None
+        };
+
+        if let Some(sess) = self.sessions.iter_mut().find(|s| s.id == sync.session_id) {
+            if let Some(sid) = sync.cli_session_id {
+                sess.cli_session_id = Some(sid);
+            }
+            if let Some(cid) = ckpt_id {
+                if let Some(anchor) = sess
+                    .turn_anchors
+                    .iter_mut()
+                    .find(|a| a.user_msg_idx == sync.user_msg_idx)
+                {
+                    anchor.checkpoint_id = Some(cid);
+                } else {
+                    sess.turn_anchors.push(TurnSyncAnchor {
+                        user_msg_idx: sync.user_msg_idx,
+                        pre_turn_cli_session_id: None,
+                        checkpoint_id: Some(cid),
+                    });
+                }
+            }
+            for (path, baseline) in sync.checkpoint_backups {
+                let (added, removed) = sync
+                    .file_diff_stats
+                    .get(&path)
+                    .copied()
+                    .unwrap_or((0, 0));
+                if let Some(existing) = sess.changed_files.iter_mut().find(|f| f.path == path) {
+                    let after = fs::read_to_string(&path).unwrap_or_default();
+                    let (new_add, new_del) = compute_file_diff_counts(
+                        existing.original_content.as_deref().unwrap_or(""),
+                        &after,
+                    );
+                    existing.added_lines = new_add;
+                    existing.removed_lines = new_del;
+                } else {
+                    sess.changed_files.push(SessionFileChange {
+                        path,
+                        added_lines: added,
+                        removed_lines: removed,
+                        original_content: baseline,
+                        first_turn_msg_idx: sync.user_msg_idx,
+                    });
+                }
+            }
+        }
+    }
+
+    pub fn active_session_changed_files(&self) -> &[SessionFileChange] {
+        &self.active_session().changed_files
+    }
+
+    pub fn count_rewind_impact(&self, user_msg_idx: usize) -> (usize, Vec<PathBuf>) {
+        let dropped = self.messages.len().saturating_sub(user_msg_idx + 1);
+        let mut affected: Vec<PathBuf> = Vec::new();
+        for ch in &self.active_session().changed_files {
+            if ch.first_turn_msg_idx >= user_msg_idx && !affected.contains(&ch.path) {
+                affected.push(ch.path.clone());
+            }
+        }
+        for msg in self.messages.iter().skip(user_msg_idx) {
+            for p in &msg.modified_files {
+                if !affected.contains(p) {
+                    affected.push(p.clone());
+                }
+            }
+        }
+        let target_ckpts: Vec<&str> = self
+            .active_session()
+            .turn_anchors
+            .iter()
+            .filter(|a| a.user_msg_idx >= user_msg_idx)
+            .filter_map(|a| a.checkpoint_id.as_deref())
+            .collect();
+        for ckpt in &self.checkpoints {
+            if target_ckpts.contains(&ckpt.id.as_str()) {
+                for p in ckpt.file_backups.keys() {
+                    if !affected.contains(p) {
+                        affected.push(p.clone());
+                    }
+                }
+            }
+        }
+        (dropped, affected)
+    }
+
+    fn restore_file_backup(path: &Path, backup: Option<&str>) {
+        match backup {
+            Some(content) => {
+                if let Some(parent) = path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let _ = fs::write(path, content);
+            }
+            None => {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+
+    pub fn revert_session_changed_file(&mut self, path: &Path) -> bool {
+        let sess = self.active_session_mut();
+        let Some(pos) = sess.changed_files.iter().position(|f| f.path == path) else {
+            return false;
+        };
+        let entry = sess.changed_files.remove(pos);
+        Self::restore_file_backup(&entry.path, entry.original_content.as_deref());
+        self.save_history();
+        true
+    }
+
+    pub fn revert_all_session_changed_files(&mut self) -> Vec<PathBuf> {
+        let entries: Vec<SessionFileChange> = self
+            .active_session_mut()
+            .changed_files
+            .drain(..)
+            .collect();
+        let mut restored = Vec::with_capacity(entries.len());
+        for entry in entries {
+            Self::restore_file_backup(&entry.path, entry.original_content.as_deref());
+            restored.push(entry.path);
+        }
+        self.save_history();
+        restored
+    }
+
+    pub fn keep_all_session_changed_files(&mut self) {
+        self.active_session_mut().changed_files.clear();
+        self.save_history();
+    }
+
+    pub fn edit_message_and_rewind(
+        &mut self,
+        user_msg_idx: usize,
+        new_prompt: String,
+        revert_files: bool,
+        mode: AgentWorkbenchMode,
+        ctx: Option<&IdeCodeContext>,
+    ) -> Vec<PathBuf> {
+        if user_msg_idx >= self.messages.len() || self.is_busy.load(Ordering::Relaxed) {
+            return Vec::new();
+        }
+        let mut restored_paths: Vec<PathBuf> = Vec::new();
+
+        let (pre_turn_sid, target_ckpt_ids): (Option<String>, Vec<String>) = {
+            let sess = self.active_session();
+            let sid = sess
+                .turn_anchors
+                .iter()
+                .find(|a| a.user_msg_idx == user_msg_idx)
+                .and_then(|a| a.pre_turn_cli_session_id.clone());
+            let ckpts = sess
+                .turn_anchors
+                .iter()
+                .filter(|a| a.user_msg_idx >= user_msg_idx)
+                .filter_map(|a| a.checkpoint_id.clone())
+                .collect();
+            (sid, ckpts)
+        };
+
+        if revert_files {
+            // 按逆序从新到旧回放受影响轮次的快照，使最早状态生效
+            let mut remaining = Vec::with_capacity(self.checkpoints.len());
+            let mut to_restore = Vec::new();
+            for ckpt in self.checkpoints.drain(..) {
+                if target_ckpt_ids.contains(&ckpt.id) {
+                    to_restore.push(ckpt);
+                } else {
+                    remaining.push(ckpt);
+                }
+            }
+            self.checkpoints = remaining;
+            for ckpt in to_restore.into_iter().rev() {
+                for (path, backup) in ckpt.file_backups {
+                    Self::restore_file_backup(&path, backup.as_deref());
+                    if !restored_paths.contains(&path) {
+                        restored_paths.push(path);
+                    }
+                }
+            }
+            let sess = self.active_session_mut();
+            let mut kept_changes = Vec::new();
+            for mut ch in sess.changed_files.drain(..) {
+                if ch.first_turn_msg_idx >= user_msg_idx {
+                    if !restored_paths.contains(&ch.path) {
+                        Self::restore_file_backup(&ch.path, ch.original_content.as_deref());
+                        restored_paths.push(ch.path);
+                    }
+                } else {
+                    let after = fs::read_to_string(&ch.path).unwrap_or_default();
+                    let (a, d) = compute_file_diff_counts(
+                        ch.original_content.as_deref().unwrap_or(""),
+                        &after,
+                    );
+                    ch.added_lines = a;
+                    ch.removed_lines = d;
+                    if a > 0 || d > 0 {
+                        kept_changes.push(ch);
+                    }
+                }
+            }
+            sess.changed_files = kept_changes;
+        }
+
+        // 截断后续对话与锚点，并与 CLI 客户端会话同步
+        self.messages.truncate(user_msg_idx);
+        let effective = self.effective_provider_kind();
+        let sess = self.active_session_mut();
+        sess.turn_anchors.retain(|a| a.user_msg_idx < user_msg_idx);
+        if effective == AgentProviderKind::ClaudeCodeCli {
+            sess.cli_session_id = pre_turn_sid.clone();
+            sess.pending_fork_session = pre_turn_sid.is_some();
+        } else {
+            // Cursor CLI 等无独立 --fork 参数的客户端：开启与回退后消息栈一致的同步新会话
+            sess.cli_session_id = None;
+            sess.pending_fork_session = false;
+        }
+
+        self.submit_workbench_prompt(&new_prompt, mode, ctx);
+        restored_paths
     }
 
     /// 轮询 Agent 工具在磁盘上修改过的文件路径（供编辑器热刷新缓冲区与 Git 状态）
@@ -831,6 +1234,7 @@ impl AgentHub {
         if self.streaming_session_id.lock().as_deref() == Some(self.active_session().id.as_str()) {
             *self.streaming_text.lock() = None;
         }
+        self.save_history();
     }
 
     pub fn create_checkpoint(&mut self, label: impl Into<String>, files: &[(&Path, &str)]) -> String {
@@ -885,7 +1289,7 @@ impl AgentHub {
             );
             s.loading = false;
             s.error = Some(
-                "未检测到本地 AI CLI：请确认本机已安装 cursor-agent / agy / claude / codex / gemini CLI 并点击右上角 ↻ 刷新。"
+                "未检测到本地 AI CLI：请确认本机已安装 cursor-agent / agy / claude / codex CLI 并点击右上角 ↻ 刷新。"
                     .to_string(),
             );
             self.inline_edit = Some(s);
@@ -986,7 +1390,7 @@ impl AgentHub {
         let backend = self.resolve_execution_backend(AgentWorkbenchMode::Ask);
         if matches!(backend, ExecutionBackend::LocalOffline) {
             *self.async_commit_msg.lock() = Some(Err(
-                "未检测到可用的本地 AI CLI（cursor-agent / agy / claude / codex / gemini），请点击右上角 ↻ 刷新 CLI 状态"
+                "未检测到可用的本地 AI CLI（cursor-agent / agy / claude / codex），请点击右上角 ↻ 刷新 CLI 状态"
                     .to_string(),
             ));
             if let Some(cb) = &self.wakeup {
@@ -1051,9 +1455,12 @@ impl AgentHub {
     }
 
     fn resolve_execution_backend(&self, mode: AgentWorkbenchMode) -> ExecutionBackend {
+        let target = self.effective_provider_kind();
+        let active_sess = self.active_session();
         let make_params = |kind: AgentProviderKind| -> Option<CliRunParams> {
             let reg = self.providers.iter().find(|p| p.kind == kind)?;
             let bin = reg.binary_path.clone()?;
+            let use_resume = kind == target && reg.supports_session_resume;
             Some(CliRunParams {
                 kind,
                 bin,
@@ -1063,6 +1470,12 @@ impl AgentHub {
                 fast_mode: reg.fast_mode,
                 effort: reg.reasoning_effort,
                 mode,
+                resume_session_id: if use_resume {
+                    active_sess.cli_session_id.clone()
+                } else {
+                    None
+                },
+                fork_session: use_resume && active_sess.pending_fork_session,
             })
         };
 
@@ -1074,7 +1487,6 @@ impl AgentHub {
             }
         }
 
-        let target = self.effective_provider_kind();
         if let Some(params) = make_params(target) {
             return ExecutionBackend::Cli(params);
         }
@@ -1167,6 +1579,7 @@ impl AgentHub {
             user_display.push_str(&format!("\n\n```{lang_tag}\n{}\n```", snip.content.trim_end()));
         }
 
+        let user_msg_idx = self.messages.len();
         self.messages.push(AgentChatMessage {
             role: "user".to_string(),
             agent: self.active_provider,
@@ -1177,6 +1590,17 @@ impl AgentHub {
             modified_files: Vec::new(),
             attachments: attached_items.clone(),
         });
+        {
+            let sess = self.active_session_mut();
+            let pre_sid = sess.cli_session_id.clone();
+            sess.turn_anchors.retain(|a| a.user_msg_idx != user_msg_idx);
+            sess.turn_anchors.push(TurnSyncAnchor {
+                user_msg_idx,
+                pre_turn_cli_session_id: pre_sid,
+                checkpoint_id: None,
+            });
+        }
+        self.save_history();
 
         let trimmed = effective_prompt.as_str();
         if trimmed.starts_with("/check")
@@ -1224,9 +1648,11 @@ impl AgentHub {
         let target_session_id = self.active_session().id.clone();
         match self.resolve_execution_backend(mode) {
             ExecutionBackend::Cli(params) => {
+                self.active_session_mut().pending_fork_session = false;
                 self.dispatch_cli_async(
                     params,
                     target_session_id,
+                    user_msg_idx,
                     effective_prompt,
                     mode,
                     ctx.cloned(),
@@ -1271,7 +1697,7 @@ impl AgentHub {
                 self.messages.push(AgentChatMessage {
                     role: "assistant".to_string(),
                     agent: self.active_provider,
-                    content: "⚠ 未检测到本机 AI CLI。\n请确认已安装 `cursor-agent` (Cursor CLI)、`agy` (Antigravity CLI)、`claude`、`codex` 或 `gemini` CLI，然后点击右上角 `↻` 刷新即可自动识别模型列表。".to_string(),
+                    content: "⚠ 未检测到本机 AI CLI。\n请确认已安装 `cursor-agent` (Cursor CLI)、`agy` (Antigravity CLI)、`claude` 或 `codex` CLI，然后点击右上角 `↻` 刷新即可自动识别模型列表。".to_string(),
                     thought: Some("No local CLI detected.".to_string()),
                     checkpoint_id: None,
                     patch: None,
@@ -1422,7 +1848,10 @@ impl AgentHub {
         }
         self.cancel_requested.store(false, Ordering::SeqCst);
         *self.streaming_session_id.lock() = Some(target_session_id.clone());
-        *self.streaming_text.lock() = Some(format!("正在连接 {} ({})...", cfg.model, cfg.base_url));
+        *self.streaming_text.lock() = Some(StreamingAgentProgress::with_phase(format!(
+            "正在连接 {} ({})...",
+            cfg.model, cfg.base_url
+        )));
 
         let (sys_prompt, user_prompt) = self.build_system_and_user_prompt(
             &prompt,
@@ -1503,8 +1932,10 @@ impl AgentHub {
         }
         self.cancel_requested.store(false, Ordering::SeqCst);
         *self.streaming_session_id.lock() = Some(target_session_id.clone());
-        *self.streaming_text.lock() =
-            Some(format!("🤖 Agent ({}) 正在规划工具调用...", cfg.model));
+        *self.streaming_text.lock() = Some(StreamingAgentProgress::with_phase(format!(
+            "🤖 Agent ({}) 正在规划工具调用...",
+            cfg.model
+        )));
 
         let (sys_prompt, user_prompt) = self.build_system_and_user_prompt(
             &prompt,
@@ -1619,7 +2050,9 @@ impl AgentHub {
         }
         self.cancel_requested.store(false, Ordering::SeqCst);
         *self.streaming_session_id.lock() = Some(target_session_id.clone());
-        *self.streaming_text.lock() = Some(format!("正在通过 ACP ({acp_cmd}) 建立会话..."));
+        *self.streaming_text.lock() = Some(StreamingAgentProgress::with_phase(format!(
+            "正在通过 ACP ({acp_cmd}) 建立会话..."
+        )));
 
         let (sys_prompt, user_prompt) = self.build_system_and_user_prompt(
             &prompt,
@@ -1694,6 +2127,7 @@ impl AgentHub {
         &mut self,
         params: CliRunParams,
         target_session_id: String,
+        user_msg_idx: usize,
         prompt: String,
         mode: AgentWorkbenchMode,
         ctx: Option<IdeCodeContext>,
@@ -1713,9 +2147,9 @@ impl AgentHub {
             .unwrap_or("cli")
             .to_string();
         let resolved_badge = self.active_resolved_cli_model();
-        *self.streaming_text.lock() = Some(format!(
+        *self.streaming_text.lock() = Some(StreamingAgentProgress::with_phase(format!(
             "正在通过 `{cli_label}` [{resolved_badge}] 实时处理中..."
-        ));
+        )));
 
         let (sys_prompt, user_prompt) = self.build_system_and_user_prompt(
             &prompt,
@@ -1727,6 +2161,7 @@ impl AgentHub {
         let combined_prompt = format!("{sys_prompt}\n\n{user_prompt}");
 
         let inbox = self.async_inbox.clone();
+        let sync_inbox = self.async_cli_sync_inbox.clone();
         let mod_inbox = self.modified_files_inbox.clone();
         let busy = self.is_busy.clone();
         let cancel = self.cancel_requested.clone();
@@ -1758,6 +2193,13 @@ impl AgentHub {
                 let (content, thought, patch, modified_files) = match run_res {
                     Ok(out) => {
                         let p = maybe_extract_patch_from_reply(&out.reply, mode, ctx.as_ref());
+                        sync_inbox.lock().push(CliTurnSyncUpdate {
+                            session_id: target_session_id.clone(),
+                            user_msg_idx,
+                            cli_session_id: out.cli_session_id,
+                            checkpoint_backups: out.checkpoint_backups,
+                            file_diff_stats: out.file_diff_stats,
+                        });
                         (
                             out.reply,
                             out.thought.or_else(|| {
@@ -1814,8 +2256,9 @@ impl AgentHub {
         let wakeup = self.wakeup.clone();
         let provider = self.active_provider;
 
-        *stream_buf.lock() =
-            Some("正在后台执行 `cargo check --workspace --offline`...".to_string());
+        *stream_buf.lock() = Some(StreamingAgentProgress::with_phase(
+            "正在后台执行 `cargo check --workspace --offline`...",
+        ));
         if let Some(cb) = &wakeup {
             cb();
         }
@@ -2114,11 +2557,313 @@ mod tests {
             hub.mode_cli_flag_for_active(AgentWorkbenchMode::Edit),
             "--permission-mode acceptEdits"
         );
+    }
 
-        hub.active_provider = AgentProviderKind::GeminiCli;
+    #[test]
+    fn test_streaming_progress_preserves_thought_and_execution_steps() {
+        let root = Path::new(".");
+        let reply_acc = Arc::new(Mutex::new(String::new()));
+        let thought_acc = Arc::new(Mutex::new(String::new()));
+        let err_slot = Arc::new(Mutex::new(None::<String>));
+        let touched = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
+        let sbuf = Arc::new(Mutex::new(Some(StreamingAgentProgress::with_phase(
+            "正在连接...",
+        ))));
+
+        let ev_think = serde_json::json!({
+            "type": "thinking",
+            "subtype": "delta",
+            "text": "The user wants to inspect Cargo.toml first."
+        });
+        let ev_tool = serde_json::json!({
+            "type": "tool_call",
+            "subtype": "started",
+            "tool_call": { "readToolCall": { "args": { "path": "Cargo.toml" } } }
+        });
+        let ev_reply = serde_json::json!({
+            "type": "assistant",
+            "timestamp_ms": 1,
+            "message": { "content": [{ "text": "我先查看工作区配置。" }] }
+        });
+
+        for ev in [&ev_think, &ev_tool, &ev_reply] {
+            crate::cli_runner::handle_stream_json_event(
+                AgentProviderKind::CursorCli,
+                root,
+                ev,
+                &reply_acc,
+                &thought_acc,
+                &err_slot,
+                &touched,
+                &sbuf,
+            );
+        }
+
+        let snap = sbuf.lock().clone().expect("progress present");
+        assert!(snap.thought_text.contains("inspect Cargo.toml"));
+        assert!(snap
+            .execution_steps
+            .iter()
+            .any(|s| s.contains("读取") && s.contains("Cargo.toml")));
+        assert_eq!(snap.reply_text, "我先查看工作区配置。");
+
+        // Claude stream_event 也同时保留思考与工具执行步骤
+        let claude_sbuf = Arc::new(Mutex::new(None));
+        let claude_reply = Arc::new(Mutex::new(String::new()));
+        let claude_thought = Arc::new(Mutex::new(String::new()));
+        let claude_events = [
+            serde_json::json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_delta",
+                    "delta": { "type": "thinking_delta", "thinking": "Checking agent_panel.rs layout." }
+                }
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "message": {
+                    "content": [{
+                        "type": "tool_use",
+                        "name": "Grep",
+                        "input": { "pattern": "BusyIndicator" }
+                    }]
+                }
+            }),
+            serde_json::json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_delta",
+                    "delta": { "type": "text_delta", "text": "正在修改渲染逻辑。" }
+                }
+            }),
+        ];
+        for ev in &claude_events {
+            crate::cli_runner::handle_stream_json_event(
+                AgentProviderKind::ClaudeCodeCli,
+                root,
+                ev,
+                &claude_reply,
+                &claude_thought,
+                &err_slot,
+                &touched,
+                &claude_sbuf,
+            );
+        }
+        let claude_snap = claude_sbuf.lock().clone().expect("claude progress present");
+        assert!(claude_snap.thought_text.contains("Checking agent_panel.rs"));
+        assert!(claude_snap
+            .execution_steps
+            .iter()
+            .any(|s| s.contains("搜索") && s.contains("BusyIndicator")));
+        assert_eq!(claude_snap.reply_text, "正在修改渲染逻辑。");
+    }
+
+    #[test]
+    fn test_cli_capability_detection_and_message_edit_rewind() {
+        use crate::cli_discovery::parse_cli_rewind_capabilities;
+
         assert_eq!(
-            hub.mode_cli_flag_for_active(AgentWorkbenchMode::Ask),
-            "--approval-mode plan"
+            parse_cli_rewind_capabilities(
+                AgentProviderKind::CursorCli,
+                "Usage: cursor-agent [options]\n  --resume <chatId>\n  create-chat"
+            ),
+            (true, true)
         );
+        assert_eq!(
+            parse_cli_rewind_capabilities(
+                AgentProviderKind::CursorCli,
+                "Usage: cursor-agent --print"
+            ),
+            (false, false)
+        );
+        assert_eq!(
+            parse_cli_rewind_capabilities(
+                AgentProviderKind::ClaudeCodeCli,
+                "  --resume <id>\n  --fork-session"
+            ),
+            (true, true)
+        );
+        assert_eq!(
+            parse_cli_rewind_capabilities(AgentProviderKind::ClaudeCodeCli, "  --resume <id>"),
+            (true, false)
+        );
+        assert_eq!(
+            parse_cli_rewind_capabilities(
+                AgentProviderKind::GoogleAntigravityAcp,
+                "  --conversation <id>"
+            ),
+            (true, false)
+        );
+        assert_eq!(
+            parse_cli_rewind_capabilities(AgentProviderKind::OpenAiCodexCli, "resume [ID]"),
+            (true, false)
+        );
+
+        let mut hub = AgentHub::new(Path::new("."));
+        for reg in &mut hub.providers {
+            reg.binary_path = None;
+        }
+        hub.api_config = AiApiConfig::default();
+        hub.active_provider = AgentProviderKind::ClaudeCodeCli;
+        hub.set_provider_capabilities(AgentProviderKind::ClaudeCodeCli, true, true, true);
+        assert!(hub.active_cli_supports_checkpoint_rewind());
+
+        let tmp_file = std::env::temp_dir().join(format!("rust_ai_ide_rewind_{}.txt", Uuid::new_v4()));
+        fs::write(&tmp_file, "line1\nchanged_by_turn_1\n").unwrap();
+
+        hub.messages.clear();
+        hub.messages.push(AgentChatMessage {
+            role: "user".to_string(),
+            agent: AgentProviderKind::ClaudeCodeCli,
+            content: "first prompt".to_string(),
+            thought: None,
+            checkpoint_id: None,
+            patch: None,
+            modified_files: Vec::new(),
+            attachments: Vec::new(),
+        });
+        hub.messages.push(AgentChatMessage {
+            role: "assistant".to_string(),
+            agent: AgentProviderKind::ClaudeCodeCli,
+            content: "first reply".to_string(),
+            thought: None,
+            checkpoint_id: None,
+            patch: None,
+            modified_files: Vec::new(),
+            attachments: Vec::new(),
+        });
+        hub.messages.push(AgentChatMessage {
+            role: "user".to_string(),
+            agent: AgentProviderKind::ClaudeCodeCli,
+            content: "second prompt".to_string(),
+            thought: None,
+            checkpoint_id: None,
+            patch: None,
+            modified_files: vec![tmp_file.clone()],
+            attachments: Vec::new(),
+        });
+        hub.messages.push(AgentChatMessage {
+            role: "assistant".to_string(),
+            agent: AgentProviderKind::ClaudeCodeCli,
+            content: "second reply".to_string(),
+            thought: None,
+            checkpoint_id: None,
+            patch: None,
+            modified_files: vec![tmp_file.clone()],
+            attachments: Vec::new(),
+        });
+
+        let mut backups = HashMap::new();
+        backups.insert(tmp_file.clone(), Some("line1\noriginal\n".to_string()));
+        let mut stats = HashMap::new();
+        stats.insert(tmp_file.clone(), (1usize, 1usize));
+        let sid = hub.active_session().id.clone();
+        {
+            let sess = hub.active_session_mut();
+            sess.cli_session_id = Some("claude-sid-turn-1".to_string());
+            sess.turn_anchors.push(TurnSyncAnchor {
+                user_msg_idx: 2,
+                pre_turn_cli_session_id: Some("claude-sid-turn-0".to_string()),
+                checkpoint_id: None,
+            });
+        }
+        hub.apply_cli_turn_sync_update(
+            CliTurnSyncUpdate {
+                session_id: sid.clone(),
+                user_msg_idx: 2,
+                cli_session_id: Some("claude-sid-turn-2".to_string()),
+                checkpoint_backups: backups,
+                file_diff_stats: stats,
+            },
+            &sid,
+        );
+        assert_eq!(hub.active_session_changed_files().len(), 1);
+        let (dropped, affected) = hub.count_rewind_impact(2);
+        assert_eq!(dropped, 1);
+        assert_eq!(affected, vec![tmp_file.clone()]);
+
+        // 编辑消息 idx=2 并选择回退文件
+        let restored = hub.edit_message_and_rewind(
+            2,
+            "edited second prompt".to_string(),
+            true,
+            AgentWorkbenchMode::Agent,
+            None,
+        );
+        assert_eq!(restored, vec![tmp_file.clone()]);
+        assert_eq!(fs::read_to_string(&tmp_file).unwrap(), "line1\noriginal\n");
+        assert!(hub.active_session_changed_files().is_empty());
+        // 与 Claude CLI 会话锚点同步（回退到 turn 2 前的 claude-sid-turn-0 并标记 fork_session）
+        assert_eq!(
+            hub.active_session().cli_session_id.as_deref(),
+            Some("claude-sid-turn-0")
+        );
+        assert!(hub.active_session().pending_fork_session);
+        assert_eq!(hub.messages[2].content, "edited second prompt");
+
+        // Cursor CLI 在回退后清空 cli_session_id 以避免保留被回退轮次上下文
+        hub.active_provider = AgentProviderKind::CursorCli;
+        hub.set_provider_capabilities(AgentProviderKind::CursorCli, true, true, true);
+        hub.active_session_mut().cli_session_id = Some("cursor-old-chat".to_string());
+        hub.edit_message_and_rewind(
+            2,
+            "cursor edited prompt".to_string(),
+            false,
+            AgentWorkbenchMode::Agent,
+            None,
+        );
+        assert_eq!(hub.active_session().cli_session_id, None);
+        assert!(!hub.active_session().pending_fork_session);
+
+        let _ = fs::remove_file(&tmp_file);
+    }
+
+    #[test]
+    fn test_agent_history_persistence_roundtrip() {
+        let hist_path = std::env::temp_dir().join(format!("rust_ai_ide_hist_{}.json", Uuid::new_v4()));
+
+        let mut hub1 = AgentHub::new(Path::new("."));
+        hub1.set_history_file_path(Some(hist_path.clone()));
+        hub1.messages.push(AgentChatMessage {
+            role: "user".to_string(),
+            agent: AgentProviderKind::CursorCli,
+            content: "持久化的第一条提问".to_string(),
+            thought: None,
+            checkpoint_id: None,
+            patch: None,
+            modified_files: Vec::new(),
+            attachments: Vec::new(),
+        });
+        hub1.active_session_mut().cli_session_id = Some("cursor-chat-99".to_string());
+        hub1.rename_active_session("修复支付逻辑");
+        let s2 = hub1.new_session();
+        assert_eq!(s2, 1);
+        hub1.messages.push(AgentChatMessage {
+            role: "user".to_string(),
+            agent: AgentProviderKind::CursorCli,
+            content: "第二个会话的问题".to_string(),
+            thought: None,
+            checkpoint_id: None,
+            patch: None,
+            modified_files: Vec::new(),
+            attachments: Vec::new(),
+        });
+        hub1.save_history();
+
+        let mut hub2 = AgentHub::new(Path::new("."));
+        hub2.set_history_file_path(Some(hist_path.clone()));
+        assert_eq!(hub2.sessions.len(), 2);
+        assert_eq!(hub2.active_session_idx, 1);
+        assert_eq!(hub2.sessions[0].title, "修复支付逻辑");
+        assert_eq!(
+            hub2.sessions[0].cli_session_id.as_deref(),
+            Some("cursor-chat-99")
+        );
+        assert!(hub2.messages.iter().any(|m| m.content == "第二个会话的问题"));
+        assert!(hub2.switch_session(0));
+        assert!(hub2.messages.iter().any(|m| m.content == "持久化的第一条提问"));
+        assert!(!hub2.active_session().is_busy);
+
+        let _ = fs::remove_file(&hist_path);
     }
 }

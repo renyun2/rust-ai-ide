@@ -1,5 +1,5 @@
 use crate::tools::resolve_safe_workspace_path;
-use crate::types::AgentWakeupCallback;
+use crate::types::{AgentWakeupCallback, StreamingAgentProgress};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use std::fs;
@@ -83,7 +83,7 @@ pub fn execute_acp_stdio_session(
     root: &Path,
     prompt_text: &str,
     active_file: Option<&Path>,
-    stream_buf: &Arc<Mutex<Option<String>>>,
+    stream_buf: &Arc<Mutex<Option<StreamingAgentProgress>>>,
     active_pid: &Arc<Mutex<Option<u32>>>,
     modified_inbox: Option<&Arc<Mutex<Vec<PathBuf>>>>,
     wakeup: Option<&AgentWakeupCallback>,
@@ -177,15 +177,40 @@ pub fn execute_acp_stdio_session(
                 } else if let Some(m) = method {
                     if m == "session/update" {
                         let update = &msg["params"]["update"];
-                        if let Some(chunk) = update["content"]["text"].as_str() {
-                            assembled.push_str(chunk);
-                            *stream_buf.lock() = Some(assembled.clone());
+                        let su_kind = update["sessionUpdate"].as_str().unwrap_or("");
+                        let txt = update["content"]["text"]
+                            .as_str()
+                            .or_else(|| update["text"].as_str());
+                        if su_kind.contains("thought") {
+                            if let Some(t) = txt {
+                                StreamingAgentProgress::update_slot(stream_buf, |p| {
+                                    p.phase = "思考中...".to_string();
+                                    p.thought_text.push_str(t);
+                                });
+                                if let Some(cb) = wakeup {
+                                    cb();
+                                }
+                            }
+                        } else if su_kind.contains("tool") || su_kind == "plan" {
+                            let label = update["title"]
+                                .as_str()
+                                .or_else(|| update["toolCallId"].as_str())
+                                .or(txt)
+                                .unwrap_or("执行工具步骤");
+                            StreamingAgentProgress::update_slot(stream_buf, |p| {
+                                p.phase = "正在执行步骤...".to_string();
+                                p.push_execution_step(label);
+                            });
                             if let Some(cb) = wakeup {
                                 cb();
                             }
-                        } else if let Some(text) = update["text"].as_str() {
-                            assembled.push_str(text);
-                            *stream_buf.lock() = Some(assembled.clone());
+                        } else if let Some(chunk) = txt {
+                            assembled.push_str(chunk);
+                            let reply_snapshot = assembled.clone();
+                            StreamingAgentProgress::update_slot(stream_buf, |p| {
+                                p.phase = "正在生成回复...".to_string();
+                                p.reply_text = reply_snapshot;
+                            });
                             if let Some(cb) = wakeup {
                                 cb();
                             }
@@ -193,6 +218,13 @@ pub fn execute_acp_stdio_session(
                     } else if m == "fs/read_text_file" {
                         if let Some(req_id) = msg.get("id") {
                             let path_str = msg["params"]["path"].as_str().unwrap_or("");
+                            StreamingAgentProgress::update_slot(stream_buf, |p| {
+                                p.phase = "正在读取工作区文件...".to_string();
+                                p.push_execution_step(format!("读取 {path_str}"));
+                            });
+                            if let Some(cb) = wakeup {
+                                cb();
+                            }
                             let resp = match resolve_safe_workspace_path(root, path_str)
                                 .and_then(|p| fs::read_to_string(&p).map_err(|e| e.to_string()))
                             {

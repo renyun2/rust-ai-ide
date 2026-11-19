@@ -286,7 +286,7 @@ fn strip_json_trailing_commas(input: &str) -> String {
     out
 }
 
-/// 自动发现本机所有已安装的 AI CLI（Cursor `cursor-agent` / Antigravity `agy` / Claude `claude` / Codex `codex` / Gemini `gemini`）及其模型、快速模式与思考深度
+/// 自动发现本机所有已安装的 AI CLI（Cursor `cursor-agent` / Antigravity `agy` / Claude `claude` / Codex `codex`）及其模型、快速模式与思考深度
 pub fn discover_local_cli_registrations() -> Vec<AgentRegistration> {
     let home = user_home_dir();
     let shared_catalog_models = home
@@ -537,37 +537,6 @@ pub fn discover_local_cli_registrations() -> Vec<AgentRegistration> {
         .cloned()
         .unwrap_or_else(|| "default".to_string());
 
-    // 5. Gemini CLI (`gemini.cmd` / `gemini`)
-    let gemini_path =
-        find_executable_in_path("gemini.cmd").or_else(|| find_executable_in_path("gemini"));
-    let gemini_cfg_path = home
-        .as_ref()
-        .map(|h| h.join(".gemini").join("settings.json"))
-        .filter(|p| p.exists());
-    let mut gemini_models = Vec::new();
-    if let Some(cfg_p) = &gemini_cfg_path {
-        if let Ok(raw) = fs::read_to_string(cfg_p) {
-            if let Some(m) = extract_json_string_field(&raw, "model") {
-                push_unique_model(&mut gemini_models, m);
-            }
-        }
-    }
-    for m in [
-        "auto",
-        "gemini-2.5-pro",
-        "gemini-3.5-flash",
-        "gemini-3.1-flash-lite",
-    ] {
-        push_unique_model(&mut gemini_models, m);
-    }
-    for m in &shared_catalog_models {
-        push_unique_model(&mut gemini_models, m);
-    }
-    let gemini_active_model = gemini_models
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "auto".to_string());
-
     vec![
         AgentRegistration {
             kind: AgentProviderKind::CursorCli,
@@ -580,6 +549,8 @@ pub fn discover_local_cli_registrations() -> Vec<AgentRegistration> {
                 None => "未检测到 cursor-agent CLI".to_string(),
             },
             available: cursor_path.is_some(),
+            supports_session_resume: cursor_path.is_some(),
+            supports_checkpoint_rewind: cursor_path.is_some(),
             binary_path: cursor_path,
             config_path: cursor_cfg_path,
             active_model: cursor_active_model,
@@ -598,6 +569,8 @@ pub fn discover_local_cli_registrations() -> Vec<AgentRegistration> {
                 None => "未检测到 agy.exe (Antigravity CLI)".to_string(),
             },
             available: agy_path.is_some(),
+            supports_session_resume: agy_path.is_some(),
+            supports_checkpoint_rewind: false,
             binary_path: agy_path,
             config_path: agy_cfg_path,
             active_model: agy_active_model,
@@ -613,6 +586,8 @@ pub fn discover_local_cli_registrations() -> Vec<AgentRegistration> {
                 None => "未检测到 claude CLI".to_string(),
             },
             available: claude_path.is_some(),
+            supports_session_resume: claude_path.is_some(),
+            supports_checkpoint_rewind: claude_path.is_some(),
             binary_path: claude_path,
             config_path: claude_cfg_path,
             active_model: claude_active_model,
@@ -628,6 +603,8 @@ pub fn discover_local_cli_registrations() -> Vec<AgentRegistration> {
                 None => "未检测到 codex CLI".to_string(),
             },
             available: codex_path.is_some(),
+            supports_session_resume: codex_path.is_some(),
+            supports_checkpoint_rewind: false,
             binary_path: codex_path,
             config_path: codex_cfg_path,
             active_model: codex_active_model,
@@ -635,21 +612,6 @@ pub fn discover_local_cli_registrations() -> Vec<AgentRegistration> {
             exact_model_catalog: codex_models,
             fast_mode: false,
             reasoning_effort: codex_effort,
-        },
-        AgentRegistration {
-            kind: AgentProviderKind::GeminiCli,
-            status_text: match &gemini_path {
-                Some(_) => format!("gemini · {gemini_active_model}"),
-                None => "未检测到 gemini CLI".to_string(),
-            },
-            available: gemini_path.is_some(),
-            binary_path: gemini_path,
-            config_path: gemini_cfg_path,
-            active_model: gemini_active_model,
-            discovered_models: gemini_models.clone(),
-            exact_model_catalog: gemini_models,
-            fast_mode: true,
-            reasoning_effort: ReasoningEffort::Medium,
         },
     ]
 }
@@ -675,19 +637,64 @@ pub fn extract_json_string_field(raw: &str, field_name: &str) -> Option<String> 
     None
 }
 
-/// 后台异步调用 `cursor-agent --list-models` 动态获取本机 Cursor CLI 全部可用模型（返回 `(分组基础模型列表, 精确模型ID目录)`）
-pub fn probe_cursor_cli_list_models(bin: &Path) -> Option<(Vec<String>, Vec<String>)> {
-    let output = if let Some((node_exe, index_js)) = resolve_cursor_node_entry(bin) {
+/// 解析本地 CLI `--help` 文本，检测是否支持会话恢复与消息编辑回退同步（`(supports_session_resume, supports_checkpoint_rewind)`）
+pub fn parse_cli_rewind_capabilities(kind: AgentProviderKind, help_text: &str) -> (bool, bool) {
+    let lower = help_text.to_ascii_lowercase();
+    match kind {
+        AgentProviderKind::CursorCli | AgentProviderKind::CursorInlineEngine => {
+            let has_resume =
+                lower.contains("--resume") || lower.contains("create-chat") || lower.contains("resume");
+            (has_resume, has_resume)
+        }
+        AgentProviderKind::ClaudeCodeCli => {
+            let has_resume = lower.contains("--resume");
+            let has_fork = lower.contains("--fork-session");
+            (has_resume, has_resume && has_fork)
+        }
+        AgentProviderKind::OpenAiCodexCli => {
+            let has_resume = lower.contains("resume");
+            (has_resume, false)
+        }
+        AgentProviderKind::GoogleAntigravityAcp => {
+            let has_conv = lower.contains("--conversation") || lower.contains("--continue");
+            (has_conv, false)
+        }
+        AgentProviderKind::CustomLlmApi => (false, false),
+    }
+}
+
+/// 在后台实际运行 `<cli> --help` 探测客户端能力
+pub fn probe_cli_rewind_capabilities(kind: AgentProviderKind, bin: &Path) -> Option<(bool, bool)> {
+    if kind == AgentProviderKind::CustomLlmApi {
+        return Some((false, false));
+    }
+    let output = run_cli_probe(bin, &["--help"])?;
+    let combined = format!(
+        "{}\n{}",
+        strip_ansi_basic(&String::from_utf8_lossy(&output.stdout)),
+        strip_ansi_basic(&String::from_utf8_lossy(&output.stderr))
+    );
+    if combined.trim().is_empty() {
+        return None;
+    }
+    Some(parse_cli_rewind_capabilities(kind, &combined))
+}
+
+fn run_cli_probe(bin: &Path, args: &[&str]) -> Option<std::process::Output> {
+    if let Some((node_exe, index_js)) = resolve_cursor_node_entry(bin) {
         let mut cmd = Command::new(node_exe);
-        cmd.arg(index_js)
-            .arg("--list-models")
-            .stdin(Stdio::null());
+        cmd.arg(index_js).args(args).stdin(Stdio::null());
         #[cfg(target_os = "windows")]
         cmd.creation_flags(CREATE_NO_WINDOW);
-        cmd.output().ok()?
+        cmd.output().ok()
     } else {
-        run_cli_with_args(bin, &["--list-models"])?
-    };
+        run_cli_with_args(bin, args)
+    }
+}
+
+/// 后台异步调用 `cursor-agent --list-models` 动态获取本机 Cursor CLI 全部可用模型（返回 `(分组基础模型列表, 精确模型ID目录)`）
+pub fn probe_cursor_cli_list_models(bin: &Path) -> Option<(Vec<String>, Vec<String>)> {
+    let output = run_cli_probe(bin, &["--list-models"])?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut base_models = Vec::new();
@@ -740,34 +747,6 @@ pub fn probe_agy_cli_models(bin: &Path) -> Option<Vec<String>> {
                 break;
             }
             push_unique_model(&mut models, trimmed);
-        }
-    }
-    if models.is_empty() {
-        None
-    } else {
-        Some(models)
-    }
-}
-
-/// 后台异步调用 `gemini --list-models` 动态获取本机 Gemini CLI 支持的模型列表
-pub fn probe_gemini_cli_list_models(bin: &Path) -> Option<Vec<String>> {
-    let output = run_cli_with_args(bin, &["--list-models"])?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut models = Vec::new();
-    for line in stdout.lines() {
-        let clean = strip_ansi_basic(line);
-        let trimmed = clean.trim();
-        if trimmed.is_empty()
-            || trimmed.starts_with("Available")
-            || trimmed.starts_with("Description:")
-            || trimmed.starts_with("Context limit:")
-        {
-            continue;
-        }
-        if !clean.starts_with(' ') && trimmed.contains(" (") && trimmed.ends_with(')') {
-            if let Some((slug, _)) = trimmed.split_once(" (") {
-                push_unique_model(&mut models, slug.trim());
-            }
         }
     }
     if models.is_empty() {

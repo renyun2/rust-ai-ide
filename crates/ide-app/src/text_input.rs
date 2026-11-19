@@ -425,28 +425,47 @@ impl TextInputField {
                         text: String::new(),
                     });
                 } else {
-                    let mut seg_start = line_start;
-                    let mut cur = String::new();
-                    for (offset, &ch) in chars[line_start..idx].iter().enumerate() {
-                        cur.push(ch);
-                        let (w, _) = canvas.measure_text(&cur, style);
-                        if w > max_w && cur.chars().count() > 1 {
-                            cur.pop();
-                            let split_at = line_start + offset;
+                    let (full_w, _) = canvas.measure_text(&raw_segment, style);
+                    if full_w <= max_w {
+                        out.push(WrappedLineSeg {
+                            start_char: line_start,
+                            end_char: idx,
+                            text: raw_segment,
+                        });
+                    } else {
+                        let mut seg_start = line_start;
+                        while seg_start < idx {
+                            let rem_str: String = chars[seg_start..idx].iter().collect();
+                            let (rw, _) = canvas.measure_text(&rem_str, style);
+                            if rw <= max_w {
+                                out.push(WrappedLineSeg {
+                                    start_char: seg_start,
+                                    end_char: idx,
+                                    text: rem_str,
+                                });
+                                break;
+                            }
+                            let mut take_n =
+                                canvas.measure_caret_col_in_line(&rem_str, max_w, style).max(1);
+                            let rem_len = idx - seg_start;
+                            if take_n >= rem_len {
+                                take_n = rem_len.saturating_sub(1).max(1);
+                            }
+                            let mut cand: String =
+                                chars[seg_start..seg_start + take_n].iter().collect();
+                            if take_n > 1 && canvas.measure_text(&cand, style).0 > max_w {
+                                take_n -= 1;
+                                cand = chars[seg_start..seg_start + take_n].iter().collect();
+                            }
+                            let split_at = seg_start + take_n;
                             out.push(WrappedLineSeg {
                                 start_char: seg_start,
                                 end_char: split_at,
-                                text: cur,
+                                text: cand,
                             });
                             seg_start = split_at;
-                            cur = ch.to_string();
                         }
                     }
-                    out.push(WrappedLineSeg {
-                        start_char: seg_start,
-                        end_char: idx,
-                        text: cur,
-                    });
                 }
                 line_start = idx + 1;
             }
@@ -810,22 +829,12 @@ fn first_visible_char_for_scroll(
     scroll_px: i32,
     style: FontStyle,
 ) -> usize {
-    if scroll_px <= 0 {
+    if scroll_px <= 0 || display_text.is_empty() {
         return 0;
     }
-    let chars: Vec<char> = display_text.chars().collect();
-    let mut start_idx = 0usize;
-    let mut acc = String::new();
-    for (i, &ch) in chars.iter().enumerate() {
-        acc.push(ch);
-        let (w, _) = canvas.measure_text(&acc, style);
-        if w >= scroll_px {
-            start_idx = i;
-            break;
-        }
-        start_idx = i + 1;
-    }
-    start_idx
+    canvas
+        .measure_caret_col_in_line(display_text, scroll_px, style)
+        .min(display_text.chars().count())
 }
 
 fn visible_horizontal_slice_for(
@@ -835,18 +844,24 @@ fn visible_horizontal_slice_for(
     avail_w: i32,
     style: FontStyle,
 ) -> (usize, String) {
-    let chars: Vec<char> = display_text.chars().collect();
-    let start_idx = first_visible_char_for_scroll(display_text, canvas, scroll_px, style);
-    let mut slice = String::new();
-    for &ch in chars.iter().skip(start_idx) {
-        slice.push(ch);
-        let (w, _) = canvas.measure_text(&slice, style);
-        if w > avail_w && slice.chars().count() > 1 {
-            slice.pop();
-            break;
-        }
+    if display_text.is_empty() {
+        return (0, String::new());
     }
-    (start_idx, slice)
+    let start_idx = first_visible_char_for_scroll(display_text, canvas, scroll_px, style);
+    let tail_byte = char_to_byte_idx(display_text, start_idx);
+    let tail = &display_text[tail_byte..];
+    if tail.is_empty() {
+        return (start_idx, String::new());
+    }
+    let (tw, _) = canvas.measure_text(tail, style);
+    if tw <= avail_w {
+        return (start_idx, tail.to_string());
+    }
+    let take_n = canvas
+        .measure_caret_col_in_line(tail, avail_w, style)
+        .max(1);
+    let end_byte = char_to_byte_idx(tail, take_n);
+    (start_idx, tail[..end_byte].to_string())
 }
 
 fn normalize_input(s: &str, multiline: bool) -> String {

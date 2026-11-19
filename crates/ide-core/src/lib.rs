@@ -408,7 +408,47 @@ pub enum ToolWindowId {
     GitLog,
 }
 
-/// 顶部主菜单分类（对齐 IntelliJ IDEA Main Menu）
+/// UI 界面语言切换（支持简体中文 / English 实时热切换）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum UiLanguage {
+    ZhCn,
+    EnUs,
+}
+
+impl Default for UiLanguage {
+    fn default() -> Self {
+        Self::ZhCn
+    }
+}
+
+impl UiLanguage {
+    pub fn all() -> &'static [Self] {
+        &[Self::ZhCn, Self::EnUs]
+    }
+
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            Self::ZhCn => "简体中文 (Chinese)",
+            Self::EnUs => "English",
+        }
+    }
+
+    pub fn short_label(&self) -> &'static str {
+        match self {
+            Self::ZhCn => "中文",
+            Self::EnUs => "EN",
+        }
+    }
+
+    pub fn toggle(&self) -> Self {
+        match self {
+            Self::ZhCn => Self::EnUs,
+            Self::EnUs => Self::ZhCn,
+        }
+    }
+}
+
+/// 顶部主菜单分类（对齐 IntelliJ IDEA Main Menu，支持中英文国际化）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MainMenuCategory {
     File,
@@ -442,84 +482,142 @@ impl MainMenuCategory {
     }
 
     pub fn label(&self) -> &'static str {
-        match self {
-            Self::File => "File",
-            Self::Edit => "Edit",
-            Self::View => "View",
-            Self::Navigate => "Navigate",
-            Self::Code => "Code",
-            Self::Refactor => "Refactor",
-            Self::Run => "Run",
-            Self::Git => "Git",
-            Self::Tools => "Tools",
-            Self::Window => "Window",
-            Self::Help => "Help",
+        self.label_i18n(UiLanguage::EnUs)
+    }
+
+    pub fn label_i18n(&self, lang: UiLanguage) -> &'static str {
+        match (self, lang) {
+            (Self::File, UiLanguage::ZhCn) => "文件",
+            (Self::File, UiLanguage::EnUs) => "File",
+            (Self::Edit, UiLanguage::ZhCn) => "编辑",
+            (Self::Edit, UiLanguage::EnUs) => "Edit",
+            (Self::View, UiLanguage::ZhCn) => "视图",
+            (Self::View, UiLanguage::EnUs) => "View",
+            (Self::Navigate, UiLanguage::ZhCn) => "导航",
+            (Self::Navigate, UiLanguage::EnUs) => "Navigate",
+            (Self::Code, UiLanguage::ZhCn) => "代码",
+            (Self::Code, UiLanguage::EnUs) => "Code",
+            (Self::Refactor, UiLanguage::ZhCn) => "重构",
+            (Self::Refactor, UiLanguage::EnUs) => "Refactor",
+            (Self::Run, UiLanguage::ZhCn) => "运行",
+            (Self::Run, UiLanguage::EnUs) => "Run",
+            (Self::Git, UiLanguage::ZhCn) => "Git",
+            (Self::Git, UiLanguage::EnUs) => "Git",
+            (Self::Tools, UiLanguage::ZhCn) => "工具",
+            (Self::Tools, UiLanguage::EnUs) => "Tools",
+            (Self::Window, UiLanguage::ZhCn) => "窗口",
+            (Self::Window, UiLanguage::EnUs) => "Window",
+            (Self::Help, UiLanguage::ZhCn) => "帮助",
+            (Self::Help, UiLanguage::EnUs) => "Help",
         }
     }
 
     pub fn items(&self) -> Vec<IdeAction> {
+        self.entries()
+            .into_iter()
+            .filter_map(|e| match e {
+                MenuEntry::Action(a) => Some(a),
+                MenuEntry::Separator => None,
+            })
+            .collect()
+    }
+
+    pub fn entries(&self) -> Vec<MenuEntry> {
         match self {
             Self::File => vec![
-                IdeAction::NewFileInProject,
-                IdeAction::NewFolderInProject,
-                IdeAction::SaveActiveFile,
-                IdeAction::OpenSettingsModal,
+                MenuEntry::Action(IdeAction::OpenFolder),
+                MenuEntry::Separator,
+                MenuEntry::Action(IdeAction::NewFileInProject),
+                MenuEntry::Action(IdeAction::NewFolderInProject),
+                MenuEntry::Separator,
+                MenuEntry::Action(IdeAction::SaveActiveFile),
+                MenuEntry::Action(IdeAction::CloseActiveTab),
+                MenuEntry::Separator,
+                MenuEntry::Action(IdeAction::OpenSettingsModal),
             ],
             Self::Edit => vec![
-                IdeAction::UndoEdit,
-                IdeAction::RedoEdit,
-                IdeAction::DuplicateLine,
-                IdeAction::DeleteLine,
-                IdeAction::FindInFiles,
+                MenuEntry::Action(IdeAction::UndoEdit),
+                MenuEntry::Action(IdeAction::RedoEdit),
+                MenuEntry::Separator,
+                MenuEntry::Action(IdeAction::DuplicateLine),
+                MenuEntry::Action(IdeAction::DeleteLine),
+                MenuEntry::Separator,
+                MenuEntry::Action(IdeAction::FindInFiles),
             ],
             Self::View => vec![
-                IdeAction::ToggleProjectWindow,
-                IdeAction::ToggleCommitWindow,
-                IdeAction::ToggleStructureWindow,
-                IdeAction::ToggleAgentHubWindow,
-                IdeAction::ToggleTerminalWindow,
-                IdeAction::SwitchTheme,
+                MenuEntry::Action(IdeAction::ToggleProjectWindow),
+                MenuEntry::Action(IdeAction::ToggleCommitWindow),
+                MenuEntry::Action(IdeAction::ToggleStructureWindow),
+                MenuEntry::Action(IdeAction::ToggleAgentHubWindow),
+                MenuEntry::Action(IdeAction::ToggleTerminalWindow),
+                MenuEntry::Separator,
+                MenuEntry::Action(IdeAction::ZoomInUi),
+                MenuEntry::Action(IdeAction::ZoomOutUi),
+                MenuEntry::Action(IdeAction::ResetUiZoom),
+                MenuEntry::Separator,
+                MenuEntry::Action(IdeAction::SwitchTheme),
+                MenuEntry::Action(IdeAction::SwitchUiLanguage),
             ],
             Self::Navigate => vec![
-                IdeAction::SearchEverywhere,
-                IdeAction::GoToFile,
-                IdeAction::FindAction,
-                IdeAction::GoToDeclaration,
+                MenuEntry::Action(IdeAction::SearchEverywhere),
+                MenuEntry::Action(IdeAction::GoToFile),
+                MenuEntry::Action(IdeAction::FindAction),
+                MenuEntry::Separator,
+                MenuEntry::Action(IdeAction::GoToDeclaration),
             ],
             Self::Code => vec![
-                IdeAction::ToggleLineComment,
-                IdeAction::ReformatCode,
-                IdeAction::InlineAiEdit,
-                IdeAction::ShowIntentionActions,
+                MenuEntry::Action(IdeAction::ToggleLineComment),
+                MenuEntry::Action(IdeAction::ReformatCode),
+                MenuEntry::Separator,
+                MenuEntry::Action(IdeAction::InlineAiEdit),
+                MenuEntry::Action(IdeAction::ShowIntentionActions),
             ],
-            Self::Refactor => vec![IdeAction::RenameSymbol, IdeAction::InlineAiEdit],
+            Self::Refactor => vec![
+                MenuEntry::Action(IdeAction::RenameSymbol),
+                MenuEntry::Separator,
+                MenuEntry::Action(IdeAction::InlineAiEdit),
+            ],
             Self::Run => vec![
-                IdeAction::RunActiveConfig,
-                IdeAction::DebugActiveConfig,
-                IdeAction::ToggleBreakpoint,
+                MenuEntry::Action(IdeAction::RunActiveConfig),
+                MenuEntry::Action(IdeAction::DebugActiveConfig),
+                MenuEntry::Separator,
+                MenuEntry::Action(IdeAction::ToggleBreakpoint),
             ],
             Self::Git => vec![
-                IdeAction::GitCommitPopup,
-                IdeAction::GitPull,
-                IdeAction::GitPush,
-                IdeAction::GitNewBranch,
-                IdeAction::RevertLastCheckpoint,
+                MenuEntry::Action(IdeAction::GitCommitPopup),
+                MenuEntry::Action(IdeAction::GitPull),
+                MenuEntry::Action(IdeAction::GitPush),
+                MenuEntry::Separator,
+                MenuEntry::Action(IdeAction::GitNewBranch),
+                MenuEntry::Action(IdeAction::RevertLastCheckpoint),
             ],
             Self::Tools => vec![
-                IdeAction::SendSelectionToAgent,
-                IdeAction::SwitchToAntigravity,
-                IdeAction::SwitchToClaudeCode,
-                IdeAction::SwitchToCodexCli,
+                MenuEntry::Action(IdeAction::SendSelectionToAgent),
+                MenuEntry::Separator,
+                MenuEntry::Action(IdeAction::SwitchToAntigravity),
+                MenuEntry::Action(IdeAction::SwitchToClaudeCode),
+                MenuEntry::Action(IdeAction::SwitchToCodexCli),
             ],
             Self::Window => vec![
-                IdeAction::WidenLeftPanel,
-                IdeAction::NarrowLeftPanel,
-                IdeAction::WidenRightPanel,
-                IdeAction::RaiseBottomPanel,
+                MenuEntry::Action(IdeAction::WidenLeftPanel),
+                MenuEntry::Action(IdeAction::NarrowLeftPanel),
+                MenuEntry::Action(IdeAction::WidenRightPanel),
+                MenuEntry::Action(IdeAction::RaiseBottomPanel),
             ],
-            Self::Help => vec![IdeAction::FindAction, IdeAction::OpenSettingsModal],
+            Self::Help => vec![
+                MenuEntry::Action(IdeAction::FindAction),
+                MenuEntry::Separator,
+                MenuEntry::Action(IdeAction::SwitchUiLanguage),
+                MenuEntry::Action(IdeAction::OpenSettingsModal),
+            ],
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuEntry {
+    Action(IdeAction),
+    Separator,
 }
 
 /// IDE 全局快捷键与 Action 命令定义（100% 对齐 IntelliJ IDEA + Cursor）
@@ -531,7 +629,8 @@ pub enum IdeAction {
     GoToFile,                // Ctrl+Shift+N / Ctrl+P
     FindInFiles,             // Ctrl+Shift+F
     GoToDeclaration,         // Ctrl+B
-    // 文件与项目树操作
+    // 文件与工作区/项目树操作
+    OpenFolder,              // Ctrl+O
     NewFileInProject,        // Alt+Insert / Ctrl+N
     NewFolderInProject,      // Ctrl+Alt+N
     DeleteSelectedPath,      // Delete
@@ -572,6 +671,10 @@ pub enum IdeAction {
     ToggleTerminalWindow,    // Alt+F12
     OpenSettingsModal,       // Ctrl+Alt+S
     SwitchTheme,             // Ctrl+`
+    SwitchUiLanguage,        // Ctrl+Alt+U
+    ZoomInUi,                // Ctrl+=
+    ZoomOutUi,               // Ctrl+-
+    ResetUiZoom,             // Ctrl+0
     WidenLeftPanel,
     NarrowLeftPanel,
     WidenRightPanel,
@@ -581,6 +684,7 @@ pub enum IdeAction {
 impl IdeAction {
     pub fn all() -> &'static [Self] {
         &[
+            Self::OpenFolder,
             Self::SearchEverywhere,
             Self::FindAction,
             Self::GoToFile,
@@ -620,6 +724,10 @@ impl IdeAction {
             Self::ToggleTerminalWindow,
             Self::OpenSettingsModal,
             Self::SwitchTheme,
+            Self::SwitchUiLanguage,
+            Self::ZoomInUi,
+            Self::ZoomOutUi,
+            Self::ResetUiZoom,
         ]
     }
 
@@ -630,6 +738,7 @@ impl IdeAction {
             Self::GoToFile => "Ctrl+Shift+N",
             Self::FindInFiles => "Ctrl+Shift+F",
             Self::GoToDeclaration => "Ctrl+B",
+            Self::OpenFolder => "Ctrl+O",
             Self::NewFileInProject => "Alt+Insert",
             Self::NewFolderInProject => "Ctrl+Alt+N",
             Self::DeleteSelectedPath => "Delete",
@@ -665,6 +774,10 @@ impl IdeAction {
             Self::ToggleTerminalWindow => "Alt+F12",
             Self::OpenSettingsModal => "Ctrl+Alt+S",
             Self::SwitchTheme => "Ctrl+`",
+            Self::SwitchUiLanguage => "Ctrl+Alt+U",
+            Self::ZoomInUi => "Ctrl+=",
+            Self::ZoomOutUi => "Ctrl+-",
+            Self::ResetUiZoom => "Ctrl+0",
             Self::WidenLeftPanel => "Ctrl+Shift+Right",
             Self::NarrowLeftPanel => "Ctrl+Shift+Left",
             Self::WidenRightPanel => "Ctrl+Alt+Left",
@@ -673,51 +786,216 @@ impl IdeAction {
     }
 
     pub fn title(&self) -> &'static str {
-        match self {
-            Self::SearchEverywhere => "Search Everywhere (全局搜索文件/符号/命令)",
-            Self::FindAction => "Find Action... (查找并执行 IDE 动作)",
-            Self::GoToFile => "Go to File... (按文件名快速跳转)",
-            Self::FindInFiles => "Find in Files... (Ripgrep 全局文本搜索)",
-            Self::GoToDeclaration => "Go to Declaration or Usages (跳转定义)",
-            Self::NewFileInProject => "New File... (在当前目录下新建源码文件)",
-            Self::NewFolderInProject => "New Directory... (在当前目录下新建文件夹)",
-            Self::DeleteSelectedPath => "Delete File/Directory (删除选中项)",
-            Self::SaveActiveFile => "Save All Documents (保存当前及所有修改)",
-            Self::CloseActiveTab => "Close Active Editor Tab (关闭当前标签页)",
-            Self::UndoEdit => "Undo (撤销上一步编辑)",
-            Self::RedoEdit => "Redo (重做编辑)",
-            Self::DuplicateLine => "Duplicate Line or Selection (IDEA 复制当前行)",
-            Self::DeleteLine => "Delete Line at Caret (IDEA 删除当前行)",
-            Self::ToggleLineComment => "Comment with Line Comment (切换行注释)",
-            Self::ReformatCode => "Reformat Code (IDEA 代码格式化)",
-            Self::RenameSymbol => "Rename Symbol... (安全重命名符号)",
-            Self::ShowIntentionActions => "Show Context Actions & AI Fix (意图修复)",
-            Self::InlineAiEdit => "Cursor Ctrl+K Inline AI Edit (行内 AI 重构 Diff)",
-            Self::SendSelectionToAgent => "Send Selection to Active Agent (发送选区至智能体)",
-            Self::AcceptInlineDiff => "Accept AI Proposed Hunk Diff (接受 AI 修改)",
-            Self::RejectInlineDiff => "Reject AI Proposed Hunk Diff (拒绝 AI 修改)",
-            Self::RevertLastCheckpoint => "Revert to Last Checkpoint (回滚至快照)",
-            Self::SwitchToAntigravity => "Switch Agent: Google Antigravity (ACP)",
-            Self::SwitchToClaudeCode => "Switch Agent: Claude Code CLI",
-            Self::SwitchToCodexCli => "Switch Agent: OpenAI Codex CLI",
-            Self::RunActiveConfig => "Run Active Configuration (运行当前配置)",
-            Self::DebugActiveConfig => "Debug Active Configuration (启动 DAP 调试)",
-            Self::ToggleBreakpoint => "Toggle Line Breakpoint (切换行断点)",
-            Self::GitCommitPopup => "Commit... (打开 Git 提交与暂存面板)",
-            Self::GitPull => "Git Pull (从远程拉取更新)",
-            Self::GitPush => "Git Push... (推送提交至远程仓库)",
-            Self::GitNewBranch => "Git New Branch... (基于当前 HEAD 创建新分支)",
-            Self::ToggleProjectWindow => "Project Tool Window (切换项目树面板)",
-            Self::ToggleCommitWindow => "Commit Tool Window (切换 Git 提交面板)",
-            Self::ToggleStructureWindow => "Structure Tool Window (切换代码结构大纲)",
-            Self::ToggleAgentHubWindow => "Multi-Agent Hub Window (切换右侧 AI 面板)",
-            Self::ToggleTerminalWindow => "Terminal Tool Window (切换底部终端)",
-            Self::OpenSettingsModal => "Settings... (打开 IDE 设置与快捷键映射)",
-            Self::SwitchTheme => "Switch Theme (切换 Islands Dark / Darcula / Light)",
-            Self::WidenLeftPanel => "Stretch Left Tool Window Right (加宽左侧栏)",
-            Self::NarrowLeftPanel => "Stretch Left Tool Window Left (缩窄左侧栏)",
-            Self::WidenRightPanel => "Stretch Right Tool Window Left (加宽右侧 AI 栏)",
-            Self::RaiseBottomPanel => "Stretch Bottom Tool Window Up (加高底部面板)",
+        self.title_i18n(UiLanguage::ZhCn)
+    }
+
+    pub fn title_i18n(&self, lang: UiLanguage) -> &'static str {
+        match (self, lang) {
+            (Self::OpenFolder, UiLanguage::ZhCn) => "打开文件夹... (切换并加载其他本地项目工作区)",
+            (Self::OpenFolder, UiLanguage::EnUs) => "Open Folder... (Switch to another project workspace)",
+            (Self::SearchEverywhere, UiLanguage::ZhCn) => "随处搜索 Search Everywhere (全局搜索文件/符号/命令)",
+            (Self::SearchEverywhere, UiLanguage::EnUs) => "Search Everywhere (Files / Symbols / Actions)",
+            (Self::FindAction, UiLanguage::ZhCn) => "查找动作 Find Action... (查找并执行 IDE 动作)",
+            (Self::FindAction, UiLanguage::EnUs) => "Find Action... (Search & Run IDE Commands)",
+            (Self::GoToFile, UiLanguage::ZhCn) => "转到文件 Go to File... (按文件名快速跳转)",
+            (Self::GoToFile, UiLanguage::EnUs) => "Go to File... (Quick Jump by File Name)",
+            (Self::FindInFiles, UiLanguage::ZhCn) => "在文件中查找 Find in Files... (Ripgrep 全局文本搜索)",
+            (Self::FindInFiles, UiLanguage::EnUs) => "Find in Files... (Ripgrep Workspace Text Search)",
+            (Self::GoToDeclaration, UiLanguage::ZhCn) => "转到声明或用法 Go to Declaration",
+            (Self::GoToDeclaration, UiLanguage::EnUs) => "Go to Declaration or Usages",
+            (Self::NewFileInProject, UiLanguage::ZhCn) => "新建文件 New File... (在当前目录下新建源码文件)",
+            (Self::NewFileInProject, UiLanguage::EnUs) => "New File... (Create File in Active Directory)",
+            (Self::NewFolderInProject, UiLanguage::ZhCn) => "新建目录 New Directory... (在当前目录下新建文件夹)",
+            (Self::NewFolderInProject, UiLanguage::EnUs) => "New Directory... (Create Folder in Active Directory)",
+            (Self::DeleteSelectedPath, UiLanguage::ZhCn) => "删除文件/目录 Delete",
+            (Self::DeleteSelectedPath, UiLanguage::EnUs) => "Delete File/Directory",
+            (Self::SaveActiveFile, UiLanguage::ZhCn) => "全部保存 Save All (保存当前及所有修改)",
+            (Self::SaveActiveFile, UiLanguage::EnUs) => "Save All Documents",
+            (Self::CloseActiveTab, UiLanguage::ZhCn) => "关闭当前标签页 Close Tab",
+            (Self::CloseActiveTab, UiLanguage::EnUs) => "Close Active Editor Tab",
+            (Self::UndoEdit, UiLanguage::ZhCn) => "撤销 Undo (撤销上一步编辑)",
+            (Self::UndoEdit, UiLanguage::EnUs) => "Undo Last Edit",
+            (Self::RedoEdit, UiLanguage::ZhCn) => "重做 Redo (重做编辑)",
+            (Self::RedoEdit, UiLanguage::EnUs) => "Redo Edit",
+            (Self::DuplicateLine, UiLanguage::ZhCn) => "复制当前行 Duplicate Line",
+            (Self::DuplicateLine, UiLanguage::EnUs) => "Duplicate Line or Selection",
+            (Self::DeleteLine, UiLanguage::ZhCn) => "删除当前行 Delete Line",
+            (Self::DeleteLine, UiLanguage::EnUs) => "Delete Line at Caret",
+            (Self::ToggleLineComment, UiLanguage::ZhCn) => "切换行注释 Line Comment",
+            (Self::ToggleLineComment, UiLanguage::EnUs) => "Comment with Line Comment",
+            (Self::ReformatCode, UiLanguage::ZhCn) => "格式化代码 Reformat Code",
+            (Self::ReformatCode, UiLanguage::EnUs) => "Reformat Code",
+            (Self::RenameSymbol, UiLanguage::ZhCn) => "重命名符号 Rename...",
+            (Self::RenameSymbol, UiLanguage::EnUs) => "Rename Symbol...",
+            (Self::ShowIntentionActions, UiLanguage::ZhCn) => "显示意图动作与 AI 修复",
+            (Self::ShowIntentionActions, UiLanguage::EnUs) => "Show Context Actions & AI Fix",
+            (Self::InlineAiEdit, UiLanguage::ZhCn) => "AI 行内改写 Inline AI Edit (Ctrl+K Diff)",
+            (Self::InlineAiEdit, UiLanguage::EnUs) => "Inline AI Edit (Ctrl+K Diff)",
+            (Self::SendSelectionToAgent, UiLanguage::ZhCn) => "发送选中代码至 AI 助手",
+            (Self::SendSelectionToAgent, UiLanguage::EnUs) => "Send Selection to Active Agent",
+            (Self::AcceptInlineDiff, UiLanguage::ZhCn) => "接受 AI 行内修改",
+            (Self::AcceptInlineDiff, UiLanguage::EnUs) => "Accept AI Proposed Hunk Diff",
+            (Self::RejectInlineDiff, UiLanguage::ZhCn) => "拒绝 AI 行内修改",
+            (Self::RejectInlineDiff, UiLanguage::EnUs) => "Reject AI Proposed Hunk Diff",
+            (Self::RevertLastCheckpoint, UiLanguage::ZhCn) => "回滚到上一个快照 Checkpoint",
+            (Self::RevertLastCheckpoint, UiLanguage::EnUs) => "Revert to Last Checkpoint",
+            (Self::SwitchToAntigravity, UiLanguage::ZhCn) => "切换智能体: Google Antigravity (ACP)",
+            (Self::SwitchToAntigravity, UiLanguage::EnUs) => "Switch Agent: Google Antigravity (ACP)",
+            (Self::SwitchToClaudeCode, UiLanguage::ZhCn) => "切换智能体: Claude Code CLI",
+            (Self::SwitchToClaudeCode, UiLanguage::EnUs) => "Switch Agent: Claude Code CLI",
+            (Self::SwitchToCodexCli, UiLanguage::ZhCn) => "切换智能体: OpenAI Codex CLI",
+            (Self::SwitchToCodexCli, UiLanguage::EnUs) => "Switch Agent: OpenAI Codex CLI",
+            (Self::RunActiveConfig, UiLanguage::ZhCn) => "运行当前配置 Run",
+            (Self::RunActiveConfig, UiLanguage::EnUs) => "Run Active Configuration",
+            (Self::DebugActiveConfig, UiLanguage::ZhCn) => "调试当前配置 Debug (DAP)",
+            (Self::DebugActiveConfig, UiLanguage::EnUs) => "Debug Active Configuration (DAP)",
+            (Self::ToggleBreakpoint, UiLanguage::ZhCn) => "切换行断点 Toggle Breakpoint",
+            (Self::ToggleBreakpoint, UiLanguage::EnUs) => "Toggle Line Breakpoint",
+            (Self::GitCommitPopup, UiLanguage::ZhCn) => "Git 提交 Commit...",
+            (Self::GitCommitPopup, UiLanguage::EnUs) => "Commit...",
+            (Self::GitPull, UiLanguage::ZhCn) => "更新项目 Git Pull",
+            (Self::GitPull, UiLanguage::EnUs) => "Update Project (Git Pull)",
+            (Self::GitPush, UiLanguage::ZhCn) => "推送代码 Git Push...",
+            (Self::GitPush, UiLanguage::EnUs) => "Git Push...",
+            (Self::GitNewBranch, UiLanguage::ZhCn) => "新建 Git 分支 New Branch...",
+            (Self::GitNewBranch, UiLanguage::EnUs) => "Git New Branch...",
+            (Self::ToggleProjectWindow, UiLanguage::ZhCn) => "项目工具窗口 Project",
+            (Self::ToggleProjectWindow, UiLanguage::EnUs) => "Project Tool Window",
+            (Self::ToggleCommitWindow, UiLanguage::ZhCn) => "Git 提交工具窗口 Commit",
+            (Self::ToggleCommitWindow, UiLanguage::EnUs) => "Commit Tool Window",
+            (Self::ToggleStructureWindow, UiLanguage::ZhCn) => "代码结构工具窗口 Structure",
+            (Self::ToggleStructureWindow, UiLanguage::EnUs) => "Structure Tool Window",
+            (Self::ToggleAgentHubWindow, UiLanguage::ZhCn) => "AI 助手工具窗口 AI Assistant",
+            (Self::ToggleAgentHubWindow, UiLanguage::EnUs) => "AI Assistant Tool Window",
+            (Self::ToggleTerminalWindow, UiLanguage::ZhCn) => "终端工具窗口 Terminal",
+            (Self::ToggleTerminalWindow, UiLanguage::EnUs) => "Terminal Tool Window",
+            (Self::OpenSettingsModal, UiLanguage::ZhCn) => "设置 Settings... (语言、主题与快捷键)",
+            (Self::OpenSettingsModal, UiLanguage::EnUs) => "Settings... (Language, Theme & Keymap)",
+            (Self::SwitchTheme, UiLanguage::ZhCn) => "快速切换主题 Switch Theme",
+            (Self::SwitchTheme, UiLanguage::EnUs) => "Quick Switch Theme",
+            (Self::SwitchUiLanguage, UiLanguage::ZhCn) => "切换界面语言 (中文 / English)",
+            (Self::SwitchUiLanguage, UiLanguage::EnUs) => "Switch UI Language (English / 中文)",
+            (Self::ZoomInUi, UiLanguage::ZhCn) => "放大界面与字体 Zoom In UI (+10%)",
+            (Self::ZoomInUi, UiLanguage::EnUs) => "Zoom In UI & Fonts (+10%)",
+            (Self::ZoomOutUi, UiLanguage::ZhCn) => "缩小界面与字体 Zoom Out UI (-10%)",
+            (Self::ZoomOutUi, UiLanguage::EnUs) => "Zoom Out UI & Fonts (-10%)",
+            (Self::ResetUiZoom, UiLanguage::ZhCn) => "重置界面缩放 Reset UI Zoom (100% 跟随系统 DPI)",
+            (Self::ResetUiZoom, UiLanguage::EnUs) => "Reset UI Zoom (100% System DPI)",
+            (Self::WidenLeftPanel, UiLanguage::ZhCn) => "加宽左侧面板",
+            (Self::WidenLeftPanel, UiLanguage::EnUs) => "Stretch Left Panel Right",
+            (Self::NarrowLeftPanel, UiLanguage::ZhCn) => "缩窄左侧面板",
+            (Self::NarrowLeftPanel, UiLanguage::EnUs) => "Stretch Left Panel Left",
+            (Self::WidenRightPanel, UiLanguage::ZhCn) => "加宽右侧 AI 面板",
+            (Self::WidenRightPanel, UiLanguage::EnUs) => "Stretch Right Panel Left",
+            (Self::RaiseBottomPanel, UiLanguage::ZhCn) => "加高底部工具面板",
+            (Self::RaiseBottomPanel, UiLanguage::EnUs) => "Stretch Bottom Panel Up",
+        }
+    }
+
+    pub fn menu_title(&self) -> &'static str {
+        self.menu_title_i18n(UiLanguage::EnUs)
+    }
+
+    pub fn menu_title_i18n(&self, lang: UiLanguage) -> &'static str {
+        match (self, lang) {
+            (Self::OpenFolder, UiLanguage::ZhCn) => "打开文件夹...",
+            (Self::OpenFolder, UiLanguage::EnUs) => "Open Folder...",
+            (Self::SearchEverywhere, UiLanguage::ZhCn) => "随处搜索...",
+            (Self::SearchEverywhere, UiLanguage::EnUs) => "Search Everywhere...",
+            (Self::FindAction, UiLanguage::ZhCn) => "查找动作...",
+            (Self::FindAction, UiLanguage::EnUs) => "Find Action...",
+            (Self::GoToFile, UiLanguage::ZhCn) => "转到文件...",
+            (Self::GoToFile, UiLanguage::EnUs) => "Go to File...",
+            (Self::FindInFiles, UiLanguage::ZhCn) => "在文件中查找...",
+            (Self::FindInFiles, UiLanguage::EnUs) => "Find in Files...",
+            (Self::GoToDeclaration, UiLanguage::ZhCn) => "转到声明或用法",
+            (Self::GoToDeclaration, UiLanguage::EnUs) => "Go to Declaration or Usages",
+            (Self::NewFileInProject, UiLanguage::ZhCn) => "新建文件...",
+            (Self::NewFileInProject, UiLanguage::EnUs) => "New File...",
+            (Self::NewFolderInProject, UiLanguage::ZhCn) => "新建文件夹...",
+            (Self::NewFolderInProject, UiLanguage::EnUs) => "New Directory...",
+            (Self::DeleteSelectedPath, UiLanguage::ZhCn) => "删除...",
+            (Self::DeleteSelectedPath, UiLanguage::EnUs) => "Delete...",
+            (Self::SaveActiveFile, UiLanguage::ZhCn) => "全部保存",
+            (Self::SaveActiveFile, UiLanguage::EnUs) => "Save All",
+            (Self::CloseActiveTab, UiLanguage::ZhCn) => "关闭标签页",
+            (Self::CloseActiveTab, UiLanguage::EnUs) => "Close Tab",
+            (Self::UndoEdit, UiLanguage::ZhCn) => "撤销",
+            (Self::UndoEdit, UiLanguage::EnUs) => "Undo",
+            (Self::RedoEdit, UiLanguage::ZhCn) => "重做",
+            (Self::RedoEdit, UiLanguage::EnUs) => "Redo",
+            (Self::DuplicateLine, UiLanguage::ZhCn) => "复制当前行或选区",
+            (Self::DuplicateLine, UiLanguage::EnUs) => "Duplicate Line or Selection",
+            (Self::DeleteLine, UiLanguage::ZhCn) => "删除当前行",
+            (Self::DeleteLine, UiLanguage::EnUs) => "Delete Line",
+            (Self::ToggleLineComment, UiLanguage::ZhCn) => "使用行注释",
+            (Self::ToggleLineComment, UiLanguage::EnUs) => "Comment with Line Comment",
+            (Self::ReformatCode, UiLanguage::ZhCn) => "重新格式化代码",
+            (Self::ReformatCode, UiLanguage::EnUs) => "Reformat Code",
+            (Self::RenameSymbol, UiLanguage::ZhCn) => "重命名...",
+            (Self::RenameSymbol, UiLanguage::EnUs) => "Rename...",
+            (Self::ShowIntentionActions, UiLanguage::ZhCn) => "显示上下文操作",
+            (Self::ShowIntentionActions, UiLanguage::EnUs) => "Show Context Actions",
+            (Self::InlineAiEdit, UiLanguage::ZhCn) => "AI 行内编辑 (Ctrl+K)",
+            (Self::InlineAiEdit, UiLanguage::EnUs) => "Inline AI Edit (Ctrl+K)",
+            (Self::SendSelectionToAgent, UiLanguage::ZhCn) => "询问 AI 助手",
+            (Self::SendSelectionToAgent, UiLanguage::EnUs) => "Ask AI Assistant",
+            (Self::AcceptInlineDiff, UiLanguage::ZhCn) => "接受行内 Diff",
+            (Self::AcceptInlineDiff, UiLanguage::EnUs) => "Accept Inline Diff",
+            (Self::RejectInlineDiff, UiLanguage::ZhCn) => "拒绝行内 Diff",
+            (Self::RejectInlineDiff, UiLanguage::EnUs) => "Reject Inline Diff",
+            (Self::RevertLastCheckpoint, UiLanguage::ZhCn) => "回滚至上次快照",
+            (Self::RevertLastCheckpoint, UiLanguage::EnUs) => "Revert to Last Checkpoint",
+            (Self::SwitchToAntigravity, UiLanguage::ZhCn) => "使用 Google Antigravity (ACP)",
+            (Self::SwitchToAntigravity, UiLanguage::EnUs) => "Use Google Antigravity (ACP)",
+            (Self::SwitchToClaudeCode, UiLanguage::ZhCn) => "使用 Claude Code CLI",
+            (Self::SwitchToClaudeCode, UiLanguage::EnUs) => "Use Claude Code CLI",
+            (Self::SwitchToCodexCli, UiLanguage::ZhCn) => "使用 OpenAI Codex CLI",
+            (Self::SwitchToCodexCli, UiLanguage::EnUs) => "Use OpenAI Codex CLI",
+            (Self::RunActiveConfig, UiLanguage::ZhCn) => "运行当前配置",
+            (Self::RunActiveConfig, UiLanguage::EnUs) => "Run Active Configuration",
+            (Self::DebugActiveConfig, UiLanguage::ZhCn) => "调试当前配置",
+            (Self::DebugActiveConfig, UiLanguage::EnUs) => "Debug Active Configuration",
+            (Self::ToggleBreakpoint, UiLanguage::ZhCn) => "切换行断点",
+            (Self::ToggleBreakpoint, UiLanguage::EnUs) => "Toggle Line Breakpoint",
+            (Self::GitCommitPopup, UiLanguage::ZhCn) => "提交...",
+            (Self::GitCommitPopup, UiLanguage::EnUs) => "Commit...",
+            (Self::GitPull, UiLanguage::ZhCn) => "更新项目 (Pull)",
+            (Self::GitPull, UiLanguage::EnUs) => "Update Project (Pull)",
+            (Self::GitPush, UiLanguage::ZhCn) => "推送...",
+            (Self::GitPush, UiLanguage::EnUs) => "Push...",
+            (Self::GitNewBranch, UiLanguage::ZhCn) => "新建分支...",
+            (Self::GitNewBranch, UiLanguage::EnUs) => "New Branch...",
+            (Self::ToggleProjectWindow, UiLanguage::ZhCn) => "项目",
+            (Self::ToggleProjectWindow, UiLanguage::EnUs) => "Project",
+            (Self::ToggleCommitWindow, UiLanguage::ZhCn) => "提交",
+            (Self::ToggleCommitWindow, UiLanguage::EnUs) => "Commit",
+            (Self::ToggleStructureWindow, UiLanguage::ZhCn) => "结构",
+            (Self::ToggleStructureWindow, UiLanguage::EnUs) => "Structure",
+            (Self::ToggleAgentHubWindow, UiLanguage::ZhCn) => "AI 助手",
+            (Self::ToggleAgentHubWindow, UiLanguage::EnUs) => "AI Assistant",
+            (Self::ToggleTerminalWindow, UiLanguage::ZhCn) => "终端",
+            (Self::ToggleTerminalWindow, UiLanguage::EnUs) => "Terminal",
+            (Self::OpenSettingsModal, UiLanguage::ZhCn) => "设置...",
+            (Self::OpenSettingsModal, UiLanguage::EnUs) => "Settings...",
+            (Self::SwitchTheme, UiLanguage::ZhCn) => "快速切换主题...",
+            (Self::SwitchTheme, UiLanguage::EnUs) => "Quick Switch Theme...",
+            (Self::SwitchUiLanguage, UiLanguage::ZhCn) => "界面语言: 中文 / English",
+            (Self::SwitchUiLanguage, UiLanguage::EnUs) => "UI Language: English / 中文",
+            (Self::ZoomInUi, UiLanguage::ZhCn) => "放大界面与字体 (+10%)",
+            (Self::ZoomInUi, UiLanguage::EnUs) => "Zoom In UI & Fonts (+10%)",
+            (Self::ZoomOutUi, UiLanguage::ZhCn) => "缩小界面与字体 (-10%)",
+            (Self::ZoomOutUi, UiLanguage::EnUs) => "Zoom Out UI & Fonts (-10%)",
+            (Self::ResetUiZoom, UiLanguage::ZhCn) => "重置界面缩放 (100%)",
+            (Self::ResetUiZoom, UiLanguage::EnUs) => "Reset UI Zoom (100%)",
+            (Self::WidenLeftPanel, UiLanguage::ZhCn) => "右拉加宽左侧面板",
+            (Self::WidenLeftPanel, UiLanguage::EnUs) => "Stretch Left Panel Right",
+            (Self::NarrowLeftPanel, UiLanguage::ZhCn) => "左拉缩窄左侧面板",
+            (Self::NarrowLeftPanel, UiLanguage::EnUs) => "Stretch Left Panel Left",
+            (Self::WidenRightPanel, UiLanguage::ZhCn) => "左拉加宽右侧面板",
+            (Self::WidenRightPanel, UiLanguage::EnUs) => "Stretch Right Panel Left",
+            (Self::RaiseBottomPanel, UiLanguage::ZhCn) => "上拉加高底部面板",
+            (Self::RaiseBottomPanel, UiLanguage::EnUs) => "Stretch Bottom Panel Up",
         }
     }
 }
@@ -733,5 +1011,32 @@ mod tests {
         assert_eq!(LanguageId::from_path(Path::new("agent/run.py")), LanguageId::Python);
         let t = ThemeKind::IslandsDark.next();
         assert_eq!(t, ThemeKind::DarculaClassic);
+    }
+
+    #[test]
+    fn test_menu_and_action_i18n_coverage() {
+        assert_eq!(UiLanguage::default(), UiLanguage::ZhCn);
+        assert_eq!(UiLanguage::ZhCn.toggle(), UiLanguage::EnUs);
+        assert_eq!(UiLanguage::EnUs.toggle(), UiLanguage::ZhCn);
+
+        for &cat in MainMenuCategory::all() {
+            let zh = cat.label_i18n(UiLanguage::ZhCn);
+            let en = cat.label_i18n(UiLanguage::EnUs);
+            assert!(!zh.is_empty());
+            assert!(!en.is_empty());
+            if cat != MainMenuCategory::Git {
+                assert_ne!(zh, en, "category {cat:?} should differ between ZH and EN");
+            }
+        }
+
+        assert!(MainMenuCategory::File.items().contains(&IdeAction::OpenFolder));
+        assert!(MainMenuCategory::View.items().contains(&IdeAction::SwitchUiLanguage));
+
+        for &act in IdeAction::all() {
+            assert!(!act.menu_title_i18n(UiLanguage::ZhCn).is_empty());
+            assert!(!act.menu_title_i18n(UiLanguage::EnUs).is_empty());
+            assert!(!act.title_i18n(UiLanguage::ZhCn).is_empty());
+            assert!(!act.title_i18n(UiLanguage::EnUs).is_empty());
+        }
     }
 }

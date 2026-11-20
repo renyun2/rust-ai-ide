@@ -5,18 +5,20 @@ mod canvas;
 mod ide_state;
 mod image_preview;
 mod persistence;
+mod svg_icon;
 mod text_input;
 
 use crate::canvas::{
     detect_system_dpi_scale, render_ri_icon_rgba, save_ri_icon_png, SurfaceCanvas,
 };
 use crate::ide_state::{
-    write_windows_clipboard_text, FocusTarget, IdeApplicationState, IdeCursorKind,
-    TextInputNavAction, WindowControlCmd,
+    duplicate_open_count, workspace_paths_equal, write_windows_clipboard_text, FocusTarget,
+    IdeApplicationState, IdeCursorKind, TextInputNavAction, WindowControlCmd,
 };
 use anyhow::Result;
 use ide_core::{IdeAction, MainMenuCategory, ToolWindowId};
 use softbuffer::{Context, Surface};
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
@@ -25,9 +27,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tao::dpi::{LogicalSize, PhysicalPosition};
 use tao::event::{ElementState, Event, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
-use tao::event_loop::{ControlFlow, EventLoopBuilder};
+use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget};
 use tao::keyboard::{Key, ModifiersState};
-use tao::window::{CursorIcon, Icon, ResizeDirection, WindowBuilder};
+use tao::window::{CursorIcon, Icon, ResizeDirection, Window, WindowBuilder, WindowId};
 
 #[cfg(target_os = "windows")]
 fn cursor_pos_in_window(
@@ -67,7 +69,120 @@ fn cursor_pos_in_window(
 
 #[derive(Debug, Clone, Copy)]
 enum IdeWakeupEvent {
-    Wakeup,
+    Wakeup(WindowId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowCommand {
+    None,
+    CloseWindow,
+}
+
+struct IdeWindowHost {
+    window: Rc<Window>,
+    _context: Context<Rc<Window>>,
+    surface: Surface<Rc<Window>, Rc<Window>>,
+    app_state: IdeApplicationState,
+    surface_canvas: SurfaceCanvas,
+    cursor_pos: (i32, i32),
+    last_cursor_icon: CursorIcon,
+    modifiers: ModifiersState,
+    left_mouse_down: bool,
+    last_shift_press: Option<Instant>,
+    last_titlebar_click: Option<(Instant, (i32, i32))>,
+    last_input_click: Option<(Instant, (i32, i32), u8)>,
+    last_pty_rev: u64,
+    pending_redraw: bool,
+    is_focused: bool,
+    is_minimized: bool,
+    last_wheel_time: Option<Instant>,
+    last_wheel_dir: f32,
+    wheel_velocity_boost: f32,
+    wheel_accum_y: f32,
+    wheel_accum_x: f32,
+}
+
+fn spawn_ide_window(
+    elwt: &EventLoopWindowTarget<IdeWakeupEvent>,
+    proxy: &EventLoopProxy<IdeWakeupEvent>,
+    workspace_root: PathBuf,
+    storage_dir: Option<&Path>,
+    window_icon: Option<Icon>,
+    init_log_w: f64,
+    init_log_h: f64,
+    init_maximized: bool,
+) -> Result<IdeWindowHost> {
+    let window = Rc::new(
+        WindowBuilder::new()
+            .with_title(format!(
+                "{} — Rust AI IDE",
+                workspace_root
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("RI")
+            ))
+            .with_window_icon(window_icon)
+            .with_decorations(false)
+            .with_resizable(true)
+            .with_maximized(init_maximized)
+            .with_inner_size(LogicalSize::new(init_log_w, init_log_h))
+            .build(elwt)?,
+    );
+    apply_windows11_rounded_corners(&window);
+
+    let context = Context::new(window.clone())
+        .map_err(|e| anyhow::anyhow!("Failed to initialize softbuffer context: {e}"))?;
+    let surface = Surface::new(&context, window.clone())
+        .map_err(|e| anyhow::anyhow!("Failed to create rendering surface: {e}"))?;
+
+    let wid = window.id();
+    let proxy_w = proxy.clone();
+    let wakeup: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let _ = proxy_w.send_event(IdeWakeupEvent::Wakeup(wid));
+    });
+
+    let mut app_state = IdeApplicationState::new_with_wakeup(workspace_root, Some(wakeup));
+    if let Some(dir) = storage_dir {
+        app_state.restore_from_persistence_dir(dir.to_path_buf());
+    }
+    let _ = app_state.take_workspace_title_dirty();
+    window.set_title(&app_state.taskbar_title());
+    let init_os_scale = (window.scale_factor() as f32).clamp(0.75, 4.0);
+    app_state.system_dpi_scale = init_os_scale;
+    app_state.window_maximized = window.is_maximized();
+    let init_phys = window.inner_size();
+    let surface_canvas = SurfaceCanvas::new_with_scale(
+        init_phys.width.max(1) as usize,
+        init_phys.height.max(1) as usize,
+        app_state.effective_scale(),
+    );
+    app_state.adapt_panels_for_logical_width(surface_canvas.width as i32);
+    let last_pty_rev = app_state.active_terminal_revision();
+
+    Ok(IdeWindowHost {
+        window,
+        _context: context,
+        surface,
+        app_state,
+        surface_canvas,
+        cursor_pos: (0, 0),
+        last_cursor_icon: CursorIcon::Default,
+        modifiers: ModifiersState::default(),
+        left_mouse_down: false,
+        last_shift_press: None,
+        last_titlebar_click: None,
+        last_input_click: None,
+        last_pty_rev,
+        pending_redraw: true,
+        is_focused: true,
+        is_minimized: false,
+        last_wheel_time: None,
+        last_wheel_dir: 0.0,
+        wheel_velocity_boost: 1.0,
+        wheel_accum_y: 0.0,
+        wheel_accum_x: 0.0,
+    })
 }
 
 fn sync_ime_position(
@@ -89,11 +204,195 @@ fn load_ri_window_icon() -> Option<Icon> {
 
 fn sync_window_title(window: &tao::window::Window, state: &mut IdeApplicationState) {
     if state.take_workspace_title_dirty() {
-        window.set_title(&format!(
-            "RI — {} [{}]",
-            state.workspace_name(),
-            state.workspace_root.display()
-        ));
+        window.set_title(&state.taskbar_title());
+    }
+}
+
+fn find_workspace_window(
+    windows: &HashMap<WindowId, IdeWindowHost>,
+    path: &Path,
+    origin_id: WindowId,
+) -> Option<WindowId> {
+    let matches: Vec<WindowId> = windows
+        .iter()
+        .filter(|(_, host)| workspace_paths_equal(&host.app_state.workspace_root, path))
+        .map(|(id, _)| *id)
+        .collect();
+    if matches.is_empty() {
+        return None;
+    }
+    if matches.contains(&origin_id) {
+        return Some(origin_id);
+    }
+    if let Some(id) = matches.iter().copied().find(|id| {
+        windows
+            .get(id)
+            .is_some_and(|host| host.is_focused && !host.is_minimized)
+    }) {
+        return Some(id);
+    }
+    matches.into_iter().find(|id| *id != origin_id)
+}
+
+#[cfg(target_os = "windows")]
+fn activate_os_window(window: &tao::window::Window) {
+    use tao::platform::windows::WindowExtWindows;
+    #[link(name = "user32")]
+    extern "system" {
+        fn IsIconic(hwnd: *mut core::ffi::c_void) -> i32;
+        fn ShowWindow(hwnd: *mut core::ffi::c_void, cmd: i32) -> i32;
+        fn SetForegroundWindow(hwnd: *mut core::ffi::c_void) -> i32;
+        fn BringWindowToTop(hwnd: *mut core::ffi::c_void) -> i32;
+    }
+    const SW_RESTORE: i32 = 9;
+    let hwnd = window.hwnd() as *mut core::ffi::c_void;
+    unsafe {
+        if IsIconic(hwnd) != 0 {
+            ShowWindow(hwnd, SW_RESTORE);
+        }
+        if SetForegroundWindow(hwnd) == 0 {
+            BringWindowToTop(hwnd);
+            SetForegroundWindow(hwnd);
+        } else {
+            BringWindowToTop(hwnd);
+        }
+    }
+    window.set_focus();
+}
+
+#[cfg(not(target_os = "windows"))]
+fn activate_os_window(window: &tao::window::Window) {
+    window.set_minimized(false);
+    window.set_focus();
+}
+
+#[cfg(target_os = "windows")]
+fn flash_os_window(window: &tao::window::Window) {
+    use tao::platform::windows::WindowExtWindows;
+    #[repr(C)]
+    struct FlashWInfo {
+        cb_size: u32,
+        hwnd: *mut core::ffi::c_void,
+        flags: u32,
+        count: u32,
+        timeout: u32,
+    }
+    #[link(name = "user32")]
+    extern "system" {
+        fn FlashWindowEx(info: *const FlashWInfo) -> i32;
+    }
+    const FLASHW_ALL: u32 = 0x0000_0003;
+    let info = FlashWInfo {
+        cb_size: std::mem::size_of::<FlashWInfo>() as u32,
+        hwnd: window.hwnd() as *mut core::ffi::c_void,
+        flags: FLASHW_ALL,
+        count: 6,
+        timeout: 70,
+    };
+    unsafe {
+        FlashWindowEx(&info);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn flash_os_window(window: &tao::window::Window) {
+    use tao::window::UserAttentionType;
+    window.request_user_attention(Some(UserAttentionType::Critical));
+}
+
+/// Focus the window that already has `path`. Repeated attempts flash that window.
+fn focus_already_open_project(
+    windows: &mut HashMap<WindowId, IdeWindowHost>,
+    recent: &mut Option<(WindowId, u32, Instant)>,
+    created_this_batch: &HashSet<WindowId>,
+    origin_id: WindowId,
+    path: &Path,
+) -> bool {
+    let Some(existing_id) = find_workspace_window(windows, path, origin_id) else {
+        return false;
+    };
+    let fresh = created_this_batch.contains(&existing_id);
+    let flashed = if fresh {
+        false
+    } else {
+        let now = Instant::now();
+        let count = duplicate_open_count(recent, &existing_id, now);
+        *recent = Some((existing_id, count, now));
+        count >= 2
+    };
+
+    if let Some(host) = windows.get_mut(&existing_id) {
+        host.is_minimized = false;
+        host.is_focused = true;
+        activate_os_window(&host.window);
+        if flashed {
+            flash_os_window(&host.window);
+            host.app_state.start_window_attention_flash();
+        }
+        host.pending_redraw = true;
+        host.window.request_redraw();
+    }
+    if fresh {
+        return true;
+    }
+
+    let same = existing_id == origin_id;
+    if let Some(origin) = windows.get_mut(&origin_id) {
+        origin.app_state.status_notification = if flashed {
+            origin
+                .app_state
+                .tr(
+                    "该项目已打开，窗口已闪烁提示",
+                    "Project is already open — flashed that window",
+                )
+                .to_string()
+        } else if same {
+            origin
+                .app_state
+                .tr(
+                    "该项目已在当前窗口打开",
+                    "This project is already open in this window",
+                )
+                .to_string()
+        } else {
+            origin
+                .app_state
+                .tr(
+                    "该项目已打开，已切换到对应窗口",
+                    "Project is already open — switched to that window",
+                )
+                .to_string()
+        };
+        origin.pending_redraw = true;
+    }
+    if flashed && !same {
+        if let Some(target) = windows.get_mut(&existing_id) {
+            target.app_state.status_notification = target
+                .app_state
+                .tr(
+                    "该项目已在此窗口打开",
+                    "This project is already open in this window",
+                )
+                .to_string();
+            target.pending_redraw = true;
+        }
+    }
+    true
+}
+
+fn schedule_attention_frames(
+    windows: &HashMap<WindowId, IdeWindowHost>,
+    control_flow: &mut ControlFlow,
+    ui_test_mode: bool,
+) {
+    if ui_test_mode {
+        return;
+    }
+    if windows
+        .values()
+        .any(|host| host.app_state.window_attention_until.is_some())
+    {
+        *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(16));
     }
 }
 
@@ -326,511 +625,745 @@ fn main() -> Result<()> {
 
     let event_loop = EventLoopBuilder::<IdeWakeupEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
-    let wakeup: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-        let _ = proxy.send_event(IdeWakeupEvent::Wakeup);
-    });
 
-    let (init_log_w, init_log_h) = if saved_global.window_width >= 800
-        && saved_global.window_height >= 540
-    {
-        (
-            saved_global.window_width as f64,
-            saved_global.window_height as f64,
-        )
-    } else if let Some(mon) = event_loop.primary_monitor() {
-        let mscale = mon.scale_factor().max(0.5);
-        let msize = mon.size();
-        let mon_log_w = msize.width as f64 / mscale;
-        let mon_log_h = msize.height as f64 / mscale;
-        (
-            1560.0_f64.min((mon_log_w * 0.92).max(1120.0)),
-            940.0_f64.min((mon_log_h * 0.90).max(700.0)),
-        )
-    } else {
-        (1560.0, 940.0)
-    };
+    let (init_log_w, init_log_h) =
+        if saved_global.window_width >= 800 && saved_global.window_height >= 540 {
+            (
+                saved_global.window_width as f64,
+                saved_global.window_height as f64,
+            )
+        } else if let Some(mon) = event_loop.primary_monitor() {
+            let mscale = mon.scale_factor().max(0.5);
+            let msize = mon.size();
+            let mon_log_w = msize.width as f64 / mscale;
+            let mon_log_h = msize.height as f64 / mscale;
+            (
+                1560.0_f64.min((mon_log_w * 0.92).max(1120.0)),
+                940.0_f64.min((mon_log_h * 0.90).max(700.0)),
+            )
+        } else {
+            (1560.0, 940.0)
+        };
 
-    let window = Rc::new(
-        WindowBuilder::new()
-            .with_title(format!("RI — Rust AI IDE [{}]", workspace_root.display()))
-            .with_window_icon(load_ri_window_icon())
-            .with_decorations(false)
-            .with_resizable(true)
-            .with_maximized(saved_global.window_maximized)
-            .with_inner_size(LogicalSize::new(init_log_w, init_log_h))
-            .build(&event_loop)?,
-    );
-    apply_windows11_rounded_corners(&window);
-
-    let context = Context::new(window.clone())
-        .map_err(|e| anyhow::anyhow!("Failed to initialize softbuffer context: {e}"))?;
-    let mut surface = Surface::new(&context, window.clone())
-        .map_err(|e| anyhow::anyhow!("Failed to create rendering surface: {e}"))?;
-
-    let mut app_state = IdeApplicationState::new_with_wakeup(workspace_root, Some(wakeup));
-    if let Some(dir) = storage_dir {
-        app_state.restore_from_persistence_dir(dir);
-        sync_window_title(&window, &mut app_state);
-    }
-    let init_os_scale = (window.scale_factor() as f32).clamp(0.75, 4.0);
-    app_state.system_dpi_scale = init_os_scale;
-    app_state.window_maximized = window.is_maximized();
-    let init_phys = window.inner_size();
-    let mut surface_canvas = SurfaceCanvas::new_with_scale(
-        init_phys.width.max(1) as usize,
-        init_phys.height.max(1) as usize,
-        app_state.effective_scale(),
-    );
-    app_state.adapt_panels_for_logical_width(surface_canvas.width as i32);
-    let mut cursor_pos: (i32, i32) = (0, 0);
-    let mut last_cursor_icon = CursorIcon::Default;
-    let mut modifiers = ModifiersState::default();
-    let mut left_mouse_down = false;
-    let mut last_shift_press: Option<Instant> = None;
-    let mut last_titlebar_click: Option<(Instant, (i32, i32))> = None;
-    let mut last_input_click: Option<(Instant, (i32, i32), u8)> = None;
+    let shared_window_icon = load_ri_window_icon();
+    let initial_host = spawn_ide_window(
+        &event_loop,
+        &proxy,
+        workspace_root,
+        storage_dir.as_deref(),
+        shared_window_icon.clone(),
+        init_log_w,
+        init_log_h,
+        saved_global.window_maximized,
+    )?;
+    let primary_window_id = initial_host.window.id();
+    let mut windows: HashMap<WindowId, IdeWindowHost> = HashMap::new();
+    windows.insert(primary_window_id, initial_host);
     let mut ui_test_frames: u32 = 0;
-    let mut last_pty_rev = app_state.active_terminal_revision();
-    let mut pending_redraw = true;
-    let mut last_wheel_time: Option<Instant> = None;
-    let mut last_wheel_dir: f32 = 0.0;
-    let mut wheel_velocity_boost: f32 = 1.0;
-    let mut wheel_accum_y: f32 = 0.0;
-    let mut wheel_accum_x: f32 = 0.0;
+    let mut recent_reopen: Option<(WindowId, u32, Instant)> = None;
 
-    event_loop.run(move |event, _, control_flow| {
+    event_loop.run(move |event, elwt, control_flow| {
+        let mut any_anim = false;
+        let mut any_active_terminal = false;
+        for host in windows.values() {
+            if !host.is_minimized && host.app_state.has_active_animations() {
+                any_anim = true;
+            }
+            if !host.is_minimized
+                && ((host.app_state.bottom_tool == Some(ToolWindowId::Terminal)
+                    && (host.is_focused
+                        || host
+                            .app_state
+                            .terminal
+                            .active_pty()
+                            .alive
+                            .load(std::sync::atomic::Ordering::Relaxed)))
+                    || host.app_state.terminal.any_run_active())
+            {
+                any_active_terminal = true;
+            }
+        }
         if ui_test_mode {
             *control_flow = ControlFlow::Poll;
-        } else if app_state.has_active_animations() {
+        } else if any_anim {
             *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(16));
-        } else if app_state.bottom_tool == Some(ToolWindowId::Terminal) {
+        } else if any_active_terminal {
             *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(80));
         } else {
             *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(260));
         }
 
+        let mut spawn_pending = |windows: &mut HashMap<WindowId, IdeWindowHost>| {
+            let mut new_window_requests: Vec<(WindowId, PathBuf)> = Vec::new();
+            let mut switch_requests: Vec<(WindowId, PathBuf)> = Vec::new();
+            for (&origin_id, host) in windows.iter_mut() {
+                for p in host.app_state.pending_new_windows.drain(..) {
+                    new_window_requests.push((origin_id, p));
+                }
+                for p in host.app_state.pending_switch_workspaces.drain(..) {
+                    switch_requests.push((origin_id, p));
+                }
+            }
+            let mut created_this_batch: HashSet<WindowId> = HashSet::new();
+            for (origin_id, target_path) in new_window_requests {
+                if focus_already_open_project(
+                    windows,
+                    &mut recent_reopen,
+                    &created_this_batch,
+                    origin_id,
+                    &target_path,
+                ) {
+                    continue;
+                }
+                match spawn_ide_window(
+                    elwt,
+                    &proxy,
+                    target_path.clone(),
+                    storage_dir.as_deref(),
+                    shared_window_icon.clone(),
+                    init_log_w,
+                    init_log_h,
+                    false,
+                ) {
+                    Ok(mut new_host) => {
+                        let new_id = new_host.window.id();
+                        new_host.window.request_redraw();
+                        new_host.pending_redraw = false;
+                        windows.insert(new_id, new_host);
+                        created_this_batch.insert(new_id);
+                        if let Some(origin) = windows.get_mut(&origin_id) {
+                            origin.app_state.status_notification = format!(
+                                "{}: {}",
+                                origin
+                                    .app_state
+                                    .tr("已在新窗口开启项目", "Opened project in new window"),
+                                target_path.display()
+                            );
+                            origin.pending_redraw = true;
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(origin) = windows.get_mut(&origin_id) {
+                            origin.app_state.status_notification = format!(
+                                "{}: {e}",
+                                origin.app_state.tr("无法创建新窗口", "Failed to create new window")
+                            );
+                            origin.pending_redraw = true;
+                        }
+                    }
+                }
+            }
+            for (origin_id, target_path) in switch_requests {
+                if focus_already_open_project(
+                    windows,
+                    &mut recent_reopen,
+                    &created_this_batch,
+                    origin_id,
+                    &target_path,
+                ) {
+                    continue;
+                }
+                if let Some(origin) = windows.get_mut(&origin_id) {
+                    origin.app_state.switch_workspace(target_path);
+                    sync_window_title(&origin.window, &mut origin.app_state);
+                    origin.pending_redraw = true;
+                    origin.window.request_redraw();
+                }
+            }
+        };
+
         match event {
-            Event::UserEvent(IdeWakeupEvent::Wakeup) => {
-                let _ = app_state.poll_background_updates();
-                sync_window_title(&window, &mut app_state);
-                pending_redraw = true;
+            Event::UserEvent(IdeWakeupEvent::Wakeup(wid)) => {
+                if let Some(host) = windows.get_mut(&wid) {
+                    let _ = host.app_state.poll_background_updates();
+                    sync_window_title(&host.window, &mut host.app_state);
+                    if !host.is_minimized {
+                        host.pending_redraw = true;
+                    }
+                }
+                spawn_pending(&mut windows);
+                schedule_attention_frames(&windows, control_flow, ui_test_mode);
             }
             Event::MainEventsCleared => {
+                spawn_pending(&mut windows);
+                schedule_attention_frames(&windows, control_flow, ui_test_mode);
                 if ui_test_mode {
-                    ui_test_frames += 1;
-                    if ui_test_frames == 2 {
-                        window.request_redraw();
-                    } else if ui_test_frames == 5 {
-                        app_state.hamburger_menu_expanded = true;
-                        app_state.active_menu_category = Some(MainMenuCategory::View);
-                        app_state.trigger_ctrl_k_inline_edit();
-                        window.request_redraw();
-                    } else if ui_test_frames >= 10 {
-                        let screenshot_dir = Path::new(
-                            r"C:\Users\renyu\.gemini\antigravity-acp\brain\bdfa34ef-e982-4639-9e67-ad62c315c891",
-                        );
-                        if screenshot_dir.exists() {
-                            let _ = surface_canvas
-                                .save_png(&screenshot_dir.join("idea_window_live_test.png"));
+                    if let Some(host) = windows.get_mut(&primary_window_id) {
+                        ui_test_frames += 1;
+                        if ui_test_frames == 2 {
+                            host.window.request_redraw();
+                        } else if ui_test_frames == 5 {
+                            host.app_state.hamburger_menu_expanded = true;
+                            host.app_state.active_menu_category = Some(MainMenuCategory::View);
+                            host.app_state.trigger_ctrl_k_inline_edit();
+                            host.window.request_redraw();
+                        } else if ui_test_frames >= 10 {
+                            let screenshot_dir = Path::new(
+                                r"C:\Users\renyu\.gemini\antigravity-acp\brain\bdfa34ef-e982-4639-9e67-ad62c315c891",
+                            );
+                            if screenshot_dir.exists() {
+                                let _ = host
+                                    .surface_canvas
+                                    .save_png(&screenshot_dir.join("idea_window_live_test.png"));
+                            }
+                            println!(
+                                "Automated Live Window UI Test passed ({} frames rendered).",
+                                ui_test_frames
+                            );
+                            *control_flow = ControlFlow::Exit;
                         }
-                        println!(
-                            "Automated Live Window UI Test passed ({} frames rendered).",
-                            ui_test_frames
-                        );
+                    }
+                } else {
+                    for host in windows.values_mut() {
+                        if host.is_minimized {
+                            let _ = host.app_state.poll_background_updates();
+                            host.surface_canvas.shrink_for_minimized();
+                            host.app_state.trim_caches_when_minimized();
+                            continue;
+                        }
+                        let mut need_redraw = host.pending_redraw;
+                        if host.app_state.poll_background_updates() {
+                            sync_window_title(&host.window, &mut host.app_state);
+                            need_redraw = true;
+                        }
+                        if host.app_state.step_animations() {
+                            need_redraw = true;
+                        }
+                        let current_rev = host.app_state.active_terminal_revision();
+                        if current_rev != host.last_pty_rev {
+                            host.last_pty_rev = current_rev;
+                            need_redraw = true;
+                        }
+                        if host.is_focused
+                            && host.app_state.last_input_activity.elapsed()
+                                >= Duration::from_millis(530)
+                        {
+                            host.app_state.caret_visible = !host.app_state.caret_visible;
+                            host.app_state.last_input_activity = Instant::now();
+                            need_redraw = true;
+                        }
+                        if need_redraw {
+                            host.pending_redraw = false;
+                            host.window.request_redraw();
+                        }
+                    }
+                }
+            }
+            Event::RedrawRequested(wid) => {
+                if let Some(host) = windows.get_mut(&wid) {
+                    host.render_frame();
+                }
+            }
+            Event::WindowEvent {
+                window_id, event, ..
+            } => {
+                let cmd = if let Some(host) = windows.get_mut(&window_id) {
+                    host.handle_window_event(event)
+                } else {
+                    WindowCommand::None
+                };
+                if cmd == WindowCommand::CloseWindow {
+                    if let Some(host) = windows.remove(&window_id) {
+                        host.app_state.save_all_persisted_state();
+                    }
+                    if windows.is_empty() {
                         *control_flow = ControlFlow::Exit;
                     }
                 } else {
-                    let mut need_redraw = pending_redraw;
-                    if app_state.poll_background_updates() {
-                        sync_window_title(&window, &mut app_state);
-                        need_redraw = true;
-                    }
-                    if app_state.step_animations() {
-                        need_redraw = true;
-                    }
-                    if app_state.bottom_tool == Some(ToolWindowId::Terminal) {
-                        let current_rev = app_state.active_terminal_revision();
-                        if current_rev != last_pty_rev {
-                            last_pty_rev = current_rev;
-                            need_redraw = true;
-                        }
-                    }
-                    if app_state.last_input_activity.elapsed() >= Duration::from_millis(530) {
-                        app_state.caret_visible = !app_state.caret_visible;
-                        app_state.last_input_activity = Instant::now();
-                        need_redraw = true;
-                    }
-                    if need_redraw {
-                        pending_redraw = false;
-                        window.request_redraw();
-                    }
+                    spawn_pending(&mut windows);
+                    schedule_attention_frames(&windows, control_flow, ui_test_mode);
                 }
             }
-            Event::RedrawRequested(_) => {
-                pending_redraw = false;
-                let size = window.inner_size();
-                let width = size.width.max(1);
-                let height = size.height.max(1);
-                app_state.system_dpi_scale = (window.scale_factor() as f32).clamp(0.75, 4.0);
-                app_state.window_maximized = window.is_maximized();
+            _ => {}
+        }
+    });
+}
 
-                surface_canvas.resize_physical(
-                    width as usize,
-                    height as usize,
-                    app_state.effective_scale(),
-                );
-                app_state.render(&mut surface_canvas);
-                sync_ime_position(&window, &app_state, &surface_canvas);
-                sync_window_cursor(
-                    &window,
-                    &app_state,
-                    &surface_canvas,
-                    cursor_pos,
-                    &mut last_cursor_icon,
-                );
-                last_pty_rev = app_state.active_terminal_revision();
+impl IdeWindowHost {
+    fn render_frame(&mut self) {
+        self.pending_redraw = false;
+        let size = self.window.inner_size();
+        if size.width == 0 || size.height == 0 || self.window.is_minimized() {
+            self.is_minimized = true;
+            self.surface_canvas.shrink_for_minimized();
+            self.app_state.trim_caches_when_minimized();
+            return;
+        }
+        self.is_minimized = false;
+        let width = size.width.max(1);
+        let height = size.height.max(1);
+        self.app_state.system_dpi_scale = (self.window.scale_factor() as f32).clamp(0.75, 4.0);
+        self.app_state.window_maximized = self.window.is_maximized();
 
-                if let (Some(nz_w), Some(nz_h)) =
-                    (NonZeroU32::new(width), NonZeroU32::new(height))
+        self.surface_canvas.resize_physical(
+            width as usize,
+            height as usize,
+            self.app_state.effective_scale(),
+        );
+        self.app_state.render(&mut self.surface_canvas);
+        sync_ime_position(&self.window, &self.app_state, &self.surface_canvas);
+        sync_window_cursor(
+            &self.window,
+            &self.app_state,
+            &self.surface_canvas,
+            self.cursor_pos,
+            &mut self.last_cursor_icon,
+        );
+        self.last_pty_rev = self.app_state.active_terminal_revision();
+
+        if let (Some(nz_w), Some(nz_h)) = (NonZeroU32::new(width), NonZeroU32::new(height)) {
+            if self.surface.resize(nz_w, nz_h).is_ok() {
+                if let Ok(mut buffer) = self.surface.buffer_mut() {
+                    self.surface_canvas.copy_to_softbuffer(&mut buffer);
+                    let _ = buffer.present();
+                }
+            }
+        }
+    }
+
+    fn handle_window_event(&mut self, event: WindowEvent<'_>) -> WindowCommand {
+        match event {
+            WindowEvent::CloseRequested => {
+                return WindowCommand::CloseWindow;
+            }
+            WindowEvent::Focused(focused) => {
+                self.is_focused = focused;
+                if focused {
+                    self.pending_redraw = true;
+                }
+            }
+            WindowEvent::Resized(new_size) => {
+                let minimized = new_size.width == 0
+                    || new_size.height == 0
+                    || self.window.is_minimized();
+                self.is_minimized = minimized;
+                if minimized {
+                    self.surface_canvas.shrink_for_minimized();
+                    self.app_state.trim_caches_when_minimized();
+                } else {
+                    self.app_state.window_maximized = self.window.is_maximized();
+                    self.pending_redraw = true;
+                }
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                self.app_state.system_dpi_scale = (scale_factor as f32).clamp(0.75, 4.0);
+                self.surface_canvas
+                    .set_scale_factor(self.app_state.effective_scale());
+                self.pending_redraw = true;
+            }
+            WindowEvent::ReceivedImeText(text) => {
+                self.app_state.insert_text_at_focus(&text);
+                sync_ime_position(&self.window, &self.app_state, &self.surface_canvas);
+                self.pending_redraw = true;
+            }
+            WindowEvent::HoveredFile(path) => {
+                let pos = cursor_pos_in_window(&self.window, &self.surface_canvas, self.cursor_pos);
+                self.cursor_pos = pos;
+                self.app_state.external_drag_hover = Some((path, pos));
+                self.pending_redraw = true;
+            }
+            WindowEvent::HoveredFileCancelled => {
+                if self.app_state.external_drag_hover.take().is_some() {
+                    self.pending_redraw = true;
+                }
+            }
+            WindowEvent::DroppedFile(path) => {
+                let pos = cursor_pos_in_window(&self.window, &self.surface_canvas, self.cursor_pos);
+                self.cursor_pos = pos;
+                self.app_state.handle_os_dropped_file(path, pos.0, pos.1);
+                self.surface_canvas
+                    .set_scale_factor(self.app_state.effective_scale());
+                sync_ime_position(&self.window, &self.app_state, &self.surface_canvas);
+                self.pending_redraw = true;
+            }
+            WindowEvent::ModifiersChanged(new_mods) => {
+                if new_mods.shift_key()
+                    && !self.modifiers.shift_key()
+                    && !new_mods.control_key()
+                    && !new_mods.alt_key()
                 {
-                    if surface.resize(nz_w, nz_h).is_ok() {
-                        if let Ok(mut buffer) = surface.buffer_mut() {
-                            surface_canvas.copy_to_softbuffer(&mut buffer);
-                            let _ = buffer.present();
+                    let now = Instant::now();
+                    if let Some(prev) = self.last_shift_press {
+                        if now.duration_since(prev) <= Duration::from_millis(400) {
+                            self.app_state.execute_ide_action(IdeAction::SearchEverywhere);
+                            self.last_shift_press = None;
+                            self.pending_redraw = true;
+                        } else {
+                            self.last_shift_press = Some(now);
                         }
+                    } else {
+                        self.last_shift_press = Some(now);
                     }
+                }
+                self.modifiers = new_mods;
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_pos = self.surface_canvas.to_logical_pos(position.x, position.y);
+                let win_w = self.surface_canvas.width as i32;
+                let win_h = self.surface_canvas.height as i32;
+
+                let dragged_split = self.app_state.update_splitter_drag(
+                    self.cursor_pos.0,
+                    self.cursor_pos.1,
+                    win_w,
+                    win_h,
+                );
+                let dragged_dock = self.left_mouse_down
+                    && self.app_state.update_dock_drag(
+                        self.cursor_pos.0,
+                        self.cursor_pos.1,
+                        win_w,
+                        win_h,
+                    );
+                let dragged_scroll = self
+                    .app_state
+                    .update_scrollbar_drag(self.cursor_pos.0, self.cursor_pos.1);
+                let dragged_ide_file = self.left_mouse_down
+                    && !dragged_split
+                    && !dragged_scroll
+                    && !dragged_dock
+                    && self
+                        .app_state
+                        .update_ide_drag(self.cursor_pos.0, self.cursor_pos.1);
+                let dragged_text = self.left_mouse_down
+                    && !dragged_split
+                    && !dragged_scroll
+                    && !dragged_ide_file
+                    && !dragged_dock
+                    && self.app_state.handle_input_mouse_drag(
+                        self.cursor_pos.0,
+                        self.cursor_pos.1,
+                        &self.surface_canvas,
+                    );
+                if dragged_split || dragged_scroll || dragged_ide_file || dragged_text || dragged_dock {
+                    if dragged_text {
+                        sync_ime_position(&self.window, &self.app_state, &self.surface_canvas);
+                    }
+                    self.pending_redraw = true;
+                } else if self
+                    .app_state
+                    .handle_mouse_move(self.cursor_pos.0, self.cursor_pos.1)
+                {
+                    self.pending_redraw = true;
+                }
+                sync_window_cursor(
+                    &self.window,
+                    &self.app_state,
+                    &self.surface_canvas,
+                    self.cursor_pos,
+                    &mut self.last_cursor_icon,
+                );
+            }
+            WindowEvent::CursorLeft { .. } => {
+                if self.app_state.armed_window_control.take().is_some()
+                    || self.app_state.close_top_menu()
+                {
+                    self.pending_redraw = true;
                 }
             }
-            Event::WindowEvent { event, .. } => match event {
-                WindowEvent::CloseRequested => {
-                    app_state.save_all_persisted_state();
-                    *control_flow = ControlFlow::Exit;
-                }
-                WindowEvent::Resized(_) => {
-                    app_state.window_maximized = window.is_maximized();
-                    pending_redraw = true;
-                }
-                WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                    app_state.system_dpi_scale = (scale_factor as f32).clamp(0.75, 4.0);
-                    surface_canvas.set_scale_factor(app_state.effective_scale());
-                    pending_redraw = true;
-                }
-                WindowEvent::ReceivedImeText(text) => {
-                    app_state.insert_text_at_focus(&text);
-                    sync_ime_position(&window, &app_state, &surface_canvas);
-                    pending_redraw = true;
-                }
-                WindowEvent::HoveredFile(path) => {
-                    let pos = cursor_pos_in_window(&window, &surface_canvas, cursor_pos);
-                    cursor_pos = pos;
-                    app_state.external_drag_hover = Some((path, pos));
-                    pending_redraw = true;
-                }
-                WindowEvent::HoveredFileCancelled => {
-                    if app_state.external_drag_hover.take().is_some() {
-                        pending_redraw = true;
-                    }
-                }
-                WindowEvent::DroppedFile(path) => {
-                    let pos = cursor_pos_in_window(&window, &surface_canvas, cursor_pos);
-                    cursor_pos = pos;
-                    app_state.handle_os_dropped_file(path, pos.0, pos.1);
-                    surface_canvas.set_scale_factor(app_state.effective_scale());
-                    sync_ime_position(&window, &app_state, &surface_canvas);
-                    pending_redraw = true;
-                }
-                WindowEvent::ModifiersChanged(new_mods) => {
-                    // 检测 IDEA 标志性 "Double Shift" (双击 Shift 呼出 Search Everywhere)
-                    if new_mods.shift_key()
-                        && !modifiers.shift_key()
-                        && !new_mods.control_key()
-                        && !new_mods.alt_key()
-                    {
-                        let now = Instant::now();
-                        if let Some(prev) = last_shift_press {
-                            if now.duration_since(prev) <= Duration::from_millis(400) {
-                                app_state.execute_ide_action(IdeAction::SearchEverywhere);
-                                last_shift_press = None;
-                                pending_redraw = true;
-                            } else {
-                                last_shift_press = Some(now);
-                            }
-                        } else {
-                            last_shift_press = Some(now);
-                        }
-                    }
-                    modifiers = new_mods;
-                }
-                WindowEvent::CursorMoved { position, .. } => {
-                    cursor_pos = surface_canvas.to_logical_pos(position.x, position.y);
-                    let win_w = surface_canvas.width as i32;
-                    let win_h = surface_canvas.height as i32;
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => match state {
+                ElementState::Pressed => {
+                    self.left_mouse_down = true;
+                    let win_w = self.surface_canvas.width as i32;
+                    let win_h = self.surface_canvas.height as i32;
 
-                    let dragged_split =
-                        app_state.update_splitter_drag(cursor_pos.0, cursor_pos.1, win_w, win_h);
-                    let dragged_scroll = app_state.update_scrollbar_drag(cursor_pos.1);
-                    let dragged_ide_file = left_mouse_down
-                        && !dragged_split
-                        && !dragged_scroll
-                        && app_state.update_ide_drag(cursor_pos.0, cursor_pos.1);
-                    let dragged_text = left_mouse_down
-                        && !dragged_split
-                        && !dragged_scroll
-                        && !dragged_ide_file
-                        && app_state.handle_input_mouse_drag(
-                            cursor_pos.0,
-                            cursor_pos.1,
-                            &surface_canvas,
-                        );
-                    if dragged_split || dragged_scroll || dragged_ide_file || dragged_text {
-                        if dragged_text {
-                            sync_ime_position(&window, &app_state, &surface_canvas);
-                        }
-                        pending_redraw = true;
-                    } else if app_state.handle_mouse_move(cursor_pos.0, cursor_pos.1) {
-                        pending_redraw = true;
-                    }
-                    sync_window_cursor(
-                        &window,
-                        &app_state,
-                        &surface_canvas,
-                        cursor_pos,
-                        &mut last_cursor_icon,
-                    );
-                }
-                WindowEvent::MouseInput {
-                    state,
-                    button: MouseButton::Left,
-                    ..
-                } => match state {
-                    ElementState::Pressed => {
-                        left_mouse_down = true;
-                        let win_w = surface_canvas.width as i32;
-                        let win_h = surface_canvas.height as i32;
-
-                        if !window.is_maximized() {
-                            if let Some(dir) =
-                                detect_resize_direction(cursor_pos.0, cursor_pos.1, win_w, win_h)
-                            {
-                                left_mouse_down = false;
-                                let _ = window.drag_resize_window(dir);
-                                return;
-                            }
-                        }
-
-                        if app_state.try_begin_splitter_drag(
-                            cursor_pos.0,
-                            cursor_pos.1,
+                    if !self.window.is_maximized() {
+                        if let Some(dir) = detect_resize_direction(
+                            self.cursor_pos.0,
+                            self.cursor_pos.1,
                             win_w,
                             win_h,
-                        ) || app_state.try_begin_scrollbar_drag(cursor_pos.0, cursor_pos.1)
-                        {
-                            sync_ime_position(&window, &app_state, &surface_canvas);
-                            pending_redraw = true;
-                            return;
+                        ) {
+                            self.left_mouse_down = false;
+                            let _ = self.window.drag_resize_window(dir);
+                            return WindowCommand::None;
                         }
+                    }
 
-                        if app_state.is_point_in_toolbar_blank(cursor_pos.0, cursor_pos.1) {
-                            let now = Instant::now();
-                            let is_double = last_titlebar_click
-                                .map(|(prev_t, prev_p)| {
-                                    now.duration_since(prev_t) <= Duration::from_millis(350)
-                                        && (cursor_pos.0 - prev_p.0).abs() <= 4
-                                        && (cursor_pos.1 - prev_p.1).abs() <= 4
-                                })
-                                .unwrap_or(false);
-                            if is_double {
-                                let next = !window.is_maximized();
-                                window.set_maximized(next);
-                                app_state.window_maximized = next;
-                                last_titlebar_click = None;
-                            } else {
-                                last_titlebar_click = Some((now, cursor_pos));
-                                left_mouse_down = false;
-                                let _ = window.drag_window();
-                            }
-                            pending_redraw = true;
-                            return;
+                    if self.app_state.try_begin_splitter_drag(
+                        self.cursor_pos.0,
+                        self.cursor_pos.1,
+                        win_w,
+                        win_h,
+                    ) || self
+                        .app_state
+                        .try_begin_scrollbar_drag(self.cursor_pos.0, self.cursor_pos.1)
+                    {
+                        sync_ime_position(&self.window, &self.app_state, &self.surface_canvas);
+                        self.pending_redraw = true;
+                        return WindowCommand::None;
+                    }
+
+                    if self
+                        .app_state
+                        .is_point_in_toolbar_blank(self.cursor_pos.0, self.cursor_pos.1)
+                    {
+                        if self.app_state.close_top_menu() {
+                            self.pending_redraw = true;
                         }
-
                         let now = Instant::now();
-                        let streak = last_input_click
-                            .and_then(|(prev_t, prev_p, prev_s)| {
-                                if now.duration_since(prev_t) <= Duration::from_millis(380)
-                                    && (cursor_pos.0 - prev_p.0).abs() <= 4
-                                    && (cursor_pos.1 - prev_p.1).abs() <= 4
-                                {
-                                    Some((prev_s + 1).min(3))
-                                } else {
-                                    None
-                                }
+                        let is_double = self
+                            .last_titlebar_click
+                            .map(|(prev_t, prev_p)| {
+                                now.duration_since(prev_t) <= Duration::from_millis(350)
+                                    && (self.cursor_pos.0 - prev_p.0).abs() <= 4
+                                    && (self.cursor_pos.1 - prev_p.1).abs() <= 4
                             })
-                            .unwrap_or(1);
-
-                        app_state.begin_ide_drag_candidate_at(cursor_pos.0, cursor_pos.1);
-                        app_state.handle_mouse_click_with_mods(
-                            cursor_pos.0,
-                            cursor_pos.1,
-                            modifiers.shift_key(),
-                            &surface_canvas,
-                        );
-                        surface_canvas.set_scale_factor(app_state.effective_scale());
-                        sync_window_title(&window, &mut app_state);
-                        if streak == 2 {
-                            let _ = app_state.handle_input_double_click(
-                                cursor_pos.0,
-                                cursor_pos.1,
-                                &surface_canvas,
-                            );
-                            last_input_click = Some((now, cursor_pos, 2));
-                        } else if streak >= 3 {
-                            let _ = app_state.handle_input_triple_click(
-                                cursor_pos.0,
-                                cursor_pos.1,
-                                &surface_canvas,
-                            );
-                            last_input_click = None;
+                            .unwrap_or(false);
+                        if is_double {
+                            let next = !self.window.is_maximized();
+                            self.window.set_maximized(next);
+                            self.app_state.window_maximized = next;
+                            self.last_titlebar_click = None;
                         } else {
-                            last_input_click = Some((now, cursor_pos, 1));
+                            self.last_titlebar_click = Some((now, self.cursor_pos));
+                            self.left_mouse_down = false;
+                            let _ = self.window.drag_window();
                         }
-                        if let Some(cmd) = app_state.take_window_control_cmd() {
-                            match cmd {
-                                WindowControlCmd::Minimize => {
-                                    window.set_minimized(true);
-                                }
-                                WindowControlCmd::ToggleMaximize => {
-                                    let next = !window.is_maximized();
-                                    window.set_maximized(next);
-                                    app_state.window_maximized = next;
-                                }
-                                WindowControlCmd::Close => {
-                                    app_state.save_all_persisted_state();
-                                    *control_flow = ControlFlow::Exit;
-                                }
-                            }
-                        }
-                        sync_ime_position(&window, &app_state, &surface_canvas);
-                        pending_redraw = true;
+                        self.pending_redraw = true;
+                        return WindowCommand::None;
                     }
-                    ElementState::Released => {
-                        left_mouse_down = false;
-                        let _ = app_state.finish_ide_drag_at(cursor_pos.0, cursor_pos.1);
-                        app_state.end_splitter_drag();
-                        app_state.save_global_settings();
-                        app_state.end_scrollbar_drag();
-                        app_state.end_mouse_text_drag();
-                        sync_window_cursor(
-                            &window,
-                            &app_state,
-                            &surface_canvas,
-                            cursor_pos,
-                            &mut last_cursor_icon,
-                        );
-                        pending_redraw = true;
-                    }
-                    _ => {}
-                },
-                WindowEvent::MouseInput {
-                    state: ElementState::Pressed,
-                    button: MouseButton::Right,
-                    ..
-                } => {
-                    app_state.open_context_menu_at(cursor_pos.0, cursor_pos.1, &surface_canvas);
-                    sync_ime_position(&window, &app_state, &surface_canvas);
-                    pending_redraw = true;
-                }
-                WindowEvent::MouseWheel { delta, .. } => {
-                    let (raw_dx, raw_dy) = match delta {
-                        MouseScrollDelta::LineDelta(x, y) => (-x, -y),
-                        MouseScrollDelta::PixelDelta(p) => {
-                            let px_per_line =
-                                (22.0 * surface_canvas.scale_factor).max(12.0) as f64;
-                            ((-p.x / px_per_line) as f32, (-p.y / px_per_line) as f32)
-                        }
-                        _ => (0.0, 0.0),
-                    };
 
-                    if modifiers.control_key() && !modifiers.alt_key() {
-                        if raw_dy < -0.01 {
-                            app_state.execute_ide_action(IdeAction::ZoomInUi);
-                            surface_canvas.set_scale_factor(app_state.effective_scale());
-                            pending_redraw = true;
-                        } else if raw_dy > 0.01 {
-                            app_state.execute_ide_action(IdeAction::ZoomOutUi);
-                            surface_canvas.set_scale_factor(app_state.effective_scale());
-                            pending_redraw = true;
-                        }
-                    } else if raw_dx.abs() > 0.001 || raw_dy.abs() > 0.001 {
-                        let now = Instant::now();
-                        let dir = if raw_dy.abs() > 0.001 {
-                            raw_dy.signum()
-                        } else {
-                            raw_dx.signum()
-                        };
-                        if let Some(prev) = last_wheel_time {
-                            let dt_ms = now.duration_since(prev).as_millis();
-                            if dt_ms <= 65 && (dir * last_wheel_dir) > 0.0 {
-                                wheel_velocity_boost = (wheel_velocity_boost + 0.48).min(4.0);
-                            } else if dt_ms > 140 || (dir * last_wheel_dir) < 0.0 {
-                                wheel_velocity_boost = 1.0;
-                                if (dir * last_wheel_dir) < 0.0 {
-                                    wheel_accum_y = 0.0;
-                                    wheel_accum_x = 0.0;
-                                }
+                    let now = Instant::now();
+                    let streak = self
+                        .last_input_click
+                        .and_then(|(prev_t, prev_p, prev_s)| {
+                            if now.duration_since(prev_t) <= Duration::from_millis(380)
+                                && (self.cursor_pos.0 - prev_p.0).abs() <= 4
+                                && (self.cursor_pos.1 - prev_p.1).abs() <= 4
+                            {
+                                Some((prev_s + 1).min(3))
                             } else {
-                                wheel_velocity_boost = (wheel_velocity_boost * 0.85).max(1.0);
+                                None
                             }
-                        } else {
-                            wheel_velocity_boost = 1.0;
-                        }
-                        last_wheel_time = Some(now);
-                        if dir != 0.0 {
-                            last_wheel_dir = dir;
-                        }
+                        })
+                        .unwrap_or(1);
 
-                        if modifiers.shift_key() && raw_dx.abs() < 0.01 {
-                            wheel_accum_x += raw_dy * 36.0 * wheel_velocity_boost;
-                        } else {
-                            wheel_accum_y += raw_dy * 3.5 * wheel_velocity_boost;
-                            wheel_accum_x += raw_dx * 36.0 * wheel_velocity_boost;
-                        }
+                    if let Some(cmd) = self
+                        .app_state
+                        .window_control_at(self.cursor_pos.0, self.cursor_pos.1)
+                    {
+                        self.app_state.arm_window_control(cmd);
+                        self.pending_redraw = true;
+                        return WindowCommand::None;
+                    }
 
-                        let mut lines_delta = wheel_accum_y.trunc() as i32;
-                        if lines_delta == 0 && raw_dy.abs() >= 0.25 {
-                            lines_delta = if raw_dy > 0.0 { 1 } else { -1 };
-                            wheel_accum_y = 0.0;
-                        } else {
-                            wheel_accum_y -= lines_delta as f32;
-                        }
-
-                        let horiz_px_delta = wheel_accum_x.trunc() as i32;
-                        wheel_accum_x -= horiz_px_delta as f32;
-
-                        if lines_delta != 0 || horiz_px_delta != 0 {
-                            app_state.handle_mouse_wheel_2d(
-                                cursor_pos.0,
-                                cursor_pos.1,
-                                lines_delta,
-                                horiz_px_delta,
-                            );
-                            pending_redraw = true;
+                    self.app_state
+                        .begin_ide_drag_candidate_at(self.cursor_pos.0, self.cursor_pos.1);
+                    self.app_state.handle_mouse_click_with_mods(
+                        self.cursor_pos.0,
+                        self.cursor_pos.1,
+                        self.modifiers.shift_key(),
+                        &self.surface_canvas,
+                    );
+                    self.surface_canvas
+                        .set_scale_factor(self.app_state.effective_scale());
+                    sync_window_title(&self.window, &mut self.app_state);
+                    if streak == 2 {
+                        let _ = self.app_state.handle_input_double_click(
+                            self.cursor_pos.0,
+                            self.cursor_pos.1,
+                            &self.surface_canvas,
+                        );
+                        self.last_input_click = Some((now, self.cursor_pos, 2));
+                    } else if streak >= 3 {
+                        let _ = self.app_state.handle_input_triple_click(
+                            self.cursor_pos.0,
+                            self.cursor_pos.1,
+                            &self.surface_canvas,
+                        );
+                        self.last_input_click = None;
+                    } else {
+                        self.last_input_click = Some((now, self.cursor_pos, 1));
+                    }
+                    if let Some(cmd) = self.app_state.take_window_control_cmd() {
+                        match cmd {
+                            WindowControlCmd::Minimize => {
+                                self.window.set_minimized(true);
+                            }
+                            WindowControlCmd::ToggleMaximize => {
+                                let next = !self.window.is_maximized();
+                                self.window.set_maximized(next);
+                                self.app_state.window_maximized = next;
+                            }
+                            WindowControlCmd::Close => {
+                                return WindowCommand::CloseWindow;
+                            }
                         }
                     }
+                    sync_ime_position(&self.window, &self.app_state, &self.surface_canvas);
+                    self.pending_redraw = true;
                 }
-                WindowEvent::KeyboardInput {
-                    event:
-                        KeyEvent {
-                            logical_key,
-                            state: ElementState::Pressed,
-                            ..
-                        },
-                    ..
-                } => {
-                    let ctrl = modifiers.control_key();
-                    let alt = modifiers.alt_key();
-                    let shift = modifiers.shift_key();
+                ElementState::Released => {
+                    self.left_mouse_down = false;
+                    if let Some(cmd) = self
+                        .app_state
+                        .release_armed_window_control(self.cursor_pos.0, self.cursor_pos.1)
+                    {
+                        match cmd {
+                            WindowControlCmd::Minimize => {
+                                self.window.set_minimized(true);
+                            }
+                            WindowControlCmd::ToggleMaximize => {
+                                let next = !self.window.is_maximized();
+                                self.window.set_maximized(next);
+                                self.app_state.window_maximized = next;
+                            }
+                            WindowControlCmd::Close => {
+                                return WindowCommand::CloseWindow;
+                            }
+                        }
+                    }
+                    let _ = self
+                        .app_state
+                        .finish_ide_drag_at(self.cursor_pos.0, self.cursor_pos.1);
+                    self.app_state.end_dock_drag(
+                        self.cursor_pos.0,
+                        self.cursor_pos.1,
+                        self.surface_canvas.width as i32,
+                        self.surface_canvas.height as i32,
+                    );
+                    self.app_state.end_splitter_drag();
+                    self.app_state.save_global_settings();
+                    self.app_state.end_scrollbar_drag();
+                    self.app_state.end_mouse_text_drag();
+                    sync_window_cursor(
+                        &self.window,
+                        &self.app_state,
+                        &self.surface_canvas,
+                        self.cursor_pos,
+                        &mut self.last_cursor_icon,
+                    );
+                    self.pending_redraw = true;
+                }
+                _ => {}
+            },
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Right,
+                ..
+            } => {
+                self.app_state.open_context_menu_at(
+                    self.cursor_pos.0,
+                    self.cursor_pos.1,
+                    &self.surface_canvas,
+                );
+                sync_ime_position(&self.window, &self.app_state, &self.surface_canvas);
+                self.pending_redraw = true;
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let (raw_dx, raw_dy) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (-x, -y),
+                    MouseScrollDelta::PixelDelta(p) => {
+                        let px_per_line =
+                            (22.0 * self.surface_canvas.scale_factor).max(12.0) as f64;
+                        ((-p.x / px_per_line) as f32, (-p.y / px_per_line) as f32)
+                    }
+                    _ => (0.0, 0.0),
+                };
 
-                    match &logical_key {
+                if self.modifiers.control_key() && !self.modifiers.alt_key() {
+                    if raw_dy < -0.01 {
+                        self.app_state.execute_ide_action(IdeAction::ZoomInUi);
+                        self.surface_canvas
+                            .set_scale_factor(self.app_state.effective_scale());
+                        self.pending_redraw = true;
+                    } else if raw_dy > 0.01 {
+                        self.app_state.execute_ide_action(IdeAction::ZoomOutUi);
+                        self.surface_canvas
+                            .set_scale_factor(self.app_state.effective_scale());
+                        self.pending_redraw = true;
+                    }
+                } else if raw_dx.abs() > 0.001 || raw_dy.abs() > 0.001 {
+                    let now = Instant::now();
+                    let dir = if raw_dy.abs() > 0.001 {
+                        raw_dy.signum()
+                    } else {
+                        raw_dx.signum()
+                    };
+                    if let Some(prev) = self.last_wheel_time {
+                        let dt_ms = now.duration_since(prev).as_millis();
+                        if dt_ms <= 65 && (dir * self.last_wheel_dir) > 0.0 {
+                            self.wheel_velocity_boost = (self.wheel_velocity_boost + 0.48).min(4.0);
+                        } else if dt_ms > 140 || (dir * self.last_wheel_dir) < 0.0 {
+                            self.wheel_velocity_boost = 1.0;
+                            if (dir * self.last_wheel_dir) < 0.0 {
+                                self.wheel_accum_y = 0.0;
+                                self.wheel_accum_x = 0.0;
+                            }
+                        } else {
+                            self.wheel_velocity_boost = (self.wheel_velocity_boost * 0.85).max(1.0);
+                        }
+                    } else {
+                        self.wheel_velocity_boost = 1.0;
+                    }
+                    self.last_wheel_time = Some(now);
+                    if dir != 0.0 {
+                        self.last_wheel_dir = dir;
+                    }
+
+                    if self.modifiers.shift_key() && raw_dx.abs() < 0.01 {
+                        self.wheel_accum_x += raw_dy * 36.0 * self.wheel_velocity_boost;
+                    } else {
+                        self.wheel_accum_y += raw_dy * 3.5 * self.wheel_velocity_boost;
+                        self.wheel_accum_x += raw_dx * 36.0 * self.wheel_velocity_boost;
+                    }
+
+                    let mut lines_delta = self.wheel_accum_y.trunc() as i32;
+                    if lines_delta == 0 && raw_dy.abs() >= 0.25 {
+                        lines_delta = if raw_dy > 0.0 { 1 } else { -1 };
+                        self.wheel_accum_y = 0.0;
+                    } else {
+                        self.wheel_accum_y -= lines_delta as f32;
+                    }
+
+                    let horiz_px_delta = self.wheel_accum_x.trunc() as i32;
+                    self.wheel_accum_x -= horiz_px_delta as f32;
+
+                    if lines_delta != 0 || horiz_px_delta != 0 {
+                        self.app_state.handle_mouse_wheel_2d(
+                            self.cursor_pos.0,
+                            self.cursor_pos.1,
+                            lines_delta,
+                            horiz_px_delta,
+                        );
+                        self.pending_redraw = true;
+                    }
+                }
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key,
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } => {
+                self.handle_keyboard_pressed(logical_key);
+                self.app_state.touch_caret_activity();
+                self.surface_canvas
+                    .set_scale_factor(self.app_state.effective_scale());
+                sync_ime_position(&self.window, &self.app_state, &self.surface_canvas);
+                self.pending_redraw = true;
+            }
+            _ => {}
+        }
+        WindowCommand::None
+    }
+
+    fn handle_keyboard_pressed(&mut self, logical_key: Key<'_>) {
+        let ctrl = self.modifiers.control_key();
+        let alt = self.modifiers.alt_key();
+        let shift = self.modifiers.shift_key();
+        let app_state = &mut self.app_state;
+        let surface_canvas = &mut self.surface_canvas;
+
+        match &logical_key {
                         // 1. IDEA + Cursor 组合快捷键
                         Key::Character(ch) if ctrl && alt && ch.eq_ignore_ascii_case("s") => {
                             app_state.execute_ide_action(IdeAction::OpenSettingsModal);
@@ -858,6 +1391,9 @@ fn main() -> Result<()> {
                         }
                         Key::Character(ch) if ctrl && shift && ch.eq_ignore_ascii_case("k") => {
                             app_state.execute_ide_action(IdeAction::GitPush);
+                        }
+                        Key::Character(ch) if ctrl && shift && ch.eq_ignore_ascii_case("g") => {
+                            app_state.execute_ide_action(IdeAction::GitBranches);
                         }
                         Key::Character(ch) if ctrl && shift && ch.eq_ignore_ascii_case("z") => {
                             app_state.execute_ide_action(IdeAction::RedoEdit);
@@ -892,9 +1428,6 @@ fn main() -> Result<()> {
                                 pty.clear();
                                 pty.send_raw_bytes(b"\x0c");
                             }
-                        }
-                        Key::Character(ch) if ctrl && ch.eq_ignore_ascii_case("k") => {
-                            app_state.execute_ide_action(IdeAction::InlineAiEdit);
                         }
                         Key::Character(ch) if ctrl && ch.eq_ignore_ascii_case("p") => {
                             app_state.execute_ide_action(IdeAction::SearchEverywhere);
@@ -959,8 +1492,8 @@ fn main() -> Result<()> {
                         Key::Character(ch) if alt && *ch == "8" => {
                             app_state.execute_ide_action(IdeAction::ToggleAgentHubWindow);
                         }
-                        Key::Character(ch) if alt && ch.eq_ignore_ascii_case("l") => {
-                            app_state.execute_ide_action(IdeAction::SendSelectionToAgent);
+                        Key::Character(ch) if alt && *ch == "9" => {
+                            app_state.execute_ide_action(IdeAction::GitShowLog);
                         }
                         // 功能键 F4..F12
                         Key::F4 if ctrl => {
@@ -971,6 +1504,9 @@ fn main() -> Result<()> {
                         }
                         Key::F9 if shift => {
                             app_state.execute_ide_action(IdeAction::DebugActiveConfig);
+                        }
+                        Key::F10 if ctrl && shift => {
+                            app_state.execute_ide_action(IdeAction::RunCurrentFile);
                         }
                         Key::F10 if shift => {
                             app_state.execute_ide_action(IdeAction::RunActiveConfig);
@@ -1027,6 +1563,7 @@ fn main() -> Result<()> {
                                 || app_state.agent_mode_popup_open
                                 || app_state.agent_sessions_popup_open
                                 || app_state.run_config_popup_open
+                                || app_state.mobile_popup_open
                                 || app_state.project_popup_open
                                 || app_state.more_menu_popup_open;
                             app_state.active_menu_category = None;
@@ -1036,6 +1573,7 @@ fn main() -> Result<()> {
                             app_state.agent_mode_popup_open = false;
                             app_state.agent_sessions_popup_open = false;
                             app_state.run_config_popup_open = false;
+                            app_state.mobile_popup_open = false;
                             app_state.project_popup_open = false;
                             app_state.more_menu_popup_open = false;
                             if had_menu || had_popup {
@@ -1117,6 +1655,10 @@ fn main() -> Result<()> {
                                 }
                                 app_state.focus = FocusTarget::Editor;
                             }
+                            FocusTarget::NewRunConfigModal => {
+                                let cmd_line = app_state.modal_text_input.as_str().to_string();
+                                app_state.add_and_run_command_line(&cmd_line);
+                            }
                             FocusTarget::NewFolderModal => {
                                 let name = app_state.modal_text_input.as_str().to_string();
                                 if app_state.project_tree.create_new_directory(&name).is_ok() {
@@ -1138,6 +1680,32 @@ fn main() -> Result<()> {
                                 app_state.status_notification =
                                     format!("正在创建并切换分支 '{}'...", name.trim());
                                 app_state.focus = FocusTarget::Editor;
+                            }
+                            FocusTarget::NewGitTagModal => {
+                                let name = app_state.modal_text_input.as_str().trim().to_string();
+                                if !name.is_empty() {
+                                    app_state.git_engine.request_create_tag(&name, None);
+                                    app_state.status_notification =
+                                        format!("正在创建 Git 标签 '{name}'...");
+                                }
+                                app_state.focus = FocusTarget::Editor;
+                            }
+                            FocusTarget::NewGitStashModal => {
+                                let msg = app_state.modal_text_input.as_str().trim().to_string();
+                                app_state.git_engine.request_stash_save(&msg, true);
+                                app_state.status_notification =
+                                    "正在将未提交变更暂存至 Stash...".to_string();
+                                app_state.focus = FocusTarget::Editor;
+                            }
+                            FocusTarget::GitAddRemoteModal => {
+                                let raw = app_state.modal_text_input.as_str().trim().to_string();
+                                let mut parts = raw.split_whitespace();
+                                if let (Some(rname), Some(rurl)) = (parts.next(), parts.next()) {
+                                    app_state.git_engine.request_add_remote(rname, rurl);
+                                    app_state.status_notification =
+                                        format!("正在添加远程仓库 '{rname}'...");
+                                }
+                                app_state.focus = FocusTarget::GitRemotesModal;
                             }
                             FocusTarget::RenamePathModal => {
                                 let new_name = app_state.modal_text_input.as_str().trim().to_string();
@@ -1174,6 +1742,13 @@ fn main() -> Result<()> {
                             FocusTarget::AgentChatInput => {
                                 if shift {
                                     app_state.insert_text_at_focus("\n");
+                                } else if app_state.agent_hub.is_active_session_busy() {
+                                    app_state.status_notification = app_state
+                                        .tr(
+                                            "当前会话正在响应中，可点击 + 新建会话并行提问",
+                                            "Active session is busy; open + New to run another in parallel",
+                                        )
+                                        .to_string();
                                 } else {
                                     let prompt = app_state.agent_chat_input.take_and_push_history();
                                     let has_extras = !app_state
@@ -1196,6 +1771,7 @@ fn main() -> Result<()> {
                                 app_state.close_image_preview();
                             }
                             FocusTarget::TerminalInput => {
+                                app_state.record_terminal_prompt_command_before_enter();
                                 let pty = app_state.terminal.active_pty_mut();
                                 pty.clear_selection();
                                 pty.scroll_offset = 0;
@@ -1211,13 +1787,17 @@ fn main() -> Result<()> {
                                 app_state.save_ai_config_modal();
                             }
                             FocusTarget::SettingsModal => {
-                                app_state.focus = FocusTarget::Editor;
+                                if app_state.settings_sdk_focus.is_some() {
+                                    app_state.commit_mobile_sdk_locations_from_inputs();
+                                    app_state.settings_sdk_focus = None;
+                                } else {
+                                    app_state.focus = FocusTarget::Editor;
+                                }
                             }
                             FocusTarget::OpenProjectChoiceModal => {
                                 if let Some(p) = app_state.pending_open_workspace.take() {
                                     if shift {
-                                        app_state.switch_workspace(p);
-                                        sync_window_title(&window, &mut app_state);
+                                        app_state.request_switch_workspace(p);
                                     } else {
                                         app_state.open_workspace_in_new_window(p);
                                     }
@@ -1227,6 +1807,12 @@ fn main() -> Result<()> {
                             FocusTarget::EditMessageRewindModal => {
                                 app_state.confirm_edit_message_rewind(!shift);
                             }
+                            FocusTarget::GitMergeModal
+                            | FocusTarget::GitRebaseModal
+                            | FocusTarget::GitUnstashModal
+                            | FocusTarget::GitResetModal
+                            | FocusTarget::GitRollbackModal
+                            | FocusTarget::GitRemotesModal => {}
                             FocusTarget::Editor => {
                                 if alt {
                                     app_state.execute_ide_action(IdeAction::ShowIntentionActions);
@@ -1352,19 +1938,10 @@ fn main() -> Result<()> {
                                 app_state.ensure_editor_cursor_visible();
                             }
                         }
-                        Key::Character(ch) if !ctrl && !alt => {
-                            app_state.insert_text_at_focus(ch);
+                            Key::Character(ch) if !ctrl && !alt => {
+                                app_state.insert_text_at_focus(ch);
+                            }
+                            _ => {}
                         }
-                        _ => {}
-                    }
-                    app_state.touch_caret_activity();
-                    surface_canvas.set_scale_factor(app_state.effective_scale());
-                    sync_ime_position(&window, &app_state, &surface_canvas);
-                    pending_redraw = true;
-                }
-                _ => {}
-            },
-            _ => {}
-        }
-    });
+    }
 }

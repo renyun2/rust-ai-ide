@@ -3,7 +3,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::Path;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use tiny_skia::{
     Color, FillRule, GradientStop, LineCap, LineJoin, LinearGradient, Paint, Path as SkiaPath,
     PathBuilder, Pixmap, Point, PremultipliedColorU8, Rect as SkiaRect, SpreadMode, Stroke,
@@ -91,7 +91,621 @@ pub struct SurfaceCanvas {
     pixmap: Pixmap,
     #[cfg(test)]
     present_buf: Vec<u32>,
-    dwrite: DWriteTextEngine,
+    dwrite: Rc<DWriteTextEngine>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FileIconKind {
+    Rust,
+    Python,
+    Notebook,
+    TypeScript,
+    Tsx,
+    JavaScript,
+    Jsx,
+    Go,
+    Java,
+    Kotlin,
+    C,
+    Cpp,
+    CSharp,
+    Php,
+    Ruby,
+    Swift,
+    Dart,
+    Lua,
+    Zig,
+    Haskell,
+    Elixir,
+    Scala,
+    RLang,
+    Perl,
+    Shell,
+    PowerShell,
+    Batch,
+    Sql,
+    Html,
+    Css,
+    Scss,
+    Less,
+    Vue,
+    Svelte,
+    Astro,
+    Json,
+    Yaml,
+    Toml,
+    Xml,
+    GraphQl,
+    Proto,
+    Wasm,
+    Groovy,
+    Clojure,
+    Erlang,
+    OCaml,
+    FSharp,
+    Julia,
+    Nim,
+    Assembly,
+    Solidity,
+    Crystal,
+    Elm,
+    PureScript,
+    Haxe,
+    Gleam,
+    Coffee,
+    ReScript,
+    Shader,
+    Project,
+    Qt,
+    Unity,
+    Godot,
+    Http,
+    Bazel,
+    Cmake,
+    Maven,
+    Gradle,
+    Meson,
+    Helm,
+    Jenkins,
+    Vite,
+    Webpack,
+    Eslint,
+    Prettier,
+    Editorconfig,
+    GithubActions,
+    Gitlab,
+    Nginx,
+    Task,
+    Just,
+    Npm,
+    Terraform,
+    GoMod,
+    Changelog,
+    Authors,
+    Codeowners,
+    Kubernetes,
+    Csv,
+    Spreadsheet,
+    Ini,
+    Env,
+    Markdown,
+    Readme,
+    Text,
+    Log,
+    Diff,
+    Image,
+    Svg,
+    Pdf,
+    Font,
+    Audio,
+    Video,
+    Archive,
+    Binary,
+    Lock,
+    Git,
+    Docker,
+    Make,
+    License,
+    Config,
+    Database,
+    Certificate,
+    Unknown,
+}
+
+impl FileIconKind {
+    fn from_path(path: &Path) -> Self {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if let Some(kind) = Self::from_special_name(&name) {
+            return kind;
+        }
+        let in_workflows = path.components().any(|c| {
+            c.as_os_str()
+                .to_str()
+                .is_some_and(|s| s.eq_ignore_ascii_case("workflows"))
+        });
+        if in_workflows && (name.ends_with(".yml") || name.ends_with(".yaml")) {
+            return Self::GithubActions;
+        }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        Self::from_extension(&ext)
+    }
+
+    fn from_language(lang: ide_core::LanguageId) -> Self {
+        match lang {
+            ide_core::LanguageId::Rust => Self::Rust,
+            ide_core::LanguageId::TypeScript => Self::TypeScript,
+            ide_core::LanguageId::JavaScript => Self::JavaScript,
+            ide_core::LanguageId::Python => Self::Python,
+            ide_core::LanguageId::Json => Self::Json,
+            ide_core::LanguageId::Toml => Self::Toml,
+            ide_core::LanguageId::Markdown => Self::Markdown,
+            ide_core::LanguageId::PlainText => Self::Unknown,
+        }
+    }
+
+    fn from_special_name(name: &str) -> Option<Self> {
+        if name.ends_with(".tar.gz")
+            || name.ends_with(".tar.bz2")
+            || name.ends_with(".tar.xz")
+            || name.ends_with(".tar.zst")
+        {
+            return Some(Self::Archive);
+        }
+        if name.ends_with(".lock")
+            || name.ends_with("-lock.json")
+            || name.ends_with("-lock.yaml")
+            || name == "go.sum"
+            || name == "npm-shrinkwrap.json"
+        {
+            return Some(Self::Lock);
+        }
+        if name == "dockerfile" || name.starts_with("dockerfile.") || name == ".dockerignore" {
+            return Some(Self::Docker);
+        }
+        if name.starts_with("docker-compose") || name == "compose.yml" || name == "compose.yaml" {
+            return Some(Self::Docker);
+        }
+        if name.starts_with(".env") {
+            return Some(Self::Env);
+        }
+        if name.starts_with(".git") && name != ".github" {
+            return Some(Self::Git);
+        }
+        if name == "license"
+            || name.starts_with("license.")
+            || name == "licence"
+            || name.starts_with("licence.")
+            || name == "copying"
+            || name.starts_with("copying.")
+        {
+            return Some(Self::License);
+        }
+        if name == "readme" || name.starts_with("readme.") {
+            return Some(Self::Readme);
+        }
+        if name == "makefile" || name == "gnumakefile" {
+            return Some(Self::Make);
+        }
+        if name == "justfile" {
+            return Some(Self::Just);
+        }
+        if name == "cmakelists.txt" || name == "cmakecache.txt" {
+            return Some(Self::Cmake);
+        }
+        if name == "cargo.toml"
+            || name == "rust-toolchain"
+            || name.starts_with("rust-toolchain.")
+            || name == "rustfmt.toml"
+            || name == "clippy.toml"
+        {
+            return Some(Self::Rust);
+        }
+        if name == "pyproject.toml"
+            || name == "requirements.txt"
+            || name.starts_with("requirements-")
+            || name == "pipfile"
+            || name == "setup.cfg"
+            || name == ".python-version"
+        {
+            return Some(Self::Python);
+        }
+        if name == "go.mod" {
+            return Some(Self::GoMod);
+        }
+        if name == "package.json" {
+            return Some(Self::Npm);
+        }
+        if name == "pom.xml" || name == "mvnw" || name == "mvnw.cmd" {
+            return Some(Self::Maven);
+        }
+        if name == "build.gradle"
+            || name == "settings.gradle"
+            || name == "gradlew"
+            || name == "gradlew.bat"
+        {
+            return Some(Self::Gradle);
+        }
+        if name == "gemfile"
+            || name == "rakefile"
+            || name == "vagrantfile"
+            || name == ".ruby-version"
+        {
+            return Some(Self::Ruby);
+        }
+        if name == "composer.json" {
+            return Some(Self::Php);
+        }
+        if name == "tsconfig.json" || (name.starts_with("tsconfig.") && name.ends_with(".json")) {
+            return Some(Self::TypeScript);
+        }
+        if name == "jsconfig.json" || name == ".node-version" {
+            return Some(Self::JavaScript);
+        }
+        if name.starts_with(".prettier") {
+            return Some(Self::Prettier);
+        }
+        if name.starts_with(".eslint") {
+            return Some(Self::Eslint);
+        }
+        if name == ".editorconfig" {
+            return Some(Self::Editorconfig);
+        }
+        if name.starts_with(".babel")
+            || name == ".npmrc"
+            || name == ".nvmrc"
+            || name == ".yarnrc"
+            || name == ".yarnrc.yml"
+            || name == ".htaccess"
+            || name == "procfile"
+        {
+            return Some(Self::Config);
+        }
+        if name == ".bashrc"
+            || name == ".zshrc"
+            || name == ".profile"
+            || name == ".bash_profile"
+            || name == ".zprofile"
+            || name == ".bash_aliases"
+        {
+            return Some(Self::Shell);
+        }
+        if name == "jenkinsfile" {
+            return Some(Self::Jenkins);
+        }
+        if name == "containerfile"
+            || name.starts_with("containerfile.")
+            || name.ends_with(".dockerfile")
+            || name == ".containerignore"
+            || name == "earthfile"
+            || name == "skaffold.yaml"
+            || name == "skaffold.yml"
+        {
+            return Some(Self::Docker);
+        }
+        if name == "chart.yaml" || name == ".helmignore" {
+            return Some(Self::Helm);
+        }
+        if name == "kustomization.yaml" || name == "kustomization.yml" {
+            return Some(Self::Kubernetes);
+        }
+        if name == "build"
+            || name == "build.bazel"
+            || name == "workspace"
+            || name == "workspace.bazel"
+            || name == "module.bazel"
+        {
+            return Some(Self::Bazel);
+        }
+        if name == "meson.build" || name == "meson_options.txt" {
+            return Some(Self::Meson);
+        }
+        if name == "taskfile.yml" || name == "taskfile.yaml" {
+            return Some(Self::Task);
+        }
+        if name == "nginx.conf" {
+            return Some(Self::Nginx);
+        }
+        if name.starts_with("vite.config.") {
+            return Some(Self::Vite);
+        }
+        if name.starts_with("webpack.config.") {
+            return Some(Self::Webpack);
+        }
+        if name == "build.ninja"
+            || name == "build.xml"
+            || name == "configure.ac"
+            || name == "makefile.am"
+            || name == "makefile.in"
+        {
+            return Some(Self::Make);
+        }
+        if name == "mix.exs" {
+            return Some(Self::Elixir);
+        }
+        if name == "build.sbt" {
+            return Some(Self::Scala);
+        }
+        if name == "cabal.project" || name == "stack.yaml" || name == "stack.yml" {
+            return Some(Self::Haskell);
+        }
+        if name == "deny.toml" || name == "cross.toml" {
+            return Some(Self::Rust);
+        }
+        if name == ".gitlab-ci.yml" {
+            return Some(Self::Gitlab);
+        }
+        if name == "azure-pipelines.yml" {
+            return Some(Self::Config);
+        }
+        if name == "changelog" {
+            return Some(Self::Changelog);
+        }
+        if name == "authors" {
+            return Some(Self::Authors);
+        }
+        if name == "codeowners" {
+            return Some(Self::Codeowners);
+        }
+        if name == ".travis.yml"
+            || name == "appveyor.yml"
+            || name == "bitrise.yml"
+            || name == "turbo.json"
+            || name == "nx.json"
+            || name == "lerna.json"
+            || name == ".bazelrc"
+            || name == ".bazelignore"
+            || name == ".bazelversion"
+            || name == ".clang-format"
+            || name == ".clang-tidy"
+            || name == ".clangd"
+        {
+            return Some(Self::Config);
+        }
+        if name == "changelog"
+            || name == "authors"
+            || name == "notice"
+            || name == "codeowners"
+            || name == "contributing"
+        {
+            return Some(Self::Text);
+        }
+        None
+    }
+
+    fn from_extension(ext: &str) -> Self {
+        match ext {
+            "rs" => Self::Rust,
+            "py" | "pyi" | "pyw" | "pyx" => Self::Python,
+            "ipynb" => Self::Notebook,
+            "ts" | "mts" | "cts" => Self::TypeScript,
+            "tsx" => Self::Tsx,
+            "js" | "mjs" | "cjs" => Self::JavaScript,
+            "jsx" => Self::Jsx,
+            "go" | "mod" => Self::Go,
+            "java" => Self::Java,
+            "kt" | "kts" => Self::Kotlin,
+            "c" | "h" => Self::C,
+            "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" | "inl" => Self::Cpp,
+            "cs" => Self::CSharp,
+            "php" | "twig" => Self::Php,
+            "rb" | "rake" | "erb" => Self::Ruby,
+            "swift" => Self::Swift,
+            "dart" => Self::Dart,
+            "lua" => Self::Lua,
+            "zig" => Self::Zig,
+            "hs" | "lhs" => Self::Haskell,
+            "ex" | "exs" => Self::Elixir,
+            "scala" => Self::Scala,
+            "r" => Self::RLang,
+            "pl" | "pm" => Self::Perl,
+            "sh" | "bash" | "zsh" | "fish" | "awk" => Self::Shell,
+            "ps1" | "psm1" | "psd1" => Self::PowerShell,
+            "bat" | "cmd" => Self::Batch,
+            "sql" | "psql" | "cql" => Self::Sql,
+            "html" | "htm" | "xhtml" | "haml" => Self::Html,
+            "css" | "pcss" | "styl" => Self::Css,
+            "scss" | "sass" => Self::Scss,
+            "less" => Self::Less,
+            "vue" => Self::Vue,
+            "svelte" => Self::Svelte,
+            "astro" => Self::Astro,
+            "json" | "jsonc" | "json5" | "jsonl" | "hjson" | "avsc" => Self::Json,
+            "yml" | "yaml" => Self::Yaml,
+            "toml" => Self::Toml,
+            "xml" | "xsd" | "xsl" | "plist" | "rss" | "atom" => Self::Xml,
+            "graphql" | "gql" => Self::GraphQl,
+            "proto" | "thrift" => Self::Proto,
+            "wasm" | "wat" => Self::Wasm,
+            "groovy" | "gradle" => Self::Groovy,
+            "clj" | "cljs" | "cljc" | "edn" => Self::Clojure,
+            "erl" | "hrl" => Self::Erlang,
+            "ml" | "mli" => Self::OCaml,
+            "fs" | "fsx" | "fsi" => Self::FSharp,
+            "jl" => Self::Julia,
+            "nim" => Self::Nim,
+            "asm" | "s" => Self::Assembly,
+            "sol" => Self::Solidity,
+            "cr" => Self::Crystal,
+            "elm" => Self::Elm,
+            "purs" => Self::PureScript,
+            "hx" => Self::Haxe,
+            "gleam" => Self::Gleam,
+            "coffee" | "litcoffee" => Self::Coffee,
+            "res" | "resi" => Self::ReScript,
+            "glsl" | "hlsl" | "wgsl" | "vert" | "frag" | "geom" | "comp" | "tesc" | "tese"
+            | "metal" | "shader" => Self::Shader,
+            "sln" | "slnx" | "csproj" | "fsproj" | "vbproj" | "vcxproj" | "props" | "targets" => {
+                Self::Project
+            }
+            "qml" | "ui" | "qrc" => Self::Qt,
+            "unity" | "prefab" | "unitypackage" => Self::Unity,
+            "gd" | "gdscript" | "tscn" | "tres" => Self::Godot,
+            "http" | "rest" => Self::Http,
+            "dockerfile" => Self::Docker,
+            "ninja" => Self::Make,
+            "sbt" => Self::Scala,
+            "cabal" => Self::Haskell,
+            "gemspec" => Self::Ruby,
+            "nuspec" => Self::Xml,
+            "nupkg" | "snupkg" => Self::Archive,
+            "pro" | "pri" => Self::Make,
+            "rlib" | "rmeta" | "pdb" | "ilk" | "exp" | "idb" | "pch" | "gch" => Self::Binary,
+            "csv" | "tsv" => Self::Csv,
+            "xls" | "xlsx" | "ods" => Self::Spreadsheet,
+            "ini" | "cfg" | "conf" | "config" | "properties" => Self::Ini,
+            "env" => Self::Env,
+            "md" | "mdx" | "markdown" | "rmd" => Self::Markdown,
+            "txt" | "rst" | "adoc" | "asciidoc" | "tex" | "latex" | "bib" | "org" | "rtf" => {
+                Self::Text
+            }
+            "log" => Self::Log,
+            "diff" | "patch" | "rej" => Self::Diff,
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "avif" | "tif" | "tiff"
+            | "heic" => Self::Image,
+            "svg" => Self::Svg,
+            "pdf" => Self::Pdf,
+            "ttf" | "otf" | "woff" | "woff2" | "eot" => Self::Font,
+            "mp3" | "wav" | "ogg" | "flac" | "aac" | "m4a" => Self::Audio,
+            "mp4" | "webm" | "mkv" | "mov" | "avi" => Self::Video,
+            "zip" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "7z" | "rar" | "dmg" | "iso" | "jar"
+            | "war" | "apk" | "deb" | "rpm" => Self::Archive,
+            "exe" | "dll" | "so" | "dylib" | "bin" | "o" | "obj" | "a" | "lib" | "class"
+            | "msi" => Self::Binary,
+            "db" | "sqlite" | "sqlite3" | "mdb" | "prisma" => Self::Database,
+            "doc" | "docx" | "ppt" | "pptx" | "odt" | "odp" => Self::Text,
+            "pem" | "crt" | "cer" | "key" | "pub" | "p12" | "pfx" => Self::Certificate,
+            "cmake" => Self::Cmake,
+            "bzl" | "bazel" => Self::Bazel,
+            "mk" => Self::Make,
+            "m" | "mm" => Self::C,
+            "v" | "sv" | "vhd" | "vhdl" => Self::Assembly,
+            "tf" | "tfvars" => Self::Terraform,
+            "hcl" | "nix" => Self::Config,
+            "ll" => Self::Binary,
+            _ => Self::Unknown,
+        }
+    }
+
+    fn icon_name(self) -> &'static str {
+        match self {
+            Self::Rust => "rust",
+            Self::Python => "python",
+            Self::Notebook => "jupyter",
+            Self::TypeScript => "typescript",
+            Self::Tsx => "react-ts",
+            Self::JavaScript => "javascript",
+            Self::Jsx => "react",
+            Self::Go => "go",
+            Self::GoMod => "go-mod",
+            Self::Java => "java",
+            Self::Kotlin => "kotlin",
+            Self::C => "c",
+            Self::Cpp | Self::Qt => "cpp",
+            Self::CSharp => "csharp",
+            Self::Php => "php",
+            Self::Ruby => "ruby",
+            Self::Swift => "swift",
+            Self::Dart => "dart",
+            Self::Lua => "lua",
+            Self::Zig => "zig",
+            Self::Haskell => "haskell",
+            Self::Elixir => "elixir",
+            Self::Scala => "scala",
+            Self::RLang => "r",
+            Self::Perl => "perl",
+            Self::Shell | Self::Batch => "console",
+            Self::PowerShell => "powershell",
+            Self::Sql | Self::Database => "database",
+            Self::Html => "html",
+            Self::Css => "css",
+            Self::Scss => "sass",
+            Self::Less => "less",
+            Self::Vue => "vue",
+            Self::Svelte => "svelte",
+            Self::Astro => "astro",
+            Self::Json => "json",
+            Self::Yaml => "yaml",
+            Self::Toml => "toml",
+            Self::Xml => "xml",
+            Self::GraphQl => "graphql",
+            Self::Proto => "proto",
+            Self::Wasm => "webassembly",
+            Self::Groovy => "groovy",
+            Self::Clojure => "clojure",
+            Self::Erlang => "erlang",
+            Self::OCaml => "ocaml",
+            Self::FSharp => "fsharp",
+            Self::Julia => "julia",
+            Self::Nim => "nim",
+            Self::Assembly => "assembly",
+            Self::Solidity => "solidity",
+            Self::Crystal => "crystal",
+            Self::Elm => "elm",
+            Self::PureScript => "purescript",
+            Self::Haxe => "haxe",
+            Self::Gleam => "gleam",
+            Self::Coffee => "coffee",
+            Self::ReScript => "rescript",
+            Self::Shader => "shader",
+            Self::Project => "visualstudio",
+            Self::Unity => "unity",
+            Self::Godot => "godot",
+            Self::Http => "http",
+            Self::Csv | Self::Spreadsheet => "table",
+            Self::Ini | Self::Config => "settings",
+            Self::Env => "key",
+            Self::Markdown => "markdown",
+            Self::Readme => "readme",
+            Self::Text | Self::Unknown => "document",
+            Self::Log => "log",
+            Self::Diff => "diff",
+            Self::Image => "image",
+            Self::Svg => "svg",
+            Self::Pdf => "pdf",
+            Self::Font => "font",
+            Self::Audio => "audio",
+            Self::Video => "video",
+            Self::Archive => "zip",
+            Self::Binary => "exe",
+            Self::Lock => "lock",
+            Self::Git => "git",
+            Self::Docker => "docker",
+            Self::Make => "makefile",
+            Self::License => "license",
+            Self::Certificate => "certificate",
+            Self::Bazel => "bazel",
+            Self::Cmake => "cmake",
+            Self::Maven => "maven",
+            Self::Gradle => "gradle",
+            Self::Meson => "meson",
+            Self::Helm => "helm",
+            Self::Jenkins => "jenkins",
+            Self::Vite => "vite",
+            Self::Webpack => "webpack",
+            Self::Eslint => "eslint",
+            Self::Prettier => "prettier",
+            Self::Editorconfig => "editorconfig",
+            Self::GithubActions => "github-actions-workflow",
+            Self::Gitlab => "gitlab",
+            Self::Nginx => "nginx",
+            Self::Task => "taskfile",
+            Self::Just => "just",
+            Self::Npm => "npm",
+            Self::Terraform => "terraform",
+            Self::Changelog => "changelog",
+            Self::Authors => "authors",
+            Self::Codeowners => "codeowners",
+            Self::Kubernetes => "kubernetes",
+        }
+    }
 }
 
 impl SurfaceCanvas {
@@ -110,7 +724,7 @@ impl SurfaceCanvas {
             Pixmap::new(pw as u32, ph as u32).expect("Failed to allocate tiny-skia Pixmap");
         #[cfg(test)]
         let present_buf = vec![0u32; pw * ph];
-        let dwrite = DWriteTextEngine::new(scale);
+        let dwrite = shared_dwrite_for_scale(scale);
         Self {
             width: lw,
             height: lh,
@@ -126,10 +740,12 @@ impl SurfaceCanvas {
 
     pub fn set_scale_factor(&mut self, scale_factor: f32) {
         let scale = scale_factor.clamp(0.75, 4.0);
+        if (self.scale_factor - scale).abs() > 0.005 {
+            self.dwrite = shared_dwrite_for_scale(scale);
+        }
         self.scale_factor = scale;
         self.width = ((self.phys_width as f32) / scale).round().max(1.0) as usize;
         self.height = ((self.phys_height as f32) / scale).round().max(1.0) as usize;
-        self.dwrite.set_scale_factor(scale);
     }
 
     #[allow(dead_code)]
@@ -147,10 +763,12 @@ impl SurfaceCanvas {
         let ph = phys_height.max(1);
         let lw = ((pw as f32) / scale).round().max(1.0) as usize;
         let lh = ((ph as f32) / scale).round().max(1.0) as usize;
+        if (self.scale_factor - scale).abs() > 0.005 {
+            self.dwrite = shared_dwrite_for_scale(scale);
+        }
         self.scale_factor = scale;
         self.width = lw;
         self.height = lh;
-        self.dwrite.set_scale_factor(scale);
         if pw == self.phys_width && ph == self.phys_height {
             return;
         }
@@ -159,6 +777,22 @@ impl SurfaceCanvas {
         self.present_buf.resize(pw * ph, 0);
         self.phys_width = pw;
         self.phys_height = ph;
+    }
+
+    /// Shrinks the window's RGBA framebuffer to 1x1 while minimized to release ~10-30MB immediately.
+    pub fn shrink_for_minimized(&mut self) {
+        if self.phys_width <= 1 && self.phys_height <= 1 {
+            return;
+        }
+        if let Some(tiny) = Pixmap::new(1, 1) {
+            self.pixmap = tiny;
+            #[cfg(test)]
+            self.present_buf.resize(1, 0);
+            self.phys_width = 1;
+            self.phys_height = 1;
+            self.width = 1;
+            self.height = 1;
+        }
     }
 
     #[inline]
@@ -273,11 +907,33 @@ impl SurfaceCanvas {
         self.fill_rounded_rect_alpha(rect, radius, color, 255);
     }
 
+    /// 仅顶部两角带圆角的实心矩形（底部直角平齐，不会向上覆盖前一行文字）
+    pub fn fill_top_rounded_rect(&mut self, rect: Rect, radius: i32, color: u32) {
+        self.fill_rounded_rect_corners(rect, radius, color, 255, true, false);
+    }
+
+    /// 仅底部两角带圆角的实心矩形（顶部直角平齐，不会向上覆盖前一行文字）
+    pub fn fill_bottom_rounded_rect(&mut self, rect: Rect, radius: i32, color: u32) {
+        self.fill_rounded_rect_corners(rect, radius, color, 255, false, true);
+    }
+
     pub fn fill_rounded_rect_alpha(&mut self, rect: Rect, radius: i32, color: u32, alpha: u8) {
+        self.fill_rounded_rect_corners(rect, radius, color, alpha, true, true);
+    }
+
+    fn fill_rounded_rect_corners(
+        &mut self,
+        rect: Rect,
+        radius: i32,
+        color: u32,
+        alpha: u8,
+        round_top: bool,
+        round_bottom: bool,
+    ) {
         if rect.w <= 0 || rect.h <= 0 || alpha == 0 {
             return;
         }
-        if radius <= 0 {
+        if radius <= 0 || (!round_top && !round_bottom) {
             self.fill_rect_alpha(rect, color, alpha);
             return;
         }
@@ -291,18 +947,25 @@ impl SurfaceCanvas {
         if w <= 0 || h <= 0 {
             return;
         }
-        let r = ((radius as f32 * s).round() as i32).clamp(0, (w / 2).min(h / 2));
+        let max_r_v = if round_top && round_bottom { h / 2 } else { h };
+        let r = ((radius as f32 * s).round() as i32).clamp(0, (w / 2).min(max_r_v));
         if r <= 0 {
             self.fill_phys_rect(x0, y0, x1, y1, color, alpha);
             return;
         }
 
-        // 1. 中央主体全宽条带 + 上下中央水平条带直接走硬件 slice.fill
-        self.fill_phys_rect(x0, y0 + r, x1, y1 - r, color, alpha);
-        self.fill_phys_rect(x0 + r, y0, x1 - r, y0 + r, color, alpha);
-        self.fill_phys_rect(x0 + r, y1 - r, x1 - r, y1, color, alpha);
+        // 1. 中央主体全宽条带 + 上下水平条带直接走硬件 slice.fill
+        let top_r = if round_top { r } else { 0 };
+        let bot_r = if round_bottom { r } else { 0 };
+        self.fill_phys_rect(x0, y0 + top_r, x1, y1 - bot_r, color, alpha);
+        if round_top {
+            self.fill_phys_rect(x0 + r, y0, x1 - r, y0 + r, color, alpha);
+        }
+        if round_bottom {
+            self.fill_phys_rect(x0 + r, y1 - r, x1 - r, y1, color, alpha);
+        }
 
-        // 2. 仅对四角 r×r 像素执行精确 SDF 抗锯齿混合
+        // 2. 仅对启用的圆角 r×r 像素执行精确 SDF 抗锯齿混合
         let pw = self.phys_width as i32;
         let ph = self.phys_height as i32;
         let cr = ((color >> 16) & 0xFF) as u32;
@@ -313,14 +976,20 @@ impl SurfaceCanvas {
         let pw_usize = self.phys_width;
         let px = self.pixmap.pixels_mut();
 
-        let corners = [
-            (x0, y0, (x0 + r) as f32, (y0 + r) as f32),
-            (x1 - r, y0, (x1 - r) as f32, (y0 + r) as f32),
-            (x0, y1 - r, (x0 + r) as f32, (y1 - r) as f32),
-            (x1 - r, y1 - r, (x1 - r) as f32, (y1 - r) as f32),
-        ];
+        let mut corners = [(0i32, 0i32, 0.0f32, 0.0f32); 4];
+        let mut corner_len = 0usize;
+        if round_top {
+            corners[corner_len] = (x0, y0, (x0 + r) as f32, (y0 + r) as f32);
+            corners[corner_len + 1] = (x1 - r, y0, (x1 - r) as f32, (y0 + r) as f32);
+            corner_len += 2;
+        }
+        if round_bottom {
+            corners[corner_len] = (x0, y1 - r, (x0 + r) as f32, (y1 - r) as f32);
+            corners[corner_len + 1] = (x1 - r, y1 - r, (x1 - r) as f32, (y1 - r) as f32);
+            corner_len += 2;
+        }
 
-        for &(cx_start, cy_start, ccx, ccy) in &corners {
+        for &(cx_start, cy_start, ccx, ccy) in &corners[..corner_len] {
             let py_min = cy_start.max(0);
             let py_max = (cy_start + r).min(ph);
             let px_min = cx_start.max(0);
@@ -689,10 +1358,18 @@ impl SurfaceCanvas {
         }
     }
 
-    /// 绘制 IDEA 风格文件夹矢量图标
+    /// 绘制文件夹矢量图标（vscode-icons）
     pub fn draw_folder_icon(&mut self, x: i32, y: i32, color: u32) {
-        self.fill_rounded_rect(Rect::new(x, y + 1, 6, 3), 1, color);
-        self.fill_rounded_rect(Rect::new(x, y + 3, 14, 9), 2, color);
+        let _ = color;
+        crate::svg_icon::paint_icon(
+            &mut self.pixmap,
+            self.scale_factor,
+            x as f32,
+            (y - 1) as f32,
+            16.0,
+            16.0,
+            "folder",
+        );
     }
 
     /// 绘制新版 IDEA 顶部空心绿色运行三角 ▶
@@ -708,6 +1385,23 @@ impl SurfaceCanvas {
         if let Some(path) = pb.finish() {
             self.stroke_path_round(&path, 1.6, color);
         }
+    }
+
+    /// 绘制脚本运行中的暂停/停止双竖条图标 ❚❚
+    pub fn draw_pause_icon(&mut self, x: i32, y: i32, size: i32, color: u32) {
+        let bar_w = (size / 4).max(2);
+        let bar_h = size.max(6);
+        let gap = (size / 4).max(2);
+        let start_x = x + ((size - bar_w * 2 - gap) / 2).max(0);
+        self.fill_rounded_rect(Rect::new(start_x, y, bar_w, bar_h), 1, color);
+        self.fill_rounded_rect(Rect::new(start_x + bar_w + gap, y, bar_w, bar_h), 1, color);
+    }
+
+    /// 绘制移动端手机设备矢量图标 📱
+    pub fn draw_mobile_phone_icon(&mut self, x: i32, y: i32, color: u32) {
+        self.stroke_rect_border(Rect::new(x + 3, y + 1, 9, 13), color);
+        self.fill_rect(Rect::new(x + 6, y + 3, 3, 1), color);
+        self.fill_rect(Rect::new(x + 6, y + 11, 3, 1), color);
     }
 
     /// 绘制新版 IDEA 顶部设置齿轮矢量图标 ⚙
@@ -1383,99 +2077,103 @@ impl SurfaceCanvas {
         );
     }
 
-    /// 绘制文件类型小图标（替代纯文本扩展名）
-    pub fn draw_file_type_icon(&mut self, x: i32, y: i32, lang: ide_core::LanguageId) {
-        match lang {
-            ide_core::LanguageId::Rust => {
-                self.stroke_circle(x + 7, y + 7, 4.5, 1.6, 0xDF7A44);
-                self.fill_circle(x + 7, y + 7, 1, 0xDF7A44);
-            }
-            ide_core::LanguageId::TypeScript | ide_core::LanguageId::JavaScript => {
-                let c = if lang == ide_core::LanguageId::TypeScript {
-                    0x3178C6
-                } else {
-                    0xF1E05A
-                };
-                self.fill_rounded_rect(Rect::new(x + 1, y + 1, 12, 12), 2, c);
-                let fg = if lang == ide_core::LanguageId::TypeScript {
-                    0xFFFFFF
-                } else {
-                    0x1E1F22
-                };
-                self.draw_line_aa(
-                    (x + 4) as f32,
-                    (y + 5) as f32,
-                    (x + 10) as f32,
-                    (y + 5) as f32,
-                    1.3,
-                    fg,
-                );
-                self.draw_line_aa(
-                    (x + 7) as f32,
-                    (y + 5) as f32,
-                    (x + 7) as f32,
-                    (y + 10) as f32,
-                    1.3,
-                    fg,
-                );
-            }
-            ide_core::LanguageId::Python => {
-                self.fill_rounded_rect(Rect::new(x + 2, y + 2, 7, 6), 2, 0x3572A5);
-                self.fill_rounded_rect(Rect::new(x + 5, y + 6, 7, 6), 2, 0xFFD43B);
-            }
-            ide_core::LanguageId::Toml | ide_core::LanguageId::Json => {
-                let c = if lang == ide_core::LanguageId::Toml {
-                    0x9C6B30
-                } else {
-                    0xE5C07B
-                };
-                self.stroke_rounded_rect(Rect::new(x + 2, y + 2, 10, 11), 2, c, 0x2B2D30);
-                self.draw_line_aa(
-                    (x + 4) as f32,
-                    (y + 5) as f32,
-                    (x + 10) as f32,
-                    (y + 5) as f32,
-                    1.2,
-                    c,
-                );
-                self.draw_line_aa(
-                    (x + 4) as f32,
-                    (y + 8) as f32,
-                    (x + 9) as f32,
-                    (y + 8) as f32,
-                    1.2,
-                    c,
-                );
-            }
-            ide_core::LanguageId::Markdown => {
-                self.fill_rounded_rect(Rect::new(x + 1, y + 2, 12, 10), 2, 0x42A5F5);
-                let fx = x as f32 + 0.5;
-                let fy = y as f32 + 0.5;
-                let mut pb = PathBuilder::new();
-                pb.move_to(fx + 3.0, fy + 9.0);
-                pb.line_to(fx + 3.0, fy + 5.0);
-                pb.line_to(fx + 6.0, fy + 8.0);
-                pb.line_to(fx + 9.0, fy + 5.0);
-                pb.line_to(fx + 9.0, fy + 9.0);
-                if let Some(path) = pb.finish() {
-                    self.stroke_path_round(&path, 1.2, 0xFFFFFF);
-                }
-            }
-            ide_core::LanguageId::PlainText => {
-                if let Some(rect_path) = build_rounded_rect_path(
-                    (x + 3) as f32 + 0.5,
-                    (y + 2) as f32 + 0.5,
-                    8.0,
-                    10.0,
-                    1.0,
-                ) {
-                    self.stroke_path_round(&rect_path, 1.2, 0x8B949E);
-                }
-            }
-        }
+    /// 按路径绘制矢量文件图标。编程语言和常见文件各有图形，未知类型使用文档页。
+    pub fn draw_path_file_icon(&mut self, x: i32, y: i32, path: &Path) {
+        self.draw_file_icon_kind(x, y, FileIconKind::from_path(path));
     }
 
-    /// 绘制可拖拽/指示位置的垂直滚动条
+    /// 按运行配置（npm/docker/gradle/maven/cargo/python/go/文件）绘制匹配的矢量图标。
+    pub fn draw_run_config_icon(&mut self, x: i32, y: i32, cfg: &ide_core::RunConfiguration) {
+        let trimmed = cfg
+            .command
+            .trim()
+            .trim_start_matches(".\\")
+            .trim_start_matches("./");
+        let cmd_file = Path::new(trimmed)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(trimmed)
+            .to_ascii_lowercase();
+        let cmd_base = cmd_file
+            .strip_suffix(".exe")
+            .or_else(|| cmd_file.strip_suffix(".cmd"))
+            .or_else(|| cmd_file.strip_suffix(".bat"))
+            .unwrap_or(&cmd_file);
+
+        let kind = match cmd_base {
+            "npm" | "pnpm" | "yarn" | "bun" | "npx" => FileIconKind::Npm,
+            "node" | "nodemon" => FileIconKind::JavaScript,
+            "tsx" | "ts-node" | "tsc" | "deno" => FileIconKind::TypeScript,
+            "vite" => FileIconKind::Vite,
+            "docker" | "docker-compose" | "podman" => FileIconKind::Docker,
+            "gradle" | "gradlew" => FileIconKind::Gradle,
+            "mvn" | "mvnw" => FileIconKind::Maven,
+            "flutter" | "dart" => FileIconKind::Dart,
+            "adb" | "emulator" => FileIconKind::Kotlin,
+            "cargo" | "rustc" | "rustup" => FileIconKind::Rust,
+            "python" | "python3" | "py" | "pytest" | "uv" | "poetry" | "uvicorn" | "flask" => {
+                FileIconKind::Python
+            }
+            "go" => FileIconKind::Go,
+            "java" => FileIconKind::Java,
+            "make" | "gmake" => FileIconKind::Make,
+            "just" => FileIconKind::Just,
+            "cmake" => FileIconKind::Cmake,
+            "dotnet" => FileIconKind::CSharp,
+            "ruby" | "bundle" | "rake" => FileIconKind::Ruby,
+            "php" | "composer" => FileIconKind::Php,
+            "lua" => FileIconKind::Lua,
+            "powershell" | "pwsh" => FileIconKind::PowerShell,
+            "bash" | "sh" | "zsh" => FileIconKind::Shell,
+            "cmd" => FileIconKind::Batch,
+            _ => {
+                if let Some(target) = &cfg.target_file {
+                    FileIconKind::from_path(target)
+                } else {
+                    FileIconKind::from_language(cfg.language)
+                }
+            }
+        };
+        self.draw_file_icon_kind(x, y, kind);
+    }
+
+    fn draw_file_icon_kind(&mut self, x: i32, y: i32, kind: FileIconKind) {
+        crate::svg_icon::paint_icon(
+            &mut self.pixmap,
+            self.scale_factor,
+            x as f32,
+            y as f32,
+            16.0,
+            16.0,
+            kind.icon_name(),
+        );
+    }
+
+    /// 计算垂直/水平滚动条滑块偏移与长度（自动兼容窄轨道尺寸）
+    fn calc_scrollbar_thumb_span(
+        track_len: i32,
+        scroll_offset: usize,
+        visible_items: usize,
+        total_items: usize,
+    ) -> Option<(i32, i32)> {
+        if total_items <= visible_items || track_len <= 16 {
+            return None;
+        }
+        let max_scroll = total_items.saturating_sub(visible_items).max(1);
+        let clamped_offset = scroll_offset.min(max_scroll);
+        let max_thumb = (track_len as f32 - 4.0).max(8.0);
+        let min_thumb = 24.0_f32.min(max_thumb);
+        let raw_thumb = (visible_items as f32 / total_items as f32) * (track_len as f32);
+        let thumb_len = if raw_thumb.is_finite() {
+            raw_thumb.clamp(min_thumb, max_thumb) as i32
+        } else {
+            min_thumb as i32
+        };
+        let avail = (track_len - thumb_len).max(1);
+        let thumb_pos = ((clamped_offset as f32 / max_scroll as f32) * (avail as f32)) as i32;
+        Some((thumb_pos, thumb_len))
+    }
+
     pub fn draw_vertical_scrollbar(
         &mut self,
         track_rect: Rect,
@@ -1484,21 +2182,45 @@ impl SurfaceCanvas {
         total_items: usize,
         thumb_color: u32,
     ) -> Rect {
-        if total_items <= visible_items || track_rect.h <= 16 {
+        let Some((thumb_offset, thumb_h)) = Self::calc_scrollbar_thumb_span(
+            track_rect.h,
+            scroll_offset,
+            visible_items,
+            total_items,
+        ) else {
             return Rect::new(track_rect.x, track_rect.y, track_rect.w, 0);
-        }
-        let max_scroll = total_items.saturating_sub(visible_items).max(1);
-        let clamped_offset = scroll_offset.min(max_scroll);
-        let thumb_h = ((visible_items as f32 / total_items as f32) * (track_rect.h as f32))
-            .clamp(24.0, track_rect.h as f32 - 4.0) as i32;
-        let avail_h = (track_rect.h - thumb_h).max(1);
-        let thumb_y =
-            track_rect.y + ((clamped_offset as f32 / max_scroll as f32) * (avail_h as f32)) as i32;
+        };
         let thumb_rect = Rect::new(
             track_rect.x + 1,
-            thumb_y,
+            track_rect.y + thumb_offset,
             (track_rect.w - 2).max(4),
             thumb_h,
+        );
+        self.fill_rounded_rect(thumb_rect, 3, thumb_color);
+        thumb_rect
+    }
+
+    pub fn draw_horizontal_scrollbar(
+        &mut self,
+        track_rect: Rect,
+        scroll_offset: usize,
+        visible_items: usize,
+        total_items: usize,
+        thumb_color: u32,
+    ) -> Rect {
+        let Some((thumb_offset, thumb_w)) = Self::calc_scrollbar_thumb_span(
+            track_rect.w,
+            scroll_offset,
+            visible_items,
+            total_items,
+        ) else {
+            return Rect::new(track_rect.x, track_rect.y, 0, track_rect.h);
+        };
+        let thumb_rect = Rect::new(
+            track_rect.x + thumb_offset,
+            track_rect.y + 1,
+            thumb_w,
+            (track_rect.h - 2).max(4),
         );
         self.fill_rounded_rect(thumb_rect, 3, thumb_color);
         thumb_rect
@@ -1512,6 +2234,82 @@ impl SurfaceCanvas {
     /// 根据鼠标点击相对于行首的 X 偏移量计算最接近的字符列号（基于 DirectWrite 原生 `HitTestPoint` O(1) 命中测试）
     pub fn measure_caret_col_in_line(&self, line: &str, rel_x: i32, style: FontStyle) -> usize {
         self.dwrite.hit_test_col(line, rel_x, style)
+    }
+
+    /// 按最大像素宽度对文本执行末尾省略号截断（超出时显示 `…` 而非硬裁剪）
+    pub fn ellipsize_text(&self, text: &str, max_width: i32, style: FontStyle) -> String {
+        if max_width <= 0 || text.is_empty() {
+            return String::new();
+        }
+        if self.measure_text(text, style).0 <= max_width {
+            return text.to_string();
+        }
+        let (ew, _) = self.measure_text("…", style);
+        if max_width <= ew {
+            return "…".to_string();
+        }
+        let avail = max_width - ew;
+        let chars: Vec<char> = text.chars().collect();
+        let mut cut = self
+            .measure_caret_col_in_line(text, avail, style)
+            .min(chars.len());
+        while cut > 0 {
+            let prefix: String = chars[..cut].iter().collect();
+            let cand = format!("{prefix}…");
+            if self.measure_text(&cand, style).0 <= max_width {
+                return cand;
+            }
+            cut -= 1;
+        }
+        "…".to_string()
+    }
+
+    /// 对文件名或标签执行智能省略（超长时保留前缀与扩展名，如 `very_long_file….tsx`）
+    pub fn ellipsize_filename(&self, label: &str, max_width: i32, style: FontStyle) -> String {
+        if max_width <= 0 || label.is_empty() {
+            return String::new();
+        }
+        if self.measure_text(label, style).0 <= max_width {
+            return label.to_string();
+        }
+        if let Some(dot_idx) = label.rfind('.') {
+            let ext = &label[dot_idx..];
+            let stem = &label[..dot_idx];
+            if !stem.is_empty() && ext.chars().count() <= 8 {
+                let suffix = format!("…{ext}");
+                let (sw, _) = self.measure_text(&suffix, style);
+                if sw < max_width - 14 {
+                    let stem_chars: Vec<char> = stem.chars().collect();
+                    let avail = max_width - sw;
+                    let mut cut = self
+                        .measure_caret_col_in_line(stem, avail, style)
+                        .min(stem_chars.len());
+                    while cut > 1 {
+                        let prefix: String = stem_chars[..cut].iter().collect();
+                        let cand = format!("{prefix}{suffix}");
+                        if self.measure_text(&cand, style).0 <= max_width {
+                            return cand;
+                        }
+                        cut -= 1;
+                    }
+                }
+            }
+        }
+        self.ellipsize_text(label, max_width, style)
+    }
+
+    /// 自动附加省略号绘制超长文本，避免边缘生硬裁剪
+    pub fn draw_text_ellipsis(
+        &mut self,
+        x: i32,
+        y: i32,
+        text: &str,
+        color: u32,
+        max_width: i32,
+        style: FontStyle,
+    ) -> i32 {
+        let fitted = self.ellipsize_text(text, max_width, style);
+        self.draw_text_styled(x, y, &fitted, color, max_width, style)
     }
 
     /// 使用 DirectWrite ClearType 真背景合成渲染平滑中英文/符号文本，并返回绘制后的右边界 X 坐标
@@ -1981,8 +2779,26 @@ pub fn save_ri_icon_png(path: &Path, size: u32) -> Result<()> {
 // =============================================================================
 
 const MEASURE_CACHE_CAP: usize = 4096;
-const LAYOUT_CACHE_CAP: usize = 2048;
+const LAYOUT_CACHE_CAP: usize = 256;
 const MASK_CACHE_CAP: usize = 2048;
+
+fn shared_dwrite_for_scale(scale: f32) -> Rc<DWriteTextEngine> {
+    thread_local! {
+        static SHARED_DWRITE_ENGINES: RefCell<HashMap<u32, Weak<DWriteTextEngine>>> =
+            RefCell::new(HashMap::new());
+    }
+    let key = (scale.clamp(0.75, 4.0) * 100.0).round() as u32;
+    SHARED_DWRITE_ENGINES.with(|map_cell| {
+        let mut map = map_cell.borrow_mut();
+        map.retain(|_, w| w.strong_count() > 0);
+        if let Some(existing) = map.get(&key).and_then(|w| w.upgrade()) {
+            return existing;
+        }
+        let engine = Rc::new(DWriteTextEngine::new((key as f32) / 100.0));
+        map.insert(key, Rc::downgrade(&engine));
+        engine
+    })
+}
 
 /// 预光栅化的 DirectWrite ClearType 亚像素覆盖率掩码缓存项：
 /// 将昂贵的 COM `IDWriteTextLayout::Draw` 转化为内存紧凑的 `u32` 亚像素覆盖率数组，
@@ -2046,18 +2862,6 @@ impl DWriteTextEngine {
                     bitmap_stride_px: 0,
                 }),
             }
-        }
-    }
-
-    fn set_scale_factor(&self, scale_factor: f32) {
-        let scale = scale_factor.clamp(0.75, 4.0);
-        let mut st = self.state.borrow_mut();
-        if (st.scale_factor - scale).abs() > 0.005 {
-            st.scale_factor = scale;
-            st.formats.clear();
-            st.measure_cache.clear();
-            st.layout_cache.clear();
-            st.mask_cache.clear();
         }
     }
 
@@ -2777,5 +3581,178 @@ impl IDWritePixelSnapping_Impl for GlyphRenderer_Impl {
 
     fn GetPixelsPerDip(&self, _ctx: *const c_void) -> WinResult<f32> {
         Ok(1.0)
+    }
+}
+
+#[cfg(test)]
+mod file_icon_tests {
+    use super::{FileIconKind, SurfaceCanvas};
+    use std::path::Path;
+
+    #[test]
+    fn programming_and_common_files_get_distinct_vector_icons() {
+        assert_eq!(
+            FileIconKind::from_path(Path::new("src/main.rs")),
+            FileIconKind::Rust
+        );
+        assert_eq!(
+            FileIconKind::from_path(Path::new("app.tsx")),
+            FileIconKind::Tsx
+        );
+        assert_eq!(
+            FileIconKind::from_path(Path::new("lib.go")),
+            FileIconKind::Go
+        );
+        assert_eq!(
+            FileIconKind::from_path(Path::new("Main.java")),
+            FileIconKind::Java
+        );
+        assert_eq!(
+            FileIconKind::from_path(Path::new("widget.vue")),
+            FileIconKind::Vue
+        );
+        assert_eq!(
+            FileIconKind::from_path(Path::new("style.css")),
+            FileIconKind::Css
+        );
+        assert_eq!(
+            FileIconKind::from_path(Path::new("Cargo.toml")),
+            FileIconKind::Rust
+        );
+        assert_eq!(
+            FileIconKind::from_path(Path::new("Cargo.lock")),
+            FileIconKind::Lock
+        );
+        assert_eq!(
+            FileIconKind::from_path(Path::new(".gitignore")),
+            FileIconKind::Git
+        );
+        assert_eq!(
+            FileIconKind::from_path(Path::new("Dockerfile")),
+            FileIconKind::Docker
+        );
+        assert_eq!(
+            FileIconKind::from_path(Path::new("photo.PNG")),
+            FileIconKind::Image
+        );
+        assert_eq!(
+            FileIconKind::from_path(Path::new("clip.mp4")),
+            FileIconKind::Video
+        );
+        assert_eq!(
+            FileIconKind::from_path(Path::new("notes.txt")),
+            FileIconKind::Text
+        );
+        assert_eq!(
+            FileIconKind::from_path(Path::new("archive.tar.gz")),
+            FileIconKind::Archive
+        );
+        assert_eq!(
+            FileIconKind::from_path(Path::new("Makefile")),
+            FileIconKind::Make
+        );
+        assert_eq!(
+            FileIconKind::from_path(Path::new("schema.prisma")),
+            FileIconKind::Database
+        );
+        assert_eq!(
+            FileIconKind::from_path(Path::new("app.cr")),
+            FileIconKind::Crystal
+        );
+        assert_eq!(
+            FileIconKind::from_path(Path::new("shader.glsl")),
+            FileIconKind::Shader
+        );
+        assert_eq!(
+            FileIconKind::from_path(Path::new("App.sln")),
+            FileIconKind::Project
+        );
+        assert_eq!(
+            FileIconKind::from_path(Path::new("Containerfile")),
+            FileIconKind::Docker
+        );
+        assert_eq!(
+            FileIconKind::from_path(Path::new("BUILD.bazel")),
+            FileIconKind::Bazel
+        );
+        assert_eq!(
+            FileIconKind::from_path(Path::new("pom.xml")),
+            FileIconKind::Maven
+        );
+        assert_eq!(
+            FileIconKind::from_path(Path::new("Chart.yaml")),
+            FileIconKind::Helm
+        );
+        assert_eq!(
+            FileIconKind::from_path(Path::new("lib.rlib")),
+            FileIconKind::Binary
+        );
+        assert_eq!(
+            FileIconKind::from_path(Path::new("CHANGELOG")),
+            FileIconKind::Changelog
+        );
+        assert_eq!(
+            FileIconKind::from_path(Path::new("api.http")),
+            FileIconKind::Http
+        );
+        assert_eq!(
+            FileIconKind::from_path(Path::new("unknown.qqq")),
+            FileIconKind::Unknown
+        );
+        assert_ne!(
+            FileIconKind::from_path(Path::new("a.rs")),
+            FileIconKind::from_path(Path::new("a.py"))
+        );
+    }
+
+    #[test]
+    fn svg_file_icons_paint_visible_pixels() {
+        let mut canvas = SurfaceCanvas::new(48, 48);
+        canvas.draw_path_file_icon(4, 4, std::path::Path::new("src/lib.rs"));
+        canvas.draw_path_file_icon(24, 4, std::path::Path::new("README.md"));
+        canvas.draw_path_file_icon(4, 24, std::path::Path::new("docs/guide.md"));
+        canvas.draw_folder_icon(4, 24, 0xD9A343);
+        let painted = canvas.pixels().iter().filter(|px| **px != 0).count();
+        assert!(painted > 40, "icons should cover more than a few pixels, got {painted}");
+    }
+
+    #[test]
+    fn json_icon_stays_inside_its_slot() {
+        let mut canvas = SurfaceCanvas::new(80, 80);
+        canvas.draw_path_file_icon(24, 40, Path::new("data.json"));
+        let px = canvas.pixels();
+        let mut above = 0;
+        let mut inside = 0;
+        for y in 0..80 {
+            for x in 0..80 {
+                if px[y * 80 + x] == 0 {
+                    continue;
+                }
+                if y < 38 {
+                    above += 1;
+                }
+                if (24..42).contains(&x) && (40..58).contains(&y) {
+                    inside += 1;
+                }
+            }
+        }
+        assert_eq!(above, 0, "json icon painted onto the row above");
+        assert!(inside > 8, "json icon missing from its own slot, got {inside}");
+    }
+
+    #[test]
+    fn shared_dwrite_engine_and_minimized_shrink() {
+        let mut c1 = SurfaceCanvas::new_with_scale(800, 600, 1.25);
+        let c2 = SurfaceCanvas::new_with_scale(1024, 768, 1.25);
+        assert!(std::rc::Rc::ptr_eq(&c1.dwrite, &c2.dwrite));
+
+        c1.shrink_for_minimized();
+        assert_eq!(c1.phys_width, 1);
+        assert_eq!(c1.phys_height, 1);
+
+        c1.resize_physical(800, 600, 1.25);
+        assert_eq!(c1.phys_width, 800);
+        assert_eq!(c1.phys_height, 600);
+        assert!(std::rc::Rc::ptr_eq(&c1.dwrite, &c2.dwrite));
     }
 }

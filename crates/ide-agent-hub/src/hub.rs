@@ -4,7 +4,29 @@ use crate::cli_discovery::{
     probe_cursor_cli_list_models, push_unique_model, resolve_agy_model_and_effort,
     resolve_cursor_model_id,
 };
-use crate::cli_runner::{compute_file_diff_counts, execute_cli_once, CliRunParams};
+use crate::cli_runner::{
+    compute_file_diff_counts, execute_cli_once, paths_same_file, CliRunParams, TurnDiffTracker,
+};
+
+fn build_turn_file_changes(
+    modified_files: &[PathBuf],
+    backups: &HashMap<PathBuf, Option<String>>,
+    stats: &HashMap<PathBuf, (usize, usize)>,
+) -> Vec<TurnFileChange> {
+    modified_files
+        .iter()
+        .map(|p| {
+            let (added_lines, removed_lines) = stats.get(p).copied().unwrap_or((0, 0));
+            let before_content = backups.get(p).cloned().flatten();
+            TurnFileChange {
+                path: p.clone(),
+                added_lines,
+                removed_lines,
+                before_content,
+            }
+        })
+        .collect()
+}
 use crate::http_fallback::{execute_agent_tool_loop, execute_curl_llm_streaming};
 use crate::tools::{
     extract_enclosing_block, extract_first_fenced_code_block, load_workspace_agent_rules,
@@ -14,7 +36,7 @@ use crate::types::{
     AgentAttachedItem, AgentChatMessage, AgentProviderKind, AgentRegistration, AgentSession,
     AgentWakeupCallback, AgentWorkbenchMode, AiApiConfig, IdeCodeContext, InlineEditSession,
     PastedCodeSnippet, PersistedAgentHistory, ReasoningEffort, SessionFileChange,
-    StreamingAgentProgress, TurnSyncAnchor, WorkspaceCheckpoint,
+    StreamingAgentProgress, TurnFileChange, TurnSyncAnchor, WorkspaceCheckpoint,
 };
 use ide_core::LanguageId;
 use ide_search::find_in_files;
@@ -50,6 +72,7 @@ enum ExecutionBackend {
     LocalOffline,
 }
 
+#[derive(Clone)]
 struct DiscoveredModelUpdate {
     kind: AgentProviderKind,
     display_models: Vec<String>,
@@ -66,6 +89,25 @@ struct CliTurnSyncUpdate {
     file_diff_stats: HashMap<PathBuf, (usize, usize)>,
 }
 
+#[derive(Clone)]
+struct SessionExecutionSlot {
+    is_busy: Arc<AtomicBool>,
+    cancel_requested: Arc<AtomicBool>,
+    active_child_pid: Arc<Mutex<Option<u32>>>,
+    streaming_text: Arc<Mutex<Option<StreamingAgentProgress>>>,
+}
+
+impl SessionExecutionSlot {
+    fn new() -> Self {
+        Self {
+            is_busy: Arc::new(AtomicBool::new(false)),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            active_child_pid: Arc::new(Mutex::new(None)),
+            streaming_text: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
 pub struct AgentHub {
     pub workspace_root: PathBuf,
     pub active_provider: AgentProviderKind,
@@ -78,11 +120,9 @@ pub struct AgentHub {
     pub active_session_idx: usize,
     next_session_seq: usize,
     pub loaded_rules_summary: String,
+    /// 全局汇总忙标志：任意会话正在运行时为 true（供 UI 动画驱动）
     pub is_busy: Arc<AtomicBool>,
-    cancel_requested: Arc<AtomicBool>,
-    active_child_pid: Arc<Mutex<Option<u32>>>,
-    streaming_text: Arc<Mutex<Option<StreamingAgentProgress>>>,
-    streaming_session_id: Arc<Mutex<Option<String>>>,
+    session_slots: Arc<Mutex<HashMap<String, SessionExecutionSlot>>>,
     async_inbox: Arc<Mutex<Vec<(String, AgentChatMessage)>>>,
     async_checkpoints_inbox: Arc<Mutex<Vec<(String, WorkspaceCheckpoint)>>>,
     async_cli_sync_inbox: Arc<Mutex<Vec<CliTurnSyncUpdate>>>,
@@ -144,6 +184,7 @@ impl AgentHub {
             checkpoint_id: None,
             patch: None,
             modified_files: Vec::new(),
+            file_changes: Vec::new(),
             attachments: Vec::new(),
         }];
 
@@ -181,10 +222,7 @@ impl AgentHub {
             next_session_seq: 2,
             loaded_rules_summary: rules_summary,
             is_busy: Arc::new(AtomicBool::new(false)),
-            cancel_requested: Arc::new(AtomicBool::new(false)),
-            active_child_pid: Arc::new(Mutex::new(None)),
-            streaming_text: Arc::new(Mutex::new(None)),
-            streaming_session_id: Arc::new(Mutex::new(None)),
+            session_slots: Arc::new(Mutex::new(HashMap::new())),
             async_inbox: Arc::new(Mutex::new(Vec::new())),
             async_checkpoints_inbox: Arc::new(Mutex::new(Vec::new())),
             async_cli_sync_inbox: Arc::new(Mutex::new(Vec::new())),
@@ -541,6 +579,11 @@ impl AgentHub {
     }
 
     fn spawn_async_cli_model_probe(&self) {
+        use std::sync::OnceLock;
+        type ProbeCache = Mutex<HashMap<(AgentProviderKind, PathBuf), DiscoveredModelUpdate>>;
+        static CLI_PROBE_CACHE: OnceLock<ProbeCache> = OnceLock::new();
+        let probe_cache = CLI_PROBE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+
         let bins: Vec<(AgentProviderKind, PathBuf)> = self
             .providers
             .iter()
@@ -548,6 +591,13 @@ impl AgentHub {
             .collect();
 
         for (kind, bin) in bins {
+            if let Some(cached) = probe_cache.lock().get(&(kind, bin.clone())).cloned() {
+                self.async_discovered_models.lock().push(cached);
+                if let Some(cb) = &self.wakeup {
+                    cb();
+                }
+                continue;
+            }
             let slot = self.async_discovered_models.clone();
             let wakeup = self.wakeup.clone();
             thread::spawn(move || {
@@ -562,13 +612,16 @@ impl AgentHub {
                 };
                 let caps = probe_cli_rewind_capabilities(kind, &bin);
                 if !display_models.is_empty() || !exact_catalog.is_empty() || caps.is_some() {
-                    slot.lock().push(DiscoveredModelUpdate {
+                    let update = DiscoveredModelUpdate {
                         kind,
                         display_models,
                         exact_catalog,
                         supports_session_resume: caps.map(|c| c.0),
                         supports_checkpoint_rewind: caps.map(|c| c.1),
-                    });
+                    };
+                    let cache = CLI_PROBE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+                    cache.lock().insert((kind, bin), update.clone());
+                    slot.lock().push(update);
                     if let Some(cb) = wakeup {
                         cb();
                     }
@@ -707,7 +760,16 @@ impl AgentHub {
             return true;
         }
         self.sync_active_session_out();
-        self.sessions.remove(idx);
+        let removed_id = self.sessions.remove(idx).id;
+        {
+            let mut slots = self.session_slots.lock();
+            if let Some(slot) = slots.remove(&removed_id) {
+                slot.cancel_requested.store(true, Ordering::SeqCst);
+                Self::kill_slot_process(&slot);
+                slot.is_busy.store(false, Ordering::SeqCst);
+            }
+            Self::sync_global_busy_flag(&slots, &self.is_busy);
+        }
         let next_idx = if idx < self.active_session_idx {
             self.active_session_idx - 1
         } else {
@@ -754,47 +816,58 @@ impl AgentHub {
             .retain(|s| s.id != id);
     }
 
-    pub fn is_active_session_busy(&self) -> bool {
-        if !self.is_busy.load(Ordering::Relaxed) {
-            return false;
-        }
-        let active_id = self.active_session().id.as_str();
-        self.streaming_session_id.lock().as_deref() == Some(active_id)
+    fn sync_global_busy_flag(
+        slots: &HashMap<String, SessionExecutionSlot>,
+        global_busy: &AtomicBool,
+    ) {
+        let any_busy = slots
+            .values()
+            .any(|s| s.is_busy.load(Ordering::Relaxed));
+        global_busy.store(any_busy, Ordering::SeqCst);
     }
 
-    pub fn streaming_progress(&self) -> Option<StreamingAgentProgress> {
-        if !self.is_active_session_busy() {
-            return None;
-        }
-        self.streaming_text.lock().clone()
-    }
-
-    pub fn set_active_streaming_progress(&mut self, progress: Option<StreamingAgentProgress>) {
-        let sid = self.active_session().id.clone();
-        match progress {
-            Some(p) => {
-                *self.streaming_session_id.lock() = Some(sid);
-                *self.streaming_text.lock() = Some(p);
-                self.is_busy.store(true, Ordering::SeqCst);
+    fn try_begin_session_execution(
+        &mut self,
+        session_id: &str,
+        initial_progress: StreamingAgentProgress,
+    ) -> Option<SessionExecutionSlot> {
+        let slot = {
+            let mut slots = self.session_slots.lock();
+            let slot = slots
+                .entry(session_id.to_string())
+                .or_insert_with(SessionExecutionSlot::new)
+                .clone();
+            if slot.is_busy.swap(true, Ordering::SeqCst) {
+                return None;
             }
-            None => {
-                *self.streaming_session_id.lock() = None;
-                *self.streaming_text.lock() = None;
-                self.is_busy.store(false, Ordering::SeqCst);
-            }
+            slot.cancel_requested.store(false, Ordering::SeqCst);
+            *slot.active_child_pid.lock() = None;
+            *slot.streaming_text.lock() = Some(initial_progress);
+            self.is_busy.store(true, Ordering::SeqCst);
+            slot
+        };
+        if let Some(sess) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+            sess.is_busy = true;
         }
+        Some(slot)
     }
 
-    pub fn streaming_preview(&self) -> Option<String> {
-        self.streaming_progress().map(|p| p.to_preview_string())
+    fn finish_session_slot(
+        slots: &Arc<Mutex<HashMap<String, SessionExecutionSlot>>>,
+        global_busy: &Arc<AtomicBool>,
+        session_id: &str,
+    ) {
+        let guard = slots.lock();
+        if let Some(slot) = guard.get(session_id) {
+            *slot.active_child_pid.lock() = None;
+            *slot.streaming_text.lock() = None;
+            slot.is_busy.store(false, Ordering::SeqCst);
+        }
+        Self::sync_global_busy_flag(&guard, global_busy);
     }
 
-    pub fn cancel_active_request(&mut self) {
-        if !self.is_busy.load(Ordering::Relaxed) {
-            return;
-        }
-        self.cancel_requested.store(true, Ordering::SeqCst);
-        if let Some(pid) = self.active_child_pid.lock().take() {
+    fn kill_slot_process(slot: &SessionExecutionSlot) {
+        if let Some(pid) = slot.active_child_pid.lock().take() {
             #[cfg(target_os = "windows")]
             {
                 let _ = Command::new("taskkill")
@@ -809,9 +882,80 @@ impl AgentHub {
                     .output();
             }
         }
-        let target_sid = self.streaming_session_id.lock().take();
-        self.is_busy.store(false, Ordering::SeqCst);
-        let partial = self.streaming_text.lock().take();
+    }
+
+    pub fn is_active_session_busy(&self) -> bool {
+        let active_id = self.active_session().id.as_str();
+        let slots = self.session_slots.lock();
+        slots
+            .get(active_id)
+            .map(|s| s.is_busy.load(Ordering::Relaxed))
+            .unwrap_or(false)
+    }
+
+    pub fn streaming_progress(&self) -> Option<StreamingAgentProgress> {
+        let active_id = self.active_session().id.as_str();
+        let slot = {
+            let slots = self.session_slots.lock();
+            slots.get(active_id).cloned()
+        }?;
+        if !slot.is_busy.load(Ordering::Relaxed) {
+            return None;
+        }
+        let progress = slot.streaming_text.lock().clone();
+        progress
+    }
+
+    pub fn set_active_streaming_progress(&mut self, progress: Option<StreamingAgentProgress>) {
+        let sid = self.active_session().id.clone();
+        let mut slots = self.session_slots.lock();
+        match progress {
+            Some(p) => {
+                let slot = slots
+                    .entry(sid)
+                    .or_insert_with(SessionExecutionSlot::new);
+                *slot.streaming_text.lock() = Some(p);
+                slot.is_busy.store(true, Ordering::SeqCst);
+                Self::sync_global_busy_flag(&slots, &self.is_busy);
+                drop(slots);
+                self.active_session_mut().is_busy = true;
+            }
+            None => {
+                if let Some(slot) = slots.get(&sid) {
+                    *slot.streaming_text.lock() = None;
+                    slot.is_busy.store(false, Ordering::SeqCst);
+                }
+                Self::sync_global_busy_flag(&slots, &self.is_busy);
+                drop(slots);
+                self.active_session_mut().is_busy = false;
+            }
+        }
+    }
+
+    pub fn streaming_preview(&self) -> Option<String> {
+        self.streaming_progress().map(|p| p.to_preview_string())
+    }
+
+    pub fn cancel_active_request(&mut self) {
+        let active_id = self.active_session().id.clone();
+        let slot = {
+            let slots = self.session_slots.lock();
+            slots.get(&active_id).cloned()
+        };
+        let Some(slot) = slot else {
+            return;
+        };
+        if !slot.is_busy.load(Ordering::Relaxed) {
+            return;
+        }
+        slot.cancel_requested.store(true, Ordering::SeqCst);
+        Self::kill_slot_process(&slot);
+        slot.is_busy.store(false, Ordering::SeqCst);
+        let partial = slot.streaming_text.lock().take();
+        {
+            let slots = self.session_slots.lock();
+            Self::sync_global_busy_flag(&slots, &self.is_busy);
+        }
         let (content, thought) = match partial {
             Some(prog) => {
                 let c = if prog.reply_text.trim().is_empty() {
@@ -837,17 +981,10 @@ impl AgentHub {
             checkpoint_id: None,
             patch: None,
             modified_files: Vec::new(),
+            file_changes: Vec::new(),
             attachments: Vec::new(),
         };
-        let active_id = self.active_session().id.clone();
-        if target_sid.as_deref().unwrap_or(&active_id) == active_id {
-            self.messages.push(msg);
-        } else if let Some(sid) = &target_sid {
-            if let Some(sess) = self.sessions.iter_mut().find(|s| &s.id == sid) {
-                sess.messages.push(msg);
-                sess.is_busy = false;
-            }
-        }
+        self.messages.push(msg);
         self.active_session_mut().is_busy = false;
         self.save_history();
         if let Some(cb) = &self.wakeup {
@@ -858,14 +995,19 @@ impl AgentHub {
     /// 轮询后台异步消息、Checkpoint 与自动探测到的 CLI 模型列表；若有更新返回 true
     pub fn poll_async_messages(&mut self) -> bool {
         let mut changed = false;
-        let global_busy = self.is_busy.load(Ordering::Relaxed);
-        let stream_sid = self.streaming_session_id.lock().clone();
-        for sess in &mut self.sessions {
-            let should_busy = global_busy && stream_sid.as_deref() == Some(sess.id.as_str());
-            if sess.is_busy != should_busy {
-                sess.is_busy = should_busy;
-                changed = true;
+        {
+            let slots = self.session_slots.lock();
+            for sess in &mut self.sessions {
+                let should_busy = slots
+                    .get(&sess.id)
+                    .map(|s| s.is_busy.load(Ordering::Relaxed))
+                    .unwrap_or(false);
+                if sess.is_busy != should_busy {
+                    sess.is_busy = should_busy;
+                    changed = true;
+                }
             }
+            Self::sync_global_busy_flag(&slots, &self.is_busy);
         }
 
         let updates: Vec<DiscoveredModelUpdate> = {
@@ -983,15 +1125,23 @@ impl AgentHub {
                     .get(&path)
                     .copied()
                     .unwrap_or((0, 0));
-                if let Some(existing) = sess.changed_files.iter_mut().find(|f| f.path == path) {
+                if let Some(pos) = sess
+                    .changed_files
+                    .iter()
+                    .position(|f| paths_same_file(&f.path, &path))
+                {
                     let after = fs::read_to_string(&path).unwrap_or_default();
                     let (new_add, new_del) = compute_file_diff_counts(
-                        existing.original_content.as_deref().unwrap_or(""),
+                        sess.changed_files[pos].original_content.as_deref().unwrap_or(""),
                         &after,
                     );
-                    existing.added_lines = new_add;
-                    existing.removed_lines = new_del;
-                } else {
+                    if new_add == 0 && new_del == 0 {
+                        sess.changed_files.remove(pos);
+                    } else {
+                        sess.changed_files[pos].added_lines = new_add;
+                        sess.changed_files[pos].removed_lines = new_del;
+                    }
+                } else if added > 0 || removed > 0 {
                     sess.changed_files.push(SessionFileChange {
                         path,
                         added_lines: added,
@@ -1095,7 +1245,7 @@ impl AgentHub {
         mode: AgentWorkbenchMode,
         ctx: Option<&IdeCodeContext>,
     ) -> Vec<PathBuf> {
-        if user_msg_idx >= self.messages.len() || self.is_busy.load(Ordering::Relaxed) {
+        if user_msg_idx >= self.messages.len() || self.is_active_session_busy() {
             return Vec::new();
         }
         let mut restored_paths: Vec<PathBuf> = Vec::new();
@@ -1231,8 +1381,9 @@ impl AgentHub {
 
     pub fn clear_messages(&mut self) {
         self.messages.clear();
-        if self.streaming_session_id.lock().as_deref() == Some(self.active_session().id.as_str()) {
-            *self.streaming_text.lock() = None;
+        let active_id = self.active_session().id.clone();
+        if let Some(slot) = self.session_slots.lock().get(&active_id).cloned() {
+            *slot.streaming_text.lock() = None;
         }
         self.save_history();
     }
@@ -1588,6 +1739,7 @@ impl AgentHub {
             checkpoint_id: None,
             patch: None,
             modified_files: Vec::new(),
+            file_changes: Vec::new(),
             attachments: attached_items.clone(),
         });
         {
@@ -1640,6 +1792,7 @@ impl AgentHub {
                 checkpoint_id: None,
                 patch: None,
                 modified_files: hit_files,
+                file_changes: Vec::new(),
                 attachments: Vec::new(),
             });
             return;
@@ -1664,6 +1817,7 @@ impl AgentHub {
                 self.dispatch_acp_async(
                     acp_cmd,
                     target_session_id,
+                    user_msg_idx,
                     effective_prompt,
                     mode,
                     ctx.cloned(),
@@ -1676,6 +1830,7 @@ impl AgentHub {
                     self.dispatch_http_agent_loop_async(
                         cfg,
                         target_session_id,
+                        user_msg_idx,
                         effective_prompt,
                         ctx.cloned(),
                         attached_items,
@@ -1702,6 +1857,7 @@ impl AgentHub {
                     checkpoint_id: None,
                     patch: None,
                     modified_files: Vec::new(),
+                    file_changes: Vec::new(),
                     attachments: Vec::new(),
                 });
             }
@@ -1843,15 +1999,15 @@ impl AgentHub {
         attachments: Vec<AgentAttachedItem>,
         pasted_snippets: Vec<PastedCodeSnippet>,
     ) {
-        if self.is_busy.swap(true, Ordering::SeqCst) {
+        let Some(slot) = self.try_begin_session_execution(
+            &target_session_id,
+            StreamingAgentProgress::with_phase(format!(
+                "正在连接 {} ({})...",
+                cfg.model, cfg.base_url
+            )),
+        ) else {
             return;
-        }
-        self.cancel_requested.store(false, Ordering::SeqCst);
-        *self.streaming_session_id.lock() = Some(target_session_id.clone());
-        *self.streaming_text.lock() = Some(StreamingAgentProgress::with_phase(format!(
-            "正在连接 {} ({})...",
-            cfg.model, cfg.base_url
-        )));
+        };
 
         let (sys_prompt, user_prompt) = self.build_system_and_user_prompt(
             &prompt,
@@ -1861,13 +2017,13 @@ impl AgentHub {
             &pasted_snippets,
         );
         let inbox = self.async_inbox.clone();
-        let busy = self.is_busy.clone();
-        let cancel = self.cancel_requested.clone();
-        let stream_buf = self.streaming_text.clone();
-        let stream_sid = self.streaming_session_id.clone();
+        let slots = self.session_slots.clone();
+        let global_busy = self.is_busy.clone();
+        let cancel = slot.cancel_requested.clone();
+        let stream_buf = slot.streaming_text.clone();
         let wakeup = self.wakeup.clone();
         let provider = self.active_provider;
-        let active_pid = self.active_child_pid.clone();
+        let active_pid = slot.active_child_pid.clone();
 
         if let Some(cb) = &wakeup {
             cb();
@@ -1884,10 +2040,6 @@ impl AgentHub {
                 wakeup.as_ref(),
             );
 
-            *active_pid.lock() = None;
-            *stream_buf.lock() = None;
-            *stream_sid.lock() = None;
-
             if !cancel.load(Ordering::SeqCst) {
                 let (content, patch) = match reply_res {
                     Ok(text) => {
@@ -1897,7 +2049,7 @@ impl AgentHub {
                     Err(err) => (format!("✕ 请求失败：\n{err}"), None),
                 };
                 inbox.lock().push((
-                    target_session_id,
+                    target_session_id.clone(),
                     AgentChatMessage {
                         role: "assistant".to_string(),
                         agent: provider,
@@ -1906,36 +2058,39 @@ impl AgentHub {
                         checkpoint_id: None,
                         patch,
                         modified_files: Vec::new(),
+                        file_changes: Vec::new(),
                         attachments: Vec::new(),
                     },
                 ));
             }
 
-            busy.store(false, Ordering::SeqCst);
+            Self::finish_session_slot(&slots, &global_busy, &target_session_id);
             if let Some(cb) = wakeup {
                 cb();
             }
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_http_agent_loop_async(
         &mut self,
         cfg: AiApiConfig,
         target_session_id: String,
+        user_msg_idx: usize,
         prompt: String,
         ctx: Option<IdeCodeContext>,
         attachments: Vec<AgentAttachedItem>,
         pasted_snippets: Vec<PastedCodeSnippet>,
     ) {
-        if self.is_busy.swap(true, Ordering::SeqCst) {
+        let Some(slot) = self.try_begin_session_execution(
+            &target_session_id,
+            StreamingAgentProgress::with_phase(format!(
+                "🤖 Agent ({}) 正在规划工具调用...",
+                cfg.model
+            )),
+        ) else {
             return;
-        }
-        self.cancel_requested.store(false, Ordering::SeqCst);
-        *self.streaming_session_id.lock() = Some(target_session_id.clone());
-        *self.streaming_text.lock() = Some(StreamingAgentProgress::with_phase(format!(
-            "🤖 Agent ({}) 正在规划工具调用...",
-            cfg.model
-        )));
+        };
 
         let (sys_prompt, user_prompt) = self.build_system_and_user_prompt(
             &prompt,
@@ -1946,15 +2101,16 @@ impl AgentHub {
         );
         let root = self.workspace_root.clone();
         let inbox = self.async_inbox.clone();
+        let sync_inbox = self.async_cli_sync_inbox.clone();
         let ck_inbox = self.async_checkpoints_inbox.clone();
         let mod_inbox = self.modified_files_inbox.clone();
-        let busy = self.is_busy.clone();
-        let cancel = self.cancel_requested.clone();
-        let stream_buf = self.streaming_text.clone();
-        let stream_sid = self.streaming_session_id.clone();
+        let slots = self.session_slots.clone();
+        let global_busy = self.is_busy.clone();
+        let cancel = slot.cancel_requested.clone();
+        let stream_buf = slot.streaming_text.clone();
         let wakeup = self.wakeup.clone();
         let provider = self.active_provider;
-        let active_pid = self.active_child_pid.clone();
+        let active_pid = slot.active_child_pid.clone();
 
         if let Some(cb) = &wakeup {
             cb();
@@ -1975,12 +2131,35 @@ impl AgentHub {
                 wakeup.as_ref(),
             );
 
-            *active_pid.lock() = None;
-            *stream_buf.lock() = None;
-            *stream_sid.lock() = None;
-
             if !cancel.load(Ordering::SeqCst) {
-                let touched_files: Vec<PathBuf> = ckpt_backups.keys().cloned().collect();
+                let mut touched_files: Vec<PathBuf> = Vec::new();
+                let mut file_changes = Vec::new();
+                let mut file_diff_stats = HashMap::new();
+                for (path, backup) in &ckpt_backups {
+                    let after = fs::read_to_string(path).unwrap_or_default();
+                    let (added, removed) =
+                        compute_file_diff_counts(backup.as_deref().unwrap_or(""), &after);
+                    if added == 0 && removed == 0 && backup.is_some() {
+                        continue;
+                    }
+                    touched_files.push(path.clone());
+                    file_diff_stats.insert(path.clone(), (added, removed));
+                    file_changes.push(TurnFileChange {
+                        path: path.clone(),
+                        added_lines: added,
+                        removed_lines: removed,
+                        before_content: backup.clone(),
+                    });
+                }
+                if !ckpt_backups.is_empty() {
+                    sync_inbox.lock().push(CliTurnSyncUpdate {
+                        session_id: target_session_id.clone(),
+                        user_msg_idx,
+                        cli_session_id: None,
+                        checkpoint_backups: ckpt_backups.clone(),
+                        file_diff_stats,
+                    });
+                }
                 let ckpt_id = if !ckpt_backups.is_empty() {
                     let id = format!("ckpt-{}", &Uuid::new_v4().to_string()[..8]);
                     ck_inbox.lock().push((
@@ -2013,7 +2192,7 @@ impl AgentHub {
                     Err(err) => (format!("✕ Agent 执行失败：\n{err}"), None),
                 };
                 inbox.lock().push((
-                    target_session_id,
+                    target_session_id.clone(),
                     AgentChatMessage {
                         role: "assistant".to_string(),
                         agent: provider,
@@ -2022,12 +2201,13 @@ impl AgentHub {
                         checkpoint_id: ckpt_id,
                         patch,
                         modified_files: touched_files,
+                        file_changes,
                         attachments: Vec::new(),
                     },
                 ));
             }
 
-            busy.store(false, Ordering::SeqCst);
+            Self::finish_session_slot(&slots, &global_busy, &target_session_id);
             if let Some(cb) = wakeup {
                 cb();
             }
@@ -2039,20 +2219,19 @@ impl AgentHub {
         &mut self,
         acp_cmd: String,
         target_session_id: String,
+        user_msg_idx: usize,
         prompt: String,
         mode: AgentWorkbenchMode,
         ctx: Option<IdeCodeContext>,
         attachments: Vec<AgentAttachedItem>,
         pasted_snippets: Vec<PastedCodeSnippet>,
     ) {
-        if self.is_busy.swap(true, Ordering::SeqCst) {
+        let Some(slot) = self.try_begin_session_execution(
+            &target_session_id,
+            StreamingAgentProgress::with_phase(format!("正在通过 ACP ({acp_cmd}) 建立会话...")),
+        ) else {
             return;
-        }
-        self.cancel_requested.store(false, Ordering::SeqCst);
-        *self.streaming_session_id.lock() = Some(target_session_id.clone());
-        *self.streaming_text.lock() = Some(StreamingAgentProgress::with_phase(format!(
-            "正在通过 ACP ({acp_cmd}) 建立会话..."
-        )));
+        };
 
         let (sys_prompt, user_prompt) = self.build_system_and_user_prompt(
             &prompt,
@@ -2062,15 +2241,17 @@ impl AgentHub {
             &pasted_snippets,
         );
         let combined = format!("{sys_prompt}\n\n{user_prompt}");
+        let diff_tracker = TurnDiffTracker::capture(&self.workspace_root, mode);
         let root = self.workspace_root.clone();
         let inbox = self.async_inbox.clone();
+        let sync_inbox = self.async_cli_sync_inbox.clone();
         let mod_inbox = self.modified_files_inbox.clone();
-        let busy = self.is_busy.clone();
-        let cancel = self.cancel_requested.clone();
-        let stream_buf = self.streaming_text.clone();
-        let stream_sid = self.streaming_session_id.clone();
+        let slots = self.session_slots.clone();
+        let global_busy = self.is_busy.clone();
+        let cancel = slot.cancel_requested.clone();
+        let stream_buf = slot.streaming_text.clone();
         let wakeup = self.wakeup.clone();
-        let active_pid = self.active_child_pid.clone();
+        let active_pid = slot.active_child_pid.clone();
         let provider = self.active_provider;
 
         if let Some(cb) = &wakeup {
@@ -2089,20 +2270,33 @@ impl AgentHub {
                 Some(&mod_inbox),
                 wakeup.as_ref(),
             );
-            *active_pid.lock() = None;
-            *stream_buf.lock() = None;
-            *stream_sid.lock() = None;
 
             if !cancel.load(Ordering::SeqCst) {
-                let (content, patch, touched) = match res {
+                let (content, patch, extra_files) = match res {
                     Ok((reply, files)) => {
                         let p = maybe_extract_patch_from_reply(&reply, mode, ctx.as_ref());
                         (reply, p, files)
                     }
                     Err(e) => (format!("✕ ACP 会话失败：\n{e}"), None, Vec::new()),
                 };
+                let (modified_files, checkpoint_backups, file_diff_stats) =
+                    diff_tracker.finish(&extra_files);
+                let file_changes = build_turn_file_changes(
+                    &modified_files,
+                    &checkpoint_backups,
+                    &file_diff_stats,
+                );
+                if !checkpoint_backups.is_empty() {
+                    sync_inbox.lock().push(CliTurnSyncUpdate {
+                        session_id: target_session_id.clone(),
+                        user_msg_idx,
+                        cli_session_id: None,
+                        checkpoint_backups,
+                        file_diff_stats,
+                    });
+                }
                 inbox.lock().push((
-                    target_session_id,
+                    target_session_id.clone(),
                     AgentChatMessage {
                         role: "assistant".to_string(),
                         agent: provider,
@@ -2110,12 +2304,13 @@ impl AgentHub {
                         thought: Some(format!("Completed ACP session via {acp_cmd}.")),
                         checkpoint_id: None,
                         patch,
-                        modified_files: touched,
+                        modified_files,
+                        file_changes,
                         attachments: Vec::new(),
                     },
                 ));
             }
-            busy.store(false, Ordering::SeqCst);
+            Self::finish_session_slot(&slots, &global_busy, &target_session_id);
             if let Some(cb) = wakeup {
                 cb();
             }
@@ -2134,12 +2329,6 @@ impl AgentHub {
         attachments: Vec<AgentAttachedItem>,
         pasted_snippets: Vec<PastedCodeSnippet>,
     ) {
-        if self.is_busy.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        self.cancel_requested.store(false, Ordering::SeqCst);
-        *self.streaming_session_id.lock() = Some(target_session_id.clone());
-
         let cli_label = params
             .bin
             .file_name()
@@ -2147,9 +2336,14 @@ impl AgentHub {
             .unwrap_or("cli")
             .to_string();
         let resolved_badge = self.active_resolved_cli_model();
-        *self.streaming_text.lock() = Some(StreamingAgentProgress::with_phase(format!(
-            "正在通过 `{cli_label}` [{resolved_badge}] 实时处理中..."
-        )));
+        let Some(slot) = self.try_begin_session_execution(
+            &target_session_id,
+            StreamingAgentProgress::with_phase(format!(
+                "正在通过 `{cli_label}` [{resolved_badge}] 实时处理中..."
+            )),
+        ) else {
+            return;
+        };
 
         let (sys_prompt, user_prompt) = self.build_system_and_user_prompt(
             &prompt,
@@ -2163,12 +2357,12 @@ impl AgentHub {
         let inbox = self.async_inbox.clone();
         let sync_inbox = self.async_cli_sync_inbox.clone();
         let mod_inbox = self.modified_files_inbox.clone();
-        let busy = self.is_busy.clone();
-        let cancel = self.cancel_requested.clone();
-        let stream_buf = self.streaming_text.clone();
-        let stream_sid = self.streaming_session_id.clone();
+        let slots = self.session_slots.clone();
+        let global_busy = self.is_busy.clone();
+        let cancel = slot.cancel_requested.clone();
+        let stream_buf = slot.streaming_text.clone();
         let wakeup = self.wakeup.clone();
-        let active_pid = self.active_child_pid.clone();
+        let active_pid = slot.active_child_pid.clone();
         let display_provider = self.active_provider;
 
         if let Some(cb) = &wakeup {
@@ -2185,14 +2379,15 @@ impl AgentHub {
                 wakeup.as_ref(),
             );
 
-            *active_pid.lock() = None;
-            *stream_buf.lock() = None;
-            *stream_sid.lock() = None;
-
             if !cancel.load(Ordering::SeqCst) {
-                let (content, thought, patch, modified_files) = match run_res {
+                let (content, thought, patch, modified_files, file_changes) = match run_res {
                     Ok(out) => {
                         let p = maybe_extract_patch_from_reply(&out.reply, mode, ctx.as_ref());
+                        let fc = build_turn_file_changes(
+                            &out.modified_files,
+                            &out.checkpoint_backups,
+                            &out.file_diff_stats,
+                        );
                         sync_inbox.lock().push(CliTurnSyncUpdate {
                             session_id: target_session_id.clone(),
                             user_msg_idx,
@@ -2207,6 +2402,7 @@ impl AgentHub {
                             }),
                             p,
                             out.modified_files,
+                            fc,
                         )
                     }
                     Err(err_msg) => (
@@ -2216,11 +2412,12 @@ impl AgentHub {
                         None,
                         None,
                         Vec::new(),
+                        Vec::new(),
                     ),
                 };
 
                 inbox.lock().push((
-                    target_session_id,
+                    target_session_id.clone(),
                     AgentChatMessage {
                         role: "assistant".to_string(),
                         agent: display_provider,
@@ -2229,12 +2426,13 @@ impl AgentHub {
                         checkpoint_id: None,
                         patch,
                         modified_files,
+                        file_changes,
                         attachments: Vec::new(),
                     },
                 ));
             }
 
-            busy.store(false, Ordering::SeqCst);
+            Self::finish_session_slot(&slots, &global_busy, &target_session_id);
             if let Some(cb) = wakeup {
                 cb();
             }
@@ -2242,23 +2440,22 @@ impl AgentHub {
     }
 
     fn dispatch_cargo_check_async(&mut self) {
-        if self.is_busy.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        self.cancel_requested.store(false, Ordering::SeqCst);
         let target_session_id = self.active_session().id.clone();
-        *self.streaming_session_id.lock() = Some(target_session_id.clone());
+        let Some(_slot) = self.try_begin_session_execution(
+            &target_session_id,
+            StreamingAgentProgress::with_phase(
+                "正在后台执行 `cargo check --workspace --offline`...",
+            ),
+        ) else {
+            return;
+        };
         let root = self.workspace_root.clone();
         let inbox = self.async_inbox.clone();
-        let busy = self.is_busy.clone();
-        let stream_buf = self.streaming_text.clone();
-        let stream_sid = self.streaming_session_id.clone();
+        let slots = self.session_slots.clone();
+        let global_busy = self.is_busy.clone();
         let wakeup = self.wakeup.clone();
         let provider = self.active_provider;
 
-        *stream_buf.lock() = Some(StreamingAgentProgress::with_phase(
-            "正在后台执行 `cargo check --workspace --offline`...",
-        ));
         if let Some(cb) = &wakeup {
             cb();
         }
@@ -2297,10 +2494,8 @@ impl AgentHub {
                 }
                 Err(e) => format!("执行 cargo check 失败: {e}"),
             };
-            *stream_buf.lock() = None;
-            *stream_sid.lock() = None;
             inbox.lock().push((
-                target_session_id,
+                target_session_id.clone(),
                 AgentChatMessage {
                     role: "assistant".to_string(),
                     agent: provider,
@@ -2309,10 +2504,11 @@ impl AgentHub {
                     checkpoint_id: None,
                     patch: None,
                     modified_files: Vec::new(),
+                    file_changes: Vec::new(),
                     attachments: Vec::new(),
                 },
             ));
-            busy.store(false, Ordering::SeqCst);
+            Self::finish_session_slot(&slots, &global_busy, &target_session_id);
             if let Some(cb) = wakeup {
                 cb();
             }
@@ -2720,6 +2916,7 @@ mod tests {
             checkpoint_id: None,
             patch: None,
             modified_files: Vec::new(),
+            file_changes: Vec::new(),
             attachments: Vec::new(),
         });
         hub.messages.push(AgentChatMessage {
@@ -2730,6 +2927,7 @@ mod tests {
             checkpoint_id: None,
             patch: None,
             modified_files: Vec::new(),
+            file_changes: Vec::new(),
             attachments: Vec::new(),
         });
         hub.messages.push(AgentChatMessage {
@@ -2740,6 +2938,7 @@ mod tests {
             checkpoint_id: None,
             patch: None,
             modified_files: vec![tmp_file.clone()],
+            file_changes: Vec::new(),
             attachments: Vec::new(),
         });
         hub.messages.push(AgentChatMessage {
@@ -2750,6 +2949,7 @@ mod tests {
             checkpoint_id: None,
             patch: None,
             modified_files: vec![tmp_file.clone()],
+            file_changes: Vec::new(),
             attachments: Vec::new(),
         });
 
@@ -2832,6 +3032,7 @@ mod tests {
             checkpoint_id: None,
             patch: None,
             modified_files: Vec::new(),
+            file_changes: Vec::new(),
             attachments: Vec::new(),
         });
         hub1.active_session_mut().cli_session_id = Some("cursor-chat-99".to_string());
@@ -2846,6 +3047,7 @@ mod tests {
             checkpoint_id: None,
             patch: None,
             modified_files: Vec::new(),
+            file_changes: Vec::new(),
             attachments: Vec::new(),
         });
         hub1.save_history();
@@ -2865,5 +3067,160 @@ mod tests {
         assert!(!hub2.active_session().is_busy);
 
         let _ = fs::remove_file(&hist_path);
+    }
+
+    #[test]
+    fn test_turn_diff_tracker_accuracy_and_crlf_normalization() {
+        let tmp = std::env::temp_dir().join(format!("rust_ai_ide_diff_tracker_{}", Uuid::new_v4()));
+        fs::create_dir_all(&tmp).unwrap();
+        let run_git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(&tmp)
+                .output()
+                .expect("git")
+        };
+        assert!(run_git(&["init"]).status.success());
+        let _ = run_git(&["config", "user.email", "test@example.com"]);
+        let _ = run_git(&["config", "user.name", "Tester"]);
+
+        let file_a = tmp.join("a.rs");
+        fs::write(&file_a, "line1\nline2\nline3\nline4\n").unwrap();
+        assert!(run_git(&["add", "a.rs"]).status.success());
+        assert!(run_git(&["commit", "-m", "init"]).status.success());
+
+        // Pre-existing uncommitted edit + CRLF line endings
+        fs::write(&file_a, "line1\r\npre_dirty_2\r\nline3\r\nline4\r\n").unwrap();
+
+        // Ask mode: should not report pre-existing dirty files even if read
+        let ask_tracker = TurnDiffTracker::capture(&tmp, AgentWorkbenchMode::Ask);
+        let (ask_mods, _, _) = ask_tracker.finish(&[]);
+        assert!(ask_mods.is_empty());
+
+        // Agent mode: untouched pre-dirty file should yield 0 changes; modifying 1 line counts +1 -1 only
+        let agent_tracker_no_edit = TurnDiffTracker::capture(&tmp, AgentWorkbenchMode::Agent);
+        let (no_edit_mods, _, _) = agent_tracker_no_edit.finish(&[]);
+        assert!(no_edit_mods.is_empty());
+
+        let agent_tracker_edit = TurnDiffTracker::capture(&tmp, AgentWorkbenchMode::Agent);
+        fs::write(&file_a, "line1\r\npre_dirty_2\r\nline3\r\nagent_line4\r\n").unwrap();
+        let (edit_mods, _, stats) = agent_tracker_edit.finish(&[]);
+        assert_eq!(edit_mods.len(), 1);
+        assert_eq!(stats.get(&edit_mods[0]).copied(), Some((1, 1)));
+
+        // Untouched CRLF file compared to LF HEAD yields +1 -1 on the 1 changed line, not +4 -4
+        assert_eq!(
+            compute_file_diff_counts("l1\nl2\nl3\nl4\n", "l1\r\nl2\r\nl3_x\r\nl4\r\n"),
+            (1, 1)
+        );
+        // Double CR (\r\r\n), standalone \r, BOM, and missing trailing EOF newline must not inflate +N -N
+        assert_eq!(
+            compute_file_diff_counts("a\nb\nc", "\u{FEFF}a\r\r\nb\rc\nd\ne"),
+            (2, 0)
+        );
+        assert_eq!(
+            compute_file_diff_counts("a\nb\nc\n", "a\r\r\nb\rc"),
+            (0, 0)
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_turn_diff_tracker_handles_git_subdirectory_accurately() {
+        let repo = std::env::temp_dir().join(format!("rust_ai_ide_subrepo_{}", Uuid::new_v4()));
+        let sub = repo.join("packages/web");
+        fs::create_dir_all(&sub).unwrap();
+        let run_git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .expect("git")
+        };
+        assert!(run_git(&["init"]).status.success());
+        let _ = run_git(&["config", "user.email", "test@example.com"]);
+        let _ = run_git(&["config", "user.name", "Tester"]);
+
+        let target = sub.join("app.ts");
+        fs::write(&target, "const a = 1;\nconst b = 2;\n").unwrap();
+        assert!(run_git(&["add", "-A"]).status.success());
+        assert!(run_git(&["commit", "-m", "init"]).status.success());
+
+        // Pre-dirty modification inside subdirectory
+        fs::write(&target, "const a = 1;\nconst b = 2;\nconst c = 3;\n").unwrap();
+        let tracker = TurnDiffTracker::capture(&sub, AgentWorkbenchMode::Agent);
+        // Agent appends 2 lines cleanly without CRLF/newline artifacts
+        fs::write(
+            &target,
+            "const a = 1;\r\nconst b = 2;\r\nconst c = 3;\r\nconst d = 4;\r\nconst e = 5;",
+        )
+        .unwrap();
+        let (mods, _, stats) = tracker.finish(&[]);
+        assert_eq!(mods.len(), 1);
+        assert_eq!(stats.get(&mods[0]).copied(), Some((2, 0)));
+
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn test_parallel_sessions_run_concurrently_without_blocking_new_session() {
+        let mut hub = AgentHub::new(Path::new("."));
+        let s1_id = hub.active_session().id.clone();
+
+        // Simulate Session 1 currently running in background
+        let slot1 = hub
+            .try_begin_session_execution(
+                &s1_id,
+                StreamingAgentProgress::with_phase("Session 1 streaming..."),
+            )
+            .expect("session 1 should acquire its own slot");
+        assert!(hub.is_active_session_busy());
+        assert!(hub.is_busy.load(Ordering::Relaxed));
+
+        // Create and switch to Session 2 while Session 1 is still busy
+        let s2_idx = hub.new_session();
+        assert_eq!(s2_idx, 1);
+        let s2_id = hub.active_session().id.clone();
+        assert_ne!(s1_id, s2_id);
+        assert!(!hub.is_active_session_busy());
+        assert!(hub.streaming_progress().is_none());
+
+        // Session 2 MUST be able to acquire its own execution slot & submit concurrently!
+        let _slot2 = hub
+            .try_begin_session_execution(
+                &s2_id,
+                StreamingAgentProgress::with_phase("Session 2 streaming..."),
+            )
+            .expect("session 2 must not be blocked by session 1");
+        assert!(hub.is_active_session_busy());
+        assert_eq!(
+            hub.streaming_progress().unwrap().phase,
+            "Session 2 streaming..."
+        );
+
+        // Cancelling Session 2 stops ONLY Session 2, keeping Session 1 alive
+        hub.cancel_active_request();
+        assert!(!hub.is_active_session_busy());
+        assert!(hub.is_busy.load(Ordering::Relaxed));
+        assert!(slot1.is_busy.load(Ordering::Relaxed));
+
+        // Switching back to Session 1 restores Session 1's active streaming progress
+        assert!(hub.switch_session(0));
+        assert!(hub.is_active_session_busy());
+        assert_eq!(
+            hub.streaming_progress().unwrap().phase,
+            "Session 1 streaming..."
+        );
+
+        // Finishing Session 1 clears global busy flag cleanly
+        AgentHub::finish_session_slot(&hub.session_slots, &hub.is_busy, &s1_id);
+        assert!(!hub.is_active_session_busy());
+        assert!(!hub.is_busy.load(Ordering::Relaxed));
+
+        // Re-submitting in Session 2 now works cleanly (e.g. local command / offline fallback)
+        assert!(hub.switch_session(1));
+        hub.submit_workbench_prompt("/search AgentHub", AgentWorkbenchMode::Ask, None);
+        assert!(hub.messages.iter().any(|m| m.role == "assistant"));
     }
 }

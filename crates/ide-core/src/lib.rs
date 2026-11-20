@@ -1,5 +1,10 @@
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+mod mobile;
+mod run_config;
+pub use mobile::*;
+pub use run_config::{parse_shell_command_parts, RunConfigSource, RunConfiguration};
 
 /// 支持三大官方主题切换（可通过 `Ctrl+Alt+S` 设置或 `Ctrl+\`` 快速切换）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -298,103 +303,6 @@ impl LanguageId {
     }
 }
 
-/// IDEA 顶部工具栏 Run/Debug Configuration 定义
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RunConfiguration {
-    pub name: String,
-    pub language: LanguageId,
-    pub command: String,
-    pub args: Vec<String>,
-    pub cwd: PathBuf,
-}
-
-impl RunConfiguration {
-    pub fn detect_for_workspace(workspace_root: &Path) -> Vec<Self> {
-        let mut configs = Vec::new();
-
-        if workspace_root.join("Cargo.toml").exists() {
-            configs.push(Self {
-                name: "Cargo Check (Workspace)".to_string(),
-                language: LanguageId::Rust,
-                command: "cargo".to_string(),
-                args: vec![
-                    "check".to_string(),
-                    "--workspace".to_string(),
-                    "--offline".to_string(),
-                ],
-                cwd: workspace_root.to_path_buf(),
-            });
-            configs.push(Self {
-                name: "Cargo Test (All Crates)".to_string(),
-                language: LanguageId::Rust,
-                command: "cargo".to_string(),
-                args: vec![
-                    "test".to_string(),
-                    "--workspace".to_string(),
-                    "--offline".to_string(),
-                ],
-                cwd: workspace_root.to_path_buf(),
-            });
-            configs.push(Self {
-                name: "Cargo Run (ide-app)".to_string(),
-                language: LanguageId::Rust,
-                command: "cargo".to_string(),
-                args: vec![
-                    "run".to_string(),
-                    "-p".to_string(),
-                    "ide-app".to_string(),
-                    "--offline".to_string(),
-                    "--".to_string(),
-                    "--self-check".to_string(),
-                ],
-                cwd: workspace_root.to_path_buf(),
-            });
-        }
-
-        if workspace_root.join("package.json").exists() {
-            configs.push(Self {
-                name: "npm run dev (TS/JS)".to_string(),
-                language: LanguageId::TypeScript,
-                command: "npm".to_string(),
-                args: vec!["run".to_string(), "dev".to_string()],
-                cwd: workspace_root.to_path_buf(),
-            });
-            configs.push(Self {
-                name: "npm test (TS/JS)".to_string(),
-                language: LanguageId::TypeScript,
-                command: "npm".to_string(),
-                args: vec!["test".to_string()],
-                cwd: workspace_root.to_path_buf(),
-            });
-        }
-
-        if workspace_root.join("pyproject.toml").exists()
-            || workspace_root.join("requirements.txt").exists()
-            || workspace_root.join("main.py").exists()
-        {
-            configs.push(Self {
-                name: "Python: main.py".to_string(),
-                language: LanguageId::Python,
-                command: "python".to_string(),
-                args: vec!["main.py".to_string()],
-                cwd: workspace_root.to_path_buf(),
-            });
-        }
-
-        if configs.is_empty() {
-            configs.push(Self {
-                name: "Default Shell Task".to_string(),
-                language: LanguageId::PlainText,
-                command: "cargo".to_string(),
-                args: vec!["--version".to_string()],
-                cwd: workspace_root.to_path_buf(),
-            });
-        }
-
-        configs
-    }
-}
-
 /// IDEA 风格左右底部停靠工具窗口标识
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ToolWindowId {
@@ -568,31 +476,43 @@ impl MainMenuCategory {
             Self::Code => vec![
                 MenuEntry::Action(IdeAction::ToggleLineComment),
                 MenuEntry::Action(IdeAction::ReformatCode),
-                MenuEntry::Separator,
-                MenuEntry::Action(IdeAction::InlineAiEdit),
-                MenuEntry::Action(IdeAction::ShowIntentionActions),
             ],
-            Self::Refactor => vec![
-                MenuEntry::Action(IdeAction::RenameSymbol),
-                MenuEntry::Separator,
-                MenuEntry::Action(IdeAction::InlineAiEdit),
-            ],
+            Self::Refactor => vec![MenuEntry::Action(IdeAction::RenameSymbol)],
             Self::Run => vec![
                 MenuEntry::Action(IdeAction::RunActiveConfig),
+                MenuEntry::Action(IdeAction::RunCurrentFile),
                 MenuEntry::Action(IdeAction::DebugActiveConfig),
                 MenuEntry::Separator,
                 MenuEntry::Action(IdeAction::ToggleBreakpoint),
             ],
             Self::Git => vec![
                 MenuEntry::Action(IdeAction::GitCommitPopup),
-                MenuEntry::Action(IdeAction::GitPull),
                 MenuEntry::Action(IdeAction::GitPush),
+                MenuEntry::Action(IdeAction::GitPull),
+                MenuEntry::Action(IdeAction::GitFetch),
                 MenuEntry::Separator,
+                MenuEntry::Action(IdeAction::GitMerge),
+                MenuEntry::Action(IdeAction::GitRebase),
+                MenuEntry::Separator,
+                MenuEntry::Action(IdeAction::GitBranches),
                 MenuEntry::Action(IdeAction::GitNewBranch),
-                MenuEntry::Action(IdeAction::RevertLastCheckpoint),
+                MenuEntry::Action(IdeAction::GitNewTag),
+                MenuEntry::Separator,
+                MenuEntry::Action(IdeAction::GitStashChanges),
+                MenuEntry::Action(IdeAction::GitUnstashChanges),
+                MenuEntry::Action(IdeAction::GitResetHead),
+                MenuEntry::Action(IdeAction::GitRollback),
+                MenuEntry::Separator,
+                MenuEntry::Action(IdeAction::GitShowDiff),
+                MenuEntry::Action(IdeAction::GitAnnotateBlame),
+                MenuEntry::Action(IdeAction::GitFileHistory),
+                MenuEntry::Action(IdeAction::GitRollbackCurrentFile),
+                MenuEntry::Separator,
+                MenuEntry::Action(IdeAction::GitShowLog),
+                MenuEntry::Action(IdeAction::GitManageRemotes),
             ],
             Self::Tools => vec![
-                MenuEntry::Action(IdeAction::SendSelectionToAgent),
+                MenuEntry::Action(IdeAction::CheckMobileDevicesAndSdk),
                 MenuEntry::Separator,
                 MenuEntry::Action(IdeAction::SwitchToAntigravity),
                 MenuEntry::Action(IdeAction::SwitchToClaudeCode),
@@ -656,13 +576,30 @@ pub enum IdeAction {
     SwitchToCodexCli,
     // 运行与调试 (Run / Debug)
     RunActiveConfig,         // Shift+F10
+    RunCurrentFile,          // Ctrl+Shift+F10
     DebugActiveConfig,       // Shift+F9
     ToggleBreakpoint,        // Ctrl+F8
-    // Git 操作 (VCS)
-    GitCommitPopup,          // Ctrl+M / Alt+0
+    CheckMobileDevicesAndSdk,
+    // Git 操作 (VCS — 对齐 IntelliJ IDEA 全套 Git 菜单)
+    GitCommitPopup,          // Alt+0
     GitPull,                 // Ctrl+T
     GitPush,                 // Ctrl+Shift+K
-    GitNewBranch,
+    GitFetch,
+    GitMerge,
+    GitRebase,
+    GitBranches,             // Ctrl+Shift+G
+    GitNewBranch,            // Ctrl+Alt+B
+    GitNewTag,
+    GitStashChanges,
+    GitUnstashChanges,
+    GitResetHead,
+    GitRollback,
+    GitShowDiff,
+    GitAnnotateBlame,
+    GitFileHistory,
+    GitRollbackCurrentFile,
+    GitShowLog,              // Alt+9
+    GitManageRemotes,
     // 工具窗口与设置
     ToggleProjectWindow,     // Alt+1
     ToggleCommitWindow,      // Alt+0
@@ -711,12 +648,29 @@ impl IdeAction {
             Self::SwitchToClaudeCode,
             Self::SwitchToCodexCli,
             Self::RunActiveConfig,
+            Self::RunCurrentFile,
             Self::DebugActiveConfig,
             Self::ToggleBreakpoint,
+            Self::CheckMobileDevicesAndSdk,
             Self::GitCommitPopup,
             Self::GitPull,
             Self::GitPush,
+            Self::GitFetch,
+            Self::GitMerge,
+            Self::GitRebase,
+            Self::GitBranches,
             Self::GitNewBranch,
+            Self::GitNewTag,
+            Self::GitStashChanges,
+            Self::GitUnstashChanges,
+            Self::GitResetHead,
+            Self::GitRollback,
+            Self::GitShowDiff,
+            Self::GitAnnotateBlame,
+            Self::GitFileHistory,
+            Self::GitRollbackCurrentFile,
+            Self::GitShowLog,
+            Self::GitManageRemotes,
             Self::ToggleProjectWindow,
             Self::ToggleCommitWindow,
             Self::ToggleStructureWindow,
@@ -761,12 +715,29 @@ impl IdeAction {
             Self::SwitchToClaudeCode => "Alt+C",
             Self::SwitchToCodexCli => "Alt+X",
             Self::RunActiveConfig => "Shift+F10",
+            Self::RunCurrentFile => "Ctrl+Shift+F10",
             Self::DebugActiveConfig => "Shift+F9",
             Self::ToggleBreakpoint => "Ctrl+F8",
+            Self::CheckMobileDevicesAndSdk => "",
             Self::GitCommitPopup => "Alt+0",
             Self::GitPull => "Ctrl+T",
             Self::GitPush => "Ctrl+Shift+K",
+            Self::GitFetch => "",
+            Self::GitMerge => "",
+            Self::GitRebase => "",
+            Self::GitBranches => "Ctrl+Shift+G",
             Self::GitNewBranch => "Ctrl+Alt+B",
+            Self::GitNewTag => "",
+            Self::GitStashChanges => "",
+            Self::GitUnstashChanges => "",
+            Self::GitResetHead => "",
+            Self::GitRollback => "",
+            Self::GitShowDiff => "",
+            Self::GitAnnotateBlame => "",
+            Self::GitFileHistory => "",
+            Self::GitRollbackCurrentFile => "",
+            Self::GitShowLog => "Alt+9",
+            Self::GitManageRemotes => "",
             Self::ToggleProjectWindow => "Alt+1",
             Self::ToggleCommitWindow => "Alt+0",
             Self::ToggleStructureWindow => "Alt+7",
@@ -847,18 +818,52 @@ impl IdeAction {
             (Self::SwitchToCodexCli, UiLanguage::EnUs) => "Switch Agent: OpenAI Codex CLI",
             (Self::RunActiveConfig, UiLanguage::ZhCn) => "运行当前配置 Run",
             (Self::RunActiveConfig, UiLanguage::EnUs) => "Run Active Configuration",
+            (Self::RunCurrentFile, UiLanguage::ZhCn) => "运行当前文件 Run File",
+            (Self::RunCurrentFile, UiLanguage::EnUs) => "Run Current File",
             (Self::DebugActiveConfig, UiLanguage::ZhCn) => "调试当前配置 Debug (DAP)",
             (Self::DebugActiveConfig, UiLanguage::EnUs) => "Debug Active Configuration (DAP)",
             (Self::ToggleBreakpoint, UiLanguage::ZhCn) => "切换行断点 Toggle Breakpoint",
             (Self::ToggleBreakpoint, UiLanguage::EnUs) => "Toggle Line Breakpoint",
+            (Self::CheckMobileDevicesAndSdk, UiLanguage::ZhCn) => "移动端设备与 SDK 检测 (ADB / Flutter)...",
+            (Self::CheckMobileDevicesAndSdk, UiLanguage::EnUs) => "Mobile Devices & SDK Check (ADB / Flutter)...",
             (Self::GitCommitPopup, UiLanguage::ZhCn) => "Git 提交 Commit...",
             (Self::GitCommitPopup, UiLanguage::EnUs) => "Commit...",
-            (Self::GitPull, UiLanguage::ZhCn) => "更新项目 Git Pull",
+            (Self::GitPull, UiLanguage::ZhCn) => "更新项目 Update Project (Git Pull)",
             (Self::GitPull, UiLanguage::EnUs) => "Update Project (Git Pull)",
             (Self::GitPush, UiLanguage::ZhCn) => "推送代码 Git Push...",
             (Self::GitPush, UiLanguage::EnUs) => "Git Push...",
-            (Self::GitNewBranch, UiLanguage::ZhCn) => "新建 Git 分支 New Branch...",
+            (Self::GitFetch, UiLanguage::ZhCn) => "获取全部远程 Git Fetch",
+            (Self::GitFetch, UiLanguage::EnUs) => "Git Fetch All Remotes",
+            (Self::GitMerge, UiLanguage::ZhCn) => "合并分支 Git Merge...",
+            (Self::GitMerge, UiLanguage::EnUs) => "Git Merge Branches...",
+            (Self::GitRebase, UiLanguage::ZhCn) => "变基 Git Rebase...",
+            (Self::GitRebase, UiLanguage::EnUs) => "Git Rebase...",
+            (Self::GitBranches, UiLanguage::ZhCn) => "管理分支 Git Branches...",
+            (Self::GitBranches, UiLanguage::EnUs) => "Git Branches...",
+            (Self::GitNewBranch, UiLanguage::ZhCn) => "新建分支 Git New Branch...",
             (Self::GitNewBranch, UiLanguage::EnUs) => "Git New Branch...",
+            (Self::GitNewTag, UiLanguage::ZhCn) => "新建标签 Git New Tag...",
+            (Self::GitNewTag, UiLanguage::EnUs) => "Git New Tag...",
+            (Self::GitStashChanges, UiLanguage::ZhCn) => "暂存工作区更改 Stash Changes...",
+            (Self::GitStashChanges, UiLanguage::EnUs) => "Stash Changes...",
+            (Self::GitUnstashChanges, UiLanguage::ZhCn) => "恢复暂存更改 Unstash Changes...",
+            (Self::GitUnstashChanges, UiLanguage::EnUs) => "Unstash Changes...",
+            (Self::GitResetHead, UiLanguage::ZhCn) => "重置提交指针 Reset HEAD...",
+            (Self::GitResetHead, UiLanguage::EnUs) => "Reset HEAD...",
+            (Self::GitRollback, UiLanguage::ZhCn) => "回滚未提交变更 Rollback...",
+            (Self::GitRollback, UiLanguage::EnUs) => "Rollback Uncommitted Changes...",
+            (Self::GitShowDiff, UiLanguage::ZhCn) => "对比当前文件与版本库 Diff",
+            (Self::GitShowDiff, UiLanguage::EnUs) => "Compare Active File with HEAD",
+            (Self::GitAnnotateBlame, UiLanguage::ZhCn) => "切换逐行追溯 Git Blame",
+            (Self::GitAnnotateBlame, UiLanguage::EnUs) => "Annotate with Git Blame",
+            (Self::GitFileHistory, UiLanguage::ZhCn) => "查看当前文件提交历史 File History",
+            (Self::GitFileHistory, UiLanguage::EnUs) => "Show History for Active File",
+            (Self::GitRollbackCurrentFile, UiLanguage::ZhCn) => "回滚当前文件至 HEAD",
+            (Self::GitRollbackCurrentFile, UiLanguage::EnUs) => "Rollback Active File to HEAD",
+            (Self::GitShowLog, UiLanguage::ZhCn) => "显示 Git 历史库 Tool Window",
+            (Self::GitShowLog, UiLanguage::EnUs) => "Show Git Log Tool Window",
+            (Self::GitManageRemotes, UiLanguage::ZhCn) => "管理远程仓库 Remotes...",
+            (Self::GitManageRemotes, UiLanguage::EnUs) => "Manage Git Remotes...",
             (Self::ToggleProjectWindow, UiLanguage::ZhCn) => "项目工具窗口 Project",
             (Self::ToggleProjectWindow, UiLanguage::EnUs) => "Project Tool Window",
             (Self::ToggleCommitWindow, UiLanguage::ZhCn) => "Git 提交工具窗口 Commit",
@@ -954,18 +959,52 @@ impl IdeAction {
             (Self::SwitchToCodexCli, UiLanguage::EnUs) => "Use OpenAI Codex CLI",
             (Self::RunActiveConfig, UiLanguage::ZhCn) => "运行当前配置",
             (Self::RunActiveConfig, UiLanguage::EnUs) => "Run Active Configuration",
+            (Self::RunCurrentFile, UiLanguage::ZhCn) => "运行当前文件",
+            (Self::RunCurrentFile, UiLanguage::EnUs) => "Run Current File",
             (Self::DebugActiveConfig, UiLanguage::ZhCn) => "调试当前配置",
             (Self::DebugActiveConfig, UiLanguage::EnUs) => "Debug Active Configuration",
             (Self::ToggleBreakpoint, UiLanguage::ZhCn) => "切换行断点",
             (Self::ToggleBreakpoint, UiLanguage::EnUs) => "Toggle Line Breakpoint",
+            (Self::CheckMobileDevicesAndSdk, UiLanguage::ZhCn) => "移动端设备与 SDK 检测...",
+            (Self::CheckMobileDevicesAndSdk, UiLanguage::EnUs) => "Mobile Devices & SDK...",
             (Self::GitCommitPopup, UiLanguage::ZhCn) => "提交...",
             (Self::GitCommitPopup, UiLanguage::EnUs) => "Commit...",
-            (Self::GitPull, UiLanguage::ZhCn) => "更新项目 (Pull)",
-            (Self::GitPull, UiLanguage::EnUs) => "Update Project (Pull)",
+            (Self::GitPull, UiLanguage::ZhCn) => "更新项目...",
+            (Self::GitPull, UiLanguage::EnUs) => "Update Project...",
             (Self::GitPush, UiLanguage::ZhCn) => "推送...",
             (Self::GitPush, UiLanguage::EnUs) => "Push...",
+            (Self::GitFetch, UiLanguage::ZhCn) => "获取 (Fetch)",
+            (Self::GitFetch, UiLanguage::EnUs) => "Fetch",
+            (Self::GitMerge, UiLanguage::ZhCn) => "合并...",
+            (Self::GitMerge, UiLanguage::EnUs) => "Merge...",
+            (Self::GitRebase, UiLanguage::ZhCn) => "变基...",
+            (Self::GitRebase, UiLanguage::EnUs) => "Rebase...",
+            (Self::GitBranches, UiLanguage::ZhCn) => "分支...",
+            (Self::GitBranches, UiLanguage::EnUs) => "Branches...",
             (Self::GitNewBranch, UiLanguage::ZhCn) => "新建分支...",
             (Self::GitNewBranch, UiLanguage::EnUs) => "New Branch...",
+            (Self::GitNewTag, UiLanguage::ZhCn) => "新建标签...",
+            (Self::GitNewTag, UiLanguage::EnUs) => "New Tag...",
+            (Self::GitStashChanges, UiLanguage::ZhCn) => "暂存更改 (Stash)...",
+            (Self::GitStashChanges, UiLanguage::EnUs) => "Stash Changes...",
+            (Self::GitUnstashChanges, UiLanguage::ZhCn) => "恢复暂存 (Unstash)...",
+            (Self::GitUnstashChanges, UiLanguage::EnUs) => "Unstash Changes...",
+            (Self::GitResetHead, UiLanguage::ZhCn) => "重置 HEAD...",
+            (Self::GitResetHead, UiLanguage::EnUs) => "Reset HEAD...",
+            (Self::GitRollback, UiLanguage::ZhCn) => "回滚变更...",
+            (Self::GitRollback, UiLanguage::EnUs) => "Rollback...",
+            (Self::GitShowDiff, UiLanguage::ZhCn) => "当前文件与版本库对比",
+            (Self::GitShowDiff, UiLanguage::EnUs) => "Compare with Same Repository Version",
+            (Self::GitAnnotateBlame, UiLanguage::ZhCn) => "逐行追溯 (Git Blame)",
+            (Self::GitAnnotateBlame, UiLanguage::EnUs) => "Annotate with Git Blame",
+            (Self::GitFileHistory, UiLanguage::ZhCn) => "查看当前文件历史",
+            (Self::GitFileHistory, UiLanguage::EnUs) => "Show History for File",
+            (Self::GitRollbackCurrentFile, UiLanguage::ZhCn) => "回滚当前文件",
+            (Self::GitRollbackCurrentFile, UiLanguage::EnUs) => "Rollback Current File",
+            (Self::GitShowLog, UiLanguage::ZhCn) => "显示 Git 日志",
+            (Self::GitShowLog, UiLanguage::EnUs) => "Show Git Log",
+            (Self::GitManageRemotes, UiLanguage::ZhCn) => "管理远程仓库...",
+            (Self::GitManageRemotes, UiLanguage::EnUs) => "Manage Remotes...",
             (Self::ToggleProjectWindow, UiLanguage::ZhCn) => "项目",
             (Self::ToggleProjectWindow, UiLanguage::EnUs) => "Project",
             (Self::ToggleCommitWindow, UiLanguage::ZhCn) => "提交",

@@ -1,21 +1,23 @@
 use crate::agent_panel::{AgentChatCache, AGENT_INPUT_FONT, AGENT_INPUT_LINE_H};
 use crate::canvas::{FontStyle, Rect, SurfaceCanvas};
 use crate::image_preview::{
-    detect_pasted_code_snippet, is_image_file_path, load_image_for_preview,
-    read_windows_clipboard_payload, ClipboardPastePayload, DecodedPreviewImage,
+    detect_media_kind, detect_pasted_code_snippet, format_media_duration, format_media_file_size,
+    is_image_file_path, load_image_for_preview, load_media_preview_tab, open_media_with_system_app,
+    read_windows_clipboard_payload, ClipboardPastePayload, DecodedPreviewImage, MediaKind,
+    MediaPreviewTab,
 };
 use crate::persistence::{
-    self, PersistedGlobalSettings, PersistedOpenTab, PersistedProviderPref,
-    PersistedWorkspaceState,
+    self, PersistedGlobalSettings, PersistedOpenTab, PersistedProviderPref, PersistedWorkspaceState,
 };
 use crate::text_input::TextInputField;
 use ide_agent_hub::{
-    AgentAttachedItem, AgentHub, AgentProviderKind, AgentWorkbenchMode, AiApiFormat,
-    IdeCodeContext, PastedCodeSnippet,
+    parse_path_and_line_token, AgentAttachedItem, AgentHub, AgentProviderKind, AgentWorkbenchMode,
+    AiApiFormat, IdeCodeContext, PastedCodeSnippet,
 };
 use ide_core::{
-    IdeAction, IdeaTheme, MainMenuCategory, MenuEntry, RunConfiguration, ThemeKind, ToolWindowId,
-    UiLanguage,
+    detect_mobile_project, probe_mobile_environment, IdeAction, IdeaTheme, MainMenuCategory,
+    MenuEntry, MobileDeviceState, MobileEnvironmentReport, MobileProjectKind, MobileSdkLocations,
+    RunConfigSource, RunConfiguration, ThemeKind, ToolWindowId, UiLanguage,
 };
 use ide_dap::DapDebugEngine;
 use ide_git::{DiffLineKind, GitEngine};
@@ -60,6 +62,16 @@ pub(crate) fn blend_rgb(bg: u32, fg: u32, t: f32) -> u32 {
 pub enum FolderPickMode {
     AskUser,
     NewWindow,
+    /// 0 = Flutter SDK, 1 = Android SDK, 2 = JDK.
+    MobileSdk(u8),
+}
+
+fn sibling_toolchain_bin(bin: &Path, names: &[&str]) -> Option<PathBuf> {
+    let dir = bin.parent()?;
+    names
+        .iter()
+        .map(|name| dir.join(name))
+        .find(|candidate| candidate.is_file())
 }
 
 fn clean_workspace_path(path: PathBuf) -> PathBuf {
@@ -76,6 +88,37 @@ fn clean_workspace_path(path: PathBuf) -> PathBuf {
         }
     }
     resolved
+}
+
+pub(crate) fn workspace_paths_equal(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Counts repeated attempts to open a project that is already on screen.
+/// The first attempt focuses the window; the second and later attempts flash it.
+pub(crate) fn duplicate_open_count<K: PartialEq>(
+    previous: &Option<(K, u32, Instant)>,
+    key: &K,
+    now: Instant,
+) -> u32 {
+    match previous {
+        Some((prev_key, count, at))
+            if prev_key == key && now.duration_since(*at) <= Duration::from_secs(8) =>
+        {
+            count.saturating_add(1)
+        }
+        _ => 1,
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -153,6 +196,41 @@ pub enum DragSplitter {
     BottomPanel,
 }
 
+/// 可在左 / 右 / 底三条边之间拖动交换的工作区。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum DockPane {
+    Project = 0,
+    Agent = 1,
+    Tooling = 2,
+}
+
+impl Default for DockPane {
+    fn default() -> Self {
+        Self::Project
+    }
+}
+
+impl DockPane {
+    fn title(self, zh: bool) -> &'static str {
+        match (self, zh) {
+            (Self::Project, true) => "项目",
+            (Self::Project, false) => "Project",
+            (Self::Agent, true) => "AI 助手",
+            (Self::Agent, false) => "AI Assistant",
+            (Self::Tooling, true) => "工具",
+            (Self::Tooling, false) => "Tools",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DockEdge {
+    Left,
+    Right,
+    Bottom,
+}
+
 /// 鼠标悬停区域对应的原生指针形态
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdeCursorKind {
@@ -167,6 +245,7 @@ pub enum IdeCursorKind {
 pub enum DragScrollbar {
     LeftTree,
     CenterEditor,
+    CenterEditorHoriz,
     RightPanel,
     BottomTerminal,
     GitLogCommits,
@@ -199,6 +278,17 @@ pub enum TextInputNavAction {
     DeleteWordForward,
 }
 
+#[derive(Debug, Clone)]
+pub struct ActiveEditorDiff {
+    pub path: PathBuf,
+    pub subtitle: String,
+    pub diff_lines: Vec<ide_git::DiffLine>,
+    pub added_lines: usize,
+    pub removed_lines: usize,
+    pub scroll: usize,
+    pub scroll_x: i32,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ScrollTrackInfo {
     pub track: Rect,
@@ -226,6 +316,7 @@ pub enum ContextMenuAction {
     TreeCopyPath(PathBuf),
     TreeExpandAll,
     TreeCollapseAll,
+    RunFile(PathBuf),
     TabClose(usize),
     TabCloseOthers(usize),
     TabRevealInExplorer(PathBuf),
@@ -236,6 +327,8 @@ pub enum ContextMenuAction {
     TermSendInterrupt,
     TermClear,
     TermNewTab,
+    TermAddLastCommandToRunList,
+    OpenNewRunConfigModal,
     // IDEA Git 上下文菜单操作
     GitToggleCommitCheck(PathBuf),
     GitShowWorkingDiff(PathBuf),
@@ -366,6 +459,7 @@ pub enum SettingsPage {
     Debugger,
     Terminal,
     Languages,
+    MobileSdk,
     Advanced,
 }
 
@@ -398,6 +492,8 @@ impl SettingsPage {
             (Self::Terminal, UiLanguage::EnUs) => "Terminal",
             (Self::Languages, UiLanguage::ZhCn) => "语言和框架",
             (Self::Languages, UiLanguage::EnUs) => "Languages & Frameworks",
+            (Self::MobileSdk, UiLanguage::ZhCn) => "移动端 SDK",
+            (Self::MobileSdk, UiLanguage::EnUs) => "Mobile SDKs",
             (Self::Advanced, UiLanguage::ZhCn) => "高级设置",
             (Self::Advanced, UiLanguage::EnUs) => "Advanced Settings",
         }
@@ -433,6 +529,8 @@ impl SettingsPage {
             (Self::Terminal, UiLanguage::EnUs) => "Tools  /  Terminal",
             (Self::Languages, UiLanguage::ZhCn) => "语言和框架",
             (Self::Languages, UiLanguage::EnUs) => "Languages & Frameworks",
+            (Self::MobileSdk, UiLanguage::ZhCn) => "语言和框架  /  移动端 SDK",
+            (Self::MobileSdk, UiLanguage::EnUs) => "Languages & Frameworks  /  Mobile SDKs",
             (Self::Advanced, UiLanguage::ZhCn) => "高级设置",
             (Self::Advanced, UiLanguage::EnUs) => "Advanced Settings",
         }
@@ -576,6 +674,13 @@ const SETTINGS_NAV: &[SettingsNavItem] = &[
         keywords: "language rust typescript javascript python framework 语言 框架",
     },
     SettingsNavItem {
+        page: Some(SettingsPage::MobileSdk),
+        depth: 0,
+        zh: "移动端 SDK",
+        en: "Mobile SDKs",
+        keywords: "mobile sdk flutter android jdk adb install directory path 移动端 sdk 安装目录 flutter android",
+    },
+    SettingsNavItem {
         page: Some(SettingsPage::Advanced),
         depth: 0,
         zh: "高级设置",
@@ -615,6 +720,19 @@ pub enum HitAction {
     ToggleProjectPopup,
     ToggleRunConfigPopup,
     SelectRunConfig(usize),
+    ToggleRunConfigAt(usize),
+    RemoveRunConfig(usize),
+    OpenNewRunConfigModal,
+    ToggleMobilePopup,
+    RefreshMobileEnv,
+    SelectMobileDevice(String),
+    LaunchMobileEmulator(String),
+    RunMobileCommand(String),
+    InstallMobileSdkCmd(String, String),
+    OpenMobileDownloadUrl(String),
+    OpenMobileSdkSettings,
+    FocusMobileSdkPath(u8),
+    BrowseMobileSdkDir(u8),
     ToggleMoreMenuPopup,
     ToggleGitBranchPopup,
     CheckoutGitBranch(String),
@@ -622,6 +740,7 @@ pub enum HitAction {
     // 编辑器与标签页
     SelectTab(usize),
     CloseTab(usize),
+    DragDockPane(DockPane),
     OpenFile(PathBuf),
     JumpToLine(usize),
     ClickEditorLine,
@@ -664,7 +783,25 @@ pub enum HitAction {
     GitRevertSelectedCommit,
     GitCopySelectedCommitHash,
     GitMergeBranch(String),
+    GitMergeAbort,
+    GitRebaseBranch(String),
+    GitRebaseContinue,
+    GitRebaseAbort,
     GitDeleteBranch(String),
+    GitStashPop(String),
+    GitStashApply(String),
+    GitStashDrop(String),
+    GitResetTo {
+        target: String,
+        mode: ide_git::GitResetMode,
+    },
+    SelectGitResetMode(ide_git::GitResetMode),
+    GitRemoveRemote(String),
+    OpenAddRemoteModal,
+    GitConfirmRollbackAll,
+    CloseModalToEditor,
+    ClearGitFileHistoryFilter,
+    InspectBlameCommit(String),
     // Multi-Agent 与内联编辑 / AI 编辑台补丁交互
     SelectAgentProvider(AgentProviderKind),
     ToggleAgentProviderPopup,
@@ -684,6 +821,18 @@ pub enum HitAction {
     ToggleAgentSessionsPopup,
     ToggleCodeBlockCollapse(usize, usize),
     ToggleMessageThoughtCollapse(usize),
+    ToggleMessageFileChangesCollapse(usize),
+    InspectAgentFileDiff {
+        path: PathBuf,
+        msg_idx: Option<usize>,
+    },
+    CloseEditorDiff,
+    OpenDiffSourceFile(PathBuf),
+    SelectMediaTab(usize),
+    CloseMediaTab(usize),
+    OpenMediaAsText(PathBuf),
+    OpenExternalMedia(PathBuf),
+    AdjustMediaZoom(i32),
     ToggleComposerPastedSnippet(String),
     RemoveComposerPastedSnippet(String),
     RemoveComposerAttachment(PathBuf),
@@ -692,16 +841,15 @@ pub enum HitAction {
     CopyAgentMessage(usize),
     CopyAgentCodeBlock(String),
     OpenFileAtLine(PathBuf, Option<usize>),
+    OpenExternalUrl(String),
     FocusAgentChatStream,
     RunAgentQuickPrompt(&'static str),
     ApplyChatPatch(usize),
     InsertChatPatch(usize),
     PreviewPatchInEditor(usize),
-    TriggerCtrlKInlineEdit,
     FocusCtrlKPrompt,
     AcceptInlineDiff,
     RejectInlineDiff,
-    SendSelectionToAgent,
     RevertLastCheckpoint,
     ToggleAgentChangedFilesDrawer,
     KeepAllAgentChangedFiles,
@@ -759,7 +907,17 @@ pub enum FocusTarget {
     FindInFilesModal,
     NewFileModal,
     NewFolderModal,
+    NewRunConfigModal,
     NewGitBranchModal,
+    NewGitTagModal,
+    NewGitStashModal,
+    GitAddRemoteModal,
+    GitMergeModal,
+    GitRebaseModal,
+    GitUnstashModal,
+    GitResetModal,
+    GitRollbackModal,
+    GitRemotesModal,
     RenamePathModal,
     SettingsModal,
     AiConfigModal(usize),
@@ -786,6 +944,8 @@ pub struct IdeApplicationState {
     pub theme: IdeaTheme,
     pub project_tree: ProjectTreeState,
     pub open_buffers: Vec<TextBuffer>,
+    /// 没有打开文件时给状态栏和动作一个空缓冲，避免下标崩溃。不写入磁盘。
+    idle_editor: TextBuffer,
     pub active_tab: usize,
     pub scroll_line: usize,
     pub editor_scroll_x: i32,
@@ -805,8 +965,12 @@ pub struct IdeApplicationState {
     pub git_changes_group_collapsed: bool,
     pub git_unversioned_group_collapsed: bool,
     pub git_new_branch_from_ref: Option<String>,
+    pub git_blame_visible: bool,
+    pub git_file_history_filter: Option<PathBuf>,
+    pub git_reset_mode: ide_git::GitResetMode,
     pub modal_scroll: usize,
     pub settings_page: SettingsPage,
+    pub mobile_sdk: MobileSdkLocations,
     pub settings_nav_scroll: usize,
     pub settings_nav_max_scroll: usize,
     pub settings_content_max_scroll: usize,
@@ -815,6 +979,11 @@ pub struct IdeApplicationState {
     pub settings_search_rect: Rect,
     pub settings_search_text_x: i32,
     pub settings_query_input: TextInputField,
+    pub settings_sdk_focus: Option<u8>,
+    mobile_sdk_flutter: TextInputField,
+    mobile_sdk_android: TextInputField,
+    mobile_sdk_jdk: TextInputField,
+    mobile_sdk_field_rects: [Rect; 3],
     // 自定义窗口与悬浮态
     pub hover_pos: (i32, i32),
     pub last_hover_hit_idx: Option<usize>,
@@ -822,6 +991,7 @@ pub struct IdeApplicationState {
     pub last_win_size: (i32, i32),
     pub window_maximized: bool,
     pub pending_window_cmd: Option<WindowControlCmd>,
+    pub armed_window_control: Option<WindowControlCmd>,
     // 可拖拽调节的停靠面板尺寸
     pub left_tool: Option<ToolWindowId>,
     pub left_panel_width: i32,
@@ -830,6 +1000,13 @@ pub struct IdeApplicationState {
     pub right_panel_tab: RightPanelTab,
     pub bottom_tool: Option<ToolWindowId>,
     pub bottom_panel_height: i32,
+    pub dock_left: DockPane,
+    pub dock_right: DockPane,
+    pub dock_bottom: DockPane,
+    pending_dock_drag: Option<(DockPane, i32, i32)>,
+    active_dock_drag: Option<DockPane>,
+    dock_drag_pos: (i32, i32),
+    dock_drop_edge: Option<DockEdge>,
     pub active_splitter_drag: Option<DragSplitter>,
     pub active_scrollbar_drag: Option<DragScrollbar>,
     // 面板边界与滚动条信息
@@ -845,6 +1022,7 @@ pub struct IdeApplicationState {
     pub git_log_diff_rect: Rect,
     pub left_scroll_info: ScrollTrackInfo,
     pub editor_scroll_info: ScrollTrackInfo,
+    pub editor_horiz_scroll_info: ScrollTrackInfo,
     pub right_scroll_info: ScrollTrackInfo,
     pub terminal_scroll_info: ScrollTrackInfo,
     pub git_log_commits_scroll_info: ScrollTrackInfo,
@@ -864,8 +1042,11 @@ pub struct IdeApplicationState {
     pub hamburger_menu_expanded: bool,
     pub active_menu_category: Option<MainMenuCategory>,
     pub menu_category_rects: Vec<(MainMenuCategory, Rect)>,
+    pub menu_trigger_and_bar_rect: Rect,
+    pub menu_dropdown_rect: Rect,
     pub project_popup_open: bool,
     pub run_config_popup_open: bool,
+    pub mobile_popup_open: bool,
     pub more_menu_popup_open: bool,
     pub git_branch_popup_open: bool,
     pub agent_provider_popup_open: bool,
@@ -890,6 +1071,13 @@ pub struct IdeApplicationState {
     // 子系统引擎
     pub run_configs: Vec<RunConfiguration>,
     pub active_run_config: usize,
+    pub run_config_popup_scroll: usize,
+    pub run_config_popup_rect: Rect,
+    pub mobile_popup_rect: Rect,
+    pub mobile_env: MobileEnvironmentReport,
+    pub selected_mobile_device_id: Option<String>,
+    pub mobile_missing_prompted: bool,
+    mobile_probe_rx: Option<mpsc::Receiver<MobileEnvironmentReport>>,
     pub lsp_hub: LspHub,
     pub dap_engine: DapDebugEngine,
     pub git_engine: GitEngine,
@@ -919,7 +1107,11 @@ pub struct IdeApplicationState {
     pub agent_chat_sel_cursor: Option<(usize, usize)>,
     pub collapsed_code_blocks: HashMap<(usize, usize), bool>,
     pub expanded_message_thoughts: HashMap<usize, bool>,
+    pub expanded_message_file_changes: HashMap<usize, bool>,
     pub expanded_composer_snippet_id: Option<String>,
+    pub active_editor_diff: Option<ActiveEditorDiff>,
+    pub media_tabs: Vec<MediaPreviewTab>,
+    pub active_media_tab: Option<usize>,
     pub agent_chat_signature_salt: u64,
     pub image_preview_cache: HashMap<PathBuf, Arc<DecodedPreviewImage>>,
     pub active_image_preview: Option<PathBuf>,
@@ -938,6 +1130,11 @@ pub struct IdeApplicationState {
     pub content_search_hits: Vec<ContentSearchHit>,
     pub search_loading: bool,
     pub pending_open_workspace: Option<PathBuf>,
+    pub pending_new_windows: Vec<PathBuf>,
+    /// Load into this window unless another window already has the project.
+    pub pending_switch_workspaces: Vec<PathBuf>,
+    /// Repeating an open of this project pulses the window frame until this instant.
+    pub window_attention_until: Option<Instant>,
     pub folder_pick_mode: FolderPickMode,
     pub is_indexing_workspace: Arc<AtomicBool>,
     pub anim_start: Instant,
@@ -958,6 +1155,7 @@ pub struct IdeApplicationState {
     cached_runnables: Option<(PathBuf, usize, Vec<RunnableGutterEntry>)>,
     cached_structure: Option<(PathBuf, usize, Vec<StructureSymbol>)>,
     cached_highlight_lines: (PathBuf, usize, HashMap<usize, Vec<HighlightSpan>>),
+    cached_max_editor_line_w: (PathBuf, usize, i32, i32),
     pub(crate) cached_chat_rows: AgentChatCache,
     pub hit_regions: Vec<(Rect, HitAction)>,
     pub status_notification: String,
@@ -1128,6 +1326,9 @@ fn pick_initial_buffers(workspace_root: &Path, project_tree: &ProjectTreeState) 
                 break;
             }
             if !entry.is_dir && entry.path.is_file() {
+                if detect_media_kind(&entry.path).is_some() {
+                    continue;
+                }
                 if let Ok(meta) = std::fs::metadata(&entry.path) {
                     if meta.len() > 512 * 1024 {
                         continue;
@@ -1148,6 +1349,200 @@ fn pick_initial_buffers(workspace_root: &Path, project_tree: &ProjectTreeState) 
     open_buffers
 }
 
+struct TerminalTextLink {
+    start_char: usize,
+    end_char: usize,
+    action: HitAction,
+}
+
+fn terminal_links_in_line(text: &str, workspace: &Path, cwd: &Path) -> Vec<TerminalTextLink> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut covered = vec![false; chars.len()];
+    let mut links = Vec::new();
+
+    let mut i = 0;
+    while i < chars.len() {
+        let Some(scheme_len) = url_scheme_len(&chars, i) else {
+            i += 1;
+            continue;
+        };
+        let mut end = i + scheme_len;
+        while end < chars.len() && !is_url_stop(chars[end]) {
+            end += 1;
+        }
+        while end > i + scheme_len && is_url_trailing(chars[end - 1]) {
+            end -= 1;
+        }
+        if end > i + scheme_len {
+            let url: String = chars[i..end].iter().collect();
+            let lower = url.to_ascii_lowercase();
+            if lower.starts_with("https://") || lower.starts_with("http://") {
+                links.push(TerminalTextLink {
+                    start_char: i,
+                    end_char: end,
+                    action: HitAction::OpenExternalUrl(url),
+                });
+                for slot in &mut covered[i..end] {
+                    *slot = true;
+                }
+            }
+        }
+        i = end.max(i + 1);
+    }
+
+    let mut index = 0;
+    while index < chars.len() {
+        if is_link_token_sep(chars[index]) {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < chars.len() && !is_link_token_sep(chars[index]) {
+            index += 1;
+        }
+        let mut end = index;
+        while end > start && matches!(chars[end - 1], '.' | '。' | '，') {
+            end -= 1;
+        }
+        if end <= start || covered[start..end].iter().any(|flag| *flag) {
+            continue;
+        }
+        let token: String = chars[start..end].iter().collect();
+        if let Some(action) = terminal_token_action(&token, workspace, cwd) {
+            links.push(TerminalTextLink {
+                start_char: start,
+                end_char: end,
+                action,
+            });
+        }
+    }
+    links
+}
+
+fn url_scheme_len(chars: &[char], start: usize) -> Option<usize> {
+    let rest: String = chars[start..]
+        .iter()
+        .take(8)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if rest.starts_with("https://") {
+        Some(8)
+    } else if rest.starts_with("http://") {
+        Some(7)
+    } else {
+        None
+    }
+}
+
+fn is_url_stop(ch: char) -> bool {
+    ch.is_whitespace() || matches!(ch, '<' | '>' | '"' | '\'' | '`' | '|' | ' ')
+}
+
+fn is_url_trailing(ch: char) -> bool {
+    matches!(
+        ch,
+        '.' | ','
+            | ';'
+            | ':'
+            | '!'
+            | '?'
+            | ')'
+            | ']'
+            | '}'
+            | '。'
+            | '，'
+            | '；'
+            | '）'
+            | '】'
+            | '》'
+    )
+}
+
+fn is_link_token_sep(ch: char) -> bool {
+    ch.is_whitespace()
+        || matches!(
+            ch,
+            '(' | ')' | '[' | ']' | '<' | '>' | ',' | ';' | '"' | '\'' | '`' | '|'
+        )
+}
+
+fn looks_like_path_token(path: &str) -> bool {
+    path.contains('.') || path.contains('/') || path.contains('\\')
+}
+
+fn terminal_token_action(token: &str, workspace: &Path, cwd: &Path) -> Option<HitAction> {
+    if token.len() < 3 {
+        return None;
+    }
+    if let Some(path) = file_url_to_path(token) {
+        return Some(HitAction::OpenFileAtLine(path, None));
+    }
+    let (path_str, line) = parse_path_and_line_token(token)?;
+    if !looks_like_path_token(path_str) {
+        return None;
+    }
+    resolve_terminal_link_path(workspace, cwd, path_str)
+        .map(|path| HitAction::OpenFileAtLine(path, line))
+}
+
+fn file_url_to_path(token: &str) -> Option<PathBuf> {
+    let lower = token.to_ascii_lowercase();
+    let rest = lower.strip_prefix("file://")?;
+    let raw = &token[token.len() - rest.len()..];
+    let rest = raw.trim_start_matches('/');
+    let rest = rest
+        .strip_prefix("localhost/")
+        .or_else(|| rest.strip_prefix("localhost\\"))
+        .unwrap_or(rest);
+    if rest.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(rest);
+    path.is_file().then_some(path)
+}
+
+fn resolve_terminal_link_path(workspace: &Path, cwd: &Path, raw: &str) -> Option<PathBuf> {
+    let rel = Path::new(raw);
+    let candidates = if rel.is_absolute() {
+        vec![rel.to_path_buf()]
+    } else {
+        vec![cwd.join(rel), workspace.join(rel)]
+    };
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+fn open_http_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    if !(lower.starts_with("https://") || lower.starts_with("http://")) {
+        return false;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use windows::core::PCWSTR;
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+        let op: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
+        let file: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe {
+            let result = ShellExecuteW(
+                None,
+                PCWSTR(op.as_ptr()),
+                PCWSTR(file.as_ptr()),
+                PCWSTR::null(),
+                PCWSTR::null(),
+                SW_SHOWNORMAL,
+            );
+            (result.0 as isize) > 32
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = url;
+        false
+    }
+}
+
 impl IdeApplicationState {
     pub fn new(workspace_root: PathBuf) -> Self {
         Self::new_with_wakeup(workspace_root, None)
@@ -1162,6 +1557,7 @@ impl IdeApplicationState {
         let ui_lang = UiLanguage::default();
         let project_tree = ProjectTreeState::new(&workspace_root);
         let run_configs = RunConfiguration::detect_for_workspace(&workspace_root);
+        let mobile_kind = detect_mobile_project(&workspace_root);
         let lsp_hub = LspHub::new(&workspace_root);
         let dap_engine = DapDebugEngine::new();
         let git_engine = if wakeup_enabled {
@@ -1207,6 +1603,7 @@ impl IdeApplicationState {
             theme: IdeaTheme::jetbrains_islands_dark(),
             project_tree,
             open_buffers,
+            idle_editor: TextBuffer::from_text(PathBuf::new(), ""),
             active_tab: 0,
             scroll_line: 0,
             editor_scroll_x: 0,
@@ -1226,6 +1623,9 @@ impl IdeApplicationState {
             git_changes_group_collapsed: false,
             git_unversioned_group_collapsed: false,
             git_new_branch_from_ref: None,
+            git_blame_visible: false,
+            git_file_history_filter: None,
+            git_reset_mode: ide_git::GitResetMode::Mixed,
             modal_scroll: 0,
             settings_page: SettingsPage::Appearance,
             settings_nav_scroll: 0,
@@ -1236,12 +1636,19 @@ impl IdeApplicationState {
             settings_search_rect: Rect::new(0, 0, 0, 0),
             settings_search_text_x: 0,
             settings_query_input: TextInputField::single_line(),
+            mobile_sdk: MobileSdkLocations::default(),
+            settings_sdk_focus: None,
+            mobile_sdk_flutter: TextInputField::single_line(),
+            mobile_sdk_android: TextInputField::single_line(),
+            mobile_sdk_jdk: TextInputField::single_line(),
+            mobile_sdk_field_rects: [Rect::new(0, 0, 0, 0); 3],
             hover_pos: (-1, -1),
             last_hover_hit_idx: None,
             last_hover_splitter: None,
             last_win_size: (1560, 940),
             window_maximized: false,
             pending_window_cmd: None,
+            armed_window_control: None,
             left_tool: Some(ToolWindowId::Project),
             left_panel_width: 268,
             right_agent_open: true,
@@ -1249,6 +1656,13 @@ impl IdeApplicationState {
             right_panel_tab: RightPanelTab::Chat,
             bottom_tool: Some(ToolWindowId::Terminal),
             bottom_panel_height: 240,
+            dock_left: DockPane::Project,
+            dock_right: DockPane::Agent,
+            dock_bottom: DockPane::Tooling,
+            pending_dock_drag: None,
+            active_dock_drag: None,
+            dock_drag_pos: (0, 0),
+            dock_drop_edge: None,
             active_splitter_drag: None,
             active_scrollbar_drag: None,
             left_pane_rect: Rect::new(0, 0, 0, 0),
@@ -1263,6 +1677,7 @@ impl IdeApplicationState {
             git_log_diff_rect: Rect::new(0, 0, 0, 0),
             left_scroll_info: ScrollTrackInfo::default(),
             editor_scroll_info: ScrollTrackInfo::default(),
+            editor_horiz_scroll_info: ScrollTrackInfo::default(),
             right_scroll_info: ScrollTrackInfo::default(),
             terminal_scroll_info: ScrollTrackInfo::default(),
             git_log_commits_scroll_info: ScrollTrackInfo::default(),
@@ -1281,8 +1696,11 @@ impl IdeApplicationState {
             hamburger_menu_expanded: false,
             active_menu_category: None,
             menu_category_rects: Vec::new(),
+            menu_trigger_and_bar_rect: Rect::new(0, 0, 0, 0),
+            menu_dropdown_rect: Rect::new(0, 0, 0, 0),
             project_popup_open: false,
             run_config_popup_open: false,
+            mobile_popup_open: false,
             more_menu_popup_open: false,
             git_branch_popup_open: false,
             agent_provider_popup_open: false,
@@ -1306,6 +1724,16 @@ impl IdeApplicationState {
             rename_target_path: None,
             run_configs,
             active_run_config: 0,
+            run_config_popup_scroll: 0,
+            run_config_popup_rect: Rect::new(0, 0, 0, 0),
+            mobile_popup_rect: Rect::new(0, 0, 0, 0),
+            mobile_env: MobileEnvironmentReport {
+                project_kind: mobile_kind,
+                ..Default::default()
+            },
+            selected_mobile_device_id: None,
+            mobile_missing_prompted: false,
+            mobile_probe_rx: None,
             lsp_hub,
             dap_engine,
             git_engine,
@@ -1337,7 +1765,11 @@ impl IdeApplicationState {
             agent_chat_sel_cursor: None,
             collapsed_code_blocks: HashMap::new(),
             expanded_message_thoughts: HashMap::new(),
+            expanded_message_file_changes: HashMap::new(),
             expanded_composer_snippet_id: None,
+            active_editor_diff: None,
+            media_tabs: Vec::new(),
+            active_media_tab: None,
             agent_chat_signature_salt: 1,
             image_preview_cache: HashMap::new(),
             active_image_preview: None,
@@ -1356,6 +1788,9 @@ impl IdeApplicationState {
             content_search_hits: Vec::new(),
             search_loading: false,
             pending_open_workspace: None,
+            pending_new_windows: Vec::new(),
+            pending_switch_workspaces: Vec::new(),
+            window_attention_until: None,
             folder_pick_mode: FolderPickMode::AskUser,
             is_indexing_workspace,
             anim_start: now,
@@ -1380,6 +1815,7 @@ impl IdeApplicationState {
             cached_runnables: None,
             cached_structure: None,
             cached_highlight_lines: (PathBuf::new(), usize::MAX, HashMap::new()),
+            cached_max_editor_line_w: (PathBuf::new(), usize::MAX, 0, 0),
             cached_chat_rows: AgentChatCache::default(),
             hit_regions: Vec::new(),
             status_notification:
@@ -1389,6 +1825,9 @@ impl IdeApplicationState {
 
         let first_path = state.active_buffer().path.clone();
         state.dap_engine.toggle_breakpoint(&first_path, 17);
+        if wakeup_enabled && mobile_kind.is_mobile() {
+            state.refresh_mobile_environment_async();
+        }
         state
     }
 
@@ -1424,20 +1863,24 @@ impl IdeApplicationState {
     pub fn restore_from_persistence_dir(&mut self, dir: PathBuf) {
         self.persistence_dir = Some(dir.clone());
 
-        if let Some(gs) =
-            persistence::load_json::<PersistedGlobalSettings>(&persistence::global_settings_path(&dir))
-        {
+        if let Some(gs) = persistence::load_json::<PersistedGlobalSettings>(
+            &persistence::global_settings_path(&dir),
+        ) {
             self.ui_lang = gs.ui_lang;
             self.ui_scale = gs.ui_scale.clamp(0.85, 2.0);
             self.theme = IdeaTheme::from_kind(gs.theme_kind);
             self.settings_page = gs.settings_page;
             self.left_tool = gs.left_tool;
-            self.left_panel_width = gs.left_panel_width.clamp(160, 560);
+            self.left_panel_width = gs.left_panel_width.clamp(48, 2000);
             self.right_agent_open = gs.right_agent_open;
-            self.right_panel_width = gs.right_panel_width.clamp(240, 680);
+            self.right_panel_width = gs.right_panel_width.clamp(64, 2000);
             self.right_panel_tab = gs.right_panel_tab;
             self.bottom_tool = gs.bottom_tool;
-            self.bottom_panel_height = gs.bottom_panel_height.clamp(120, 480);
+            self.bottom_panel_height = gs.bottom_panel_height.clamp(40, 1400);
+            self.dock_left = gs.dock_left;
+            self.dock_right = gs.dock_right;
+            self.dock_bottom = gs.dock_bottom;
+            self.normalize_docks();
             self.window_maximized = gs.window_maximized;
             if gs.window_width >= 800 && gs.window_height >= 540 {
                 self.last_win_size = (gs.window_width, gs.window_height);
@@ -1475,6 +1918,8 @@ impl IdeApplicationState {
             if let Some(cfg) = gs.ai_api_config {
                 let _ = self.agent_hub.update_api_config(cfg);
             }
+            self.mobile_sdk = gs.mobile_sdk;
+            self.sync_mobile_sdk_inputs();
             self.agent_hub.active_provider = gs.active_provider;
             self.agent_mode = self.agent_hub.normalize_mode_for_active(gs.agent_mode);
         }
@@ -1534,6 +1979,9 @@ impl IdeApplicationState {
             right_panel_tab: self.right_panel_tab,
             bottom_tool: self.bottom_tool,
             bottom_panel_height: self.bottom_panel_height,
+            dock_left: self.dock_left,
+            dock_right: self.dock_right,
+            dock_bottom: self.dock_bottom,
             window_maximized: self.window_maximized,
             window_width: win_w,
             window_height: win_h,
@@ -1542,6 +1990,7 @@ impl IdeApplicationState {
             active_provider: self.agent_hub.active_provider,
             provider_prefs,
             ai_api_config: Some(self.agent_hub.api_config.clone()),
+            mobile_sdk: self.mobile_sdk.clone(),
         };
         persistence::save_json(&persistence::global_settings_path(dir), &gs);
     }
@@ -1565,6 +2014,16 @@ impl IdeApplicationState {
             .get(self.active_tab)
             .filter(|b| b.path.is_file())
             .map(|b| b.path.clone());
+        let custom_run_configs: Vec<RunConfiguration> = self
+            .run_configs
+            .iter()
+            .filter(|c| c.source == RunConfigSource::Custom)
+            .cloned()
+            .collect();
+        let active_run_config_name = self
+            .run_configs
+            .get(self.active_run_config)
+            .map(|c| c.name.clone());
         let ws = PersistedWorkspaceState {
             workspace_root: self.workspace_root.clone(),
             open_files,
@@ -1572,6 +2031,8 @@ impl IdeApplicationState {
             scroll_line: self.scroll_line,
             editor_scroll_x: self.editor_scroll_x,
             active_run_config: self.active_run_config,
+            active_run_config_name,
+            custom_run_configs,
             git_commit_draft: self.git_commit_input.as_str().to_string(),
         };
         persistence::save_json(
@@ -1587,7 +2048,8 @@ impl IdeApplicationState {
             return;
         };
         let mut restored_buffers = Vec::new();
-        for tab in ws.open_files {
+        let saved_no_files = ws.open_files.is_empty();
+        for tab in &ws.open_files {
             if tab.path.is_file() {
                 if let Ok(mut buf) = TextBuffer::open(&tab.path) {
                     let max_line = buf.line_count().saturating_sub(1);
@@ -1596,7 +2058,12 @@ impl IdeApplicationState {
                 }
             }
         }
-        if !restored_buffers.is_empty() {
+        if saved_no_files {
+            self.open_buffers.clear();
+            self.active_tab = 0;
+            self.scroll_line = 0;
+            self.editor_scroll_x = 0;
+        } else if !restored_buffers.is_empty() {
             self.open_buffers = restored_buffers;
             self.active_tab = ws
                 .active_tab_path
@@ -1604,12 +2071,29 @@ impl IdeApplicationState {
                 .unwrap_or(0);
             self.scroll_line = ws.scroll_line;
             self.editor_scroll_x = ws.editor_scroll_x;
-            if let Some(active_p) = self.open_buffers.get(self.active_tab).map(|b| b.path.clone()) {
+            if let Some(active_p) = self
+                .open_buffers
+                .get(self.active_tab)
+                .map(|b| b.path.clone())
+            {
                 self.project_tree.selected_path = Some(active_p);
             }
         }
+        for custom_cfg in ws.custom_run_configs.into_iter().rev() {
+            let mut cfg = custom_cfg;
+            cfg.source = RunConfigSource::Custom;
+            self.upsert_run_configuration_internal(cfg, false, false);
+        }
         if !self.run_configs.is_empty() {
-            self.active_run_config = ws.active_run_config.min(self.run_configs.len() - 1);
+            if let Some(target_name) = ws.active_run_config_name.as_deref() {
+                if let Some(pos) = self.run_configs.iter().position(|c| c.name == target_name) {
+                    self.active_run_config = pos;
+                } else {
+                    self.active_run_config = ws.active_run_config.min(self.run_configs.len() - 1);
+                }
+            } else {
+                self.active_run_config = ws.active_run_config.min(self.run_configs.len() - 1);
+            }
         }
         if !ws.git_commit_draft.is_empty() {
             self.git_commit_input.set_text(&ws.git_commit_draft);
@@ -1627,24 +2111,25 @@ impl IdeApplicationState {
     }
 
     pub fn adapt_panels_for_logical_width(&mut self, log_w: i32) {
-        if log_w < 1360 {
-            self.left_panel_width = self.left_panel_width.min(220);
-            self.right_panel_width = self.right_panel_width.min(350);
-            self.bottom_panel_height = self.bottom_panel_height.min(185);
-        } else if log_w < 1480 {
-            self.left_panel_width = self.left_panel_width.min(244);
-            self.right_panel_width = self.right_panel_width.min(390);
-            self.bottom_panel_height = self.bottom_panel_height.min(200);
-        }
+        let win_h = self.last_win_size.1.max(640);
+        self.clamp_dock_spans(log_w, win_h);
     }
 
     pub fn workspace_name(&self) -> String {
-        self.workspace_root
-            .file_name()
+        Self::folder_display_name(&self.workspace_root)
+    }
+
+    /// Windows 任务栏标题：项目名称在前，软件名称在后。
+    pub fn taskbar_title(&self) -> String {
+        format!("{} — Rust AI IDE", self.workspace_name())
+    }
+
+    fn folder_display_name(root: &Path) -> String {
+        root.file_name()
             .and_then(|n| n.to_str())
             .filter(|s| !s.is_empty())
             .map(ToOwned::to_owned)
-            .unwrap_or_else(|| self.workspace_root.display().to_string())
+            .unwrap_or_else(|| root.display().to_string())
     }
 
     pub fn workspace_badge(&self) -> String {
@@ -1677,6 +2162,31 @@ impl IdeApplicationState {
         dirty
     }
 
+    fn folder_pick_initial_dir(&self) -> PathBuf {
+        let configured = match self.folder_pick_mode {
+            FolderPickMode::MobileSdk(0) => self.mobile_sdk.flutter_sdk.as_str(),
+            FolderPickMode::MobileSdk(1) => self.mobile_sdk.android_sdk.as_str(),
+            FolderPickMode::MobileSdk(_) => self.mobile_sdk.jdk_home.as_str(),
+            _ => "",
+        };
+        let path = PathBuf::from(configured.trim());
+        if path.is_dir() {
+            path
+        } else if path.parent().is_some_and(|parent| parent.is_dir()) {
+            path.parent().unwrap().to_path_buf()
+        } else {
+            self.workspace_root.clone()
+        }
+    }
+
+    fn mobile_sdk_input_mut(&mut self, slot: u8) -> &mut TextInputField {
+        match slot {
+            0 => &mut self.mobile_sdk_flutter,
+            1 => &mut self.mobile_sdk_android,
+            _ => &mut self.mobile_sdk_jdk,
+        }
+    }
+
     pub fn request_open_folder_dialog(&mut self) {
         self.request_open_folder_dialog_with_mode(FolderPickMode::AskUser);
     }
@@ -1685,7 +2195,7 @@ impl IdeApplicationState {
         self.folder_pick_mode = mode;
         self.project_popup_open = false;
         self.more_menu_popup_open = false;
-        self.active_menu_category = None;
+        self.close_top_menu();
         self.context_menu = None;
         if FOLDER_PICKER_OPEN.swap(true, Ordering::SeqCst) {
             self.status_notification = self
@@ -1696,7 +2206,7 @@ impl IdeApplicationState {
                 .to_string();
             return;
         }
-        let initial = self.workspace_root.clone();
+        let initial = self.folder_pick_initial_dir();
         let tx = self.folder_pick_tx.clone();
         let wakeup = self.wakeup.clone();
         self.status_notification = self
@@ -1739,38 +2249,90 @@ impl IdeApplicationState {
             self.focus = FocusTarget::Editor;
         }
 
-        match std::env::current_exe() {
-            Ok(exe) => {
-                let mut cmd = std::process::Command::new(exe);
-                cmd.arg("--workspace").arg(&clean);
-                #[cfg(target_os = "windows")]
+        // Keep repeated clicks so the event loop can focus an existing window,
+        // then flash it when the same project is requested again.
+        self.pending_new_windows.push(clean.clone());
+        if let Some(cb) = &self.wakeup {
+            cb();
+        }
+        self.status_notification = format!(
+            "{}: {}",
+            self.tr("正在打开项目", "Opening project"),
+            clean.display()
+        );
+    }
+
+    /// Open `path` in this window, unless that project is already open elsewhere.
+    pub fn request_switch_workspace(&mut self, path: PathBuf) {
+        let clean = clean_workspace_path(path);
+        if !clean.is_dir() {
+            self.status_notification = format!(
+                "{}: {}",
+                self.tr("无效的文件夹路径", "Invalid folder path"),
+                clean.display()
+            );
+            return;
+        }
+        self.recent_workspaces.retain(|p| p != &clean);
+        self.recent_workspaces.insert(0, clean.clone());
+        self.recent_workspaces.truncate(10);
+        self.save_global_settings();
+        self.project_popup_open = false;
+        self.pending_open_workspace = None;
+        if self.focus == FocusTarget::OpenProjectChoiceModal {
+            self.focus = FocusTarget::Editor;
+        }
+        self.pending_switch_workspaces.push(clean.clone());
+        if let Some(cb) = &self.wakeup {
+            cb();
+        }
+        self.status_notification = format!(
+            "{}: {}",
+            self.tr("正在打开项目", "Opening project"),
+            clean.display()
+        );
+    }
+
+    pub fn start_window_attention_flash(&mut self) {
+        self.window_attention_until = Some(Instant::now() + Duration::from_millis(980));
+    }
+
+    /// Trims heavy per-window transient caches when a window is minimized.
+    pub fn trim_caches_when_minimized(&mut self) {
+        self.cached_highlight_lines.2.clear();
+        let active_media: std::collections::HashSet<PathBuf> = self
+            .media_tabs
+            .iter()
+            .map(|m| m.path.clone())
+            .collect();
+        self.image_preview_cache
+            .retain(|p, _| active_media.contains(p));
+    }
+
+    fn cache_decoded_image_preview(&mut self, path: PathBuf, img: Arc<DecodedPreviewImage>) {
+        const MAX_IMAGE_PREVIEW_CACHE: usize = 24;
+        if self.image_preview_cache.len() >= MAX_IMAGE_PREVIEW_CACHE
+            && !self.image_preview_cache.contains_key(&path)
+        {
+            let keep: std::collections::HashSet<PathBuf> = self
+                .media_tabs
+                .iter()
+                .map(|m| m.path.clone())
+                .collect();
+            self.image_preview_cache.retain(|p, _| keep.contains(p));
+            if self.image_preview_cache.len() >= MAX_IMAGE_PREVIEW_CACHE {
+                if let Some(drop_key) = self
+                    .image_preview_cache
+                    .keys()
+                    .find(|k| !keep.contains(*k))
+                    .cloned()
+                    .or_else(|| self.image_preview_cache.keys().next().cloned())
                 {
-                    use std::os::windows::process::CommandExt;
-                    cmd.creation_flags(0x0000_0200);
+                    self.image_preview_cache.remove(&drop_key);
                 }
-                match cmd.spawn() {
-                    Ok(_) => {
-                        self.status_notification = format!(
-                            "{}: {}",
-                            self.tr("已在新窗口开启项目", "Opened project in new window"),
-                            clean.display()
-                        );
-                    }
-                    Err(e) => {
-                        self.status_notification = format!(
-                            "{}: {e}",
-                            self.tr("无法启动新窗口", "Failed to launch new window")
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                self.status_notification = format!(
-                    "{}: {e}",
-                    self.tr("无法获取可执行文件路径", "Cannot locate executable")
-                );
             }
         }
+        self.image_preview_cache.insert(path, img);
     }
 
     #[inline]
@@ -1789,10 +2351,14 @@ impl IdeApplicationState {
             || (self.wakeup_enabled && !self.git_engine.has_loaded_snapshot);
         let search_busy = self.search_loading;
         let agent_busy = self.agent_hub.is_busy.load(Ordering::Relaxed);
+        let attention = self
+            .window_attention_until
+            .is_some_and(|until| now < until);
         startup_busy
             || git_busy
             || search_busy
             || agent_busy
+            || attention
             || self.startup_load_alpha > 0.01
             || self.git_load_alpha > 0.01
             || self.tree_load_alpha > 0.01
@@ -1839,7 +2405,16 @@ impl IdeApplicationState {
         ease(&mut self.git_load_alpha, git_target);
         ease(&mut self.tree_load_alpha, tree_target);
 
-        self.has_active_animations()
+        let attention_frame = if let Some(until) = self.window_attention_until {
+            if now >= until {
+                self.window_attention_until = None;
+            }
+            true
+        } else {
+            false
+        };
+
+        attention_frame || self.has_active_animations()
     }
 
     pub fn switch_workspace(&mut self, new_root: PathBuf) {
@@ -1916,9 +2491,16 @@ impl IdeApplicationState {
         self.git_log_branch_filter = None;
         self.git_working_diff_target = None;
         self.selected_git_working_file = None;
+        self.active_editor_diff = None;
+        self.media_tabs.clear();
+        self.active_media_tab = None;
+        self.expanded_message_file_changes.clear();
         self.git_changes_group_collapsed = false;
         self.git_unversioned_group_collapsed = false;
         self.git_new_branch_from_ref = None;
+        self.git_blame_visible = false;
+        self.git_file_history_filter = None;
+        self.git_reset_mode = ide_git::GitResetMode::Mixed;
         self.git_log_search_input.clear();
         self.agent_scroll = usize::MAX;
         self.modal_scroll = 0;
@@ -1928,8 +2510,19 @@ impl IdeApplicationState {
         self.project_popup_open = false;
         self.git_branch_popup_open = false;
         self.run_config_popup_open = false;
+        self.run_config_popup_scroll = 0;
+        self.mobile_popup_open = false;
+        self.mobile_popup_rect = Rect::new(0, 0, 0, 0);
+        self.selected_mobile_device_id = None;
+        self.mobile_missing_prompted = false;
+        self.mobile_probe_rx = None;
+        let mobile_kind = detect_mobile_project(&clean);
+        self.mobile_env = MobileEnvironmentReport {
+            project_kind: mobile_kind,
+            ..Default::default()
+        };
         self.more_menu_popup_open = false;
-        self.active_menu_category = None;
+        self.close_top_menu();
         self.context_menu = None;
         self.focus = FocusTarget::Editor;
         self.touch_caret_activity();
@@ -1947,6 +2540,9 @@ impl IdeApplicationState {
             self.agent_chat_signature_salt = self.agent_chat_signature_salt.wrapping_add(1);
             self.restore_workspace_state(&dir);
             self.save_global_settings();
+        }
+        if self.wakeup_enabled && mobile_kind.is_mobile() {
+            self.refresh_mobile_environment_async();
         }
         self.status_notification = format!(
             "{}: {}",
@@ -2058,25 +2654,118 @@ impl IdeApplicationState {
         }
     }
 
+    fn ensure_editor_max_line_width_cached(
+        &mut self,
+        path: &PathBuf,
+        rev: usize,
+        char_w: i32,
+        canvas: &SurfaceCanvas,
+    ) -> i32 {
+        if self.cached_max_editor_line_w.0 == *path
+            && self.cached_max_editor_line_w.1 == rev
+            && self.cached_max_editor_line_w.2 == char_w
+        {
+            return self.cached_max_editor_line_w.3;
+        }
+        let mut line_estimates: Vec<(usize, i32)> = {
+            let buf = self.active_buffer();
+            (0..buf.line_count())
+                .map(|idx| {
+                    let s = buf.line_text(idx);
+                    let est: i32 = s
+                        .chars()
+                        .map(|c| if c.is_ascii() { char_w } else { char_w * 2 })
+                        .sum();
+                    (idx, est)
+                })
+                .collect()
+        };
+        let max_est = line_estimates
+            .iter()
+            .map(|(_, est)| *est)
+            .max()
+            .unwrap_or(0);
+        // Only measure exact glyphs for the widest candidates to stay O(1) on huge files.
+        let threshold = (max_est - char_w * 16).max(0);
+        line_estimates.retain(|(_, est)| *est >= threshold);
+        line_estimates.sort_by(|a, b| b.1.cmp(&a.1));
+        let max_px = {
+            let buf = self.active_buffer();
+            line_estimates
+                .into_iter()
+                .take(12)
+                .map(|(idx, _)| {
+                    let s = buf.line_text(idx);
+                    canvas.measure_text(&s, FontStyle::CodeMono).0
+                })
+                .max()
+                .unwrap_or(0)
+        };
+        self.cached_max_editor_line_w = (path.clone(), rev, char_w, max_px);
+        max_px
+    }
+
     pub fn active_buffer(&self) -> &TextBuffer {
-        &self.open_buffers[self
-            .active_tab
-            .min(self.open_buffers.len().saturating_sub(1))]
+        if self.open_buffers.is_empty() {
+            return &self.idle_editor;
+        }
+        &self.open_buffers[self.active_tab.min(self.open_buffers.len() - 1)]
     }
 
     pub fn active_buffer_mut(&mut self) -> &mut TextBuffer {
-        let idx = self
-            .active_tab
-            .min(self.open_buffers.len().saturating_sub(1));
+        if self.open_buffers.is_empty() {
+            return &mut self.idle_editor;
+        }
+        let idx = self.active_tab.min(self.open_buffers.len() - 1);
         &mut self.open_buffers[idx]
     }
 
+    fn abort_without_open_file(&mut self) -> bool {
+        if !self.open_buffers.is_empty() {
+            return false;
+        }
+        self.status_notification = self
+            .tr("当前没有打开的文件", "No file is open")
+            .to_string();
+        true
+    }
+
     pub fn open_file(&mut self, path: PathBuf) {
+        self.active_editor_diff = None;
+        self.project_tree.selected_path = Some(path.clone());
+        if let Some(existing_idx) = self.open_buffers.iter().position(|b| b.path == path) {
+            self.active_media_tab = None;
+            self.active_tab = existing_idx;
+            self.scroll_line = 0;
+            self.editor_scroll_x = 0;
+            return;
+        }
+        if detect_media_kind(&path).is_some() {
+            self.open_media_file(path);
+            return;
+        }
+        self.open_file_as_text(path);
+    }
+
+    /// 强制以文本缓冲区打开指定文件（例如查看 `.svg` XML 源码）
+    fn ensure_active_blame_loaded(&self) {
+        if self.git_blame_visible {
+            let p = &self.active_buffer().path;
+            if !self.git_engine.file_blames.contains_key(p) {
+                self.git_engine.request_load_file_blame(p);
+            }
+        }
+    }
+
+    pub fn open_file_as_text(&mut self, path: PathBuf) {
+        self.active_editor_diff = None;
+        self.active_media_tab = None;
         self.project_tree.selected_path = Some(path.clone());
         if let Some(existing_idx) = self.open_buffers.iter().position(|b| b.path == path) {
             self.active_tab = existing_idx;
             self.scroll_line = 0;
             self.editor_scroll_x = 0;
+            self.ensure_active_blame_loaded();
             return;
         }
         if let Ok(buf) = TextBuffer::open(&path) {
@@ -2086,38 +2775,223 @@ impl IdeApplicationState {
             self.editor_scroll_x = 0;
             self.status_notification = format!("已打开: {}", path.display());
             self.save_workspace_state();
+            self.ensure_active_blame_loaded();
         }
+    }
+
+    /// 在中央编辑器标签栏打开图片 / SVG / 音频 / 视频媒体预览标签
+    pub fn open_media_file(&mut self, path: PathBuf) {
+        self.active_editor_diff = None;
+        self.project_tree.selected_path = Some(path.clone());
+        if let Some(idx) = self.media_tabs.iter().position(|m| m.path == path) {
+            self.active_media_tab = Some(idx);
+            return;
+        }
+        let cached = self.image_preview_cache.get(&path).cloned();
+        let tab = load_media_preview_tab(&path, cached);
+        if let Some(ref img) = tab.preview_image {
+            self.cache_decoded_image_preview(path.clone(), img.clone());
+        }
+        self.media_tabs.push(tab);
+        self.active_media_tab = Some(self.media_tabs.len() - 1);
+        self.status_notification = format!(
+            "{}: {}",
+            self.tr("已打开媒体预览", "Opened media preview"),
+            path.display()
+        );
+    }
+
+    /// 关闭指定索引的媒体预览标签页
+    pub fn close_media_tab(&mut self, idx: usize) {
+        if idx >= self.media_tabs.len() {
+            return;
+        }
+        let closed = self.media_tabs.remove(idx);
+        match self.active_media_tab {
+            Some(cur) if cur == idx => {
+                if self.media_tabs.is_empty() {
+                    self.active_media_tab = None;
+                } else {
+                    self.active_media_tab = Some(idx.min(self.media_tabs.len() - 1));
+                }
+            }
+            Some(cur) if cur > idx => {
+                self.active_media_tab = Some(cur - 1);
+            }
+            _ => {}
+        }
+        self.status_notification = format!(
+            "{}: {}",
+            self.tr("已关闭媒体标签", "Closed media tab"),
+            closed.path.display()
+        );
+    }
+
+    fn read_git_head_text_for_path(&self, path: &Path) -> String {
+        let rel = path
+            .strip_prefix(&self.workspace_root)
+            .ok()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        if rel.is_empty() {
+            return String::new();
+        }
+        let mut cmd = std::process::Command::new("git");
+        cmd.args(["show", &format!("HEAD:{rel}")])
+            .current_dir(&self.workspace_root)
+            .stdin(std::process::Stdio::null());
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000);
+        }
+        cmd.output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default()
+    }
+
+    pub fn open_editor_diff_from_lines(
+        &mut self,
+        path: PathBuf,
+        subtitle: String,
+        diff_lines: Vec<ide_git::DiffLine>,
+    ) {
+        let mut added_lines = 0usize;
+        let mut removed_lines = 0usize;
+        for dl in &diff_lines {
+            match dl.kind {
+                DiffLineKind::Added => added_lines += 1,
+                DiffLineKind::Removed => removed_lines += 1,
+                DiffLineKind::Context => {}
+            }
+        }
+        self.active_editor_diff = Some(ActiveEditorDiff {
+            path: path.clone(),
+            subtitle,
+            diff_lines,
+            added_lines,
+            removed_lines,
+            scroll: 0,
+            scroll_x: 0,
+        });
+        self.focus = FocusTarget::Editor;
+        self.touch_caret_activity();
+        self.status_notification = format!(
+            "{}: {}",
+            self.tr("已在文件窗口打开 Diff", "Opened diff in editor"),
+            path.display()
+        );
+    }
+
+    pub fn open_editor_diff_from_texts(
+        &mut self,
+        path: PathBuf,
+        subtitle: String,
+        old_text: &str,
+        new_text: &str,
+    ) {
+        let diff_lines = ide_git::compute_line_diff(old_text, new_text);
+        self.open_editor_diff_from_lines(path, subtitle, diff_lines);
+    }
+
+    pub fn open_git_working_diff_in_editor(&mut self, path: &Path) {
+        self.selected_git_working_file = Some(path.to_path_buf());
+        if let Some(dlines) = self.git_engine.working_diffs.get(path).cloned() {
+            let subtitle = self
+                .tr("Git 工作区变更 (HEAD ↔ 当前)", "Git Working Tree (HEAD ↔ Local)")
+                .to_string();
+            self.open_editor_diff_from_lines(path.to_path_buf(), subtitle, dlines);
+        } else {
+            let old_text = self.read_git_head_text_for_path(path);
+            let new_text = std::fs::read_to_string(path).unwrap_or_default();
+            let subtitle = self
+                .tr("Git 工作区变更 (HEAD ↔ 当前)", "Git Working Tree (HEAD ↔ Local)")
+                .to_string();
+            self.open_editor_diff_from_texts(path.to_path_buf(), subtitle, &old_text, &new_text);
+        }
+    }
+
+    pub fn open_agent_file_diff_in_editor(&mut self, path: &Path, msg_idx: Option<usize>) {
+        let old_from_msg = msg_idx.and_then(|idx| {
+            self.agent_hub.messages.get(idx).and_then(|m| {
+                m.file_changes
+                    .iter()
+                    .find(|fc| fc.path == path)
+                    .and_then(|fc| fc.before_content.clone())
+            })
+        });
+        let old_from_sess = self
+            .agent_hub
+            .active_session_changed_files()
+            .iter()
+            .find(|sf| sf.path == path)
+            .and_then(|sf| sf.original_content.clone());
+        let old_text = old_from_msg
+            .or(old_from_sess)
+            .unwrap_or_else(|| self.read_git_head_text_for_path(path));
+        let new_text = std::fs::read_to_string(path).unwrap_or_default();
+        let subtitle = self
+            .tr("AI 对话文件变更 (修改前 ↔ 修改后)", "AI Agent Diff (Before ↔ After)")
+            .to_string();
+        self.open_editor_diff_from_texts(path.to_path_buf(), subtitle, &old_text, &new_text);
     }
 
     pub fn open_file_at_line(&mut self, path: PathBuf, line_1_based: Option<usize>) {
-        self.open_file(path.clone());
-        if let Some(l1) = line_1_based {
-            let line_0 = l1.saturating_sub(1);
-            let max_line = self.active_buffer().line_count().saturating_sub(1);
-            let target = line_0.min(max_line);
-            let buf = self.active_buffer_mut();
-            buf.cursor_line = target;
-            buf.cursor_col = 0;
-            buf.clear_selection();
-            self.scroll_line = target.saturating_sub(4);
-            self.focus = FocusTarget::Editor;
-            self.touch_caret_activity();
-            self.status_notification = format!("已跳转至 {}:{}", path.display(), l1);
+        if line_1_based.is_some()
+            && detect_media_kind(&path).is_some_and(|k| k == MediaKind::Svg)
+        {
+            self.open_file_as_text(path.clone());
         } else {
-            self.focus = FocusTarget::Editor;
-            self.touch_caret_activity();
+            self.open_file(path.clone());
         }
+        if self.active_media_tab.is_none() {
+            if let Some(l1) = line_1_based {
+                let line_0 = l1.saturating_sub(1);
+                let max_line = self.active_buffer().line_count().saturating_sub(1);
+                let target = line_0.min(max_line);
+                let buf = self.active_buffer_mut();
+                buf.cursor_line = target;
+                buf.cursor_col = 0;
+                buf.clear_selection();
+                self.scroll_line = target.saturating_sub(4);
+                self.focus = FocusTarget::Editor;
+                self.touch_caret_activity();
+                self.status_notification = format!("已跳转至 {}:{}", path.display(), l1);
+                return;
+            }
+        }
+        self.focus = FocusTarget::Editor;
+        self.touch_caret_activity();
     }
 
     pub fn close_tab(&mut self, idx: usize) {
-        if self.open_buffers.len() <= 1 || idx >= self.open_buffers.len() {
+        if idx >= self.open_buffers.len() {
             return;
         }
         let closed = self.open_buffers.remove(idx);
-        if self.active_tab >= self.open_buffers.len() {
-            self.active_tab = self.open_buffers.len() - 1;
+        if idx < self.active_tab {
+            self.active_tab -= 1;
         }
-        self.status_notification = format!("已关闭标签页: {}", closed.path.display());
+        if self.open_buffers.is_empty() {
+            self.active_tab = 0;
+            self.scroll_line = 0;
+            self.editor_scroll_x = 0;
+            self.active_editor_diff = None;
+            self.status_notification = self
+                .tr("已关闭最后一个文件", "Closed the last file")
+                .to_string();
+        } else {
+            if self.active_tab >= self.open_buffers.len() {
+                self.active_tab = self.open_buffers.len() - 1;
+            }
+            self.status_notification = format!(
+                "{}: {}",
+                self.tr("已关闭标签页", "Closed tab"),
+                closed.path.display()
+            );
+        }
         self.save_workspace_state();
     }
 
@@ -2138,7 +3012,7 @@ impl IdeApplicationState {
     }
 
     pub fn execute_ide_action(&mut self, action: IdeAction) {
-        self.active_menu_category = None;
+        self.close_top_menu();
         self.context_menu = None;
         match action {
             IdeAction::OpenFolder => self.request_open_folder_dialog(),
@@ -2196,12 +3070,8 @@ impl IdeApplicationState {
                         self.open_buffers
                             .retain(|b| b.path != sel && !b.path.starts_with(&sel));
                         if self.open_buffers.is_empty() {
-                            self.open_buffers.push(TextBuffer::from_text(
-                                self.workspace_root.join("untitled.rs"),
-                                "",
-                            ));
-                        }
-                        if self.active_tab >= self.open_buffers.len() {
+                            self.active_tab = 0;
+                        } else if self.active_tab >= self.open_buffers.len() {
                             self.active_tab = self.open_buffers.len() - 1;
                         }
                         self.git_engine.request_refresh();
@@ -2212,6 +3082,9 @@ impl IdeApplicationState {
                 }
             }
             IdeAction::SaveActiveFile => {
+                if self.abort_without_open_file() {
+                    return;
+                }
                 if self.active_buffer_mut().save().is_ok() {
                     self.git_engine.request_refresh();
                     self.status_notification =
@@ -2223,6 +3096,9 @@ impl IdeApplicationState {
                 self.close_tab(idx);
             }
             IdeAction::UndoEdit => {
+                if self.abort_without_open_file() {
+                    return;
+                }
                 self.active_buffer_mut().undo();
                 self.ensure_editor_cursor_visible();
                 self.status_notification = self
@@ -2230,6 +3106,9 @@ impl IdeApplicationState {
                     .to_string();
             }
             IdeAction::RedoEdit => {
+                if self.abort_without_open_file() {
+                    return;
+                }
                 self.active_buffer_mut().redo();
                 self.ensure_editor_cursor_visible();
                 self.status_notification = self
@@ -2237,6 +3116,9 @@ impl IdeApplicationState {
                     .to_string();
             }
             IdeAction::DuplicateLine => {
+                if self.abort_without_open_file() {
+                    return;
+                }
                 self.active_buffer_mut().duplicate_current_line();
                 self.ensure_editor_cursor_visible();
                 self.status_notification = self
@@ -2244,6 +3126,9 @@ impl IdeApplicationState {
                     .to_string();
             }
             IdeAction::DeleteLine => {
+                if self.abort_without_open_file() {
+                    return;
+                }
                 self.active_buffer_mut().delete_current_line();
                 self.ensure_editor_cursor_visible();
                 self.status_notification = self
@@ -2251,6 +3136,9 @@ impl IdeApplicationState {
                     .to_string();
             }
             IdeAction::ToggleLineComment => {
+                if self.abort_without_open_file() {
+                    return;
+                }
                 self.active_buffer_mut().toggle_line_comment();
                 self.status_notification = self
                     .tr(
@@ -2260,6 +3148,9 @@ impl IdeApplicationState {
                     .to_string();
             }
             IdeAction::ReformatCode => {
+                if self.abort_without_open_file() {
+                    return;
+                }
                 self.active_buffer_mut().reformat_basic();
                 let _ = self.active_buffer_mut().save();
                 self.ensure_editor_cursor_visible();
@@ -2270,33 +3161,10 @@ impl IdeApplicationState {
                     )
                     .to_string();
             }
-            IdeAction::RenameSymbol | IdeAction::ShowIntentionActions => {
-                self.trigger_ctrl_k_inline_edit();
-            }
-            IdeAction::InlineAiEdit => self.trigger_ctrl_k_inline_edit(),
-            IdeAction::SendSelectionToAgent => {
-                if let Some(ctx) = self.build_active_ide_code_context() {
-                    let line_no = ctx.cursor_line + 1;
-                    self.agent_hub.submit_workbench_prompt(
-                        self.tr(
-                            "请审阅并优化当前光标所在代码块",
-                            "Please review and optimize the code block around the cursor",
-                        ),
-                        self.agent_mode,
-                        Some(&ctx),
-                    );
-                    self.right_agent_open = true;
-                    self.right_panel_tab = RightPanelTab::Chat;
-                    self.agent_scroll = usize::MAX;
-                    self.status_notification = format!(
-                        "{} {} {} {}",
-                        self.tr("已将第", "Sent line"),
-                        line_no,
-                        self.tr("行上下文发送至", "context to"),
-                        self.agent_hub.active_provider.display_name()
-                    );
-                }
-            }
+            IdeAction::RenameSymbol
+            | IdeAction::ShowIntentionActions
+            | IdeAction::InlineAiEdit
+            | IdeAction::SendSelectionToAgent => {}
             IdeAction::AcceptInlineDiff => self.accept_inline_diff(),
             IdeAction::RejectInlineDiff => self.reject_inline_diff(),
             IdeAction::RevertLastCheckpoint => self.revert_last_checkpoint(),
@@ -2316,19 +3184,26 @@ impl IdeApplicationState {
                 self.right_agent_open = true;
             }
             IdeAction::RunActiveConfig => {
-                if let Some(cfg) = self.run_configs.get(self.active_run_config).cloned() {
-                    self.bottom_tool = Some(ToolWindowId::Terminal);
-                    self.focus = FocusTarget::TerminalInput;
-                    self.terminal.execute_run_configuration(&cfg);
-                    self.touch_caret_activity();
-                    self.status_notification = format!(
-                        "{}: {}",
-                        self.tr("已运行配置", "Running configuration"),
-                        cfg.name
-                    );
+                self.toggle_run_config_execution(self.active_run_config);
+            }
+            IdeAction::RunCurrentFile => {
+                if self.abort_without_open_file() {
+                    return;
+                }
+                let path = self.active_buffer().path.clone();
+                if !self.run_file_in_terminal(&path) {
+                    self.status_notification = self
+                        .tr(
+                            "当前文件类型不支持直接运行",
+                            "Current file type cannot be executed directly",
+                        )
+                        .to_string();
                 }
             }
             IdeAction::DebugActiveConfig => {
+                if self.abort_without_open_file() {
+                    return;
+                }
                 let buf = self.active_buffer().clone();
                 self.dap_engine
                     .start_debug_session(buf.language, &buf.path, buf.cursor_line);
@@ -2340,6 +3215,9 @@ impl IdeApplicationState {
                 );
             }
             IdeAction::ToggleBreakpoint => {
+                if self.abort_without_open_file() {
+                    return;
+                }
                 let path = self.active_buffer().path.clone();
                 let line = self.active_buffer().cursor_line;
                 self.dap_engine.toggle_breakpoint(&path, line);
@@ -2366,11 +3244,129 @@ impl IdeApplicationState {
                     )
                     .to_string();
             }
+            IdeAction::GitFetch => {
+                self.git_engine.request_fetch();
+                self.status_notification = self
+                    .tr("正在后台执行 Git Fetch...", "Fetching all remotes...")
+                    .to_string();
+            }
+            IdeAction::GitBranches => {
+                self.git_engine.request_refresh();
+                self.git_branch_popup_open = true;
+            }
             IdeAction::GitNewBranch => {
+                self.git_new_branch_from_ref = None;
                 self.modal_text_input.set_text("feature/ai-agent-flow");
                 self.modal_text_input.select_all();
                 self.focus = FocusTarget::NewGitBranchModal;
                 self.touch_caret_activity();
+            }
+            IdeAction::GitNewTag => {
+                self.modal_text_input.set_text("v0.1.0");
+                self.modal_text_input.select_all();
+                self.focus = FocusTarget::NewGitTagModal;
+                self.touch_caret_activity();
+            }
+            IdeAction::GitMerge => {
+                self.git_engine.request_refresh();
+                self.modal_scroll = 0;
+                self.focus = FocusTarget::GitMergeModal;
+            }
+            IdeAction::GitRebase => {
+                self.git_engine.request_refresh();
+                self.modal_scroll = 0;
+                self.focus = FocusTarget::GitRebaseModal;
+            }
+            IdeAction::GitStashChanges => {
+                let default_msg = format!("WIP on {}", self.git_engine.current_branch);
+                self.modal_text_input.set_text(&default_msg);
+                self.modal_text_input.select_all();
+                self.focus = FocusTarget::NewGitStashModal;
+                self.touch_caret_activity();
+            }
+            IdeAction::GitUnstashChanges => {
+                self.git_engine.request_refresh();
+                self.modal_scroll = 0;
+                self.focus = FocusTarget::GitUnstashModal;
+            }
+            IdeAction::GitResetHead => {
+                self.git_engine.request_refresh();
+                self.focus = FocusTarget::GitResetModal;
+            }
+            IdeAction::GitRollback => {
+                self.git_engine.request_refresh();
+                self.modal_scroll = 0;
+                self.focus = FocusTarget::GitRollbackModal;
+            }
+            IdeAction::GitShowDiff => {
+                if self.abort_without_open_file() {
+                    return;
+                }
+                let p = self.active_buffer().path.clone();
+                self.open_git_working_diff_in_editor(&p);
+            }
+            IdeAction::GitAnnotateBlame => {
+                self.git_blame_visible = !self.git_blame_visible;
+                if self.git_blame_visible {
+                    let p = self.active_buffer().path.clone();
+                    self.git_engine.request_load_file_blame(&p);
+                    self.status_notification = self
+                        .tr("已开启 Git Blame 逐行注释", "Enabled Git Blame annotations")
+                        .to_string();
+                } else {
+                    self.status_notification = self
+                        .tr("已隐藏 Git Blame 注释", "Disabled Git Blame annotations")
+                        .to_string();
+                }
+            }
+            IdeAction::GitFileHistory => {
+                if self.abort_without_open_file() {
+                    return;
+                }
+                let p = self.active_buffer().path.clone();
+                self.git_file_history_filter = Some(p.clone());
+                self.git_log_scroll = 0;
+                self.selected_git_commit_hash = None;
+                self.git_engine.request_load_file_history(&p);
+                self.bottom_tool = Some(ToolWindowId::GitLog);
+                self.status_notification = format!(
+                    "{}: {}",
+                    self.tr("正在加载文件提交历史", "Loading file Git history"),
+                    p.display()
+                );
+            }
+            IdeAction::GitRollbackCurrentFile => {
+                if self.abort_without_open_file() {
+                    return;
+                }
+                let p = self.active_buffer().path.clone();
+                self.git_engine.request_rollback_file(&p);
+                self.status_notification = format!(
+                    "{}: {}",
+                    self.tr("正在回滚当前文件", "Rolling back active file"),
+                    p.display()
+                );
+            }
+            IdeAction::GitShowLog => {
+                self.git_file_history_filter = None;
+                self.bottom_tool = Some(ToolWindowId::GitLog);
+                self.git_engine.request_refresh();
+            }
+            IdeAction::GitManageRemotes => {
+                self.git_engine.request_refresh();
+                self.modal_scroll = 0;
+                self.focus = FocusTarget::GitRemotesModal;
+            }
+            IdeAction::CheckMobileDevicesAndSdk => {
+                self.mobile_popup_open = true;
+                self.mobile_missing_prompted = false;
+                self.refresh_mobile_environment_async();
+                self.status_notification = self
+                    .tr(
+                        "正在扫描连接手机 (ADB / Flutter) 与本地 SDK...",
+                        "Scanning mobile devices (ADB / Flutter) & local SDKs...",
+                    )
+                    .to_string();
             }
             IdeAction::ToggleProjectWindow => {
                 self.left_tool = if self.left_tool == Some(ToolWindowId::Project) {
@@ -2405,6 +3401,8 @@ impl IdeApplicationState {
             IdeAction::OpenSettingsModal => {
                 self.focus = FocusTarget::SettingsModal;
                 self.settings_query_input.clear();
+                self.settings_sdk_focus = None;
+                self.sync_mobile_sdk_inputs();
                 self.settings_nav_scroll = 0;
                 self.modal_scroll = 0;
                 self.touch_caret_activity();
@@ -2431,16 +3429,31 @@ impl IdeApplicationState {
                 self.set_ui_scale(1.0);
             }
             IdeAction::WidenLeftPanel => {
-                self.left_panel_width = (self.left_panel_width + 35).min(520);
+                let (_, max) = self.span_limits_for_drag(
+                    DockEdge::Left,
+                    self.last_win_size.0,
+                    self.last_win_size.1,
+                );
+                self.left_panel_width = (self.left_panel_width + 56).min(max);
             }
             IdeAction::NarrowLeftPanel => {
-                self.left_panel_width = (self.left_panel_width - 35).max(180);
+                self.left_panel_width = (self.left_panel_width - 56).max(48);
             }
             IdeAction::WidenRightPanel => {
-                self.right_panel_width = (self.right_panel_width + 35).min(600);
+                let (_, max) = self.span_limits_for_drag(
+                    DockEdge::Right,
+                    self.last_win_size.0,
+                    self.last_win_size.1,
+                );
+                self.right_panel_width = (self.right_panel_width + 56).min(max);
             }
             IdeAction::RaiseBottomPanel => {
-                self.bottom_panel_height = (self.bottom_panel_height + 30).min(420);
+                let (_, max) = self.span_limits_for_drag(
+                    DockEdge::Bottom,
+                    self.last_win_size.0,
+                    self.last_win_size.1,
+                );
+                self.bottom_panel_height = (self.bottom_panel_height + 48).min(max);
             }
         }
     }
@@ -2491,12 +3504,8 @@ impl IdeApplicationState {
             }
         }
         if self.open_buffers.is_empty() {
-            self.open_buffers.push(TextBuffer::from_text(
-                self.workspace_root.join("untitled.rs"),
-                "",
-            ));
-        }
-        if self.active_tab >= self.open_buffers.len() {
+            self.active_tab = 0;
+        } else if self.active_tab >= self.open_buffers.len() {
             self.active_tab = self.open_buffers.len() - 1;
         }
         self.project_tree.rebuild();
@@ -2593,6 +3602,488 @@ impl IdeApplicationState {
         };
     }
 
+    fn upsert_run_configuration_internal(
+        &mut self,
+        cfg: RunConfiguration,
+        set_active: bool,
+        persist: bool,
+    ) -> usize {
+        if let Some(pos) = self.run_configs.iter().position(|c| c.same_identity(&cfg)) {
+            if set_active {
+                self.active_run_config = pos;
+            }
+            if persist {
+                self.save_workspace_state();
+            }
+            return pos;
+        }
+        if self.run_configs.len() == 1
+            && self.run_configs[0].name == "Default Shell Task"
+            && self.run_configs[0].source == RunConfigSource::Detected
+        {
+            self.run_configs.clear();
+            self.active_run_config = 0;
+        }
+        let custom_count = self
+            .run_configs
+            .iter()
+            .filter(|c| c.source == RunConfigSource::Custom)
+            .count();
+        if cfg.source == RunConfigSource::Custom && custom_count >= 20 {
+            if let Some(oldest_custom) = self
+                .run_configs
+                .iter()
+                .rposition(|c| c.source == RunConfigSource::Custom)
+            {
+                self.run_configs.remove(oldest_custom);
+                if oldest_custom < self.active_run_config {
+                    self.active_run_config = self.active_run_config.saturating_sub(1);
+                } else if self.active_run_config >= self.run_configs.len() {
+                    self.active_run_config = self.run_configs.len().saturating_sub(1);
+                }
+            }
+        }
+        let idx = if cfg.source == RunConfigSource::Custom {
+            self.run_configs.insert(0, cfg);
+            if !set_active && self.run_configs.len() > 1 {
+                self.active_run_config = (self.active_run_config + 1).min(self.run_configs.len() - 1);
+            }
+            0
+        } else {
+            self.run_configs.push(cfg);
+            self.run_configs.len() - 1
+        };
+        if set_active {
+            self.active_run_config = idx;
+        }
+        if persist {
+            self.save_workspace_state();
+        }
+        idx
+    }
+
+    pub fn is_run_config_running(&self, idx: usize) -> bool {
+        let Some(cfg) = self.run_configs.get(idx) else {
+            return false;
+        };
+        self.terminal.is_run_config_running(&cfg.identity_key())
+    }
+
+    pub fn active_run_config_is_running(&self) -> bool {
+        self.is_run_config_running(self.active_run_config)
+    }
+
+    fn sync_mobile_sdk_inputs(&mut self) {
+        self.mobile_sdk_flutter
+            .set_text(&self.mobile_sdk.flutter_sdk);
+        self.mobile_sdk_android
+            .set_text(&self.mobile_sdk.android_sdk);
+        self.mobile_sdk_jdk.set_text(&self.mobile_sdk.jdk_home);
+    }
+
+    fn apply_picked_mobile_sdk_dir(&mut self, slot: u8, path: PathBuf) {
+        let text = clean_workspace_path(path).display().to_string();
+        match slot {
+            0 => {
+                self.mobile_sdk.flutter_sdk = text.clone();
+                self.mobile_sdk_flutter.set_text(&text);
+            }
+            1 => {
+                self.mobile_sdk.android_sdk = text.clone();
+                self.mobile_sdk_android.set_text(&text);
+            }
+            _ => {
+                self.mobile_sdk.jdk_home = text.clone();
+                self.mobile_sdk_jdk.set_text(&text);
+            }
+        }
+        self.save_global_settings();
+        self.mobile_missing_prompted = false;
+        self.refresh_mobile_environment_async();
+        self.status_notification =
+            format!("{}: {text}", self.tr("已设置 SDK 安装目录", "SDK install directory set"));
+    }
+
+    pub fn commit_mobile_sdk_locations_from_inputs(&mut self) -> bool {
+        let next = MobileSdkLocations {
+            flutter_sdk: self.mobile_sdk_flutter.as_str().trim().to_string(),
+            android_sdk: self.mobile_sdk_android.as_str().trim().to_string(),
+            jdk_home: self.mobile_sdk_jdk.as_str().trim().to_string(),
+        };
+        if next == self.mobile_sdk {
+            return false;
+        }
+        self.mobile_sdk = next;
+        self.save_global_settings();
+        self.mobile_missing_prompted = false;
+        self.refresh_mobile_environment_async();
+        true
+    }
+
+    pub fn refresh_mobile_environment_async(&mut self) {
+        if self.mobile_env.probing {
+            return;
+        }
+        self.mobile_env.probing = true;
+        let root = self.workspace_root.clone();
+        let kind = self.mobile_env.project_kind;
+        let locations = self.mobile_sdk.clone();
+        let wakeup = self.wakeup.clone();
+        let (tx, rx) = mpsc::channel();
+        self.mobile_probe_rx = Some(rx);
+        thread::spawn(move || {
+            let report = probe_mobile_environment(&root, kind, &locations);
+            let _ = tx.send(report);
+            if let Some(w) = wakeup {
+                w();
+            }
+        });
+    }
+
+    pub fn apply_mobile_environment_report(&mut self, report: MobileEnvironmentReport) {
+        self.mobile_env = report;
+        if let Some(cur_id) = self.selected_mobile_device_id.as_ref() {
+            if !self.mobile_env.devices.iter().any(|d| &d.id == cur_id) {
+                self.selected_mobile_device_id = None;
+            }
+        }
+        if self.selected_mobile_device_id.is_none() {
+            self.selected_mobile_device_id = self
+                .mobile_env
+                .devices
+                .iter()
+                .find(|d| d.state == MobileDeviceState::Online)
+                .map(|d| d.id.clone());
+        }
+
+        let missing = self.mobile_env.missing_required_tools();
+        if self.mobile_env.project_kind.is_mobile() && !missing.is_empty() {
+            let names: Vec<&str> = missing.iter().map(|t| t.label.as_str()).collect();
+            if !self.mobile_missing_prompted {
+                self.mobile_missing_prompted = true;
+                self.mobile_popup_open = true;
+            }
+            self.status_notification = format!(
+                "⚠ {}: {}（{}）",
+                self.tr("SDK 未安装", "SDK not installed"),
+                names.join(", "),
+                self.tr(
+                    "可在设置 → 语言和框架 → 移动端 SDK 指定安装目录",
+                    "Set the install directory under Settings → Languages & Frameworks → Mobile SDKs",
+                )
+            );
+        } else if let Some(dev) = self.selected_or_first_online_device() {
+            self.status_notification = format!(
+                "📱 {}: {} ({})",
+                self.tr("移动设备已就绪", "Mobile device ready"),
+                dev.name,
+                dev.id
+            );
+        } else if self.mobile_env.project_kind.is_mobile() {
+            self.status_notification = self
+                .tr(
+                    "移动端环境 SDK 已就绪，当前未检测到在线手机或模拟器 (可连接 USB 调试或启动 AVD)",
+                    "Mobile SDK ready; no online device/emulator connected yet",
+                )
+                .to_string();
+        }
+    }
+
+    pub fn selected_or_first_online_device(&self) -> Option<&ide_core::MobileDeviceInfo> {
+        if let Some(sel_id) = self.selected_mobile_device_id.as_deref() {
+            if let Some(dev) = self.mobile_env.devices.iter().find(|d| d.id == sel_id) {
+                return Some(dev);
+            }
+        }
+        self.mobile_env
+            .devices
+            .iter()
+            .find(|d| d.state == MobileDeviceState::Online)
+    }
+
+    fn warn_if_missing_mobile_sdk_for_cmd(&mut self, cfg: &RunConfiguration) {
+        if self.mobile_env.sdk_tools.is_empty() || self.mobile_env.probing {
+            return;
+        }
+        let is_mobile_cmd = cfg.command.eq_ignore_ascii_case("flutter")
+            || cfg.command.eq_ignore_ascii_case("dart")
+            || cfg.command.eq_ignore_ascii_case("adb")
+            || (cfg.command.eq_ignore_ascii_case("gradle")
+                && self.mobile_env.project_kind.is_mobile());
+        if !is_mobile_cmd {
+            return;
+        }
+        let missing = self.mobile_env.missing_required_tools();
+        if !missing.is_empty() {
+            let names: Vec<&str> = missing.iter().map(|t| t.label.as_str()).collect();
+            self.mobile_popup_open = true;
+            self.status_notification = format!(
+                "⚠ {}: {} — {}",
+                self.tr("SDK 未安装", "SDK not installed"),
+                names.join(", "),
+                self.tr(
+                    "请在设置 → 语言和框架 → 移动端 SDK 指定安装目录",
+                    "Set the install directory under Settings → Languages & Frameworks → Mobile SDKs",
+                )
+            );
+        }
+    }
+
+    fn start_run_config_with_mobile_device(&mut self, cfg: &RunConfiguration) {
+        let mut exec_cfg =
+            cfg.effective_with_mobile_device(self.selected_mobile_device_id.as_deref());
+        self.apply_resolved_mobile_toolchain(&mut exec_cfg);
+        self.terminal
+            .start_bound_run_configuration_as(&cfg.identity_key(), &cfg.name, &exec_cfg);
+    }
+
+    fn apply_resolved_mobile_toolchain(&self, cfg: &mut RunConfiguration) {
+        if cfg.command.contains('\\') || cfg.command.contains('/') {
+            return;
+        }
+        let bare = cfg
+            .command
+            .trim()
+            .trim_end_matches(".exe")
+            .trim_end_matches(".bat")
+            .trim_end_matches(".cmd")
+            .to_ascii_lowercase();
+        let replacement = match bare.as_str() {
+            "flutter" => self.mobile_env.flutter_bin.clone(),
+            "dart" => self
+                .mobile_env
+                .flutter_bin
+                .as_ref()
+                .and_then(|bin| sibling_toolchain_bin(bin, &["dart.bat", "dart.exe", "dart"])),
+            "adb" => self.mobile_env.adb_bin.clone(),
+            _ => None,
+        };
+        if let Some(bin) = replacement {
+            cfg.command = bin.display().to_string();
+        }
+    }
+
+    pub fn run_mobile_shell_command(&mut self, cmd_line: &str) {
+        self.bottom_tool = Some(ToolWindowId::Terminal);
+        self.focus = FocusTarget::TerminalInput;
+        self.terminal.active_pty_mut().ensure_spawned();
+        let line = format!("{cmd_line}\r\n");
+        self.terminal.active_pty_mut().send_raw_bytes(line.as_bytes());
+        self.touch_caret_activity();
+    }
+
+    pub fn launch_mobile_emulator(&mut self, avd: &str) {
+        let emulator_bin = self.mobile_env.emulator_bin.clone();
+        if let Some(bin) = emulator_bin {
+            let mut cmd = std::process::Command::new(&bin);
+            cmd.args(["-avd", avd]);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                cmd.creation_flags(CREATE_NO_WINDOW);
+            }
+            if cmd.spawn().is_ok() {
+                self.status_notification = format!(
+                    "📱 {}: {avd}",
+                    self.tr("正在启动 Android 模拟器", "Launching Android Emulator")
+                );
+                return;
+            }
+        }
+        self.run_mobile_shell_command(&format!("emulator -avd \"{avd}\""));
+        self.status_notification = format!(
+            "📱 {}: {avd}",
+            self.tr("正在终端启动模拟器", "Launching emulator in terminal")
+        );
+    }
+
+    pub fn toggle_run_config_execution(&mut self, idx: usize) {
+        let Some(cfg) = self.run_configs.get(idx).cloned() else {
+            return;
+        };
+        let key = cfg.identity_key();
+        if self.terminal.is_run_config_running(&key) {
+            self.terminal.stop_bound_run_configuration(&key);
+            self.touch_caret_activity();
+            self.status_notification = format!(
+                "{}: {}",
+                self.tr("已停止配置", "Stopped configuration"),
+                cfg.name
+            );
+        } else {
+            self.active_run_config = idx;
+            self.warn_if_missing_mobile_sdk_for_cmd(&cfg);
+            self.bottom_tool = Some(ToolWindowId::Terminal);
+            self.focus = FocusTarget::TerminalInput;
+            self.start_run_config_with_mobile_device(&cfg);
+            self.touch_caret_activity();
+            self.status_notification = format!(
+                "{}: {}",
+                self.tr("已运行配置", "Running configuration"),
+                cfg.name
+            );
+        }
+    }
+
+    pub fn run_file_in_terminal(&mut self, path: &Path) -> bool {
+        let Some(cfg) = RunConfiguration::for_file(path, &self.workspace_root) else {
+            return false;
+        };
+        let label = cfg.name.clone();
+        self.warn_if_missing_mobile_sdk_for_cmd(&cfg);
+        self.upsert_run_configuration_internal(cfg.clone(), true, true);
+        self.bottom_tool = Some(ToolWindowId::Terminal);
+        self.focus = FocusTarget::TerminalInput;
+        self.start_run_config_with_mobile_device(&cfg);
+        self.touch_caret_activity();
+        self.status_notification = format!(
+            "{}: {} ({})",
+            self.tr("已运行并加入列表", "Running & added to Run list"),
+            label,
+            cfg.command
+        );
+        true
+    }
+
+    pub fn run_gutter_entry_in_terminal(&mut self, line: usize) {
+        let buf = self.active_buffer().clone();
+        let runnable = self
+            .cached_runnables
+            .as_ref()
+            .and_then(|(_, _, entries)| entries.iter().find(|r| r.line == line).cloned());
+        let line_text = buf.line_text(line);
+
+        let cfg = match runnable {
+            Some(entry) if entry.command == "cargo" && entry.args.iter().any(|a| a == "test") => {
+                let mut base = RunConfiguration::for_file(&buf.path, &self.workspace_root)
+                    .unwrap_or_else(|| RunConfiguration {
+                        name: entry.label.clone(),
+                        language: buf.language,
+                        command: "cargo".to_string(),
+                        args: vec!["test".to_string()],
+                        cwd: self.workspace_root.clone(),
+                        source: RunConfigSource::Custom,
+                        target_file: Some(buf.path.clone()),
+                    });
+                base.args.retain(|a| a != "run");
+                if !base.args.iter().any(|a| a == "test") {
+                    base.args.insert(0, "test".to_string());
+                }
+                if let Some(fn_name) = extract_identifier_after(&line_text, "fn ") {
+                    base.name = format!("Test: {fn_name}");
+                    base.args.push(fn_name);
+                }
+                base
+            }
+            Some(entry) if entry.command == "pytest" => {
+                let mut base = RunConfiguration::for_file(&buf.path, &self.workspace_root)
+                    .unwrap_or_else(|| RunConfiguration {
+                        name: entry.label.clone(),
+                        language: buf.language,
+                        command: "pytest".to_string(),
+                        args: Vec::new(),
+                        cwd: self.workspace_root.clone(),
+                        source: RunConfigSource::Custom,
+                        target_file: Some(buf.path.clone()),
+                    });
+                if let Some(fn_name) = extract_identifier_after(&line_text, "def ") {
+                    base.name = format!("Pytest: {fn_name}");
+                    base.args.push("-k".to_string());
+                    base.args.push(fn_name);
+                }
+                base
+            }
+            Some(entry) => RunConfiguration::for_file(&buf.path, &self.workspace_root)
+                .unwrap_or_else(|| RunConfiguration {
+                    name: entry.label,
+                    language: buf.language,
+                    command: entry.command,
+                    args: entry.args,
+                    cwd: self.workspace_root.clone(),
+                    source: RunConfigSource::Custom,
+                    target_file: Some(buf.path.clone()),
+                }),
+            None => match RunConfiguration::for_file(&buf.path, &self.workspace_root) {
+                Some(c) => c,
+                None => return,
+            },
+        };
+
+        let name = cfg.name.clone();
+        self.upsert_run_configuration_internal(cfg.clone(), true, true);
+        self.bottom_tool = Some(ToolWindowId::Terminal);
+        self.focus = FocusTarget::TerminalInput;
+        self.terminal.execute_run_configuration(&cfg);
+        self.touch_caret_activity();
+        self.status_notification = format!(
+            "{}: {} (第 {} 行)",
+            self.tr("已运行并加入列表", "Running & added"),
+            name,
+            line + 1
+        );
+    }
+
+    pub fn record_terminal_prompt_command_before_enter(&mut self) -> bool {
+        let Some((cwd, cmd_line)) = self.terminal.active_pty_mut().record_prompt_command() else {
+            return false;
+        };
+        let Some(cfg) = RunConfiguration::from_terminal_command(&cmd_line, &cwd) else {
+            return false;
+        };
+        self.upsert_run_configuration_internal(cfg, false, true);
+        true
+    }
+
+    pub fn open_new_run_config_modal(&mut self, initial_cmd: Option<&str>) {
+        self.run_config_popup_open = false;
+        self.run_config_popup_scroll = 0;
+        self.modal_text_input.set_text(initial_cmd.unwrap_or(""));
+        self.focus = FocusTarget::NewRunConfigModal;
+        self.touch_caret_activity();
+    }
+
+    pub fn add_and_run_command_line(&mut self, cmd_line: &str) {
+        let cwd = self.workspace_root.clone();
+        if let Some(cfg) = RunConfiguration::from_command_line_explicit(cmd_line, &cwd) {
+            let name = cfg.name.clone();
+            self.upsert_run_configuration_internal(cfg.clone(), true, true);
+            self.bottom_tool = Some(ToolWindowId::Terminal);
+            self.focus = FocusTarget::TerminalInput;
+            self.terminal.execute_run_configuration(&cfg);
+            self.touch_caret_activity();
+            self.status_notification = format!(
+                "{}: {}",
+                self.tr("已添加并运行命令", "Added & running command"),
+                name
+            );
+        } else {
+            self.focus = FocusTarget::Editor;
+        }
+    }
+
+    pub fn remove_custom_run_config(&mut self, idx: usize) {
+        if idx >= self.run_configs.len() || self.run_configs[idx].source != RunConfigSource::Custom {
+            return;
+        }
+        let removed_name = self.run_configs[idx].name.clone();
+        self.run_configs.remove(idx);
+        if self.run_configs.is_empty() {
+            self.run_configs = RunConfiguration::detect_for_workspace(&self.workspace_root);
+            self.active_run_config = 0;
+        } else if self.active_run_config >= self.run_configs.len() {
+            self.active_run_config = self.run_configs.len() - 1;
+        } else if idx < self.active_run_config {
+            self.active_run_config -= 1;
+        }
+        self.save_workspace_state();
+        self.status_notification = format!(
+            "{}: {}",
+            self.tr("已移除运行配置", "Removed run configuration"),
+            removed_name
+        );
+    }
+
     pub fn cancel_edit_message_rewind_modal(&mut self) {
         if let Some(pending) = self.pending_edit_rewind.take() {
             self.editing_sent_msg_idx = Some(pending.msg_idx);
@@ -2646,6 +4137,7 @@ impl IdeApplicationState {
         self.clear_agent_chat_selection();
         self.collapsed_code_blocks.clear();
         self.expanded_message_thoughts.clear();
+        self.expanded_message_file_changes.clear();
         self.expanded_composer_snippet_id = None;
         self.agent_sessions_popup_open = false;
         self.agent_mode_popup_open = false;
@@ -2679,6 +4171,7 @@ impl IdeApplicationState {
             self.clear_agent_chat_selection();
             self.collapsed_code_blocks.clear();
             self.expanded_message_thoughts.clear();
+            self.expanded_message_file_changes.clear();
             self.expanded_composer_snippet_id = None;
             self.agent_sessions_popup_open = false;
             self.agent_mode_popup_open = false;
@@ -2707,6 +4200,7 @@ impl IdeApplicationState {
             self.clear_agent_chat_selection();
             self.collapsed_code_blocks.clear();
             self.expanded_message_thoughts.clear();
+            self.expanded_message_file_changes.clear();
             self.expanded_composer_snippet_id = None;
             self.agent_busy_started_at = if self.agent_hub.is_active_session_busy() {
                 Some(Instant::now())
@@ -2725,8 +4219,7 @@ impl IdeApplicationState {
         }
         let decoded = load_image_for_preview(path)?;
         let arc = Arc::new(decoded);
-        self.image_preview_cache
-            .insert(path.to_path_buf(), Arc::clone(&arc));
+        self.cache_decoded_image_preview(path.to_path_buf(), Arc::clone(&arc));
         Some(arc)
     }
 
@@ -3035,6 +4528,31 @@ impl IdeApplicationState {
         self.pending_window_cmd.take()
     }
 
+    /// 命中标题栏上的最小化 / 最大化 / 关闭按钮。
+    pub fn window_control_at(&self, x: i32, y: i32) -> Option<WindowControlCmd> {
+        self.hit_regions
+            .iter()
+            .rev()
+            .find(|(rect, _)| rect.contains(x, y))
+            .and_then(|(_, action)| match action {
+                HitAction::WindowControl(cmd) => Some(*cmd),
+                _ => None,
+            })
+    }
+
+    pub fn arm_window_control(&mut self, cmd: WindowControlCmd) {
+        self.armed_window_control = Some(cmd);
+    }
+
+    /// 鼠标抬起时，只有指针仍在按下的那个按钮上才执行。
+    pub fn release_armed_window_control(&mut self, x: i32, y: i32) -> Option<WindowControlCmd> {
+        let armed = self.armed_window_control.take()?;
+        match self.window_control_at(x, y) {
+            Some(hit) if hit == armed => Some(armed),
+            _ => None,
+        }
+    }
+
     pub fn is_point_in_toolbar_blank(&self, x: i32, y: i32) -> bool {
         if y < 0 || y >= 38 {
             return false;
@@ -3042,13 +4560,24 @@ impl IdeApplicationState {
         !self.hit_regions.iter().any(|(r, _)| r.contains(x, y))
     }
 
-    /// 鼠标移动悬浮追踪：支持菜单栏划动切换展开子菜单 + 分割线/控件悬浮高亮按需重绘
+    /// 收起顶部主菜单并恢复项目名称与分支显示
+    pub fn close_top_menu(&mut self) -> bool {
+        let was_open = self.hamburger_menu_expanded || self.active_menu_category.is_some();
+        self.hamburger_menu_expanded = false;
+        self.active_menu_category = None;
+        self.menu_trigger_and_bar_rect = Rect::new(0, 0, 0, 0);
+        self.menu_dropdown_rect = Rect::new(0, 0, 0, 0);
+        was_open
+    }
+
+    /// 鼠标移动悬浮追踪：支持菜单栏划动切换展开子菜单 + 移出菜单区域自动恢复标题 + 分割线/控件悬浮高亮按需重绘
     pub fn handle_mouse_move(&mut self, x: i32, y: i32) -> bool {
         self.hover_pos = (x, y);
         let mut changed = false;
 
-        // 展开主菜单时，鼠标划过其他一级菜单分类自动切换下拉菜单（1:1 原生桌面菜单体验）
-        if self.hamburger_menu_expanded && self.active_menu_category.is_some() {
+        // 展开主菜单后，鼠标移动经过任意一级菜单分类立即展开对应子菜单；
+        // 当鼠标移出菜单条及当前下拉子菜单区域后，自动收起菜单并恢复标题显示
+        if self.hamburger_menu_expanded {
             if let Some((cat, _)) = self
                 .menu_category_rects
                 .iter()
@@ -3056,6 +4585,15 @@ impl IdeApplicationState {
             {
                 if self.active_menu_category != Some(*cat) {
                     self.active_menu_category = Some(*cat);
+                    changed = true;
+                }
+            } else if !self.menu_category_rects.is_empty() {
+                let in_bar = self.menu_trigger_and_bar_rect.w > 0
+                    && self.menu_trigger_and_bar_rect.contains(x, y);
+                let in_dropdown = self.active_menu_category.is_some()
+                    && self.menu_dropdown_rect.w > 0
+                    && self.menu_dropdown_rect.contains(x, y);
+                if !in_bar && !in_dropdown && self.close_top_menu() {
                     changed = true;
                 }
             }
@@ -3085,12 +4623,12 @@ impl IdeApplicationState {
             return None;
         }
         let body_h = (win_h - top_bar_h - status_bar_h).max(120);
-        let bottom_h = if self.bottom_tool.is_some() {
+        let bottom_h = if self.pane_is_open(self.dock_bottom) {
             self.bottom_panel_height
         } else {
             0
         };
-        let upper_h = (body_h - bottom_h).max(100);
+        let upper_h = (body_h - bottom_h).max(56);
         let upper_bottom = top_bar_h + upper_h;
 
         // 遮罩层/菜单激活时不穿透命中底层分割线
@@ -3101,7 +4639,17 @@ impl IdeApplicationState {
                     | FocusTarget::FindInFilesModal
                     | FocusTarget::NewFileModal
                     | FocusTarget::NewFolderModal
+                    | FocusTarget::NewRunConfigModal
                     | FocusTarget::NewGitBranchModal
+                    | FocusTarget::NewGitTagModal
+                    | FocusTarget::NewGitStashModal
+                    | FocusTarget::GitAddRemoteModal
+                    | FocusTarget::GitMergeModal
+                    | FocusTarget::GitRebaseModal
+                    | FocusTarget::GitUnstashModal
+                    | FocusTarget::GitResetModal
+                    | FocusTarget::GitRollbackModal
+                    | FocusTarget::GitRemotesModal
                     | FocusTarget::RenamePathModal
                     | FocusTarget::SettingsModal
                     | FocusTarget::AiConfigModal(_)
@@ -3111,20 +4659,20 @@ impl IdeApplicationState {
             return None;
         }
 
-        if self.left_tool.is_some() && y > top_bar_h && y < upper_bottom {
+        if self.pane_is_open(self.dock_left) && y > top_bar_h && y < upper_bottom {
             let split_x = stripe_w + self.left_panel_width;
-            if (x - split_x).abs() <= 5 {
+            if (x - split_x).abs() <= 8 {
                 return Some(DragSplitter::LeftPanel);
             }
         }
-        if self.right_agent_open && y > top_bar_h && y < upper_bottom {
+        if self.pane_is_open(self.dock_right) && y > top_bar_h && y < upper_bottom {
             let split_x = win_w - stripe_w - self.right_panel_width;
-            if (x - split_x).abs() <= 5 {
+            if (x - split_x).abs() <= 8 {
                 return Some(DragSplitter::RightPanel);
             }
         }
-        if self.bottom_tool.is_some() && x > stripe_w && x < win_w - stripe_w {
-            if (y - upper_bottom).abs() <= 5 {
+        if self.pane_is_open(self.dock_bottom) && x > stripe_w && x < win_w - stripe_w {
+            if (y - upper_bottom).abs() <= 8 {
                 return Some(DragSplitter::BottomPanel);
             }
         }
@@ -3139,6 +4687,9 @@ impl IdeApplicationState {
                 DragSplitter::LeftPanel | DragSplitter::RightPanel => IdeCursorKind::EwResize,
                 DragSplitter::BottomPanel => IdeCursorKind::NsResize,
             };
+        }
+        if self.active_dock_drag.is_some() {
+            return IdeCursorKind::Pointer;
         }
         if self.active_scrollbar_drag.is_some() {
             return IdeCursorKind::Default;
@@ -3176,7 +4727,17 @@ impl IdeApplicationState {
                 | FocusTarget::FindInFilesModal
                 | FocusTarget::NewFileModal
                 | FocusTarget::NewFolderModal
+                | FocusTarget::NewRunConfigModal
                 | FocusTarget::NewGitBranchModal
+                | FocusTarget::NewGitTagModal
+                | FocusTarget::NewGitStashModal
+                | FocusTarget::GitAddRemoteModal
+                | FocusTarget::GitMergeModal
+                | FocusTarget::GitRebaseModal
+                | FocusTarget::GitUnstashModal
+                | FocusTarget::GitResetModal
+                | FocusTarget::GitRollbackModal
+                | FocusTarget::GitRemotesModal
                 | FocusTarget::RenamePathModal
                 | FocusTarget::SettingsModal
                 | FocusTarget::AiConfigModal(_)
@@ -3192,7 +4753,11 @@ impl IdeApplicationState {
                 }
                 FocusTarget::NewFileModal
                 | FocusTarget::NewFolderModal
+                | FocusTarget::NewRunConfigModal
                 | FocusTarget::NewGitBranchModal
+                | FocusTarget::NewGitTagModal
+                | FocusTarget::NewGitStashModal
+                | FocusTarget::GitAddRemoteModal
                 | FocusTarget::RenamePathModal => {
                     if self.prompt_modal_input_rect.contains(x, y) {
                         return IdeCursorKind::Text;
@@ -3204,7 +4769,12 @@ impl IdeApplicationState {
                     }
                 }
                 FocusTarget::SettingsModal => {
-                    if self.settings_search_rect.contains(x, y) {
+                    if self.settings_search_rect.contains(x, y)
+                        || self
+                            .mobile_sdk_field_rects
+                            .iter()
+                            .any(|r| r.w > 0 && r.contains(x, y))
+                    {
                         return IdeCursorKind::Text;
                     }
                 }
@@ -3293,6 +4863,11 @@ impl IdeApplicationState {
             }
             IdeAction::SwitchToCodexCli => {
                 self.agent_hub.active_provider == AgentProviderKind::OpenAiCodexCli
+            }
+            IdeAction::GitAnnotateBlame => self.git_blame_visible,
+            IdeAction::GitShowLog => {
+                self.bottom_tool == Some(ToolWindowId::GitLog)
+                    && self.git_file_history_filter.is_none()
             }
             _ => false,
         }
@@ -3436,6 +5011,15 @@ impl IdeApplicationState {
             self.agent_scroll = usize::MAX;
             changed = true;
         }
+        let mobile_report = self
+            .mobile_probe_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok());
+        if let Some(report) = mobile_report {
+            self.mobile_probe_rx = None;
+            self.apply_mobile_environment_report(report);
+            changed = true;
+        }
         if self.agent_hub.is_active_session_busy() {
             if self.agent_busy_started_at.is_none() {
                 self.agent_busy_started_at = Some(Instant::now());
@@ -3497,6 +5081,10 @@ impl IdeApplicationState {
                     self.pending_open_workspace = Some(clean);
                     self.focus = FocusTarget::OpenProjectChoiceModal;
                 }
+                FolderPickMode::MobileSdk(slot) => {
+                    self.folder_pick_mode = FolderPickMode::AskUser;
+                    self.apply_picked_mobile_sdk_dir(slot, picked);
+                }
             }
             changed = true;
         }
@@ -3504,7 +5092,7 @@ impl IdeApplicationState {
     }
 
     pub fn active_terminal_revision(&self) -> u64 {
-        self.terminal.active_pty().current_revision()
+        self.terminal.total_revision()
     }
 
     pub fn ensure_editor_cursor_visible(&mut self) {
@@ -3553,9 +5141,18 @@ impl IdeApplicationState {
             }
             FocusTarget::NewFileModal
             | FocusTarget::NewFolderModal
+            | FocusTarget::NewRunConfigModal
             | FocusTarget::NewGitBranchModal
+            | FocusTarget::NewGitTagModal
+            | FocusTarget::NewGitStashModal
+            | FocusTarget::GitAddRemoteModal
             | FocusTarget::RenamePathModal => Some(&self.modal_text_input),
-            FocusTarget::SettingsModal => Some(&self.settings_query_input),
+            FocusTarget::SettingsModal => match self.settings_sdk_focus {
+                Some(0) => Some(&self.mobile_sdk_flutter),
+                Some(1) => Some(&self.mobile_sdk_android),
+                Some(2) => Some(&self.mobile_sdk_jdk),
+                _ => Some(&self.settings_query_input),
+            },
             FocusTarget::AiConfigModal(0) => Some(&self.ai_cfg_url),
             FocusTarget::AiConfigModal(1) => Some(&self.ai_cfg_key),
             FocusTarget::AiConfigModal(2) => Some(&self.ai_cfg_model),
@@ -3574,9 +5171,18 @@ impl IdeApplicationState {
             }
             FocusTarget::NewFileModal
             | FocusTarget::NewFolderModal
+            | FocusTarget::NewRunConfigModal
             | FocusTarget::NewGitBranchModal
+            | FocusTarget::NewGitTagModal
+            | FocusTarget::NewGitStashModal
+            | FocusTarget::GitAddRemoteModal
             | FocusTarget::RenamePathModal => Some(&mut self.modal_text_input),
-            FocusTarget::SettingsModal => Some(&mut self.settings_query_input),
+            FocusTarget::SettingsModal => match self.settings_sdk_focus {
+                Some(0) => Some(&mut self.mobile_sdk_flutter),
+                Some(1) => Some(&mut self.mobile_sdk_android),
+                Some(2) => Some(&mut self.mobile_sdk_jdk),
+                _ => Some(&mut self.settings_query_input),
+            },
             FocusTarget::AiConfigModal(0) => Some(&mut self.ai_cfg_url),
             FocusTarget::AiConfigModal(1) => Some(&mut self.ai_cfg_key),
             FocusTarget::AiConfigModal(2) => Some(&mut self.ai_cfg_model),
@@ -3601,6 +5207,9 @@ impl IdeApplicationState {
                 self.git_log_scroll = 0;
             }
             FocusTarget::SettingsModal => {
+                if self.settings_sdk_focus.is_some() {
+                    return;
+                }
                 self.settings_nav_scroll = 0;
                 let query = self.settings_query_input.as_str().trim();
                 if query.is_empty() {
@@ -3638,6 +5247,9 @@ impl IdeApplicationState {
             return;
         }
         if self.focus == FocusTarget::Editor {
+            if self.open_buffers.is_empty() {
+                return;
+            }
             self.active_buffer_mut().insert_str_at_cursor(text);
             self.ensure_editor_cursor_visible();
             self.touch_caret_activity();
@@ -3944,7 +5556,11 @@ impl IdeApplicationState {
             }
             FocusTarget::NewFileModal
             | FocusTarget::NewFolderModal
+            | FocusTarget::NewRunConfigModal
             | FocusTarget::NewGitBranchModal
+            | FocusTarget::NewGitTagModal
+            | FocusTarget::NewGitStashModal
+            | FocusTarget::GitAddRemoteModal
             | FocusTarget::RenamePathModal => {
                 let start_x = self.prompt_modal_input_rect.x + 8;
                 let idx = self.modal_text_input.hit_test_singleline(
@@ -3978,13 +5594,21 @@ impl IdeApplicationState {
                 return true;
             }
             FocusTarget::SettingsModal => {
-                let idx = self.settings_query_input.hit_test_singleline(
-                    canvas,
-                    x,
-                    self.settings_search_text_x,
-                    FontStyle::UiRegular,
-                );
-                self.settings_query_input.set_cursor_at(idx, true);
+                if let Some(slot) = self.settings_sdk_focus {
+                    let rect = self.mobile_sdk_field_rects[slot as usize];
+                    let start_x = rect.x + 8;
+                    let field = self.mobile_sdk_input_mut(slot);
+                    let idx = field.hit_test_singleline(canvas, x, start_x, FontStyle::UiRegular);
+                    field.set_cursor_at(idx, true);
+                } else {
+                    let idx = self.settings_query_input.hit_test_singleline(
+                        canvas,
+                        x,
+                        self.settings_search_text_x,
+                        FontStyle::UiRegular,
+                    );
+                    self.settings_query_input.set_cursor_at(idx, true);
+                }
                 self.touch_caret_activity();
                 return true;
             }
@@ -4002,15 +5626,7 @@ impl IdeApplicationState {
                 .cloned()
             {
                 if x < row_rect.x + row_rect.w - 86 {
-                    self.selected_git_working_file = Some(path.clone());
-                    self.git_working_diff_target = Some(path.clone());
-                    self.git_diff_scroll = 0;
-                    self.bottom_tool = Some(ToolWindowId::GitLog);
-                    self.status_notification = format!(
-                        "{}: {}",
-                        self.tr("正在查看工作区文件 Diff", "Inspecting working tree diff"),
-                        path.display()
-                    );
+                    self.open_git_working_diff_in_editor(&path);
                     return true;
                 }
             }
@@ -4107,6 +5723,23 @@ impl IdeApplicationState {
                 self.touch_caret_activity();
                 true
             }
+            FocusTarget::SettingsModal
+                if self
+                    .settings_sdk_focus
+                    .is_some_and(|slot| {
+                        self.mobile_sdk_field_rects
+                            .get(slot as usize)
+                            .is_some_and(|r| r.w > 0 && r.contains(x, y))
+                    }) =>
+            {
+                let slot = self.settings_sdk_focus.unwrap_or(0);
+                let start_x = self.mobile_sdk_field_rects[slot as usize].x + 8;
+                let field = self.mobile_sdk_input_mut(slot);
+                let idx = field.hit_test_singleline(canvas, x, start_x, FontStyle::UiRegular);
+                field.select_word_at(idx);
+                self.touch_caret_activity();
+                true
+            }
             FocusTarget::SettingsModal if self.settings_search_rect.contains(x, y) => {
                 let idx = self.settings_query_input.hit_test_singleline(
                     canvas,
@@ -4168,7 +5801,11 @@ impl IdeApplicationState {
             | FocusTarget::FindInFilesModal
             | FocusTarget::NewFileModal
             | FocusTarget::NewFolderModal
+            | FocusTarget::NewRunConfigModal
             | FocusTarget::NewGitBranchModal
+            | FocusTarget::NewGitTagModal
+            | FocusTarget::NewGitStashModal
+            | FocusTarget::GitAddRemoteModal
             | FocusTarget::RenamePathModal
             | FocusTarget::AiConfigModal(_)
             | FocusTarget::SettingsModal => self.select_all_at_focus(),
@@ -4185,6 +5822,18 @@ impl IdeApplicationState {
     /// 二维平滑滚轮滚动：支持垂直加速滚动与代码编辑器水平滚动 (`Shift+滚轮` 或触控板横向滑动)
     pub fn handle_mouse_wheel_2d(&mut self, x: i32, y: i32, lines_delta: i32, horiz_px_delta: i32) {
         if lines_delta == 0 && horiz_px_delta == 0 {
+            return;
+        }
+        if self.run_config_popup_open && self.run_config_popup_rect.contains(x, y) {
+            let max_scroll = self.run_configs.len().saturating_sub(9);
+            if lines_delta < 0 {
+                self.run_config_popup_scroll = self
+                    .run_config_popup_scroll
+                    .saturating_sub((-lines_delta) as usize);
+            } else if lines_delta > 0 {
+                self.run_config_popup_scroll =
+                    (self.run_config_popup_scroll + lines_delta as usize).min(max_scroll);
+            }
             return;
         }
         match self.focus {
@@ -4306,6 +5955,24 @@ impl IdeApplicationState {
                     pty.scroll_offset = pty.scroll_offset.saturating_sub(lines_delta as usize);
                 }
             }
+        } else if let Some(ref mut ed_diff) = self.active_editor_diff {
+            let max_line = ed_diff.diff_lines.len().saturating_sub(5);
+            if lines_delta < 0 {
+                ed_diff.scroll = ed_diff.scroll.saturating_sub((-lines_delta) as usize);
+            } else if lines_delta > 0 {
+                ed_diff.scroll = (ed_diff.scroll + lines_delta as usize).min(max_line);
+            }
+            if horiz_px_delta != 0 {
+                let limit_hx = if self.editor_horiz_scroll_info.visible > 0 {
+                    self.editor_horiz_scroll_info
+                        .total
+                        .saturating_sub(self.editor_horiz_scroll_info.visible)
+                        as i32
+                } else {
+                    2400
+                };
+                ed_diff.scroll_x = (ed_diff.scroll_x + horiz_px_delta).clamp(0, limit_hx);
+            }
         } else {
             let max_line = self.active_buffer().line_count().saturating_sub(5);
             if lines_delta < 0 {
@@ -4314,12 +5981,20 @@ impl IdeApplicationState {
                 self.scroll_line = (self.scroll_line + lines_delta as usize).min(max_line);
             }
             if horiz_px_delta != 0 {
-                self.editor_scroll_x = (self.editor_scroll_x + horiz_px_delta).clamp(0, 2400);
+                let limit_hx = if self.editor_horiz_scroll_info.visible > 0 {
+                    self.editor_horiz_scroll_info
+                        .total
+                        .saturating_sub(self.editor_horiz_scroll_info.visible)
+                        as i32
+                } else {
+                    2400
+                };
+                self.editor_scroll_x = (self.editor_scroll_x + horiz_px_delta).clamp(0, limit_hx);
             }
         }
     }
 
-    /// 检测鼠标按下位置是否命中任意面板的垂直滚动条轨道
+    /// 检测鼠标按下位置是否命中任意面板的垂直/水平滚动条轨道
     pub fn try_begin_scrollbar_drag(&mut self, x: i32, y: i32) -> bool {
         let hit_padding = 4;
         let check = |info: ScrollTrackInfo| -> bool {
@@ -4330,41 +6005,54 @@ impl IdeApplicationState {
                 && y >= info.track.y
                 && y < info.track.y + info.track.h
         };
+        let check_horiz = |info: ScrollTrackInfo| -> bool {
+            info.total > info.visible
+                && info.track.w > 0
+                && x >= info.track.x
+                && x < info.track.x + info.track.w
+                && y >= info.track.y - hit_padding
+                && y < info.track.y + info.track.h + hit_padding
+        };
         if check(self.left_scroll_info) {
             self.active_scrollbar_drag = Some(DragScrollbar::LeftTree);
-            self.update_scrollbar_drag(y);
+            self.update_scrollbar_drag(x, y);
             return true;
         }
         if check(self.editor_scroll_info) {
             self.active_scrollbar_drag = Some(DragScrollbar::CenterEditor);
-            self.update_scrollbar_drag(y);
+            self.update_scrollbar_drag(x, y);
+            return true;
+        }
+        if check_horiz(self.editor_horiz_scroll_info) {
+            self.active_scrollbar_drag = Some(DragScrollbar::CenterEditorHoriz);
+            self.update_scrollbar_drag(x, y);
             return true;
         }
         if check(self.right_scroll_info) {
             self.active_scrollbar_drag = Some(DragScrollbar::RightPanel);
-            self.update_scrollbar_drag(y);
+            self.update_scrollbar_drag(x, y);
             return true;
         }
         if self.bottom_tool == Some(ToolWindowId::GitLog) {
             if check(self.git_log_commits_scroll_info) {
                 self.active_scrollbar_drag = Some(DragScrollbar::GitLogCommits);
-                self.update_scrollbar_drag(y);
+                self.update_scrollbar_drag(x, y);
                 return true;
             }
             if check(self.git_log_diff_scroll_info) {
                 self.active_scrollbar_drag = Some(DragScrollbar::GitLogDiff);
-                self.update_scrollbar_drag(y);
+                self.update_scrollbar_drag(x, y);
                 return true;
             }
         } else if check(self.terminal_scroll_info) {
             self.active_scrollbar_drag = Some(DragScrollbar::BottomTerminal);
-            self.update_scrollbar_drag(y);
+            self.update_scrollbar_drag(x, y);
             return true;
         }
         false
     }
 
-    pub fn update_scrollbar_drag(&mut self, y: i32) -> bool {
+    pub fn update_scrollbar_drag(&mut self, x: i32, y: i32) -> bool {
         let Some(sb) = self.active_scrollbar_drag else {
             return false;
         };
@@ -4382,7 +6070,23 @@ impl IdeApplicationState {
                 }
             }
             DragScrollbar::CenterEditor => {
-                self.scroll_line = ratio_for(self.editor_scroll_info);
+                if let Some(ref mut ed_diff) = self.active_editor_diff {
+                    ed_diff.scroll = ratio_for(self.editor_scroll_info);
+                } else {
+                    self.scroll_line = ratio_for(self.editor_scroll_info);
+                }
+            }
+            DragScrollbar::CenterEditorHoriz => {
+                let info = self.editor_horiz_scroll_info;
+                let max_s = info.total.saturating_sub(info.visible).max(1);
+                let rel =
+                    ((x - info.track.x) as f32 / (info.track.w.max(1) as f32)).clamp(0.0, 1.0);
+                let next_x = (rel * max_s as f32).round() as i32;
+                if let Some(ref mut ed_diff) = self.active_editor_diff {
+                    ed_diff.scroll_x = next_x;
+                } else {
+                    self.editor_scroll_x = next_x;
+                }
             }
             DragScrollbar::RightPanel => {
                 self.agent_scroll = ratio_for(self.right_scroll_info);
@@ -4431,12 +6135,19 @@ impl IdeApplicationState {
             return;
         }
         let count = checked.len();
-        self.git_engine
-            .request_commit_selected_files(&msg, self.git_amend_commit, push_after, checked);
+        self.git_engine.request_commit_selected_files(
+            &msg,
+            self.git_amend_commit,
+            push_after,
+            checked,
+        );
         self.status_notification = if push_after {
             format!(
                 "{} ({count})...",
-                self.tr("正在后台提交并推送勾选的 Git 变更", "Committing and pushing selected changes")
+                self.tr(
+                    "正在后台提交并推送勾选的 Git 变更",
+                    "Committing and pushing selected changes"
+                )
             )
         } else {
             format!(
@@ -4463,16 +6174,269 @@ impl IdeApplicationState {
         let status_h = 26;
         match drag {
             DragSplitter::LeftPanel => {
-                self.left_panel_width = (x - stripe_w).clamp(170, 540);
+                let (min, max) = self.span_limits_for_drag(DockEdge::Left, win_w, win_h);
+                self.left_panel_width = (x - stripe_w).clamp(min, max);
             }
             DragSplitter::RightPanel => {
-                self.right_panel_width = (win_w - stripe_w - x).clamp(280, 680);
+                let (min, max) = self.span_limits_for_drag(DockEdge::Right, win_w, win_h);
+                self.right_panel_width = (win_w - stripe_w - x).clamp(min, max);
             }
             DragSplitter::BottomPanel => {
-                self.bottom_panel_height = (win_h - status_h - y).clamp(110, 460);
+                let (min, max) = self.span_limits_for_drag(DockEdge::Bottom, win_w, win_h);
+                self.bottom_panel_height = (win_h - status_h - y).clamp(min, max);
             }
         }
         true
+    }
+
+    fn pane_is_open(&self, pane: DockPane) -> bool {
+        match pane {
+            DockPane::Project => self.left_tool.is_some(),
+            DockPane::Agent => self.right_agent_open,
+            DockPane::Tooling => self.bottom_tool.is_some(),
+        }
+    }
+
+    fn pane_on(&self, edge: DockEdge) -> DockPane {
+        match edge {
+            DockEdge::Left => self.dock_left,
+            DockEdge::Right => self.dock_right,
+            DockEdge::Bottom => self.dock_bottom,
+        }
+    }
+
+    fn set_pane_on(&mut self, edge: DockEdge, pane: DockPane) {
+        match edge {
+            DockEdge::Left => self.dock_left = pane,
+            DockEdge::Right => self.dock_right = pane,
+            DockEdge::Bottom => self.dock_bottom = pane,
+        }
+    }
+
+    fn normalize_docks(&mut self) {
+        let all = [self.dock_left, self.dock_right, self.dock_bottom];
+        let mut seen = [false; 3];
+        let mut ok = true;
+        for pane in all {
+            let idx = pane as usize;
+            if idx > 2 || seen[idx] {
+                ok = false;
+                break;
+            }
+            seen[idx] = true;
+        }
+        if !ok {
+            self.dock_left = DockPane::Project;
+            self.dock_right = DockPane::Agent;
+            self.dock_bottom = DockPane::Tooling;
+        }
+    }
+
+    fn swap_dock(&mut self, a: DockEdge, b: DockEdge) {
+        if a == b {
+            return;
+        }
+        let pa = self.pane_on(a);
+        let pb = self.pane_on(b);
+        self.set_pane_on(a, pb);
+        self.set_pane_on(b, pa);
+    }
+
+    fn span_limits_for_drag(&self, edge: DockEdge, win_w: i32, win_h: i32) -> (i32, i32) {
+        let stripe = 84;
+        let min_editor_w = 72;
+        let min_editor_h = 56;
+        match edge {
+            DockEdge::Left => {
+                let right = if self.pane_is_open(self.dock_right) {
+                    self.right_panel_width
+                } else {
+                    0
+                };
+                let min = 48;
+                let max = (win_w - stripe - right - min_editor_w).max(min);
+                (min, max)
+            }
+            DockEdge::Right => {
+                let left = if self.pane_is_open(self.dock_left) {
+                    self.left_panel_width
+                } else {
+                    0
+                };
+                let min = 64;
+                let max = (win_w - stripe - left - min_editor_w).max(min);
+                (min, max)
+            }
+            DockEdge::Bottom => {
+                let body = (win_h - 38 - 26).max(min_editor_h + 40);
+                let min = 40;
+                let max = (body - min_editor_h).max(min);
+                (min, max)
+            }
+        }
+    }
+
+    fn clamp_dock_spans(&mut self, win_w: i32, win_h: i32) {
+        let (lmin, lmax) = self.span_limits_for_drag(DockEdge::Left, win_w, win_h);
+        self.left_panel_width = self.left_panel_width.clamp(lmin, lmax);
+        let (rmin, rmax) = self.span_limits_for_drag(DockEdge::Right, win_w, win_h);
+        self.right_panel_width = self.right_panel_width.clamp(rmin, rmax);
+        let (lmin, lmax) = self.span_limits_for_drag(DockEdge::Left, win_w, win_h);
+        self.left_panel_width = self.left_panel_width.clamp(lmin, lmax);
+        let (bmin, bmax) = self.span_limits_for_drag(DockEdge::Bottom, win_w, win_h);
+        self.bottom_panel_height = self.bottom_panel_height.clamp(bmin, bmax);
+    }
+
+    fn edge_of_pane(&self, pane: DockPane) -> DockEdge {
+        if self.dock_left == pane {
+            DockEdge::Left
+        } else if self.dock_right == pane {
+            DockEdge::Right
+        } else {
+            DockEdge::Bottom
+        }
+    }
+
+    fn dock_edge_at(&self, x: i32, y: i32, win_w: i32, win_h: i32) -> Option<DockEdge> {
+        let top = 38;
+        let status = 26;
+        let stripe = 42;
+        if y <= top || y >= win_h - status || x <= stripe || x >= win_w - stripe {
+            return None;
+        }
+        if self.left_pane_rect.w > 20 && self.left_pane_rect.contains(x, y) {
+            return Some(self.edge_of_pane(DockPane::Project));
+        }
+        if self.right_pane_rect.w > 20 && self.right_pane_rect.contains(x, y) {
+            return Some(self.edge_of_pane(DockPane::Agent));
+        }
+        if self.bottom_pane_rect.w > 20 && self.bottom_pane_rect.contains(x, y) {
+            return Some(self.edge_of_pane(DockPane::Tooling));
+        }
+        let body_x = stripe;
+        let body_r = win_w - stripe;
+        let body_b = win_h - status;
+        let dl = x - body_x;
+        let dr = body_r - x;
+        let db = body_b - y;
+        let mut best = DockEdge::Left;
+        let mut dist = dl;
+        if dr < dist {
+            best = DockEdge::Right;
+            dist = dr;
+        }
+        if db < dist {
+            best = DockEdge::Bottom;
+            dist = db;
+        }
+        if dist <= 220 {
+            Some(best)
+        } else {
+            None
+        }
+    }
+
+    pub fn update_dock_drag(&mut self, x: i32, y: i32, win_w: i32, win_h: i32) -> bool {
+        if let Some((pane, ox, oy)) = self.pending_dock_drag {
+            if (x - ox).abs() + (y - oy).abs() >= 6 {
+                self.pending_dock_drag = None;
+                self.pending_ide_drag = None;
+                self.active_ide_drag = None;
+                self.active_dock_drag = Some(pane);
+                self.dock_drag_pos = (x, y);
+                self.dock_drop_edge = self.dock_edge_at(x, y, win_w, win_h);
+                self.status_notification = self
+                    .tr(
+                        "拖到左、右或底边松开，即可移动该分区",
+                        "Release on the left, right, or bottom edge to move this pane",
+                    )
+                    .to_string();
+                return true;
+            }
+            return false;
+        }
+        if self.active_dock_drag.is_some() {
+            self.dock_drag_pos = (x, y);
+            self.dock_drop_edge = self.dock_edge_at(x, y, win_w, win_h);
+            return true;
+        }
+        false
+    }
+
+    pub fn end_dock_drag(&mut self, x: i32, y: i32, win_w: i32, win_h: i32) {
+        let pane = self.active_dock_drag.take();
+        self.pending_dock_drag = None;
+        let Some(pane) = pane else {
+            self.dock_drop_edge = None;
+            return;
+        };
+        let target = self
+            .dock_edge_at(x, y, win_w, win_h)
+            .or(self.dock_drop_edge);
+        self.dock_drop_edge = None;
+        let Some(target) = target else {
+            return;
+        };
+        let from = self.edge_of_pane(pane);
+        if from == target {
+            return;
+        }
+        let displaced = self.pane_on(target);
+        self.swap_dock(from, target);
+        let zh = self.ui_lang == UiLanguage::ZhCn;
+        self.status_notification = format!(
+            "{}: {} ↔ {}",
+            self.tr("已移动分区", "Moved pane"),
+            pane.title(zh),
+            displaced.title(zh)
+        );
+        self.save_global_settings();
+    }
+
+    pub(crate) fn arm_pane_header_drag(&mut self, canvas: &mut SurfaceCanvas, rect: Rect, pane: DockPane) {
+        if rect.w < 24 || rect.h < 24 {
+            return;
+        }
+        let strip = Rect::new(rect.x + 2, rect.y + 2, (rect.w - 4).max(8), 28);
+        self.hit_regions
+            .push((strip, HitAction::DragDockPane(pane)));
+        let t = self.theme;
+        let (hx, hy) = self.hover_pos;
+        let grip = Rect::new(rect.x + 6, rect.y + 8, 12, 16);
+        let hot = grip.contains(hx, hy) || self.active_dock_drag == Some(pane);
+        let col = if hot { t.accent_blue } else { t.text_muted };
+        for row in 0..3 {
+            for col_i in 0..2 {
+                canvas.fill_rect(
+                    Rect::new(grip.x + 1 + col_i * 5, grip.y + 1 + row * 5, 2, 2),
+                    col,
+                );
+            }
+        }
+    }
+
+    fn place_dock_pane(&mut self, canvas: &mut SurfaceCanvas, pane: DockPane, rect: Rect) {
+        if rect.w <= 8 || rect.h <= 8 {
+            return;
+        }
+        match pane {
+            DockPane::Project => {
+                self.left_pane_rect = rect;
+                if let Some(tool) = self.left_tool {
+                    self.render_left_tool_window(canvas, rect, tool);
+                }
+            }
+            DockPane::Agent => {
+                self.right_pane_rect = rect;
+                self.render_right_agent_hub(canvas, rect);
+            }
+            DockPane::Tooling => {
+                self.bottom_pane_rect = rect;
+                if let Some(tool) = self.bottom_tool {
+                    self.render_bottom_tool_window(canvas, rect, tool);
+                }
+            }
+        }
     }
 
     pub fn end_splitter_drag(&mut self) {
@@ -4504,13 +6468,15 @@ impl IdeApplicationState {
         let action = hit_match.map(|(_, (_, act))| act.clone());
 
         let Some(act) = action else {
-            self.active_menu_category = None;
+            self.close_top_menu();
             self.git_branch_popup_open = false;
             self.agent_provider_popup_open = false;
             self.agent_model_popup_open = false;
             self.agent_mode_popup_open = false;
             self.agent_sessions_popup_open = false;
             self.run_config_popup_open = false;
+        self.run_config_popup_scroll = 0;
+            self.mobile_popup_open = false;
             self.project_popup_open = false;
             self.more_menu_popup_open = false;
             self.context_menu = None;
@@ -4524,10 +6490,12 @@ impl IdeApplicationState {
             self.context_menu = None;
         }
 
-        // 点击非弹窗区时自动收起对应下拉框
+        // 点击非菜单控制区（含菜单项、编辑器等）时自动收起顶部菜单并恢复标题显示
         match &act {
             HitAction::OpenMenuCategory(_) | HitAction::ToggleHamburgerMenu => {}
-            _ => self.active_menu_category = None,
+            _ => {
+                self.close_top_menu();
+            }
         }
         match &act {
             HitAction::ToggleGitBranchPopup => {}
@@ -4550,8 +6518,25 @@ impl IdeApplicationState {
             _ => self.agent_sessions_popup_open = false,
         }
         match &act {
-            HitAction::ToggleRunConfigPopup => {}
-            _ => self.run_config_popup_open = false,
+            HitAction::ToggleRunConfigPopup
+            | HitAction::ToggleRunConfigAt(_)
+            | HitAction::RemoveRunConfig(_) => {}
+            _ => {
+                self.run_config_popup_open = false;
+                self.run_config_popup_scroll = 0;
+            }
+        }
+        match &act {
+            HitAction::ToggleMobilePopup
+            | HitAction::RefreshMobileEnv
+            | HitAction::SelectMobileDevice(_)
+            | HitAction::LaunchMobileEmulator(_)
+            | HitAction::RunMobileCommand(_)
+            | HitAction::InstallMobileSdkCmd(_, _)
+            | HitAction::OpenMobileDownloadUrl(_) => {}
+            _ => {
+                self.mobile_popup_open = false;
+            }
         }
         match &act {
             HitAction::ToggleProjectPopup => {}
@@ -4564,11 +6549,14 @@ impl IdeApplicationState {
 
         match act {
             HitAction::WindowControl(cmd) => {
-                self.pending_window_cmd = Some(cmd);
+                self.armed_window_control = Some(cmd);
             }
             HitAction::ToggleHamburgerMenu => {
                 self.hamburger_menu_expanded = !self.hamburger_menu_expanded;
-                if !self.hamburger_menu_expanded {
+                if self.hamburger_menu_expanded {
+                    self.project_popup_open = false;
+                    self.git_branch_popup_open = false;
+                } else {
                     self.active_menu_category = None;
                 }
             }
@@ -4591,14 +6579,100 @@ impl IdeApplicationState {
             }
             HitAction::ToggleRunConfigPopup => {
                 self.run_config_popup_open = !self.run_config_popup_open;
+                if self.run_config_popup_open && self.active_run_config >= 9 {
+                    let max_scroll = self.run_configs.len().saturating_sub(9);
+                    self.run_config_popup_scroll =
+                        self.active_run_config.saturating_sub(4).min(max_scroll);
+                } else if !self.run_config_popup_open {
+                    self.run_config_popup_scroll = 0;
+                }
             }
             HitAction::SelectRunConfig(idx) => {
                 if idx < self.run_configs.len() {
                     self.active_run_config = idx;
                     let name = self.run_configs[idx].name.clone();
+                    self.save_workspace_state();
                     self.status_notification = format!("已切换运行配置: {name}");
                 }
                 self.run_config_popup_open = false;
+                self.run_config_popup_scroll = 0;
+            }
+            HitAction::RemoveRunConfig(idx) => {
+                self.remove_custom_run_config(idx);
+            }
+            HitAction::ToggleRunConfigAt(idx) => {
+                self.toggle_run_config_execution(idx);
+            }
+            HitAction::OpenNewRunConfigModal => {
+                self.open_new_run_config_modal(None);
+            }
+            HitAction::ToggleMobilePopup => {
+                self.mobile_popup_open = !self.mobile_popup_open;
+                if self.mobile_popup_open
+                    && self.mobile_env.sdk_tools.is_empty()
+                    && !self.mobile_env.probing
+                {
+                    self.refresh_mobile_environment_async();
+                }
+            }
+            HitAction::RefreshMobileEnv => {
+                self.commit_mobile_sdk_locations_from_inputs();
+                self.mobile_missing_prompted = false;
+                self.refresh_mobile_environment_async();
+                self.status_notification = self
+                    .tr(
+                        "正在刷新手机设备列表 (ADB / Flutter) 与本地 SDK...",
+                        "Refreshing mobile devices (ADB / Flutter) & local SDKs...",
+                    )
+                    .to_string();
+            }
+            HitAction::SelectMobileDevice(id) => {
+                self.selected_mobile_device_id = Some(id.clone());
+                let name = self
+                    .mobile_env
+                    .devices
+                    .iter()
+                    .find(|d| d.id == id)
+                    .map(|d| d.name.as_str())
+                    .unwrap_or(id.as_str());
+                self.status_notification = format!(
+                    "📱 {}: {} ({})",
+                    self.tr("已选定目标移动设备", "Selected target mobile device"),
+                    name,
+                    id
+                );
+                self.mobile_popup_open = false;
+            }
+            HitAction::LaunchMobileEmulator(avd) => {
+                self.launch_mobile_emulator(&avd);
+                self.mobile_popup_open = false;
+            }
+            HitAction::RunMobileCommand(cmd) => {
+                self.run_mobile_shell_command(&cmd);
+                self.status_notification =
+                    format!("▶ {}: {cmd}", self.tr("已在终端执行", "Executed in terminal"));
+                self.mobile_popup_open = false;
+            }
+            HitAction::InstallMobileSdkCmd(label, cmd) => {
+                self.run_mobile_shell_command(&cmd);
+                self.status_notification = format!(
+                    "⚙ {}: {label} ({cmd})",
+                    self.tr("已启动 SDK 安装命令", "Started SDK install command")
+                );
+                self.mobile_popup_open = false;
+            }
+            HitAction::OpenMobileDownloadUrl(url) => {
+                if open_http_url(&url) {
+                    self.status_notification = format!(
+                        "🌐 {}: {url}",
+                        self.tr("已打开官方下载页面", "Opened official download page")
+                    );
+                } else {
+                    self.status_notification = format!(
+                        "{}: {url}",
+                        self.tr("无法打开下载链接", "Could not open download URL")
+                    );
+                }
             }
             HitAction::ToggleMoreMenuPopup => {
                 self.more_menu_popup_open = !self.more_menu_popup_open;
@@ -4623,13 +6697,20 @@ impl IdeApplicationState {
                 self.touch_caret_activity();
             }
             HitAction::SelectTab(idx) => {
+                self.active_editor_diff = None;
+                self.active_media_tab = None;
                 self.active_tab = idx;
                 self.scroll_line = 0;
                 self.editor_scroll_x = 0;
                 self.focus = FocusTarget::Editor;
                 self.touch_caret_activity();
+                self.ensure_active_blame_loaded();
             }
             HitAction::CloseTab(idx) => self.close_tab(idx),
+            HitAction::DragDockPane(pane) => {
+                self.pending_dock_drag = Some((pane, x, y));
+                self.mouse_drag_target = None;
+            }
             HitAction::OpenFile(p) => {
                 self.open_file(p);
                 self.focus = FocusTarget::Editor;
@@ -4707,20 +6788,14 @@ impl IdeApplicationState {
             HitAction::ToggleCommitFileCheck(path) => {
                 let checked = self.git_engine.toggle_commit_file_checked(&path);
                 self.selected_git_working_file = Some(path.clone());
-                let fname = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("file");
+                let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
                 self.status_notification = if checked {
                     format!(
                         "{}: {fname}",
                         self.tr("已勾选纳入提交", "Included in commit")
                     )
                 } else {
-                    format!(
-                        "{}: {fname}",
-                        self.tr("已取消勾选", "Excluded from commit")
-                    )
+                    format!("{}: {fname}", self.tr("已取消勾选", "Excluded from commit"))
                 };
             }
             HitAction::ToggleCommitGroupCheck { untracked_group } => {
@@ -4748,15 +6823,7 @@ impl IdeApplicationState {
                             .map(|c| c.path.clone())
                     });
                 if let Some(path) = target {
-                    self.selected_git_working_file = Some(path.clone());
-                    self.git_working_diff_target = Some(path.clone());
-                    self.git_diff_scroll = 0;
-                    self.bottom_tool = Some(ToolWindowId::GitLog);
-                    self.status_notification = format!(
-                        "{}: {}",
-                        self.tr("正在查看工作区文件 Diff", "Inspecting working tree diff"),
-                        path.display()
-                    );
+                    self.open_git_working_diff_in_editor(&path);
                 } else {
                     self.status_notification = self
                         .tr("当前工作区没有可对比的变更文件", "No changed files to diff")
@@ -4852,15 +6919,7 @@ impl IdeApplicationState {
                 self.touch_caret_activity();
             }
             HitAction::InspectGitWorkingFileDiff(path) => {
-                self.selected_git_working_file = Some(path.clone());
-                self.git_working_diff_target = Some(path.clone());
-                self.git_diff_scroll = 0;
-                self.bottom_tool = Some(ToolWindowId::GitLog);
-                self.status_notification = format!(
-                    "{}: {}",
-                    self.tr("正在查看工作区文件 Diff", "Inspecting working tree diff"),
-                    path.display()
-                );
+                self.open_git_working_diff_in_editor(&path);
             }
             HitAction::SelectGitLogBranchFilter(branch_opt) => {
                 self.git_log_branch_filter = branch_opt.clone();
@@ -4965,13 +7024,100 @@ impl IdeApplicationState {
             }
             HitAction::GitMergeBranch(branch) => {
                 self.git_branch_popup_open = false;
+                self.focus = FocusTarget::Editor;
                 self.git_engine.request_merge_branch(&branch);
                 self.status_notification = format!("Merging '{branch}'...");
+            }
+            HitAction::GitMergeAbort => {
+                self.git_branch_popup_open = false;
+                self.focus = FocusTarget::Editor;
+                self.git_engine.request_merge_abort();
+                self.status_notification = self
+                    .tr("正在中止当前 Merge...", "Aborting active merge...")
+                    .to_string();
+            }
+            HitAction::GitRebaseBranch(branch) => {
+                self.git_branch_popup_open = false;
+                self.focus = FocusTarget::Editor;
+                self.git_engine.request_rebase_branch(&branch);
+                self.status_notification = format!("Rebasing onto '{branch}'...");
+            }
+            HitAction::GitRebaseContinue => {
+                self.git_branch_popup_open = false;
+                self.focus = FocusTarget::Editor;
+                self.git_engine.request_rebase_continue();
+                self.status_notification = self
+                    .tr("正在继续 Git Rebase...", "Continuing Git Rebase...")
+                    .to_string();
+            }
+            HitAction::GitRebaseAbort => {
+                self.git_branch_popup_open = false;
+                self.focus = FocusTarget::Editor;
+                self.git_engine.request_rebase_abort();
+                self.status_notification = self
+                    .tr("正在中止 Git Rebase...", "Aborting Git Rebase...")
+                    .to_string();
             }
             HitAction::GitDeleteBranch(branch) => {
                 self.git_branch_popup_open = false;
                 self.git_engine.request_delete_branch(&branch);
                 self.status_notification = format!("Deleting branch '{branch}'...");
+            }
+            HitAction::GitStashPop(sref) => {
+                self.git_engine.request_stash_pop(&sref);
+                self.focus = FocusTarget::Editor;
+                self.status_notification = format!("Popping stash {sref}...");
+            }
+            HitAction::GitStashApply(sref) => {
+                self.git_engine.request_stash_apply(&sref);
+                self.focus = FocusTarget::Editor;
+                self.status_notification = format!("Applying stash {sref}...");
+            }
+            HitAction::GitStashDrop(sref) => {
+                self.git_engine.request_stash_drop(&sref);
+                self.status_notification = format!("Dropping stash {sref}...");
+            }
+            HitAction::SelectGitResetMode(mode) => {
+                self.git_reset_mode = mode;
+            }
+            HitAction::GitResetTo { target, mode } => {
+                self.git_engine.request_reset(&target, mode);
+                self.focus = FocusTarget::Editor;
+                self.status_notification = format!("Reset ({}) -> {target}...", mode.as_flag());
+            }
+            HitAction::GitRemoveRemote(name) => {
+                self.git_engine.request_remove_remote(&name);
+                self.status_notification = format!("Removing remote '{name}'...");
+            }
+            HitAction::OpenAddRemoteModal => {
+                self.modal_text_input
+                    .set_text("origin https://github.com/org/repo.git");
+                self.modal_text_input.select_all();
+                self.focus = FocusTarget::GitAddRemoteModal;
+                self.touch_caret_activity();
+            }
+            HitAction::GitConfirmRollbackAll => {
+                self.git_engine.request_rollback_all();
+                self.focus = FocusTarget::Editor;
+                self.status_notification = self
+                    .tr(
+                        "正在回滚工作区全部未提交变更...",
+                        "Rolling back all uncommitted changes...",
+                    )
+                    .to_string();
+            }
+            HitAction::CloseModalToEditor => {
+                self.focus = FocusTarget::Editor;
+            }
+            HitAction::ClearGitFileHistoryFilter => {
+                self.git_file_history_filter = None;
+                self.git_log_scroll = 0;
+            }
+            HitAction::InspectBlameCommit(hash) => {
+                self.git_file_history_filter = None;
+                self.selected_git_commit_hash = Some(hash.clone());
+                self.git_engine.request_load_commit_detail(&hash);
+                self.bottom_tool = Some(ToolWindowId::GitLog);
             }
             HitAction::SelectAgentProvider(provider) => {
                 self.agent_hub.active_provider = provider;
@@ -5137,6 +7283,7 @@ impl IdeApplicationState {
                 self.agent_hub.clear_messages();
                 self.collapsed_code_blocks.clear();
                 self.expanded_message_thoughts.clear();
+                self.expanded_message_file_changes.clear();
                 self.agent_scroll = 0;
                 self.clear_agent_chat_selection();
                 self.agent_chat_signature_salt = self.agent_chat_signature_salt.wrapping_add(1);
@@ -5187,6 +7334,63 @@ impl IdeApplicationState {
                 self.expanded_message_thoughts.insert(msg_idx, !cur);
                 self.agent_chat_signature_salt = self.agent_chat_signature_salt.wrapping_add(1);
             }
+            HitAction::ToggleMessageFileChangesCollapse(msg_idx) => {
+                let cur = self
+                    .expanded_message_file_changes
+                    .get(&msg_idx)
+                    .copied()
+                    .unwrap_or(false);
+                self.expanded_message_file_changes.insert(msg_idx, !cur);
+                self.agent_chat_signature_salt = self.agent_chat_signature_salt.wrapping_add(1);
+            }
+            HitAction::InspectAgentFileDiff { path, msg_idx } => {
+                self.open_agent_file_diff_in_editor(&path, msg_idx);
+            }
+            HitAction::CloseEditorDiff => {
+                self.active_editor_diff = None;
+                self.focus = FocusTarget::Editor;
+            }
+            HitAction::OpenDiffSourceFile(path) => {
+                self.open_file(path);
+                self.focus = FocusTarget::Editor;
+                self.touch_caret_activity();
+            }
+            HitAction::SelectMediaTab(idx) => {
+                self.active_editor_diff = None;
+                if idx < self.media_tabs.len() {
+                    self.active_media_tab = Some(idx);
+                }
+                self.focus = FocusTarget::Editor;
+                self.touch_caret_activity();
+            }
+            HitAction::CloseMediaTab(idx) => {
+                self.close_media_tab(idx);
+            }
+            HitAction::OpenMediaAsText(path) => {
+                self.open_file_as_text(path);
+                self.focus = FocusTarget::Editor;
+                self.touch_caret_activity();
+            }
+            HitAction::OpenExternalMedia(path) => {
+                if open_media_with_system_app(&path) {
+                    self.status_notification = format!(
+                        "{}: {}",
+                        self.tr("已在系统默认应用中打开", "Opened in system player"),
+                        path.display()
+                    );
+                }
+            }
+            HitAction::AdjustMediaZoom(delta) => {
+                if let Some(idx) = self.active_media_tab {
+                    if let Some(tab) = self.media_tabs.get_mut(idx) {
+                        tab.zoom_pct = if delta == 0 {
+                            100
+                        } else {
+                            ((tab.zoom_pct as i32) + delta).clamp(25, 300) as u32
+                        };
+                    }
+                }
+            }
             HitAction::ToggleComposerPastedSnippet(id) => {
                 if self.expanded_composer_snippet_id.as_deref() == Some(id.as_str()) {
                     self.expanded_composer_snippet_id = None;
@@ -5223,6 +7427,17 @@ impl IdeApplicationState {
             HitAction::OpenFileAtLine(path, line_opt) => {
                 self.open_file_at_line(path, line_opt);
             }
+            HitAction::OpenExternalUrl(url) => {
+                if open_http_url(&url) {
+                    self.status_notification = format!(
+                        "{}: {url}",
+                        self.tr("已在浏览器中打开", "Opened in browser")
+                    );
+                } else {
+                    self.status_notification =
+                        format!("{}: {url}", self.tr("无法打开链接", "Could not open link"));
+                }
+            }
             HitAction::FocusAgentChatStream => {
                 self.focus = FocusTarget::AgentChatStream;
                 if let Some(pos) = self.hit_test_agent_chat_stream(x, y, canvas) {
@@ -5243,7 +7458,6 @@ impl IdeApplicationState {
             HitAction::ApplyChatPatch(msg_idx) => self.apply_chat_patch(msg_idx),
             HitAction::InsertChatPatch(msg_idx) => self.insert_chat_patch(msg_idx),
             HitAction::PreviewPatchInEditor(msg_idx) => self.preview_chat_patch_in_editor(msg_idx),
-            HitAction::TriggerCtrlKInlineEdit => self.trigger_ctrl_k_inline_edit(),
             HitAction::FocusCtrlKPrompt => {
                 self.focus = FocusTarget::CtrlKPrompt;
                 let start_x = self.ctrl_k_input_box_rect.x + 28;
@@ -5256,9 +7470,6 @@ impl IdeApplicationState {
             }
             HitAction::AcceptInlineDiff => self.accept_inline_diff(),
             HitAction::RejectInlineDiff => self.reject_inline_diff(),
-            HitAction::SendSelectionToAgent => {
-                self.execute_ide_action(IdeAction::SendSelectionToAgent)
-            }
             HitAction::RevertLastCheckpoint => self.revert_last_checkpoint(),
             HitAction::ToggleAgentChangedFilesDrawer => {
                 self.agent_changed_files_expanded = !self.agent_changed_files_expanded;
@@ -5266,9 +7477,9 @@ impl IdeApplicationState {
             HitAction::KeepAllAgentChangedFiles => {
                 self.agent_hub.keep_all_session_changed_files();
                 self.agent_changed_files_expanded = false;
-                self.status_notification =
-                    self.tr("已保留本轮全部文件更改", "Kept all changed files")
-                        .to_string();
+                self.status_notification = self
+                    .tr("已保留本轮全部文件更改", "Kept all changed files")
+                    .to_string();
             }
             HitAction::RevertAllAgentChangedFiles => {
                 let restored = self.agent_hub.revert_all_session_changed_files();
@@ -5349,6 +7560,7 @@ impl IdeApplicationState {
             }
             HitAction::FocusTerminalInput => {
                 self.focus = FocusTarget::TerminalInput;
+                self.terminal.active_pty_mut().ensure_spawned();
                 if let Some((tl, tc)) = self.hit_test_terminal(x, y, canvas) {
                     let pty = self.terminal.active_pty_mut();
                     if !shift || pty.sel_anchor.is_none() {
@@ -5397,12 +7609,7 @@ impl IdeApplicationState {
                 };
             }
             HitAction::RunGutterEntry(line) => {
-                self.bottom_tool = Some(ToolWindowId::Terminal);
-                self.terminal
-                    .execute_command_line("cargo test --workspace --offline");
-                self.focus = FocusTarget::TerminalInput;
-                self.touch_caret_activity();
-                self.status_notification = format!("已运行第 {} 行测试/入口", line + 1);
+                self.run_gutter_entry_in_terminal(line);
             }
             HitAction::SelectTheme(kind) => {
                 self.theme = IdeaTheme::from_kind(kind);
@@ -5420,6 +7627,7 @@ impl IdeApplicationState {
                 self.set_ui_scale((pct as f32 / 100.0).clamp(0.85, 2.0));
             }
             HitAction::SelectSettingsPage(page) => {
+                self.settings_sdk_focus = None;
                 if self.settings_page != page {
                     self.settings_page = page;
                     self.modal_scroll = 0;
@@ -5427,6 +7635,7 @@ impl IdeApplicationState {
                 }
             }
             HitAction::FocusSettingsSearch => {
+                self.settings_sdk_focus = None;
                 let idx = self.settings_query_input.hit_test_singleline(
                     canvas,
                     x,
@@ -5438,8 +7647,17 @@ impl IdeApplicationState {
                 self.touch_caret_activity();
             }
             HitAction::ApplySettings => {
+                let rechecked = self.commit_mobile_sdk_locations_from_inputs();
                 self.save_all_persisted_state();
-                self.status_notification = self.tr("设置已应用", "Settings applied").to_string();
+                self.status_notification = if rechecked {
+                    self.tr(
+                        "已保存移动端 SDK 目录并重新检测",
+                        "Saved mobile SDK directories and rechecked",
+                    )
+                    .to_string()
+                } else {
+                    self.tr("设置已应用", "Settings applied").to_string()
+                };
             }
             HitAction::OpenFolderDialog => {
                 self.request_open_folder_dialog_with_mode(FolderPickMode::AskUser);
@@ -5457,7 +7675,7 @@ impl IdeApplicationState {
             }
             HitAction::ConfirmOpenPendingInThisWindow => {
                 if let Some(p) = self.pending_open_workspace.take() {
-                    self.switch_workspace(p);
+                    self.request_switch_workspace(p);
                 }
                 self.focus = FocusTarget::Editor;
             }
@@ -5467,17 +7685,43 @@ impl IdeApplicationState {
                 }
                 self.focus = FocusTarget::Editor;
             }
+            HitAction::OpenMobileSdkSettings => {
+                self.settings_page = SettingsPage::MobileSdk;
+                self.execute_ide_action(IdeAction::OpenSettingsModal);
+            }
+            HitAction::FocusMobileSdkPath(slot) => {
+                let slot = slot.min(2);
+                self.settings_page = SettingsPage::MobileSdk;
+                if self.focus != FocusTarget::SettingsModal {
+                    self.execute_ide_action(IdeAction::OpenSettingsModal);
+                }
+                self.settings_sdk_focus = Some(slot);
+                let start_x = self.mobile_sdk_field_rects[slot as usize].x + 8;
+                let field = self.mobile_sdk_input_mut(slot);
+                let idx = field.hit_test_singleline(canvas, x, start_x, FontStyle::UiRegular);
+                field.set_cursor_at(idx, shift);
+                self.mouse_drag_target = Some(FocusTarget::SettingsModal);
+                self.touch_caret_activity();
+            }
+            HitAction::BrowseMobileSdkDir(slot) => {
+                self.commit_mobile_sdk_locations_from_inputs();
+                self.request_open_folder_dialog_with_mode(FolderPickMode::MobileSdk(slot.min(2)));
+            }
             HitAction::CloseModalOrPopup => {
+                if self.focus == FocusTarget::SettingsModal {
+                    self.commit_mobile_sdk_locations_from_inputs();
+                }
                 self.pending_open_workspace = None;
                 self.active_image_preview = None;
                 self.prev_focus_before_image_preview = None;
                 self.focus = FocusTarget::Editor;
-                self.active_menu_category = None;
+                self.close_top_menu();
                 self.git_branch_popup_open = false;
                 self.agent_provider_popup_open = false;
                 self.agent_model_popup_open = false;
                 self.agent_sessions_popup_open = false;
                 self.run_config_popup_open = false;
+        self.run_config_popup_scroll = 0;
                 self.project_popup_open = false;
                 self.more_menu_popup_open = false;
                 self.context_menu = None;
@@ -5486,12 +7730,13 @@ impl IdeApplicationState {
     }
 
     pub fn open_context_menu_at(&mut self, x: i32, y: i32, canvas: &SurfaceCanvas) {
-        self.active_menu_category = None;
+        self.close_top_menu();
         self.git_branch_popup_open = false;
         self.agent_provider_popup_open = false;
         self.agent_model_popup_open = false;
         self.agent_sessions_popup_open = false;
         self.run_config_popup_open = false;
+        self.run_config_popup_scroll = 0;
         self.project_popup_open = false;
         self.more_menu_popup_open = false;
 
@@ -5526,6 +7771,22 @@ impl IdeApplicationState {
             ];
             if let Some(buf) = self.open_buffers.get(tab_idx) {
                 let p = buf.path.clone();
+                if RunConfiguration::for_file(&p, &self.workspace_root).is_some() {
+                    let fname = p
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("file");
+                    let label = match self.ui_lang {
+                        UiLanguage::ZhCn => format!("运行 '{fname}'"),
+                        UiLanguage::EnUs => format!("Run '{fname}'"),
+                    };
+                    items.push(item(
+                        &label,
+                        "Ctrl+Shift+F10",
+                        ContextMenuAction::RunFile(p.clone()),
+                        true,
+                    ));
+                }
                 items.push(item(
                     self.tr("在资源管理器中显示", "Reveal in Explorer"),
                     "",
@@ -5560,6 +7821,22 @@ impl IdeApplicationState {
                         ContextMenuAction::TreeOpenFile(path.clone()),
                         false,
                     ));
+                    if RunConfiguration::for_file(&path, &self.workspace_root).is_some() {
+                        let fname = path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("file");
+                        let label = match self.ui_lang {
+                            UiLanguage::ZhCn => format!("运行 '{fname}'"),
+                            UiLanguage::EnUs => format!("Run '{fname}'"),
+                        };
+                        items.push(item(
+                            &label,
+                            "Ctrl+Shift+F10",
+                            ContextMenuAction::RunFile(path.clone()),
+                            false,
+                        ));
+                    }
                 }
                 items.push(item(
                     self.tr("新建文件...", "New File..."),
@@ -5814,6 +8091,18 @@ impl IdeApplicationState {
                     ContextMenuAction::TermNewTab,
                     true,
                 ),
+                item(
+                    self.tr("将上一条命令加入运行列表", "Add Last Command to Run List"),
+                    "",
+                    ContextMenuAction::TermAddLastCommandToRunList,
+                    true,
+                ),
+                item(
+                    self.tr("添加运行命令...", "Add Run Command..."),
+                    "",
+                    ContextMenuAction::OpenNewRunConfigModal,
+                    false,
+                ),
             ];
             self.context_menu = Some(ContextMenuState { x, y, items });
             return;
@@ -5846,14 +8135,31 @@ impl IdeApplicationState {
             self.focus,
             FocusTarget::NewFileModal
                 | FocusTarget::NewFolderModal
+                | FocusTarget::NewRunConfigModal
                 | FocusTarget::NewGitBranchModal
+                | FocusTarget::NewGitTagModal
+                | FocusTarget::NewGitStashModal
+                | FocusTarget::GitAddRemoteModal
                 | FocusTarget::RenamePathModal
         ) && self.prompt_modal_input_rect.contains(x, y)
         {
             Some(self.focus)
         } else if self.focus == FocusTarget::SettingsModal
-            && self.settings_search_rect.contains(x, y)
+            && (self.settings_search_rect.contains(x, y)
+                || self
+                    .mobile_sdk_field_rects
+                    .iter()
+                    .any(|r| r.w > 0 && r.contains(x, y)))
         {
+            if let Some(slot) = (0..3u8).find(|slot| {
+                self.mobile_sdk_field_rects
+                    .get(*slot as usize)
+                    .is_some_and(|r| r.w > 0 && r.contains(x, y))
+            }) {
+                self.settings_sdk_focus = Some(slot);
+            } else {
+                self.settings_sdk_focus = None;
+            }
             Some(FocusTarget::SettingsModal)
         } else {
             None
@@ -5901,7 +8207,7 @@ impl IdeApplicationState {
                 }
             }
             self.touch_caret_activity();
-            let items = vec![
+            let mut items = vec![
                 item(
                     self.tr("剪切", "Cut"),
                     "Ctrl+X",
@@ -5950,19 +8256,24 @@ impl IdeApplicationState {
                     ContextMenuAction::Ide(IdeAction::ReformatCode),
                     false,
                 ),
-                item(
-                    self.tr("AI 行内改写", "Inline AI Edit"),
-                    "Ctrl+K",
-                    ContextMenuAction::Ide(IdeAction::InlineAiEdit),
-                    true,
-                ),
-                item(
-                    self.tr("发送代码至 AI", "Send to AI Assistant"),
-                    "Alt+L",
-                    ContextMenuAction::Ide(IdeAction::SendSelectionToAgent),
-                    false,
-                ),
             ];
+            let active_path = self.active_buffer().path.clone();
+            if RunConfiguration::for_file(&active_path, &self.workspace_root).is_some() {
+                let fname = active_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("file");
+                let run_lbl = match self.ui_lang {
+                    UiLanguage::ZhCn => format!("运行 '{fname}'"),
+                    UiLanguage::EnUs => format!("Run '{fname}'"),
+                };
+                items.push(item(
+                    &run_lbl,
+                    "Ctrl+Shift+F10",
+                    ContextMenuAction::RunFile(active_path),
+                    true,
+                ));
+            }
             self.context_menu = Some(ContextMenuState { x, y, items });
             return;
         }
@@ -6109,6 +8420,9 @@ impl IdeApplicationState {
                     .tr("已折叠全部项目目录", "Collapsed all project folders")
                     .to_string();
             }
+            ContextMenuAction::RunFile(path) => {
+                self.run_file_in_terminal(&path);
+            }
             ContextMenuAction::TabClose(idx) => self.close_tab(idx),
             ContextMenuAction::TabCloseOthers(keep_idx) => {
                 if self.open_buffers.len() > 1 && keep_idx < self.open_buffers.len() {
@@ -6150,30 +8464,42 @@ impl IdeApplicationState {
                 self.bottom_tool = Some(ToolWindowId::Terminal);
                 self.focus = FocusTarget::TerminalInput;
             }
+            ContextMenuAction::TermAddLastCommandToRunList => {
+                let last_cmd = self.terminal.active_pty().history.last().cloned();
+                if let Some(cmd) = last_cmd {
+                    let cwd = self.terminal.active_pty().cwd.clone();
+                    if let Some(cfg) = RunConfiguration::from_command_line_explicit(&cmd, &cwd) {
+                        let name = cfg.name.clone();
+                        self.upsert_run_configuration_internal(cfg, true, true);
+                        self.status_notification = format!(
+                            "{}: {}",
+                            self.tr("已将命令加入运行列表", "Added command to Run list"),
+                            name
+                        );
+                    }
+                } else {
+                    self.open_new_run_config_modal(None);
+                }
+            }
+            ContextMenuAction::OpenNewRunConfigModal => {
+                let last_cmd = self.terminal.active_pty().history.last().cloned();
+                self.open_new_run_config_modal(last_cmd.as_deref());
+            }
             ContextMenuAction::GitToggleCommitCheck(path) => {
                 let checked = self.git_engine.toggle_commit_file_checked(&path);
                 self.selected_git_working_file = Some(path.clone());
-                let fname = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("file");
+                let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
                 self.status_notification = if checked {
                     format!(
                         "{}: {fname}",
                         self.tr("已勾选纳入提交", "Included in commit")
                     )
                 } else {
-                    format!(
-                        "{}: {fname}",
-                        self.tr("已取消勾选", "Excluded from commit")
-                    )
+                    format!("{}: {fname}", self.tr("已取消勾选", "Excluded from commit"))
                 };
             }
             ContextMenuAction::GitShowWorkingDiff(path) => {
-                self.git_working_diff_target = Some(path.clone());
-                self.git_diff_scroll = 0;
-                self.bottom_tool = Some(ToolWindowId::GitLog);
-                self.open_file(path);
+                self.open_git_working_diff_in_editor(&path);
             }
             ContextMenuAction::GitRollbackFile(path) => {
                 self.git_engine.request_rollback_file(&path);
@@ -6358,69 +8684,77 @@ impl IdeApplicationState {
             Rect::new(w - right_stripe_w, body_y, right_stripe_w, body_h),
         );
 
-        let left_w = if self.left_tool.is_some() {
+        self.clamp_dock_spans(w, h);
+        let left_w = if self.pane_is_open(self.dock_left) {
             self.left_panel_width
         } else {
             0
         };
-        let right_w = if self.right_agent_open {
+        let right_w = if self.pane_is_open(self.dock_right) {
             self.right_panel_width
         } else {
             0
         };
-        let bottom_h = if self.bottom_tool.is_some() {
+        let bottom_h = if self.pane_is_open(self.dock_bottom) {
             self.bottom_panel_height
         } else {
             0
         };
-        let upper_h = (body_h - bottom_h).max(100);
+        let upper_h = (body_h - bottom_h).max(56);
 
-        // 5. 左侧悬浮岛屿面板 (Project / Commit / Structure)
-        if let Some(tool) = self.left_tool {
-            let island = Rect::new(left_stripe_w + 2, body_y + 2, left_w - 4, upper_h - 4);
-            self.left_pane_rect = island;
-            self.render_left_tool_window(canvas, island, tool);
-        } else {
-            self.left_pane_rect = Rect::new(0, 0, 0, 0);
+        self.left_pane_rect = Rect::new(0, 0, 0, 0);
+        self.right_pane_rect = Rect::new(0, 0, 0, 0);
+        self.bottom_pane_rect = Rect::new(0, 0, 0, 0);
+        if !self.pane_is_open(DockPane::Project) {
             self.left_scroll_info = ScrollTrackInfo::default();
         }
-
-        // 6. 右侧 Multi-Agent 悬浮岛屿面板
-        if self.right_agent_open {
-            let island = Rect::new(
-                w - right_stripe_w - right_w + 2,
-                body_y + 2,
-                right_w - 4,
-                upper_h - 4,
-            );
-            self.right_pane_rect = island;
-            self.render_right_agent_hub(canvas, island);
-        } else {
-            self.right_pane_rect = Rect::new(0, 0, 0, 0);
+        if !self.pane_is_open(DockPane::Agent) {
             self.right_scroll_info = ScrollTrackInfo::default();
         }
+        if !self.pane_is_open(DockPane::Tooling) {
+            self.terminal_scroll_info = ScrollTrackInfo::default();
+        }
+
+        let left_island = if left_w > 8 {
+            Rect::new(
+                left_stripe_w + 2,
+                body_y + 2,
+                (left_w - 4).max(8),
+                (upper_h - 4).max(8),
+            )
+        } else {
+            Rect::new(0, 0, 0, 0)
+        };
+        let right_island = if right_w > 8 {
+            Rect::new(
+                w - right_stripe_w - right_w + 2,
+                body_y + 2,
+                (right_w - 4).max(8),
+                (upper_h - 4).max(8),
+            )
+        } else {
+            Rect::new(0, 0, 0, 0)
+        };
+        let bottom_island = if bottom_h > 8 {
+            Rect::new(
+                left_stripe_w + 2,
+                body_y + upper_h + 2,
+                (w - left_stripe_w - right_stripe_w - 4).max(8),
+                (bottom_h - 4).max(8),
+            )
+        } else {
+            Rect::new(0, 0, 0, 0)
+        };
+        self.place_dock_pane(canvas, self.dock_left, left_island);
+        self.place_dock_pane(canvas, self.dock_right, right_island);
+        self.place_dock_pane(canvas, self.dock_bottom, bottom_island);
 
         // 7. 中央代码编辑器区域
         let editor_x = left_stripe_w + left_w + 2;
-        let editor_w = (w - left_stripe_w - right_stripe_w - left_w - right_w - 4).max(220);
-        let editor_rect = Rect::new(editor_x, body_y + 2, editor_w, upper_h - 4);
+        let editor_w = (w - left_stripe_w - right_stripe_w - left_w - right_w - 4).max(64);
+        let editor_rect = Rect::new(editor_x, body_y + 2, editor_w, (upper_h - 4).max(48));
         self.editor_pane_rect = editor_rect;
         self.render_center_editor(canvas, editor_rect);
-
-        // 8. 底部悬浮岛屿面板 (Terminal / Problems / Debug / Git Log)
-        if let Some(btool) = self.bottom_tool {
-            let bottom_island = Rect::new(
-                left_stripe_w + 2,
-                body_y + upper_h + 2,
-                w - left_stripe_w - right_stripe_w - 4,
-                bottom_h - 4,
-            );
-            self.bottom_pane_rect = bottom_island;
-            self.render_bottom_tool_window(canvas, bottom_island, btool);
-        } else {
-            self.bottom_pane_rect = Rect::new(0, 0, 0, 0);
-            self.terminal_scroll_info = ScrollTrackInfo::default();
-        }
 
         // 8.5 分割线悬浮/拖拽视觉反馈线
         let active_split = self.active_splitter_drag.or_else(|| {
@@ -6449,6 +8783,41 @@ impl IdeApplicationState {
                         t.accent_blue,
                     );
                 }
+            }
+        }
+
+        if self.active_dock_drag.is_some() {
+            if let Some(edge) = self.dock_drop_edge {
+                let mark = match edge {
+                    DockEdge::Left => {
+                        Rect::new(left_stripe_w + 2, body_y + 6, 4, (upper_h - 12).max(8))
+                    }
+                    DockEdge::Right => Rect::new(
+                        w - right_stripe_w - 6,
+                        body_y + 6,
+                        4,
+                        (upper_h - 12).max(8),
+                    ),
+                    DockEdge::Bottom => Rect::new(
+                        left_stripe_w + 8,
+                        (body_y + body_h - 8).max(body_y),
+                        (w - left_stripe_w - right_stripe_w - 16).max(8),
+                        4,
+                    ),
+                };
+                canvas.fill_rect(mark, t.accent_blue);
+            }
+            if let Some(pane) = self.active_dock_drag {
+                let (mx, my) = self.dock_drag_pos;
+                let card = Rect::new((mx + 14).min(w - 180), (my + 16).min(h - 48), 164, 32);
+                canvas.fill_rounded_rect_alpha(card, 8, t.popup_bg, 232);
+                canvas.stroke_rounded_rect(card, 8, t.accent_blue, t.popup_bg);
+                canvas.draw_text_centered(
+                    card,
+                    pane.title(self.ui_lang == UiLanguage::ZhCn),
+                    t.text_primary,
+                    FontStyle::UiBold,
+                );
             }
         }
 
@@ -6487,9 +8856,7 @@ impl IdeApplicationState {
 
         // 9. 顶层弹出菜单与模态对话框
         self.overlay_hit_start = self.hit_regions.len();
-        if self.hamburger_menu_expanded {
-            self.render_expanded_menu_strip(canvas);
-        }
+        self.menu_dropdown_rect = Rect::new(0, 0, 0, 0);
         if let Some(cat) = self.active_menu_category {
             self.render_main_menu_dropdown(canvas, cat);
         }
@@ -6501,6 +8868,9 @@ impl IdeApplicationState {
         }
         if self.run_config_popup_open {
             self.render_run_config_popup(canvas, w);
+        }
+        if self.mobile_popup_open {
+            self.render_mobile_env_popup(canvas, w);
         }
         if self.more_menu_popup_open {
             self.render_more_menu_popup(canvas, w);
@@ -6526,9 +8896,21 @@ impl IdeApplicationState {
             }
             FocusTarget::NewFileModal
             | FocusTarget::NewFolderModal
+            | FocusTarget::NewRunConfigModal
             | FocusTarget::NewGitBranchModal
+            | FocusTarget::NewGitTagModal
+            | FocusTarget::NewGitStashModal
+            | FocusTarget::GitAddRemoteModal
             | FocusTarget::RenamePathModal => {
                 self.render_input_prompt_modal(canvas, w, h);
+            }
+            FocusTarget::GitMergeModal
+            | FocusTarget::GitRebaseModal
+            | FocusTarget::GitUnstashModal
+            | FocusTarget::GitResetModal
+            | FocusTarget::GitRollbackModal
+            | FocusTarget::GitRemotesModal => {
+                self.render_git_operation_modal(canvas, w, h);
             }
             FocusTarget::SettingsModal => {
                 self.render_settings_modal(canvas, w, h);
@@ -6555,6 +8937,30 @@ impl IdeApplicationState {
         if !self.window_maximized {
             canvas.stroke_rect_border(Rect::new(0, 0, w, h), t.border_color);
         }
+        self.render_window_attention_flash(canvas, w, h);
+    }
+
+    fn render_window_attention_flash(&self, canvas: &mut SurfaceCanvas, w: i32, h: i32) {
+        let Some(until) = self.window_attention_until else {
+            return;
+        };
+        let now = Instant::now();
+        if now >= until {
+            return;
+        }
+        let total = 0.98_f32;
+        let left = until.duration_since(now).as_secs_f32();
+        let elapsed = (total - left).clamp(0.0, total);
+        let on = ((elapsed / total) * 6.0) as i32 % 2 == 0;
+        if !on {
+            return;
+        }
+        let color = self.theme.accent_blue;
+        let thickness = 4;
+        canvas.fill_rect_alpha(Rect::new(0, 0, w, thickness), color, 220);
+        canvas.fill_rect_alpha(Rect::new(0, h - thickness, w, thickness), color, 220);
+        canvas.fill_rect_alpha(Rect::new(0, 0, thickness, h), color, 220);
+        canvas.fill_rect_alpha(Rect::new(w - thickness, 0, thickness, h), color, 220);
     }
 
     fn render_main_toolbar(&mut self, canvas: &mut SurfaceCanvas, rect: Rect) {
@@ -6582,64 +8988,110 @@ impl IdeApplicationState {
         self.hit_regions
             .push((ham_btn, HitAction::ToggleHamburgerMenu));
 
-        // 2. [WS] 动态工作区徽标 + 项目名 ▾
-        let ws_badge = self.workspace_badge();
-        let ws_name = self.workspace_name();
-        let (ws_tw, _) = canvas.measure_text(&ws_name, FontStyle::UiBold);
-        let proj_w = (ws_tw + 52).clamp(118, 220);
-        let mut cur_x = 68;
-        let proj_box = Rect::new(cur_x, 5, proj_w, 28);
-        if self.project_popup_open || proj_box.contains(hx, hy) {
-            canvas.fill_rounded_rect(proj_box, 6, t.panel_bg);
-        }
-        let badge_rect = Rect::new(cur_x + 4, 9, 20, 20);
-        canvas.fill_rounded_rect(badge_rect, 4, 0xCF6A33);
-        canvas.draw_text_centered(badge_rect, &ws_badge, 0xFFFFFF, FontStyle::UiSmall);
-        canvas.draw_text_styled(
-            cur_x + 30,
-            10,
-            &ws_name,
-            t.text_primary,
-            proj_w - 50,
-            FontStyle::UiBold,
-        );
-        canvas.draw_chevron_down(cur_x + proj_w - 16, 17, t.text_muted);
-        self.hit_regions
-            .push((proj_box, HitAction::ToggleProjectPopup));
-        cur_x += proj_w + 6;
-
-        // 3. Git 分支 Widget: ⎇ master ▾ (+ 柔和加载旋转弧)
-        let branch_name = self.git_engine.current_branch.clone();
-        let (btw, _) = canvas.measure_text(&branch_name, FontStyle::UiRegular);
-        let git_extra = if self.git_load_alpha > 0.02 { 16 } else { 0 };
-        let git_w = (btw + 44 + git_extra).clamp(84, 170);
-        let git_box = Rect::new(cur_x, 5, git_w, 28);
-        if self.git_branch_popup_open || git_box.contains(hx, hy) {
-            canvas.fill_rounded_rect(git_box, 6, t.panel_bg);
-        }
-        canvas.draw_git_branch_icon(cur_x + 8, 12, t.text_secondary);
-        canvas.draw_text_styled(
-            cur_x + 24,
-            10,
-            &branch_name,
-            t.text_primary,
-            git_w - 40 - git_extra,
-            FontStyle::UiRegular,
-        );
-        if self.git_load_alpha > 0.02 {
-            canvas.draw_subtle_spinner(
-                cur_x + git_w - 25,
-                19,
-                4.5,
-                self.spinner_phase(),
-                t.accent_blue,
-                t.border_color,
-                self.git_load_alpha,
+        // 2. 顶部主工具栏左侧内容：
+        // 展开主菜单时隐藏项目名称和 Git 分支，直接在顶部工具栏原位展示主菜单栏
+        self.menu_category_rects.clear();
+        let right_controls_total = 148 + 148; // 5 个动作图标 + 窗口控制区
+        let left_content_end_x = if self.hamburger_menu_expanded {
+            let lang = self.ui_lang;
+            let menu_right_limit = (rect.w - right_controls_total - 8).max(68);
+            let mut mx = 68;
+            for &cat in MainMenuCategory::all() {
+                let label = cat.label_i18n(lang);
+                let (tw, _) = canvas.measure_text(label, FontStyle::UiRegular);
+                let item_w = tw + 18;
+                if mx + item_w > menu_right_limit && mx > 68 {
+                    break;
+                }
+                let item_rect = Rect::new(mx, 6, item_w, 26);
+                let active = self.active_menu_category == Some(cat);
+                let hovered = item_rect.contains(hx, hy);
+                if active || hovered {
+                    canvas.fill_rounded_rect(
+                        item_rect,
+                        5,
+                        if active { t.popup_hover_bg } else { t.panel_bg },
+                    );
+                }
+                canvas.draw_text_centered(
+                    item_rect,
+                    label,
+                    if active { 0xFFFFFF } else { t.text_primary },
+                    if active {
+                        FontStyle::UiBold
+                    } else {
+                        FontStyle::UiRegular
+                    },
+                );
+                self.menu_category_rects.push((cat, item_rect));
+                self.hit_regions
+                    .push((item_rect, HitAction::OpenMenuCategory(cat)));
+                mx += item_w + 2;
+            }
+            self.menu_trigger_and_bar_rect = Rect::new(8, 0, (mx - 8 + 8).max(60), 42);
+            mx
+        } else {
+            self.menu_trigger_and_bar_rect = Rect::new(0, 0, 0, 0);
+            // [WS] 动态工作区徽标 + 项目名 ▾
+            let ws_badge = self.workspace_badge();
+            let ws_name = self.workspace_name();
+            let (ws_tw, _) = canvas.measure_text(&ws_name, FontStyle::UiBold);
+            let proj_w = (ws_tw + 52).clamp(118, 220);
+            let mut cur_x = 68;
+            let proj_box = Rect::new(cur_x, 5, proj_w, 28);
+            if self.project_popup_open || proj_box.contains(hx, hy) {
+                canvas.fill_rounded_rect(proj_box, 6, t.panel_bg);
+            }
+            let badge_rect = Rect::new(cur_x + 4, 9, 20, 20);
+            canvas.fill_rounded_rect(badge_rect, 4, 0xCF6A33);
+            canvas.draw_text_centered(badge_rect, &ws_badge, 0xFFFFFF, FontStyle::UiSmall);
+            canvas.draw_text_styled(
+                cur_x + 30,
+                10,
+                &ws_name,
+                t.text_primary,
+                proj_w - 50,
+                FontStyle::UiBold,
             );
-        }
-        canvas.draw_chevron_down(cur_x + git_w - 15, 17, t.text_muted);
-        self.hit_regions
-            .push((git_box, HitAction::ToggleGitBranchPopup));
+            canvas.draw_chevron_down(cur_x + proj_w - 16, 17, t.text_muted);
+            self.hit_regions
+                .push((proj_box, HitAction::ToggleProjectPopup));
+            cur_x += proj_w + 6;
+
+            // 3. Git 分支 Widget: ⎇ master ▾ (+ 柔和加载旋转弧)
+            let branch_name = self.git_engine.current_branch.clone();
+            let (btw, _) = canvas.measure_text(&branch_name, FontStyle::UiRegular);
+            let git_extra = if self.git_load_alpha > 0.02 { 16 } else { 0 };
+            let git_w = (btw + 44 + git_extra).clamp(84, 170);
+            let git_box = Rect::new(cur_x, 5, git_w, 28);
+            if self.git_branch_popup_open || git_box.contains(hx, hy) {
+                canvas.fill_rounded_rect(git_box, 6, t.panel_bg);
+            }
+            canvas.draw_git_branch_icon(cur_x + 8, 12, t.text_secondary);
+            canvas.draw_text_styled(
+                cur_x + 24,
+                10,
+                &branch_name,
+                t.text_primary,
+                git_w - 40 - git_extra,
+                FontStyle::UiRegular,
+            );
+            if self.git_load_alpha > 0.02 {
+                canvas.draw_subtle_spinner(
+                    cur_x + git_w - 25,
+                    19,
+                    4.5,
+                    self.spinner_phase(),
+                    t.accent_blue,
+                    t.border_color,
+                    self.git_load_alpha,
+                );
+            }
+            canvas.draw_chevron_down(cur_x + git_w - 15, 17, t.text_muted);
+            self.hit_regions
+                .push((git_box, HitAction::ToggleGitBranchPopup));
+            cur_x + git_w
+        };
 
         // 4. 最右侧：自定义无边框窗口控制按钮 [—] [□/❐] [×] (预留 138px)
         let cap_w = 46;
@@ -6648,7 +9100,11 @@ impl IdeApplicationState {
         let max_rect = Rect::new(rect.w - cap_w * 2, 0, cap_w, cap_h);
         let close_rect = Rect::new(rect.w - cap_w, 0, cap_w, cap_h);
 
-        if min_rect.contains(hx, hy) {
+        let min_hot = min_rect.contains(hx, hy);
+        let min_pressed = self.armed_window_control == Some(WindowControlCmd::Minimize) && min_hot;
+        if min_pressed {
+            canvas.fill_rect(min_rect, blend_rgb(t.panel_bg, 0x000000, 0.28));
+        } else if min_hot {
             canvas.fill_rect(min_rect, t.panel_bg);
         }
         canvas.draw_window_minimize_icon(
@@ -6661,7 +9117,12 @@ impl IdeApplicationState {
             HitAction::WindowControl(WindowControlCmd::Minimize),
         ));
 
-        if max_rect.contains(hx, hy) {
+        let max_hot = max_rect.contains(hx, hy);
+        let max_pressed =
+            self.armed_window_control == Some(WindowControlCmd::ToggleMaximize) && max_hot;
+        if max_pressed {
+            canvas.fill_rect(max_rect, blend_rgb(t.panel_bg, 0x000000, 0.28));
+        } else if max_hot {
             canvas.fill_rect(max_rect, t.panel_bg);
         }
         if self.window_maximized {
@@ -6683,8 +9144,9 @@ impl IdeApplicationState {
         ));
 
         let close_hovered = close_rect.contains(hx, hy);
+        let close_pressed = self.armed_window_control == Some(WindowControlCmd::Close) && close_hovered;
         if close_hovered {
-            canvas.fill_rect(close_rect, 0xC42B1C);
+            canvas.fill_rect(close_rect, if close_pressed { 0xA32016 } else { 0xC42B1C });
         }
         canvas.draw_window_close_icon(
             close_rect.x + cap_w / 2,
@@ -6700,7 +9162,7 @@ impl IdeApplicationState {
             HitAction::WindowControl(WindowControlCmd::Close),
         ));
 
-        // 5. IDEA 运行工具区：[运行配置 ▾] [▷] [🐞] [⋮] [🔍] [⚙]（紧邻窗口控制按钮左侧）
+        // 5. IDEA 运行工具区：[📱 移动设备/SDK ▾] [运行配置 ▾] [▷] [🐞] [⋮] [🔍] [⚙]（紧邻窗口控制按钮左侧）
         let cfg_fallback = self.tr("当前文件", "Current File");
         let cfg_name = self
             .run_configs
@@ -6708,41 +9170,118 @@ impl IdeApplicationState {
             .map(|c| c.name.as_str())
             .unwrap_or(cfg_fallback);
         let (ctw, _) = canvas.measure_text(cfg_name, FontStyle::UiRegular);
-        let cfg_w = (ctw + 52).clamp(118, 240);
-        let right_controls_total = 148 + 148; // 5 个动作图标 + 窗口控制区
-        let cfg_x = (rect.w - right_controls_total - cfg_w - 8).max(cur_x + git_w + 18);
+        let cfg_w = (ctw + 52).clamp(118, 232);
+        let right_actions_start_x = rect.w - right_controls_total;
+        let cfg_x = (right_actions_start_x - cfg_w - 8).max(left_content_end_x + 12);
 
-        let cfg_box = Rect::new(cfg_x, 5, cfg_w, 28);
-        canvas.fill_rounded_rect(
-            cfg_box,
-            6,
-            if self.run_config_popup_open || cfg_box.contains(hx, hy) {
-                t.popup_hover_bg
+        if self.mobile_env.project_kind.is_mobile() || self.mobile_popup_open {
+            let missing_cnt = if !self.mobile_env.sdk_tools.is_empty() {
+                self.mobile_env.missing_required_tools().len()
             } else {
-                t.panel_bg
-            },
-        );
-        canvas.draw_file_type_icon(cfg_x + 8, 12, self.active_buffer().language);
-        canvas.draw_text_styled(
-            cfg_x + 26,
-            10,
-            cfg_name,
-            t.text_primary,
-            cfg_w - 42,
-            FontStyle::UiRegular,
-        );
-        canvas.draw_chevron_down(cfg_x + cfg_w - 15, 17, t.text_muted);
-        self.hit_regions
-            .push((cfg_box, HitAction::ToggleRunConfigPopup));
+                0
+            };
+            let online_dev = self.selected_or_first_online_device().cloned();
+            let (mob_label, status_dot_color): (String, u32) = if self.mobile_env.probing {
+                (
+                    self.tr("检测设备中...", "Probing SDK...").to_string(),
+                    t.accent_blue,
+                )
+            } else if missing_cnt > 0 {
+                (
+                    match self.ui_lang {
+                        UiLanguage::ZhCn => format!("缺少 {missing_cnt} 项SDK"),
+                        UiLanguage::EnUs => format!("{missing_cnt} SDK missing"),
+                    },
+                    t.breakpoint_red,
+                )
+            } else if let Some(dev) = &online_dev {
+                (dev.name.clone(), t.run_green)
+            } else {
+                (
+                    self.tr("未连接设备", "No Device").to_string(),
+                    t.text_muted,
+                )
+            };
+            let (mtw, _) = canvas.measure_text(&mob_label, FontStyle::UiSmall);
+            let mob_w = (mtw + 48).clamp(112, 176);
+            let mob_x = cfg_x - mob_w - 6;
+            if mob_x >= left_content_end_x + 8 {
+                let mob_box = Rect::new(mob_x, 5, mob_w, 28);
+                canvas.fill_rounded_rect(
+                    mob_box,
+                    6,
+                    if self.mobile_popup_open || mob_box.contains(hx, hy) {
+                        t.popup_hover_bg
+                    } else {
+                        t.panel_bg
+                    },
+                );
+                canvas.draw_mobile_phone_icon(mob_x + 7, 12, status_dot_color);
+                canvas.fill_circle(mob_x + 19, 23, 3, status_dot_color);
+                canvas.draw_text_styled(
+                    mob_x + 25,
+                    11,
+                    &mob_label,
+                    if missing_cnt > 0 {
+                        0xF78166
+                    } else {
+                        t.text_primary
+                    },
+                    mob_w - 40,
+                    FontStyle::UiSmall,
+                );
+                canvas.draw_chevron_down(mob_x + mob_w - 14, 17, t.text_muted);
+                self.hit_regions
+                    .push((mob_box, HitAction::ToggleMobilePopup));
+            }
+        }
 
-        let mut ix = cfg_x + cfg_w + 8;
+        let active_running = self.active_run_config_is_running();
+        if cfg_x + cfg_w + 8 <= right_actions_start_x {
+            let cfg_box = Rect::new(cfg_x, 5, cfg_w, 28);
+            canvas.fill_rounded_rect(
+                cfg_box,
+                6,
+                if self.run_config_popup_open || cfg_box.contains(hx, hy) {
+                    t.popup_hover_bg
+                } else {
+                    t.panel_bg
+                },
+            );
+            if let Some(cfg) = self.run_configs.get(self.active_run_config) {
+                canvas.draw_run_config_icon(cfg_x + 8, 12, cfg);
+            } else {
+                let icon_path = self.active_buffer().path.clone();
+                canvas.draw_path_file_icon(cfg_x + 8, 12, &icon_path);
+            }
+            if active_running {
+                canvas.fill_circle(cfg_x + 21, 24, 3, t.run_green);
+            }
+            canvas.draw_text_styled(
+                cfg_x + 26,
+                10,
+                cfg_name,
+                t.text_primary,
+                cfg_w - 42,
+                FontStyle::UiRegular,
+            );
+            canvas.draw_chevron_down(cfg_x + cfg_w - 15, 17, t.text_muted);
+            self.hit_regions
+                .push((cfg_box, HitAction::ToggleRunConfigPopup));
+        }
 
-        // 空心绿色运行三角 ▷ (Shift+F10)
+        let mut ix = right_actions_start_x;
+
+        // 绑定当前选中配置：空闲显示绿色运行三角 ▷，当前配置运行中变为暂停/停止 ❚❚ (Shift+F10)
         let run_btn = Rect::new(ix, 6, 26, 26);
         if run_btn.contains(hx, hy) {
             canvas.fill_rounded_rect(run_btn, 5, t.panel_bg);
         }
-        canvas.stroke_play_triangle(ix + 7, 13, 12, t.run_green);
+        if active_running {
+            canvas.draw_pause_icon(ix + 7, 13, 12, t.breakpoint_red);
+        } else {
+            canvas.stroke_play_triangle(ix + 7, 13, 12, t.run_green);
+        }
         self.hit_regions.push((run_btn, HitAction::RunActiveConfig));
         ix += 28;
 
@@ -6791,60 +9330,6 @@ impl IdeApplicationState {
         canvas.fill_rect(Rect::new(min_rect.x - 4, 9, 1, 20), t.border_color);
     }
 
-    fn render_expanded_menu_strip(&mut self, canvas: &mut SurfaceCanvas) {
-        let t = self.theme;
-        let (hx, hy) = self.hover_pos;
-        let lang = self.ui_lang;
-        self.menu_category_rects.clear();
-
-        let mut item_widths = Vec::with_capacity(MainMenuCategory::all().len());
-        let mut total_w = 16;
-        for &cat in MainMenuCategory::all() {
-            let label = cat.label_i18n(lang);
-            let (tw, _) = canvas.measure_text(label, FontStyle::UiRegular);
-            let iw = tw + 20;
-            item_widths.push((cat, label, iw));
-            total_w += iw + 2;
-        }
-
-        let bar = Rect::new(10, 40, total_w, 32);
-        self.active_overlay_rects.push(bar);
-        canvas.fill_rounded_shadow(bar, 6);
-        canvas.stroke_rounded_rect(bar, 6, t.border_color, t.popup_bg);
-
-        let mut cx = bar.x + 8;
-        for (cat, label, item_w) in item_widths {
-            let item_rect = Rect::new(cx, bar.y + 3, item_w, 26);
-            let active = self.active_menu_category == Some(cat);
-            let hovered = item_rect.contains(hx, hy);
-            if active || hovered {
-                canvas.fill_rounded_rect(
-                    item_rect,
-                    5,
-                    if active {
-                        t.popup_hover_bg
-                    } else {
-                        t.panel_header_bg
-                    },
-                );
-            }
-            canvas.draw_text_centered(
-                item_rect,
-                label,
-                if active { 0xFFFFFF } else { t.text_primary },
-                if active {
-                    FontStyle::UiBold
-                } else {
-                    FontStyle::UiRegular
-                },
-            );
-            self.menu_category_rects.push((cat, item_rect));
-            self.hit_regions
-                .push((item_rect, HitAction::OpenMenuCategory(cat)));
-            cx += item_w + 2;
-        }
-    }
-
     fn render_left_stripe(&mut self, canvas: &mut SurfaceCanvas, rect: Rect) {
         let t = self.theme;
         let (hx, hy) = self.hover_pos;
@@ -6884,7 +9369,13 @@ impl IdeApplicationState {
                         } else {
                             t.tool_stripe_bg
                         };
-                        canvas.draw_count_badge(btn, chg_cnt, t.accent_blue, 0xFFFFFF, badge_cutout);
+                        canvas.draw_count_badge(
+                            btn,
+                            chg_cnt,
+                            t.accent_blue,
+                            0xFFFFFF,
+                            badge_cutout,
+                        );
                     }
                 }
                 ToolWindowId::Structure => canvas.draw_structure_icon(ix, iy, icon_color),
@@ -7052,6 +9543,7 @@ impl IdeApplicationState {
         let t = self.theme;
         let (hx, hy) = self.hover_pos;
         canvas.stroke_rounded_rect(rect, 8, t.border_color, t.panel_bg);
+        self.arm_pane_header_drag(canvas, rect, DockPane::Project);
 
         let title = match tool {
             ToolWindowId::Project => self.tr("项目", "Project"),
@@ -7061,18 +9553,18 @@ impl IdeApplicationState {
         };
         let (title_w, _) = canvas.measure_text(title, FontStyle::UiBold);
         canvas.draw_text_styled(
-            rect.x + 12,
+            rect.x + 22,
             rect.y + 8,
             title,
             t.text_primary,
             106,
             FontStyle::UiBold,
         );
-        canvas.draw_chevron_down(rect.x + 12 + title_w + 6, rect.y + 14, t.text_muted);
+        canvas.draw_chevron_down(rect.x + 22 + title_w + 6, rect.y + 14, t.text_muted);
 
         if tool == ToolWindowId::Project && self.tree_load_alpha > 0.02 {
             canvas.draw_subtle_spinner(
-                rect.x + 12 + title_w + 25,
+                rect.x + 22 + title_w + 25,
                 rect.y + 16,
                 4.8,
                 self.spinner_phase(),
@@ -7082,7 +9574,7 @@ impl IdeApplicationState {
             );
         } else if tool == ToolWindowId::Commit && self.git_load_alpha > 0.02 {
             canvas.draw_subtle_spinner(
-                rect.x + 12 + title_w + 25,
+                rect.x + 22 + title_w + 25,
                 rect.y + 16,
                 4.8,
                 self.spinner_phase(),
@@ -7096,7 +9588,7 @@ impl IdeApplicationState {
             ToolWindowId::Project => {
                 // 顶部矢量图标工具栏：[打开文件夹] [新建文件] [新建文件夹] [展开全部] [折叠全部]
                 let btn_y = rect.y + 5;
-                let title_end = rect.x + 12 + title_w + 18;
+                let title_end = rect.x + 22 + title_w + 18;
                 let mut bx = (rect.x + rect.w - 144).max(title_end);
 
                 if bx + 140 <= rect.x + rect.w {
@@ -7196,7 +9688,9 @@ impl IdeApplicationState {
 
                 for entry in entries {
                     let row_rect = Rect::new(rect.x + 6, y, rect.w - 18, 22);
-                    let is_active = (!entry.is_dir && self.active_buffer().path == entry.path)
+                    let is_active = (!self.open_buffers.is_empty()
+                        && !entry.is_dir
+                        && self.active_buffer().path == entry.path)
                         || (self.project_tree.selected_path.as_ref() == Some(&entry.path));
                     let row_hovered = !is_active && row_rect.contains(hx, hy);
                     if is_active {
@@ -7215,7 +9709,7 @@ impl IdeApplicationState {
                         canvas.draw_folder_icon(base_x + 12, y + 4, 0xD9A343);
                         base_x + 30
                     } else {
-                        canvas.draw_file_type_icon(base_x + 10, y + 4, entry.language);
+                        canvas.draw_path_file_icon(base_x + 10, y + 4, &entry.path);
                         base_x + 28
                     };
 
@@ -7226,18 +9720,33 @@ impl IdeApplicationState {
                     } else {
                         t.text_secondary
                     };
-                    canvas.draw_text_styled(
-                        text_x,
-                        y + 2,
-                        &entry.name,
-                        color,
-                        rect.x + rect.w - text_x - 14,
-                        if is_active {
-                            FontStyle::UiBold
-                        } else {
-                            FontStyle::UiRegular
-                        },
-                    );
+                    let entry_style = if is_active {
+                        FontStyle::UiBold
+                    } else {
+                        FontStyle::UiRegular
+                    };
+                    let max_name_w = (rect.x + rect.w - text_x - 14).max(20);
+                    if entry.is_dir {
+                        canvas.draw_text_ellipsis(
+                            text_x,
+                            y + 2,
+                            &entry.name,
+                            color,
+                            max_name_w,
+                            entry_style,
+                        );
+                    } else {
+                        let shown_name =
+                            canvas.ellipsize_filename(&entry.name, max_name_w, entry_style);
+                        canvas.draw_text_styled(
+                            text_x,
+                            y + 2,
+                            &shown_name,
+                            color,
+                            max_name_w,
+                            entry_style,
+                        );
+                    }
                     self.project_entry_rects
                         .push((row_rect, entry.path.clone(), entry.is_dir));
                     if entry.is_dir {
@@ -7267,7 +9776,7 @@ impl IdeApplicationState {
             ToolWindowId::Commit => {
                 // 顶部右侧 IDEA Commit 工具栏：[历史库 Log] [↻ 刷新] [⇄ Diff] [↶ 回滚勾选项]
                 let btn_y = rect.y + 5;
-                let title_end = rect.x + 12 + title_w + 18;
+                let title_end = rect.x + 22 + title_w + 18;
                 let rb_all_btn = Rect::new(rect.x + rect.w - 32, btn_y, 24, 22);
                 if rb_all_btn.contains(hx, hy) {
                     canvas.fill_rounded_rect(rb_all_btn, 4, t.popup_hover_bg);
@@ -7606,12 +10115,8 @@ impl IdeApplicationState {
                                     rect.w - 64,
                                     FontStyle::UiBold,
                                 );
-                                let hdr_title_hit = Rect::new(
-                                    rect.x + 45,
-                                    y,
-                                    (rect.w - 60).max(40),
-                                    row_h - 1,
-                                );
+                                let hdr_title_hit =
+                                    Rect::new(rect.x + 45, y, (rect.w - 60).max(40), row_h - 1);
                                 self.hit_regions.push((
                                     hdr_title_hit,
                                     HitAction::ToggleCommitGroupCheck { untracked_group },
@@ -7660,8 +10165,7 @@ impl IdeApplicationState {
                                 }
 
                                 // 2) 文件类型图标 + 文件名 + 相对目录
-                                let lang = ide_core::LanguageId::from_path(&ch.path);
-                                canvas.draw_file_type_icon(rect.x + 34, y + 4, lang);
+                                canvas.draw_path_file_icon(rect.x + 34, y + 4, &ch.path);
 
                                 let fname = ch
                                     .path
@@ -7683,10 +10187,15 @@ impl IdeApplicationState {
                                 };
                                 let right_actions_w = 88;
                                 let text_avail_w = (rect.w - 52 - right_actions_w - 10).max(40);
+                                let fname_shown = canvas.ellipsize_filename(
+                                    fname,
+                                    text_avail_w,
+                                    FontStyle::UiSmall,
+                                );
                                 let next_x = canvas.draw_text_styled(
                                     rect.x + 52,
                                     y + 2,
-                                    fname,
+                                    &fname_shown,
                                     status_color,
                                     text_avail_w,
                                     FontStyle::UiSmall,
@@ -7694,7 +10203,7 @@ impl IdeApplicationState {
                                 if !parent_dir.is_empty()
                                     && next_x + 24 < rect.x + rect.w - right_actions_w
                                 {
-                                    canvas.draw_text_styled(
+                                    canvas.draw_text_ellipsis(
                                         next_x + 6,
                                         y + 2,
                                         &parent_dir,
@@ -7704,16 +10213,22 @@ impl IdeApplicationState {
                                     );
                                 }
 
-                                // 点击复选框或文件名行直接勾选/取消勾选（不直接暂存或提交）
-                                let row_check_rect = Rect::new(
-                                    rect.x + 8,
+                                // 点击左侧复选框区域仅勾选/取消勾选（不直接暂存或提交）；
+                                // 点击文件名区域直接在中央文件窗口打开该文件的 Diff 对比视图
+                                let chk_hit_rect = Rect::new(rect.x + 8, y, 25, row_h - 1);
+                                self.hit_regions.push((
+                                    chk_hit_rect,
+                                    HitAction::ToggleCommitFileCheck(ch.path.clone()),
+                                ));
+                                let name_diff_rect = Rect::new(
+                                    rect.x + 34,
                                     y,
-                                    (rect.w - 16 - right_actions_w).max(50),
+                                    (rect.w - 42 - right_actions_w).max(24),
                                     row_h - 1,
                                 );
                                 self.hit_regions.push((
-                                    row_check_rect,
-                                    HitAction::ToggleCommitFileCheck(ch.path.clone()),
+                                    name_diff_rect,
+                                    HitAction::InspectGitWorkingFileDiff(ch.path.clone()),
                                 ));
 
                                 // 3) 右侧操作区：状态徽章 (M / A / D / U) + Diff + 打开文件 + 回滚
@@ -8025,10 +10540,49 @@ impl IdeApplicationState {
         }
     }
 
+    fn render_editor_welcome(&mut self, canvas: &mut SurfaceCanvas, rect: Rect) {
+        let t = self.theme;
+        self.editor_code_rect = Rect::new(0, 0, 0, 0);
+        self.editor_scroll_info = ScrollTrackInfo::default();
+        self.editor_horiz_scroll_info = ScrollTrackInfo::default();
+
+        let title = self.tr("没有打开的文件", "No files open");
+        let hint = self.tr(
+            "在项目视图中打开，或按两次 Shift 搜索",
+            "Open a file from the Project view, or press Shift twice to search",
+        );
+        let text_w = (rect.w - 32).max(24);
+        let x = rect.x + (rect.w - text_w) / 2;
+        let block_h = if rect.h >= 72 { 40 } else { 20 };
+        let y = rect.y + ((rect.h - block_h) / 2).max(4);
+        canvas.draw_text_centered(
+            Rect::new(x, y, text_w, 20),
+            title,
+            t.text_secondary,
+            FontStyle::UiRegular,
+        );
+        if rect.h >= 72 {
+            canvas.draw_text_centered(
+                Rect::new(x, y + 22, text_w, 16),
+                hint,
+                t.text_muted,
+                FontStyle::UiSmall,
+            );
+        }
+    }
+
     fn render_center_editor(&mut self, canvas: &mut SurfaceCanvas, rect: Rect) {
         let t = self.theme;
         let (hx, hy) = self.hover_pos;
         canvas.stroke_rounded_rect(rect, 8, t.border_color, t.editor_bg);
+
+        if self.open_buffers.is_empty()
+            && self.media_tabs.is_empty()
+            && self.active_editor_diff.is_none()
+        {
+            self.render_editor_welcome(canvas, rect);
+            return;
+        }
 
         // 1. 顶部多文件 Editor Tabs 栏（带文件图标、关闭按钮 `×` 与同名文件自动区分）
         let tab_bar = Rect::new(rect.x + 1, rect.y + 1, rect.w - 2, 34);
@@ -8045,7 +10599,32 @@ impl IdeApplicationState {
             .map(|b| (b.path.clone(), b.dirty, b.language))
             .collect();
 
-        for (idx, (path, dirty, lang)) in open_snapshot.iter().enumerate() {
+        let has_diff_tab = self.active_editor_diff.is_some();
+        let active_media_idx = if has_diff_tab {
+            None
+        } else {
+            self.active_media_tab
+                .filter(|&i| i < self.media_tabs.len())
+        };
+        let tabs_right_limit = if has_diff_tab {
+            rect.x + rect.w - 196
+        } else {
+            rect.x + rect.w - 12
+        };
+
+        struct EditorBarItem {
+            path: PathBuf,
+            label: String,
+            is_active: bool,
+            font_style: FontStyle,
+            tab_w: i32,
+            select_action: HitAction,
+            close_action: Option<HitAction>,
+            buffer_idx: Option<usize>,
+        }
+
+        let mut bar_items: Vec<EditorBarItem> = Vec::with_capacity(open_snapshot.len() + self.media_tabs.len());
+        for (idx, (path, dirty, _lang)) in open_snapshot.iter().enumerate() {
             let fname = path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -8077,48 +10656,107 @@ impl IdeApplicationState {
                 disambiguated
             };
 
-            let is_active = idx == self.active_tab;
+            let is_active = !has_diff_tab && active_media_idx.is_none() && idx == self.active_tab;
             let font_style = if is_active {
                 FontStyle::UiBold
             } else {
                 FontStyle::UiRegular
             };
             let (tw, _) = canvas.measure_text(&label, font_style);
-            let tab_w = (tw + 58).clamp(118, 250);
-            if tab_x + tab_w > rect.x + rect.w - 200 {
+            let tab_w = (tw + 58).clamp(108, 220);
+            bar_items.push(EditorBarItem {
+                path: path.clone(),
+                label,
+                is_active,
+                font_style,
+                tab_w,
+                select_action: HitAction::SelectTab(idx),
+                close_action: Some(HitAction::CloseTab(idx)),
+                buffer_idx: Some(idx),
+            });
+        }
+
+        for (m_idx, mtab) in self.media_tabs.iter().enumerate() {
+            let fname = mtab
+                .path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("media")
+                .to_string();
+            let is_active = !has_diff_tab && active_media_idx == Some(m_idx);
+            let font_style = if is_active {
+                FontStyle::UiBold
+            } else {
+                FontStyle::UiRegular
+            };
+            let (tw, _) = canvas.measure_text(&fname, font_style);
+            let tab_w = (tw + 58).clamp(108, 220);
+            bar_items.push(EditorBarItem {
+                path: mtab.path.clone(),
+                label: fname,
+                is_active,
+                font_style,
+                tab_w,
+                select_action: HitAction::SelectMediaTab(m_idx),
+                close_action: Some(HitAction::CloseMediaTab(m_idx)),
+                buffer_idx: None,
+            });
+        }
+
+        // 确保当前激活的文件/媒体标签在多标签溢出时始终保持可见
+        let avail_tab_strip_w = (tabs_right_limit - tab_x).max(120);
+        let mut first_visible = 0usize;
+        if let Some(active_pos) = bar_items.iter().position(|it| it.is_active) {
+            let mut prefix_w: i32 = bar_items[..=active_pos]
+                .iter()
+                .map(|it| it.tab_w + 2)
+                .sum();
+            while first_visible < active_pos && prefix_w > avail_tab_strip_w {
+                prefix_w -= bar_items[first_visible].tab_w + 2;
+                first_visible += 1;
+            }
+        }
+
+        for item in bar_items.into_iter().skip(first_visible) {
+            if tab_x + item.tab_w > tabs_right_limit {
                 break;
             }
-            let tab_rect = Rect::new(tab_x, rect.y + 3, tab_w, 30);
-            self.tab_rects.push((tab_rect, idx));
-            let tab_hovered = !is_active && tab_rect.contains(hx, hy);
+            let tab_rect = Rect::new(tab_x, rect.y + 3, item.tab_w, 30);
+            if let Some(b_idx) = item.buffer_idx {
+                self.tab_rects.push((tab_rect, b_idx));
+            }
+            let tab_hovered = !item.is_active && tab_rect.contains(hx, hy);
 
-            if is_active {
+            if item.is_active {
                 canvas.fill_rounded_rect(tab_rect, 6, t.tab_active_bg);
                 canvas.fill_rounded_rect(
-                    Rect::new(tab_x + 10, rect.y + 31, tab_w - 20, 3),
+                    Rect::new(tab_x + 10, rect.y + 31, item.tab_w - 20, 3),
                     1,
                     t.tab_underline_accent,
                 );
             } else if tab_hovered {
                 canvas.fill_rounded_rect(tab_rect, 6, t.panel_header_bg);
             }
-            canvas.draw_file_type_icon(tab_x + 10, rect.y + 11, *lang);
+            canvas.draw_path_file_icon(tab_x + 10, rect.y + 11, &item.path);
+            let label_max_w = (item.tab_w - 46).max(32);
+            let shown_label =
+                canvas.ellipsize_filename(&item.label, label_max_w, item.font_style);
             canvas.draw_text_styled(
                 tab_x + 28,
                 rect.y + 9,
-                &label,
-                if is_active || tab_hovered {
+                &shown_label,
+                if item.is_active || tab_hovered {
                     t.text_primary
                 } else {
                     t.text_secondary
                 },
-                tab_w - 46,
-                font_style,
+                label_max_w,
+                item.font_style,
             );
-            self.hit_regions.push((tab_rect, HitAction::SelectTab(idx)));
+            self.hit_regions.push((tab_rect, item.select_action));
 
-            if open_snapshot.len() > 1 {
-                let close_rect = Rect::new(tab_x + tab_w - 22, rect.y + 9, 16, 16);
+            if let Some(close_act) = item.close_action {
+                let close_rect = Rect::new(tab_x + item.tab_w - 22, rect.y + 9, 16, 16);
                 let close_hov = close_rect.contains(hx, hy);
                 if close_hov {
                     canvas.fill_rounded_rect(close_rect, 4, t.popup_hover_bg);
@@ -8129,68 +10767,59 @@ impl IdeApplicationState {
                     if close_hov { 0xFFFFFF } else { t.text_muted },
                     FontStyle::UiRegular,
                 );
-                self.hit_regions
-                    .push((close_rect, HitAction::CloseTab(idx)));
+                self.hit_regions.push((close_rect, close_act));
             }
-            tab_x += tab_w + 2;
+            tab_x += item.tab_w + 2;
         }
 
-        // 右上角 Cursor 风格 `✦ Ctrl+K` 与 `Alt+L` 图标按钮
-        let send_btn_w = 96;
-        let ctrl_k_btn_w = 100;
-        let ctrl_k_btn = Rect::new(
-            rect.x + rect.w - send_btn_w - ctrl_k_btn_w - 14,
-            rect.y + 5,
-            ctrl_k_btn_w,
-            24,
-        );
-        let ctrl_k_hov = ctrl_k_btn.contains(hx, hy);
-        canvas.stroke_rounded_rect(
-            ctrl_k_btn,
-            5,
-            t.accent_blue,
-            if ctrl_k_hov {
-                t.popup_hover_bg
-            } else {
-                t.panel_bg
-            },
-        );
-        canvas.draw_ai_sparkle_icon(ctrl_k_btn.x + 7, ctrl_k_btn.y + 4, t.accent_blue);
-        canvas.draw_text_styled(
-            ctrl_k_btn.x + 25,
-            ctrl_k_btn.y + 4,
-            self.tr("Ctrl+K 改写", "Ctrl+K Edit"),
-            if ctrl_k_hov { 0xFFFFFF } else { t.accent_blue },
-            ctrl_k_btn_w - 30,
-            FontStyle::UiSmall,
-        );
-        self.hit_regions
-            .push((ctrl_k_btn, HitAction::TriggerCtrlKInlineEdit));
-
-        let send_btn = Rect::new(rect.x + rect.w - send_btn_w - 8, rect.y + 5, send_btn_w, 24);
-        let send_hov = send_btn.contains(hx, hy);
-        canvas.stroke_rounded_rect(
-            send_btn,
-            5,
-            if send_hov {
-                t.accent_blue
-            } else {
-                t.border_color
-            },
-            if send_hov {
-                t.popup_hover_bg
-            } else {
-                t.panel_bg
-            },
-        );
-        canvas.draw_text_centered(
-            send_btn,
-            self.tr("Alt+L 问 AI", "Alt+L Ask AI"),
-            if send_hov { 0xFFFFFF } else { t.text_primary },
-            FontStyle::UiSmall,
-        );
-        self.hit_regions
-            .push((send_btn, HitAction::SendSelectionToAgent));
+        if let Some(diff_tab_info) = self
+            .active_editor_diff
+            .as_ref()
+            .map(|d| d.path.clone())
+        {
+            let fname = diff_tab_info
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("diff");
+            let diff_label = format!("Diff: {fname}");
+            let (tw, _) = canvas.measure_text(&diff_label, FontStyle::UiBold);
+            let dtab_w = (tw + 52)
+                .clamp(124, 240)
+                .min((rect.x + rect.w - tab_x - 6).max(110));
+            let dtab_x = tab_x.min(rect.x + rect.w - dtab_w - 6);
+            let dtab_rect = Rect::new(dtab_x, rect.y + 3, dtab_w, 30);
+            canvas.fill_rounded_rect(dtab_rect, 6, t.tab_active_bg);
+            canvas.fill_rounded_rect(
+                Rect::new(dtab_x + 10, rect.y + 31, dtab_w - 20, 3),
+                1,
+                t.tab_underline_accent,
+            );
+            canvas.draw_changes_diff_icon(dtab_x + 8, rect.y + 10, t.accent_blue);
+            let diff_max_w = (dtab_w - 50).max(40);
+            let shown_diff =
+                canvas.ellipsize_filename(&diff_label, diff_max_w, FontStyle::UiBold);
+            canvas.draw_text_styled(
+                dtab_x + 26,
+                rect.y + 9,
+                &shown_diff,
+                t.text_primary,
+                diff_max_w,
+                FontStyle::UiBold,
+            );
+            let close_diff_r = Rect::new(dtab_x + dtab_w - 22, rect.y + 9, 16, 16);
+            let cd_hov = close_diff_r.contains(hx, hy);
+            if cd_hov {
+                canvas.fill_rounded_rect(close_diff_r, 4, t.popup_hover_bg);
+            }
+            canvas.draw_text_centered(
+                close_diff_r,
+                "×",
+                if cd_hov { 0xFFFFFF } else { t.text_muted },
+                FontStyle::UiRegular,
+            );
+            self.hit_regions
+                .push((close_diff_r, HitAction::CloseEditorDiff));
+        }
 
         // 2. 面包屑栏
         let crumb_bar = Rect::new(rect.x + 1, rect.y + 35, rect.w - 2, 24);
@@ -8199,6 +10828,25 @@ impl IdeApplicationState {
             Rect::new(rect.x + 1, rect.y + 58, rect.w - 2, 1),
             t.border_color,
         );
+
+        if self.active_editor_diff.is_some() {
+            self.render_active_editor_diff(canvas, rect, rect.y + 60);
+            return;
+        }
+
+        if let Some(m_idx) = active_media_idx {
+            self.render_active_media_preview(canvas, rect, m_idx, rect.y + 60);
+            return;
+        }
+
+        if self.open_buffers.is_empty() {
+            self.render_editor_welcome(
+                canvas,
+                Rect::new(rect.x, rect.y + 60, rect.w, (rect.h - 64).max(24)),
+            );
+            return;
+        }
+
         let active_path_str = self
             .active_buffer()
             .path
@@ -8206,7 +10854,7 @@ impl IdeApplicationState {
             .unwrap_or(&self.active_buffer().path)
             .to_string_lossy()
             .replace('\\', "  ›  ");
-        canvas.draw_text_styled(
+        canvas.draw_text_ellipsis(
             rect.x + 14,
             rect.y + 39,
             &active_path_str,
@@ -8412,9 +11060,23 @@ impl IdeApplicationState {
         let lineno_col_w = (sample_w + 10)
             .max(char_w * (pad_digits as i32) + 8)
             .max(46);
-        let gutter_w = (8 + lineno_col_w + 26).max(76);
+        let blame_col_w = if self.git_blame_visible { 172 } else { 0 };
+        let gutter_w = (8 + lineno_col_w + blame_col_w + 26).max(76);
 
-        let code_area_h = (rect.y + rect.h - code_top_y - 4).max(24);
+        let code_start_x = rect.x + gutter_w + 14;
+        self.editor_code_start_x = code_start_x;
+        let right_limit = rect.x + rect.w - 14;
+        let horiz_avail_w = (right_limit - code_start_x).max(24);
+        let max_line_px =
+            self.ensure_editor_max_line_width_cached(&buf_path, buf_rev, char_w, canvas);
+        let content_total_w = max_line_px + 56;
+        let has_horiz_overflow = content_total_w > horiz_avail_w;
+        let max_scroll_x = (content_total_w - horiz_avail_w).max(0);
+        self.editor_scroll_x = self.editor_scroll_x.clamp(0, max_scroll_x);
+        let horiz_bar_h = if has_horiz_overflow { 11 } else { 0 };
+
+        let gutter_full_h = (rect.y + rect.h - code_top_y - 2).max(24);
+        let code_area_h = (rect.y + rect.h - code_top_y - 4 - horiz_bar_h).max(24);
         let code_body_rect = Rect::new(
             rect.x + gutter_w + 1,
             code_top_y,
@@ -8426,11 +11088,11 @@ impl IdeApplicationState {
             .push((code_body_rect, HitAction::FocusEditorBody));
 
         canvas.fill_rect(
-            Rect::new(rect.x + 1, code_top_y, gutter_w, code_area_h),
+            Rect::new(rect.x + 1, code_top_y, gutter_w, gutter_full_h),
             t.editor_gutter_bg,
         );
         canvas.fill_rect(
-            Rect::new(rect.x + gutter_w, code_top_y, 1, code_area_h),
+            Rect::new(rect.x + gutter_w, code_top_y, 1, gutter_full_h),
             t.border_color,
         );
 
@@ -8452,9 +11114,6 @@ impl IdeApplicationState {
         };
         self.ensure_highlight_lines_cached(&buf_path, buf_rev, buf_lang, &visible_lines);
 
-        let code_start_x = rect.x + gutter_w + 14;
-        self.editor_code_start_x = code_start_x;
-        let right_limit = rect.x + rect.w - 14;
         let code_clip_rect = Rect::new(
             code_body_rect.x,
             code_body_rect.y,
@@ -8463,6 +11122,18 @@ impl IdeApplicationState {
         );
 
         let file_working_diff = self.git_engine.working_diffs.get(&buf_path);
+        let file_blame_lines = if self.git_blame_visible {
+            self.git_engine.file_blames.get(&buf_path).cloned()
+        } else {
+            None
+        };
+        let blame_sep_x = rect.x + 8 + lineno_col_w + 24;
+        if self.git_blame_visible {
+            canvas.fill_rect(
+                Rect::new(blame_sep_x, code_top_y, 1, gutter_full_h),
+                blend_rgb(t.border_color, t.editor_gutter_bg, 0.55),
+            );
+        }
 
         for (vis_idx, (line_idx, line_str)) in visible_lines.iter().enumerate() {
             let line_idx = *line_idx;
@@ -8496,6 +11167,38 @@ impl IdeApplicationState {
             let bp_cx = rect.x + 8 + lineno_col_w + 5;
             if self.dap_engine.has_breakpoint(&buf_path, line_idx) {
                 canvas.fill_circle(bp_cx, row_y + 11, 5, t.breakpoint_red);
+            }
+
+            if self.git_blame_visible {
+                if let Some(blame) = file_blame_lines.as_ref().and_then(|v| v.get(line_idx)) {
+                    let blame_rect = Rect::new(blame_sep_x + 4, row_y, blame_col_w - 8, line_h);
+                    let bhov = blame_rect.contains(hx, hy);
+                    let author_short: String = blame.author.chars().take(11).collect();
+                    let label = format!("{} {}", blame.date, author_short);
+                    canvas.draw_text_ellipsis(
+                        blame_rect.x + 2,
+                        row_y + 3,
+                        &label,
+                        if bhov { t.accent_blue } else { t.text_muted },
+                        blame_rect.w - 4,
+                        FontStyle::UiSmall,
+                    );
+                    if !blame.commit_short.is_empty() {
+                        self.hit_regions.push((
+                            blame_rect,
+                            HitAction::InspectBlameCommit(blame.commit_short.clone()),
+                        ));
+                    }
+                } else {
+                    canvas.draw_text_styled(
+                        blame_sep_x + 6,
+                        row_y + 3,
+                        "…",
+                        t.text_muted,
+                        24,
+                        FontStyle::UiSmall,
+                    );
+                }
             }
 
             let is_runnable = self
@@ -8591,8 +11294,9 @@ impl IdeApplicationState {
                 if self.caret_visible && caret_x >= code_body_rect.x && caret_x < right_limit - 1 {
                     canvas.fill_rect(Rect::new(caret_x, row_y + 3, 2, 17), t.accent_blue);
                 }
+                let max_ime_x = (right_limit - 2).max(code_body_rect.x);
                 self.ime_spot = (
-                    caret_x.clamp(code_body_rect.x, right_limit - 2),
+                    caret_x.clamp(code_body_rect.x, max_ime_x),
                     row_y + line_h,
                 );
             }
@@ -8612,6 +11316,719 @@ impl IdeApplicationState {
             total_lines,
             t.border_color,
         );
+
+        // 编辑器水平滚动条（当存在超长行超出可视区时显示）
+        if has_horiz_overflow {
+            let horiz_track = Rect::new(
+                code_body_rect.x + 2,
+                rect.y + rect.h - 10,
+                (code_body_rect.w - 4).max(16),
+                7,
+            );
+            self.editor_horiz_scroll_info = ScrollTrackInfo {
+                track: horiz_track,
+                visible: horiz_avail_w.max(1) as usize,
+                total: content_total_w.max(1) as usize,
+            };
+            canvas.draw_horizontal_scrollbar(
+                horiz_track,
+                self.editor_scroll_x as usize,
+                horiz_avail_w.max(1) as usize,
+                content_total_w.max(1) as usize,
+                t.border_color,
+            );
+        } else {
+            self.editor_horiz_scroll_info = ScrollTrackInfo::default();
+        }
+    }
+
+    /// 在中央文件编辑器窗口内渲染常见媒体格式（位图图片 / SVG 矢量 / 音频波形 / 视频缩略图与属性）预览视图
+    fn render_active_media_preview(
+        &mut self,
+        canvas: &mut SurfaceCanvas,
+        rect: Rect,
+        tab_idx: usize,
+        body_top_y: i32,
+    ) {
+        let Some(tab) = self.media_tabs.get(tab_idx).cloned() else {
+            return;
+        };
+        self.editor_scroll_info = ScrollTrackInfo::default();
+        self.editor_horiz_scroll_info = ScrollTrackInfo::default();
+
+        let t = self.theme;
+        let (hx, hy) = self.hover_pos;
+
+        // 1. 面包屑栏右侧操作按钮（系统打开、SVG 查看源码、图片缩放 +/-/100%）
+        let mut right_x = rect.x + rect.w - 8;
+        let ext_w = 78;
+        right_x -= ext_w;
+        let ext_btn = Rect::new(right_x, rect.y + 37, ext_w, 19);
+        let ext_hov = ext_btn.contains(hx, hy);
+        canvas.stroke_rounded_rect(
+            ext_btn,
+            4,
+            if ext_hov { t.accent_blue } else { t.border_color },
+            if ext_hov { t.popup_hover_bg } else { t.panel_bg },
+        );
+        canvas.draw_text_centered(
+            ext_btn,
+            self.tr("系统打开", "Open Ext"),
+            if ext_hov { 0xFFFFFF } else { t.text_primary },
+            FontStyle::UiSmall,
+        );
+        self.hit_regions
+            .push((ext_btn, HitAction::OpenExternalMedia(tab.path.clone())));
+
+        if tab.kind == MediaKind::Svg {
+            let src_w = 74;
+            right_x -= src_w + 6;
+            let src_btn = Rect::new(right_x, rect.y + 37, src_w, 19);
+            let src_hov = src_btn.contains(hx, hy);
+            canvas.stroke_rounded_rect(
+                src_btn,
+                4,
+                if src_hov { t.accent_blue } else { t.border_color },
+                if src_hov { t.popup_hover_bg } else { t.panel_bg },
+            );
+            canvas.draw_text_centered(
+                src_btn,
+                self.tr("查看源码", "Source"),
+                if src_hov { 0xFFFFFF } else { t.text_primary },
+                FontStyle::UiSmall,
+            );
+            self.hit_regions
+                .push((src_btn, HitAction::OpenMediaAsText(tab.path.clone())));
+        }
+
+        if matches!(tab.kind, MediaKind::Image | MediaKind::Svg) {
+            let plus_btn = Rect::new(right_x - 28, rect.y + 37, 22, 19);
+            let pct_btn = Rect::new(plus_btn.x - 46, rect.y + 37, 44, 19);
+            let minus_btn = Rect::new(pct_btn.x - 24, rect.y + 37, 22, 19);
+            right_x = minus_btn.x;
+            for (btn, label, delta) in [
+                (minus_btn, "-", -25),
+                (pct_btn, &format!("{}%", tab.zoom_pct) as &str, 0),
+                (plus_btn, "+", 25),
+            ] {
+                let bhov = btn.contains(hx, hy);
+                canvas.stroke_rounded_rect(
+                    btn,
+                    4,
+                    if bhov { t.accent_blue } else { t.border_color },
+                    if bhov { t.popup_hover_bg } else { t.panel_bg },
+                );
+                canvas.draw_text_centered(
+                    btn,
+                    label,
+                    if bhov { 0xFFFFFF } else { t.text_secondary },
+                    FontStyle::UiSmall,
+                );
+                self.hit_regions
+                    .push((btn, HitAction::AdjustMediaZoom(delta)));
+            }
+        }
+
+        // 面包屑摘要：路径 · 格式 · 大小 · 分辨率/时长
+        let rel_path = tab
+            .path
+            .strip_prefix(&self.workspace_root)
+            .unwrap_or(&tab.path)
+            .to_string_lossy()
+            .replace('\\', "  ›  ");
+        let mut meta_parts = vec![
+            rel_path,
+            tab.format_label.clone(),
+            format_media_file_size(tab.file_size_bytes),
+        ];
+        if let Some((w, h)) = tab.orig_dimensions {
+            meta_parts.push(format!("{w} × {h} px"));
+        }
+        if let Some(dur) = tab.duration_secs {
+            meta_parts.push(format_media_duration(dur));
+        }
+        let crumb_txt = meta_parts.join("  ·  ");
+        canvas.draw_text_ellipsis(
+            rect.x + 14,
+            rect.y + 39,
+            &crumb_txt,
+            t.text_secondary,
+            (right_x - rect.x - 22).max(48),
+            FontStyle::UiSmall,
+        );
+
+        let body = Rect::new(
+            rect.x + 14,
+            body_top_y + 10,
+            (rect.w - 28).max(80),
+            (rect.y + rect.h - body_top_y - 22).max(80),
+        );
+        match tab.kind {
+            MediaKind::Image | MediaKind::Svg => self.render_media_image_body(canvas, body, &tab),
+            MediaKind::Audio => self.render_media_audio_body(canvas, body, &tab),
+            MediaKind::Video => self.render_media_video_body(canvas, body, &tab),
+        }
+    }
+
+    fn render_media_image_body(
+        &self,
+        canvas: &mut SurfaceCanvas,
+        body: Rect,
+        tab: &MediaPreviewTab,
+    ) {
+        let t = self.theme;
+        canvas.stroke_rounded_rect(body, 8, t.border_color, t.window_bg);
+
+        let inner = Rect::new(
+            body.x + 14,
+            body.y + 14,
+            (body.w - 28).max(32),
+            (body.h - 28).max(32),
+        );
+        // 透明通道棋盘格底纹，方便识别透明 PNG/SVG 边界
+        let tile = 16;
+        let c1 = t.window_bg;
+        let c2 = blend_rgb(t.window_bg, t.text_primary, 0.045);
+        for row in 0..((inner.h / tile) + 1) {
+            let ty = inner.y + row * tile;
+            let th = tile.min(inner.y + inner.h - ty);
+            if th <= 0 {
+                break;
+            }
+            for col in 0..((inner.w / tile) + 1) {
+                let tx = inner.x + col * tile;
+                let tw = tile.min(inner.x + inner.w - tx);
+                if tw <= 0 {
+                    break;
+                }
+                let col_rgb = if (row + col) % 2 == 0 { c1 } else { c2 };
+                canvas.fill_rect(Rect::new(tx, ty, tw, th), col_rgb);
+            }
+        }
+
+        if let Some(ref im) = tab.preview_image {
+            let scale = (tab.zoom_pct as f32 / 100.0).clamp(0.25, 3.0);
+            let target_w = ((inner.w as f32 * scale).round() as i32).clamp(24, inner.w);
+            let target_h = ((inner.h as f32 * scale).round() as i32).clamp(24, inner.h);
+            let target = Rect::new(
+                inner.x + (inner.w - target_w) / 2,
+                inner.y + (inner.h - target_h) / 2,
+                target_w,
+                target_h,
+            );
+            canvas.draw_rgba_image_fit(
+                target,
+                6,
+                im.width,
+                im.height,
+                &im.rgba,
+                t.window_bg,
+                t.border_color,
+            );
+        } else {
+            let msg = if tab.kind == MediaKind::Svg {
+                self.tr(
+                    "无法光栅化此复杂 SVG，可点击右上角「查看源码」或「系统打开」",
+                    "Unable to rasterize this SVG. Click Source or Open Ext above.",
+                )
+            } else {
+                self.tr(
+                    "无法解码此图片缩略图，可点击右上角「系统打开」查看",
+                    "Unable to decode this image format. Click Open Ext above.",
+                )
+            };
+            canvas.draw_text_centered(inner, msg, t.warning_yellow, FontStyle::UiRegular);
+        }
+    }
+
+    fn render_media_audio_body(
+        &mut self,
+        canvas: &mut SurfaceCanvas,
+        body: Rect,
+        tab: &MediaPreviewTab,
+    ) {
+        let t = self.theme;
+        let (hx, hy) = self.hover_pos;
+        canvas.stroke_rounded_rect(body, 8, t.border_color, t.window_bg);
+
+        let card_w = (body.w - 36).clamp(220, 620);
+        let card_h = (body.h - 32).clamp(180, 320);
+        let card = Rect::new(
+            body.x + (body.w - card_w) / 2,
+            body.y + (body.h - card_h) / 2,
+            card_w,
+            card_h,
+        );
+        canvas.stroke_rounded_rect(card, 10, t.border_color, t.panel_bg);
+
+        let fname = tab
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("audio");
+        let title_str = canvas.ellipsize_filename(
+            &format!("♪  {fname}"),
+            card.w - 110,
+            FontStyle::UiBold,
+        );
+        canvas.draw_text_styled(
+            card.x + 18,
+            card.y + 16,
+            &title_str,
+            t.text_primary,
+            card.w - 110,
+            FontStyle::UiBold,
+        );
+
+        let fmt_badge = Rect::new(card.x + card.w - 76, card.y + 15, 58, 22);
+        canvas.fill_rounded_rect(fmt_badge, 5, blend_rgb(t.panel_bg, t.accent_blue, 0.22));
+        canvas.draw_text_centered(fmt_badge, &tab.format_label, t.accent_blue, FontStyle::UiSmall);
+
+        let mut details = vec![format_media_file_size(tab.file_size_bytes)];
+        if let Some(d) = tab.duration_secs {
+            details.push(format!("{} {}", self.tr("时长", "Duration"), format_media_duration(d)));
+        }
+        if let Some(sr) = tab.sample_rate_hz {
+            details.push(format!("{sr} Hz"));
+        }
+        if let Some(ch) = tab.channels {
+            details.push(format!("{ch} ch"));
+        }
+        canvas.draw_text_ellipsis(
+            card.x + 18,
+            card.y + 42,
+            &details.join("  ·  "),
+            t.text_secondary,
+            card.w - 36,
+            FontStyle::UiSmall,
+        );
+
+        // 音频波形可视化区
+        let wave_box = Rect::new(
+            card.x + 18,
+            card.y + 72,
+            (card.w - 36).max(60),
+            (card.h - 134).max(48),
+        );
+        canvas.stroke_rounded_rect(wave_box, 8, t.border_color, t.window_bg);
+        let mid_y = wave_box.y + wave_box.h / 2;
+        canvas.fill_rect(
+            Rect::new(wave_box.x + 10, mid_y, (wave_box.w - 20).max(8), 1),
+            blend_rgb(t.border_color, t.window_bg, 0.5),
+        );
+
+        let bars = 64usize;
+        let inner_w = (wave_box.w - 24).max(bars as i32);
+        let step_w = (inner_w as f32 / bars as f32).max(2.0);
+        let bar_w = (step_w * 0.62).round().max(2.0) as i32;
+        let max_half_h = ((wave_box.h - 18) / 2).max(6);
+        for i in 0..bars {
+            let amp = tab
+                .waveform_peaks
+                .get(i)
+                .copied()
+                .unwrap_or_else(|| {
+                    let t1 = ((i as f32 * 0.37).sin().abs() + 0.25) * 0.65;
+                    t1.clamp(0.12, 0.92)
+                });
+            let bh = ((amp * max_half_h as f32).round() as i32).max(2);
+            let bx = wave_box.x + 12 + (i as f32 * step_w).round() as i32;
+            if bx + bar_w > wave_box.x + wave_box.w - 8 {
+                break;
+            }
+            let bar_col = if tab.waveform_peaks.is_empty() {
+                blend_rgb(t.text_muted, t.accent_blue, 0.45)
+            } else {
+                t.accent_blue
+            };
+            canvas.fill_rounded_rect(
+                Rect::new(bx, mid_y - bh, bar_w, bh * 2),
+                1,
+                bar_col,
+            );
+        }
+
+        let play_btn = Rect::new(
+            card.x + (card.w - 190) / 2,
+            card.y + card.h - 46,
+            190,
+            28,
+        );
+        let phov = play_btn.contains(hx, hy);
+        canvas.stroke_rounded_rect(
+            play_btn,
+            6,
+            t.accent_blue,
+            if phov {
+                t.accent_blue
+            } else {
+                blend_rgb(t.panel_bg, t.accent_blue, 0.20)
+            },
+        );
+        canvas.draw_text_centered(
+            play_btn,
+            self.tr("▶ 在系统播放器中播放", "▶ Play in System Player"),
+            if phov { 0xFFFFFF } else { t.text_primary },
+            FontStyle::UiSmall,
+        );
+        self.hit_regions
+            .push((play_btn, HitAction::OpenExternalMedia(tab.path.clone())));
+    }
+
+    fn render_media_video_body(
+        &mut self,
+        canvas: &mut SurfaceCanvas,
+        body: Rect,
+        tab: &MediaPreviewTab,
+    ) {
+        let t = self.theme;
+        let (hx, hy) = self.hover_pos;
+        canvas.stroke_rounded_rect(body, 8, t.border_color, t.window_bg);
+
+        let card_w = (body.w - 36).clamp(240, 720);
+        let card_h = (body.h - 32).clamp(200, 440);
+        let card = Rect::new(
+            body.x + (body.w - card_w) / 2,
+            body.y + (body.h - card_h) / 2,
+            card_w,
+            card_h,
+        );
+        canvas.stroke_rounded_rect(card, 10, t.border_color, t.panel_bg);
+
+        let fname = tab
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("video");
+        let title_str = canvas.ellipsize_filename(
+            &format!("▶  {fname}"),
+            card.w - 110,
+            FontStyle::UiBold,
+        );
+        canvas.draw_text_styled(
+            card.x + 18,
+            card.y + 14,
+            &title_str,
+            t.text_primary,
+            card.w - 110,
+            FontStyle::UiBold,
+        );
+
+        let fmt_badge = Rect::new(card.x + card.w - 76, card.y + 13, 58, 22);
+        canvas.fill_rounded_rect(fmt_badge, 5, blend_rgb(t.panel_bg, t.accent_blue, 0.22));
+        canvas.draw_text_centered(fmt_badge, &tab.format_label, t.accent_blue, FontStyle::UiSmall);
+
+        let frame_rect = Rect::new(
+            card.x + 18,
+            card.y + 44,
+            (card.w - 36).max(80),
+            (card.h - 102).max(80),
+        );
+        if let Some(ref thumb) = tab.preview_image {
+            canvas.draw_rgba_image_fit(
+                frame_rect,
+                8,
+                thumb.width,
+                thumb.height,
+                &thumb.rgba,
+                t.window_bg,
+                t.border_color,
+            );
+        } else {
+            canvas.stroke_rounded_rect(frame_rect, 8, t.border_color, t.window_bg);
+            canvas.draw_text_centered(
+                frame_rect,
+                self.tr("▶ 视频预览帧", "▶ Video Preview"),
+                t.text_secondary,
+                FontStyle::UiBold,
+            );
+        }
+
+        // 底部播放栏与文件元数据
+        let mut info = vec![format_media_file_size(tab.file_size_bytes)];
+        if let Some(d) = tab.duration_secs {
+            info.push(format_media_duration(d));
+        }
+        if let Some((w, h)) = tab.orig_dimensions {
+            info.push(format!("{w}×{h}"));
+        }
+        let open_btn = Rect::new(card.x + card.w - 208, card.y + card.h - 42, 190, 26);
+        canvas.draw_text_ellipsis(
+            card.x + 18,
+            card.y + card.h - 38,
+            &info.join("  ·  "),
+            t.text_secondary,
+            (open_btn.x - card.x - 28).max(40),
+            FontStyle::UiSmall,
+        );
+        let ohov = open_btn.contains(hx, hy);
+        canvas.stroke_rounded_rect(
+            open_btn,
+            6,
+            t.accent_blue,
+            if ohov {
+                t.accent_blue
+            } else {
+                blend_rgb(t.panel_bg, t.accent_blue, 0.20)
+            },
+        );
+        canvas.draw_text_centered(
+            open_btn,
+            self.tr("▶ 使用系统播放器播放", "▶ Play in System Player"),
+            if ohov { 0xFFFFFF } else { t.text_primary },
+            FontStyle::UiSmall,
+        );
+        self.hit_regions
+            .push((open_btn, HitAction::OpenExternalMedia(tab.path.clone())));
+    }
+
+    /// 在中央文件编辑器窗口内渲染 IDEA 风格工作区 / AI 会话文件 Diff 对比视图
+    fn render_active_editor_diff(
+        &mut self,
+        canvas: &mut SurfaceCanvas,
+        rect: Rect,
+        code_top_y: i32,
+    ) {
+        let Some(diff_snap) = self.active_editor_diff.clone() else {
+            return;
+        };
+        let t = self.theme;
+        let (hx, hy) = self.hover_pos;
+
+        // 面包屑 / Diff 头部栏操作按钮：[打开源文件] [× 关闭 Diff]
+        let rel_path = diff_snap
+            .path
+            .strip_prefix(&self.workspace_root)
+            .unwrap_or(&diff_snap.path)
+            .to_string_lossy()
+            .replace('\\', "  ›  ");
+        let close_btn = Rect::new(rect.x + rect.w - 78, rect.y + 37, 70, 19);
+        let open_btn = Rect::new(close_btn.x - 84, rect.y + 37, 78, 19);
+        let stats_str = format!("+{}  -{}", diff_snap.added_lines, diff_snap.removed_lines);
+        let crumb_txt = format!("{rel_path}  ·  {}   ({stats_str})", diff_snap.subtitle);
+        canvas.draw_text_ellipsis(
+            rect.x + 14,
+            rect.y + 39,
+            &crumb_txt,
+            t.text_secondary,
+            (open_btn.x - rect.x - 22).max(60),
+            FontStyle::UiSmall,
+        );
+
+        let open_hov = open_btn.contains(hx, hy);
+        canvas.stroke_rounded_rect(
+            open_btn,
+            4,
+            if open_hov { t.accent_blue } else { t.border_color },
+            if open_hov { t.popup_hover_bg } else { t.panel_bg },
+        );
+        canvas.draw_text_centered(
+            open_btn,
+            self.tr("打开文件", "Open File"),
+            if open_hov { 0xFFFFFF } else { t.text_primary },
+            FontStyle::UiSmall,
+        );
+        self.hit_regions
+            .push((open_btn, HitAction::OpenDiffSourceFile(diff_snap.path.clone())));
+
+        let close_hov = close_btn.contains(hx, hy);
+        canvas.stroke_rounded_rect(
+            close_btn,
+            4,
+            if close_hov { t.accent_blue } else { t.border_color },
+            if close_hov { t.popup_hover_bg } else { t.panel_bg },
+        );
+        canvas.draw_text_centered(
+            close_btn,
+            self.tr("× 关闭", "× Close"),
+            if close_hov { 0xFFFFFF } else { t.text_secondary },
+            FontStyle::UiSmall,
+        );
+        self.hit_regions
+            .push((close_btn, HitAction::CloseEditorDiff));
+
+        // 双行号列 Gutter (Old | New | +/-)
+        let char_w = canvas.measure_text("8", FontStyle::CodeMono).0.max(8);
+        self.editor_char_w = char_w;
+        let max_digits = diff_snap.diff_lines.len().max(1).ilog10() as usize + 1;
+        let pad_digits = max_digits.max(4);
+        let col_w = (char_w * (pad_digits as i32) + 8).max(40);
+        let gutter_w = col_w * 2 + 22;
+
+        let code_start_x = rect.x + gutter_w + 14;
+        self.editor_code_start_x = code_start_x;
+        let right_limit = rect.x + rect.w - 14;
+        let horiz_avail_w = (right_limit - code_start_x).max(24);
+        let max_line_px = diff_snap
+            .diff_lines
+            .iter()
+            .map(|dl| canvas.measure_text(&dl.content, FontStyle::CodeMono).0)
+            .max()
+            .unwrap_or(0);
+        let content_total_w = max_line_px + 48;
+        let has_horiz_overflow = content_total_w > horiz_avail_w;
+        let max_scroll_x = (content_total_w - horiz_avail_w).max(0);
+        let clamped_scroll_x = diff_snap.scroll_x.clamp(0, max_scroll_x);
+        let horiz_bar_h = if has_horiz_overflow { 11 } else { 0 };
+
+        let gutter_full_h = (rect.y + rect.h - code_top_y - 2).max(24);
+        let code_area_h = (rect.y + rect.h - code_top_y - 4 - horiz_bar_h).max(24);
+        let code_body_rect = Rect::new(
+            rect.x + gutter_w + 1,
+            code_top_y,
+            (rect.w - gutter_w - 12).max(24),
+            code_area_h,
+        );
+        self.editor_code_rect = code_body_rect;
+
+        canvas.fill_rect(
+            Rect::new(rect.x + 1, code_top_y, gutter_w, gutter_full_h),
+            t.editor_gutter_bg,
+        );
+        canvas.fill_rect(
+            Rect::new(rect.x + gutter_w, code_top_y, 1, gutter_full_h),
+            t.border_color,
+        );
+
+        let line_h = 22;
+        let max_visible_lines = (code_area_h / line_h).max(1) as usize;
+        self.editor_visible_lines = max_visible_lines;
+        let total_lines = diff_snap.diff_lines.len().max(1);
+        let max_scroll = diff_snap.diff_lines.len().saturating_sub(max_visible_lines);
+        let clamped_scroll = diff_snap.scroll.min(max_scroll);
+
+        if let Some(ref mut ed_diff) = self.active_editor_diff {
+            ed_diff.scroll = clamped_scroll;
+            ed_diff.scroll_x = clamped_scroll_x;
+        }
+
+        if diff_snap.diff_lines.is_empty() {
+            canvas.draw_text_styled(
+                code_start_x,
+                code_top_y + 18,
+                self.tr("当前文件没有代码差异。", "No diff changes for this file."),
+                t.text_muted,
+                horiz_avail_w,
+                FontStyle::UiRegular,
+            );
+        } else {
+            let code_clip_rect = Rect::new(
+                code_body_rect.x,
+                code_body_rect.y,
+                (right_limit - code_body_rect.x).max(10),
+                code_body_rect.h,
+            );
+            for (vis_idx, dl) in diff_snap
+                .diff_lines
+                .iter()
+                .skip(clamped_scroll)
+                .take(max_visible_lines)
+                .enumerate()
+            {
+                let row_y = code_top_y + (vis_idx as i32) * line_h;
+                let (bg, fg, sign, stripe_opt) = match dl.kind {
+                    DiffLineKind::Added => {
+                        (t.diff_added_bg, t.diff_added_fg, "+", Some(t.run_green))
+                    }
+                    DiffLineKind::Removed => (
+                        t.diff_removed_bg,
+                        t.diff_removed_fg,
+                        "-",
+                        Some(t.breakpoint_red),
+                    ),
+                    DiffLineKind::Context => (t.editor_bg, t.text_primary, " ", None),
+                };
+
+                if dl.kind != DiffLineKind::Context {
+                    canvas.fill_rect(
+                        Rect::new(rect.x + gutter_w + 1, row_y, code_body_rect.w, line_h),
+                        bg,
+                    );
+                }
+                if let Some(sc) = stripe_opt {
+                    canvas.fill_rect(Rect::new(rect.x + gutter_w - 3, row_y + 1, 3, line_h - 2), sc);
+                }
+
+                let old_s = dl
+                    .old_lineno
+                    .map(|n| format!("{:>width$}", n + 1, width = pad_digits))
+                    .unwrap_or_else(|| " ".repeat(pad_digits));
+                let new_s = dl
+                    .new_lineno
+                    .map(|n| format!("{:>width$}", n + 1, width = pad_digits))
+                    .unwrap_or_else(|| " ".repeat(pad_digits));
+                canvas.draw_text_styled(
+                    rect.x + 6,
+                    row_y + 2,
+                    &old_s,
+                    t.text_muted,
+                    col_w,
+                    FontStyle::CodeMono,
+                );
+                canvas.draw_text_styled(
+                    rect.x + 6 + col_w,
+                    row_y + 2,
+                    &new_s,
+                    t.text_muted,
+                    col_w,
+                    FontStyle::CodeMono,
+                );
+                canvas.draw_text_styled(
+                    rect.x + gutter_w - 16,
+                    row_y + 2,
+                    sign,
+                    fg,
+                    14,
+                    FontStyle::CodeMonoBold,
+                );
+
+                canvas.draw_text_clipped(
+                    code_start_x - clamped_scroll_x,
+                    row_y + 2,
+                    &dl.content,
+                    fg,
+                    code_clip_rect,
+                    FontStyle::CodeMono,
+                );
+            }
+        }
+
+        let track = Rect::new(rect.x + rect.w - 10, code_top_y, 7, code_area_h);
+        self.editor_scroll_info = ScrollTrackInfo {
+            track,
+            visible: max_visible_lines,
+            total: total_lines,
+        };
+        canvas.draw_vertical_scrollbar(
+            track,
+            clamped_scroll,
+            max_visible_lines,
+            total_lines,
+            t.border_color,
+        );
+
+        if has_horiz_overflow {
+            let horiz_track = Rect::new(
+                code_body_rect.x + 2,
+                rect.y + rect.h - 10,
+                (code_body_rect.w - 4).max(16),
+                7,
+            );
+            self.editor_horiz_scroll_info = ScrollTrackInfo {
+                track: horiz_track,
+                visible: horiz_avail_w.max(1) as usize,
+                total: content_total_w.max(1) as usize,
+            };
+            canvas.draw_horizontal_scrollbar(
+                horiz_track,
+                clamped_scroll_x as usize,
+                horiz_avail_w.max(1) as usize,
+                content_total_w.max(1) as usize,
+                t.border_color,
+            );
+        } else {
+            self.editor_horiz_scroll_info = ScrollTrackInfo::default();
+        }
     }
 
     fn render_bottom_tool_window(
@@ -8623,9 +12040,10 @@ impl IdeApplicationState {
         let t = self.theme;
         let (hx, hy) = self.hover_pos;
         canvas.stroke_rounded_rect(rect, 8, t.border_color, t.panel_bg);
+        self.arm_pane_header_drag(canvas, rect, DockPane::Tooling);
 
         // 顶部标题栏：1:1 对齐截图终端头部 -> `终端`  `本地 ×`  `+`  `▾`   右侧切换其他底部面板
-        let mut tx = rect.x + 12;
+        let mut tx = rect.x + 22;
         if active_tool == ToolWindowId::Terminal {
             let term_label = self.tr("终端", "Terminal");
             let (term_lw, _) = canvas.measure_text(term_label, FontStyle::UiBold);
@@ -8714,8 +12132,8 @@ impl IdeApplicationState {
                     tx + 6,
                     rect.y + 8,
                     self.tr(
-                        "Ctrl+C 复制/中断 · Ctrl+V 粘贴 · Tab 补全 · 右键菜单 · Ctrl+L 清屏",
-                        "Ctrl+C Copy/Interrupt · Ctrl+V Paste · Tab Complete · Context Menu · Ctrl+L Clear",
+                        "Ctrl+C 复制 · Ctrl+V 粘贴 · 点击链接或文件路径打开",
+                        "Ctrl+C Copy · Ctrl+V Paste · Click a link or file path to open",
                     ),
                     t.text_muted,
                     clr_btn.x - tx - 14,
@@ -8810,7 +12228,7 @@ impl IdeApplicationState {
                 let rows = (max_lines as u16).clamp(6, 80);
                 if (rows, cols) != self.last_pty_size {
                     self.last_pty_size = (rows, cols);
-                    self.terminal.active_pty().resize_pty(rows, cols);
+                    self.terminal.active_pty_mut().resize_pty(rows, cols);
                 }
 
                 let (snap, scroll_offset, sel_range) = {
@@ -8827,6 +12245,8 @@ impl IdeApplicationState {
                 let term_focused = self.focus == FocusTarget::TerminalInput;
                 let text_left = content_rect.x + 12;
                 let right_limit = content_rect.x + content_rect.w - 16;
+                let link_root = self.workspace_root.clone();
+                let link_cwd = self.terminal.cwd.clone();
 
                 if snap.lines.is_empty() && term_focused {
                     if self.caret_visible {
@@ -8871,6 +12291,28 @@ impl IdeApplicationState {
                         }
                     }
 
+                    let links = terminal_links_in_line(&raw, &link_root, &link_cwd);
+                    let mut link_geom = Vec::new();
+                    for link in links {
+                        let prefix: String = raw.chars().take(link.start_char).collect();
+                        let slice: String = raw
+                            .chars()
+                            .skip(link.start_char)
+                            .take(link.end_char.saturating_sub(link.start_char))
+                            .collect();
+                        if slice.is_empty() {
+                            continue;
+                        }
+                        let x0 = text_left + canvas.measure_text(&prefix, FontStyle::CodeMono).0;
+                        if x0 >= right_limit {
+                            continue;
+                        }
+                        let width = canvas.measure_text(&slice, FontStyle::CodeMono).0.max(4);
+                        let rect = Rect::new(x0, y, (width).min(right_limit - x0).max(4), line_h);
+                        let hot = rect.contains(hx, hy);
+                        link_geom.push((rect, slice, link.action, hot));
+                    }
+
                     let mut sx = text_left;
                     for (txt, fg) in &line.spans {
                         if sx >= right_limit {
@@ -8884,6 +12326,24 @@ impl IdeApplicationState {
                             right_limit - sx,
                             FontStyle::CodeMono,
                         );
+                    }
+
+                    for (rect, slice, action, hot) in link_geom {
+                        if hot {
+                            canvas.draw_text_styled(
+                                rect.x,
+                                y,
+                                &slice,
+                                t.syn_function,
+                                rect.w + 4,
+                                FontStyle::CodeMono,
+                            );
+                        }
+                        canvas.fill_rect(
+                            Rect::new(rect.x, y + line_h - 3, rect.w.max(2), 1),
+                            if hot { t.syn_function } else { t.accent_blue },
+                        );
+                        self.hit_regions.push((rect, action));
                     }
 
                     // 原生 ConPTY 网格光标渲染与 IME 定位
@@ -9063,6 +12523,33 @@ impl IdeApplicationState {
                 }
 
                 let mut bx = search_box.x + search_box.w + 8;
+                if let Some(ref fpath) = self.git_file_history_filter.clone() {
+                    let fname = fpath
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("file");
+                    let chip_txt = format!("File: {fname} ×");
+                    let (cw, _) = canvas.measure_text(&chip_txt, FontStyle::UiSmall);
+                    let chip_w = (cw + 14).min(180);
+                    let chip_r = Rect::new(bx, tb_rect.y + 2, chip_w, 24);
+                    canvas.stroke_rounded_rect(
+                        chip_r,
+                        4,
+                        t.accent_blue,
+                        blend_rgb(t.window_bg, t.accent_blue, 0.16),
+                    );
+                    canvas.draw_text_ellipsis(
+                        chip_r.x + 6,
+                        chip_r.y + 4,
+                        &chip_txt,
+                        t.text_primary,
+                        chip_w - 12,
+                        FontStyle::UiSmall,
+                    );
+                    self.hit_regions
+                        .push((chip_r, HitAction::ClearGitFileHistoryFilter));
+                    bx += chip_w + 6;
+                }
                 let tool_btns: Vec<(&str, u32, HitAction)> = vec![
                     (
                         self.tr("↻ 刷新", "↻ Refresh"),
@@ -9317,9 +12804,15 @@ impl IdeApplicationState {
 
                 let query = self.git_log_search_input.as_str().trim().to_lowercase();
                 let branch_filter = self.git_log_branch_filter.clone();
-                let filtered_commits: Vec<ide_git::GitLogEntry> = self
-                    .git_engine
-                    .recent_commits
+                let source_commits = if let Some(ref fpath) = self.git_file_history_filter {
+                    self.git_engine
+                        .file_histories
+                        .get(fpath)
+                        .unwrap_or(&self.git_engine.recent_commits)
+                } else {
+                    &self.git_engine.recent_commits
+                };
+                let filtered_commits: Vec<ide_git::GitLogEntry> = source_commits
                     .iter()
                     .filter(|c| {
                         if let Some(ref bf) = branch_filter {
@@ -9858,31 +13351,54 @@ impl IdeApplicationState {
         canvas.fill_rect(Rect::new(rect.x, rect.y, rect.w, 1), t.border_color);
 
         let buf = self.active_buffer();
-        let lsp_status = self.lsp_hub.status_summary(buf.language);
+        let editor_open = !self.open_buffers.is_empty();
+        let lsp_status = if editor_open {
+            self.lsp_hub.status_summary(buf.language)
+        } else {
+            self.tr("未打开文件", "No file").to_string()
+        };
         let dpi_pct = (self.effective_scale() * 100.0).round() as i32;
-        let right_info = format!(
-            "Ln {}, Col {}   |   UTF-8   |   DPI {}%   |   {}   |   {}",
-            buf.cursor_line + 1,
-            buf.cursor_col + 1,
-            dpi_pct,
-            lsp_status,
-            t.kind.display_name()
-        );
+        let right_info = if editor_open {
+            format!(
+                "Ln {}, Col {}   |   UTF-8   |   DPI {}%   |   {}   |   {}",
+                buf.cursor_line + 1,
+                buf.cursor_col + 1,
+                dpi_pct,
+                lsp_status,
+                t.kind.display_name()
+            )
+        } else {
+            format!(
+                "DPI {}%   |   {}   |   {}",
+                dpi_pct,
+                lsp_status,
+                t.kind.display_name()
+            )
+        };
         let (right_w, _) = canvas.measure_text(&right_info, FontStyle::UiSmall);
         let right_x = (rect.w - right_w - 16).max(rect.w / 2);
 
-        let rel_path = buf
-            .path
-            .strip_prefix(&self.workspace_root)
-            .unwrap_or(&buf.path)
-            .to_string_lossy()
-            .replace('\\', "  ›  ");
-        let left_info = format!(
-            "{}  ›  {}   |   {}",
-            self.workspace_name(),
-            rel_path,
-            self.status_notification
-        );
+        let left_info = if editor_open {
+            let rel_path = buf
+                .path
+                .strip_prefix(&self.workspace_root)
+                .unwrap_or(&buf.path)
+                .to_string_lossy()
+                .replace('\\', "  ›  ");
+            format!(
+                "{}  ›  {}   |   {}",
+                self.workspace_name(),
+                rel_path,
+                self.status_notification
+            )
+        } else {
+            format!(
+                "{}   |   {}   |   {}",
+                self.workspace_name(),
+                self.tr("没有打开的文件", "No file open"),
+                self.status_notification
+            )
+        };
         let busy_alpha = self
             .startup_load_alpha
             .max(self.git_load_alpha)
@@ -9938,14 +13454,27 @@ impl IdeApplicationState {
             }
         }
         menu_w = menu_w.min((canvas.width as i32 - 16).max(320));
-        let content_h: i32 = entries
+        let avail_h = (canvas.height as i32 - 52).max(200);
+        let default_h: i32 = entries
             .iter()
             .map(|e| match e {
                 MenuEntry::Action(_) => 29,
                 MenuEntry::Separator => 9,
             })
             .sum();
-        let menu_h = content_h + 14;
+        let (row_step, row_h, sep_step) = if default_h + 14 > avail_h {
+            (23, 22, 7)
+        } else {
+            (29, 28, 9)
+        };
+        let content_h: i32 = entries
+            .iter()
+            .map(|e| match e {
+                MenuEntry::Action(_) => row_step,
+                MenuEntry::Separator => sep_step,
+            })
+            .sum();
+        let menu_h = (content_h + 14).min(avail_h);
 
         let anchor_x = self
             .menu_category_rects
@@ -9954,8 +13483,9 @@ impl IdeApplicationState {
             .map(|(_, r)| r.x)
             .unwrap_or(12);
         let menu_x = anchor_x.min(canvas.width as i32 - menu_w - 8).max(8);
-        let menu_y = 74;
+        let menu_y = 38;
         let box_rect = Rect::new(menu_x, menu_y, menu_w, menu_h);
+        self.menu_dropdown_rect = box_rect;
         self.active_overlay_rects.push(box_rect);
 
         canvas.fill_rounded_shadow(box_rect, 8);
@@ -9963,16 +13493,19 @@ impl IdeApplicationState {
 
         let mut iy = menu_y + 7;
         for entry in entries {
+            if iy + 18 > menu_y + menu_h {
+                break;
+            }
             match entry {
                 MenuEntry::Separator => {
                     canvas.fill_rect(
-                        Rect::new(menu_x + 10, iy + 4, menu_w - 20, 1),
+                        Rect::new(menu_x + 10, iy + sep_step / 2, menu_w - 20, 1),
                         t.border_color,
                     );
-                    iy += 9;
+                    iy += sep_step;
                 }
                 MenuEntry::Action(act) => {
-                    let row = Rect::new(menu_x + 6, iy, menu_w - 12, 28);
+                    let row = Rect::new(menu_x + 6, iy, menu_w - 12, row_h);
                     let hovered = row.contains(hx, hy);
                     if hovered {
                         canvas.fill_rounded_rect(row, 5, t.popup_hover_bg);
@@ -9980,15 +13513,16 @@ impl IdeApplicationState {
                     if self.is_action_checked(act) {
                         canvas.draw_check_icon(
                             row.x + 8,
-                            iy + 8,
+                            iy + (row_h - 12).max(2) / 2,
                             if hovered { 0xFFFFFF } else { t.accent_blue },
                         );
                     }
                     let sc = act.shortcut_label();
                     let (sw, _) = canvas.measure_text(sc, FontStyle::UiSmall);
-                    canvas.draw_text_styled(
+                    let text_y = iy + (row_h - 18).max(2) / 2;
+                    canvas.draw_text_ellipsis(
                         row.x + 26,
-                        iy + 4,
+                        text_y,
                         act.menu_title_i18n(self.ui_lang),
                         if hovered { 0xFFFFFF } else { t.text_primary },
                         menu_w - sw - 48,
@@ -9996,7 +13530,7 @@ impl IdeApplicationState {
                     );
                     canvas.draw_text_styled(
                         row.x + row.w - sw - 12,
-                        iy + 5,
+                        text_y + 1,
                         sc,
                         if hovered { 0xE2E8F0 } else { t.text_muted },
                         sw + 4,
@@ -10004,7 +13538,7 @@ impl IdeApplicationState {
                     );
                     self.hit_regions
                         .push((row, HitAction::ExecuteIdeAction(act)));
-                    iy += 29;
+                    iy += row_step;
                 }
             }
         }
@@ -10034,7 +13568,7 @@ impl IdeApplicationState {
         } else {
             184
         };
-        let popup_y = if self.hamburger_menu_expanded { 74 } else { 40 };
+        let popup_y = 40;
         let popup_rect = Rect::new(popup_x, popup_y, popup_w, popup_h);
         self.active_overlay_rects.push(popup_rect);
 
@@ -10135,7 +13669,7 @@ impl IdeApplicationState {
             let row_w = if b == self.git_engine.current_branch {
                 popup_w - 12
             } else {
-                popup_w - 116
+                popup_w - 170
             };
             let row = Rect::new(popup_rect.x + 6, y, row_w, 26);
             let is_curr = b == self.git_engine.current_branch;
@@ -10148,7 +13682,7 @@ impl IdeApplicationState {
             } else {
                 canvas.draw_git_branch_icon(row.x + 8, y + 6, t.accent_blue);
             }
-            canvas.draw_text_styled(
+            canvas.draw_text_ellipsis(
                 row.x + 26,
                 y + 3,
                 &format!("{}{}", b, if is_curr { current_suffix } else { "" }),
@@ -10164,6 +13698,23 @@ impl IdeApplicationState {
                 .push((row, HitAction::CheckoutGitBranch(b.clone())));
 
             if !is_curr {
+                let rebase_btn = Rect::new(popup_rect.x + popup_w - 158, y + 2, 50, 22);
+                let rhov = rebase_btn.contains(hx, hy);
+                canvas.stroke_rounded_rect(
+                    rebase_btn,
+                    4,
+                    if rhov { t.syn_type } else { t.border_color },
+                    t.window_bg,
+                );
+                canvas.draw_text_centered(
+                    rebase_btn,
+                    self.tr("变基", "Rebase"),
+                    if rhov { t.syn_type } else { t.text_secondary },
+                    FontStyle::UiSmall,
+                );
+                self.hit_regions
+                    .push((rebase_btn, HitAction::GitRebaseBranch(b.clone())));
+
                 let merge_btn = Rect::new(popup_rect.x + popup_w - 104, y + 2, 48, 22);
                 let mhov = merge_btn.contains(hx, hy);
                 canvas.stroke_rounded_rect(
@@ -10264,7 +13815,7 @@ impl IdeApplicationState {
         };
         let popup_h = 56 + 5 * 28 + recent_h + 28 + (ThemeKind::all().len() as i32) * 28 + 10;
         let popup_x = 68;
-        let popup_y = if self.hamburger_menu_expanded { 74 } else { 40 };
+        let popup_y = 40;
         let popup_rect = Rect::new(popup_x, popup_y, popup_w, popup_h);
         self.active_overlay_rects.push(popup_rect);
 
@@ -10473,29 +14024,53 @@ impl IdeApplicationState {
         let t = self.theme;
         let (hx, hy) = self.hover_pos;
         let cfgs = self.run_configs.clone();
-        let popup_w = 348;
-        let popup_h = (cfgs.len().max(1) as i32) * 40 + 104;
-        let popup_x = (win_w - 460).clamp(180, win_w - popup_w - 8);
+        let max_visible = 9usize;
+        let total = cfgs.len();
+        let visible_rows = total.clamp(1, max_visible);
+        let max_scroll = total.saturating_sub(max_visible);
+        if self.run_config_popup_scroll > max_scroll {
+            self.run_config_popup_scroll = max_scroll;
+        }
+        let scroll = self.run_config_popup_scroll;
+
+        let active_path = self.active_buffer().path.clone();
+        let can_run_current_file = RunConfiguration::for_file(&active_path, &self.workspace_root).is_some();
+        let footer_h = if can_run_current_file { 132 } else { 104 };
+        let popup_w = 378;
+        let popup_h = (visible_rows as i32) * 40 + footer_h;
+        let popup_x = (win_w - 490).clamp(180, win_w - popup_w - 8);
         let popup_y = 40;
         let popup_rect = Rect::new(popup_x, popup_y, popup_w, popup_h);
+        self.run_config_popup_rect = popup_rect;
         self.active_overlay_rects.push(popup_rect);
 
         canvas.fill_rounded_shadow(popup_rect, 8);
         canvas.stroke_rounded_rect(popup_rect, 8, t.border_color, t.popup_bg);
 
+        let header_right = if total > max_visible {
+            format!("{} ({total})", self.tr("运行 / 调试配置", "Run / Debug Configurations"))
+        } else {
+            self.tr("运行 / 调试配置", "Run / Debug Configurations").to_string()
+        };
         canvas.draw_text_styled(
             popup_x + 12,
             popup_y + 8,
-            self.tr("运行 / 调试配置", "Run / Debug Configurations"),
+            &header_right,
             t.text_primary,
             popup_w - 24,
             FontStyle::UiBold,
         );
 
-        let mut y = popup_y + 32;
-        for (idx, cfg) in cfgs.iter().enumerate() {
-            let row = Rect::new(popup_x + 6, y, popup_w - 12, 36);
+        let list_top = popup_y + 32;
+        let list_h = (visible_rows as i32) * 40;
+        let has_scrollbar = total > max_visible;
+        let row_w = if has_scrollbar { popup_w - 20 } else { popup_w - 12 };
+
+        let mut y = list_top;
+        for (idx, cfg) in cfgs.iter().enumerate().skip(scroll).take(max_visible) {
+            let row = Rect::new(popup_x + 6, y, row_w, 36);
             let active = idx == self.active_run_config;
+            let row_running = self.terminal.is_run_config_running(&cfg.identity_key());
             let hovered = row.contains(hx, hy);
             if active || hovered {
                 canvas.fill_rounded_rect(row, 5, t.popup_hover_bg);
@@ -10503,8 +14078,13 @@ impl IdeApplicationState {
             if active {
                 canvas.draw_check_icon(row.x + 8, y + 11, 0xFFFFFF);
             } else {
-                canvas.draw_file_type_icon(row.x + 6, y + 10, cfg.language);
+                canvas.draw_run_config_icon(row.x + 6, y + 10, cfg);
             }
+            if row_running {
+                canvas.fill_circle(row.x + 21, y + 24, 3, t.run_green);
+            }
+            let is_custom = cfg.source == RunConfigSource::Custom;
+            let right_reserve = if is_custom { 88 } else { 34 };
             canvas.draw_text_styled(
                 row.x + 26,
                 y + 2,
@@ -10514,10 +14094,14 @@ impl IdeApplicationState {
                 } else {
                     t.text_primary
                 },
-                popup_w - 38,
+                row_w - 26 - right_reserve,
                 FontStyle::UiRegular,
             );
-            let cmd_preview = format!("{} {}", cfg.command, cfg.args.join(" "));
+            let cmd_preview = if cfg.args.is_empty() {
+                cfg.command.clone()
+            } else {
+                format!("{} {}", cfg.command, cfg.args.join(" "))
+            };
             canvas.draw_text_styled(
                 row.x + 26,
                 y + 19,
@@ -10527,12 +14111,85 @@ impl IdeApplicationState {
                 } else {
                     t.text_muted
                 },
-                popup_w - 38,
+                row_w - 26 - right_reserve,
                 FontStyle::CodeMono,
             );
-            self.hit_regions
-                .push((row, HitAction::SelectRunConfig(idx)));
+
+            // 每个脚本各自独立的 运行▷ / 暂停❚❚ 按钮
+            let toggle_btn_x = if is_custom {
+                row.x + row.w - 82
+            } else {
+                row.x + row.w - 26
+            };
+            let toggle_btn = Rect::new(toggle_btn_x, y + 7, 22, 22);
+            if toggle_btn.contains(hx, hy) {
+                canvas.fill_rounded_rect(toggle_btn, 4, t.panel_bg);
+            }
+            if row_running {
+                canvas.draw_pause_icon(toggle_btn.x + 6, toggle_btn.y + 6, 10, t.breakpoint_red);
+            } else {
+                canvas.stroke_play_triangle(toggle_btn.x + 6, toggle_btn.y + 6, 10, t.run_green);
+            }
+
+            if is_custom {
+                let badge_txt = if cfg.target_file.is_some() { "File" } else { "CLI" };
+                let badge = Rect::new(row.x + row.w - 56, y + 9, 30, 18);
+                canvas.fill_rounded_rect(
+                    badge,
+                    4,
+                    if active || hovered { 0x355C9A } else { t.panel_bg },
+                );
+                canvas.draw_text_styled(
+                    badge.x + 5,
+                    badge.y + 2,
+                    badge_txt,
+                    if active || hovered { 0xFFFFFF } else { t.text_muted },
+                    24,
+                    FontStyle::UiSmall,
+                );
+                let del_btn = Rect::new(row.x + row.w - 24, y + 8, 20, 20);
+                if del_btn.contains(hx, hy) {
+                    canvas.fill_rounded_rect(del_btn, 4, t.breakpoint_red);
+                }
+                canvas.draw_text_styled(
+                    del_btn.x + 6,
+                    del_btn.y + 2,
+                    "×",
+                    if del_btn.contains(hx, hy) || active || hovered {
+                        0xFFFFFF
+                    } else {
+                        t.text_muted
+                    },
+                    14,
+                    FontStyle::UiRegular,
+                );
+                self.hit_regions.push((
+                    Rect::new(row.x, row.y, toggle_btn_x - row.x, row.h),
+                    HitAction::SelectRunConfig(idx),
+                ));
+                self.hit_regions
+                    .push((toggle_btn, HitAction::ToggleRunConfigAt(idx)));
+                self.hit_regions
+                    .push((del_btn, HitAction::RemoveRunConfig(idx)));
+            } else {
+                self.hit_regions.push((
+                    Rect::new(row.x, row.y, toggle_btn_x - row.x, row.h),
+                    HitAction::SelectRunConfig(idx),
+                ));
+                self.hit_regions
+                    .push((toggle_btn, HitAction::ToggleRunConfigAt(idx)));
+            }
             y += 40;
+        }
+
+        if has_scrollbar {
+            canvas.draw_vertical_scrollbar(
+                Rect::new(popup_x + popup_w - 10, list_top + 2, 5, (list_h - 6).max(16)),
+                scroll,
+                max_visible,
+                total,
+                t.border_color,
+            );
         }
 
         canvas.fill_rect(
@@ -10541,19 +14198,31 @@ impl IdeApplicationState {
         );
         y += 7;
 
+        let active_running = self.active_run_config_is_running();
         let run_row = Rect::new(popup_x + 6, y, popup_w - 12, 26);
         let run_hovered = run_row.contains(hx, hy);
         if run_hovered {
             canvas.fill_rounded_rect(run_row, 5, t.popup_hover_bg);
         }
-        canvas.stroke_play_triangle(run_row.x + 9, y + 7, 10, t.run_green);
+        if active_running {
+            canvas.draw_pause_icon(run_row.x + 9, y + 7, 10, t.breakpoint_red);
+        } else {
+            canvas.stroke_play_triangle(run_row.x + 9, y + 7, 10, t.run_green);
+        }
         canvas.draw_text_styled(
             run_row.x + 26,
             y + 4,
-            self.tr(
-                "运行当前配置 (Shift+F10)",
-                "Run Active Configuration (Shift+F10)",
-            ),
+            if active_running {
+                self.tr(
+                    "暂停/停止当前配置 (Shift+F10)",
+                    "Stop Active Configuration (Shift+F10)",
+                )
+            } else {
+                self.tr(
+                    "运行当前配置 (Shift+F10)",
+                    "Run Active Configuration (Shift+F10)",
+                )
+            },
             if run_hovered {
                 0xFFFFFF
             } else {
@@ -10563,6 +14232,70 @@ impl IdeApplicationState {
             FontStyle::UiRegular,
         );
         self.hit_regions.push((run_row, HitAction::RunActiveConfig));
+        y += 28;
+
+        if can_run_current_file {
+            let fname = active_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("file");
+            let file_label = match self.ui_lang {
+                UiLanguage::ZhCn => format!("运行当前文件 '{fname}' (Ctrl+Shift+F10)"),
+                UiLanguage::EnUs => format!("Run '{fname}' (Ctrl+Shift+F10)"),
+            };
+            let file_row = Rect::new(popup_x + 6, y, popup_w - 12, 26);
+            let file_hovered = file_row.contains(hx, hy);
+            if file_hovered {
+                canvas.fill_rounded_rect(file_row, 5, t.popup_hover_bg);
+            }
+            canvas.draw_path_file_icon(file_row.x + 6, y + 5, &active_path);
+            canvas.draw_text_styled(
+                file_row.x + 26,
+                y + 4,
+                &file_label,
+                if file_hovered {
+                    0xFFFFFF
+                } else {
+                    t.text_primary
+                },
+                popup_w - 36,
+                FontStyle::UiRegular,
+            );
+            self.hit_regions
+                .push((file_row, HitAction::ExecuteIdeAction(IdeAction::RunCurrentFile)));
+            y += 28;
+        }
+
+        let add_row = Rect::new(popup_x + 6, y, popup_w - 12, 26);
+        let add_hovered = add_row.contains(hx, hy);
+        if add_hovered {
+            canvas.fill_rounded_rect(add_row, 5, t.popup_hover_bg);
+        }
+        canvas.draw_text_styled(
+            add_row.x + 10,
+            y + 3,
+            "+",
+            t.accent_blue,
+            16,
+            FontStyle::UiBold,
+        );
+        canvas.draw_text_styled(
+            add_row.x + 26,
+            y + 4,
+            self.tr(
+                "添加命令行配置...",
+                "Add Run Command...",
+            ),
+            if add_hovered {
+                0xFFFFFF
+            } else {
+                t.text_primary
+            },
+            popup_w - 36,
+            FontStyle::UiRegular,
+        );
+        self.hit_regions
+            .push((add_row, HitAction::OpenNewRunConfigModal));
         y += 28;
 
         let dbg_row = Rect::new(popup_x + 6, y, popup_w - 12, 26);
@@ -10588,6 +14321,417 @@ impl IdeApplicationState {
         );
         self.hit_regions
             .push((dbg_row, HitAction::DebugActiveConfig));
+    }
+
+    fn render_mobile_env_popup(&mut self, canvas: &mut SurfaceCanvas, win_w: i32) {
+        let t = self.theme;
+        let (hx, hy) = self.hover_pos;
+        let devices = self.mobile_env.devices.clone();
+        let tools = self.mobile_env.sdk_tools.clone();
+        let has_flutter = matches!(
+            self.mobile_env.project_kind,
+            MobileProjectKind::Flutter | MobileProjectKind::FlutterAndAndroid
+        );
+
+        let dev_rows = devices.len().clamp(1, 5);
+        let tool_rows = tools.len().clamp(1, 6);
+        let missing_cnt = self.mobile_env.missing_required_tools().len();
+
+        let popup_w = 436;
+        let header_h = 38;
+        let warn_h = if missing_cnt > 0 { 26 } else { 0 };
+        let dev_section_h = 26 + (dev_rows as i32) * 34;
+        let sdk_section_h = 28 + (tool_rows as i32) * 44;
+        let quick_h = 38;
+        let popup_h = (header_h + warn_h + dev_section_h + sdk_section_h + quick_h).min(640);
+        let popup_x = (win_w - 640).clamp(140, win_w - popup_w - 8);
+        let popup_y = 40;
+        let popup_rect = Rect::new(popup_x, popup_y, popup_w, popup_h);
+        self.mobile_popup_rect = popup_rect;
+        self.active_overlay_rects.push(popup_rect);
+
+        canvas.fill_rounded_shadow(popup_rect, 8);
+        canvas.stroke_rounded_rect(popup_rect, 8, t.border_color, t.popup_bg);
+
+        let kind_tag = match self.mobile_env.project_kind {
+            MobileProjectKind::Flutter => "Flutter",
+            MobileProjectKind::AndroidNative => "Android",
+            MobileProjectKind::FlutterAndAndroid => "Flutter + Android",
+            MobileProjectKind::None => "Mobile SDK",
+        };
+        let title_str = format!(
+            "{} · {kind_tag}",
+            self.tr("移动设备与 SDK 环境", "Mobile Devices & SDK")
+        );
+        canvas.draw_mobile_phone_icon(popup_x + 12, popup_y + 12, t.accent_blue);
+        canvas.draw_text_styled(
+            popup_x + 30,
+            popup_y + 9,
+            &title_str,
+            t.text_primary,
+            popup_w - 190,
+            FontStyle::UiBold,
+        );
+
+        let path_rect = Rect::new(popup_x + popup_w - 150, popup_y + 7, 60, 24);
+        let path_hot = path_rect.contains(hx, hy);
+        canvas.fill_rounded_rect(
+            path_rect,
+            5,
+            if path_hot { t.accent_blue } else { t.panel_bg },
+        );
+        canvas.draw_text_styled(
+            path_rect.x + 10,
+            path_rect.y + 4,
+            self.tr("目录", "Path"),
+            if path_hot { 0xFFFFFF } else { t.text_primary },
+            path_rect.w - 12,
+            FontStyle::UiSmall,
+        );
+        self.hit_regions
+            .push((path_rect, HitAction::OpenMobileSdkSettings));
+
+        let refresh_rect = Rect::new(popup_x + popup_w - 84, popup_y + 7, 74, 24);
+        let refresh_hot = refresh_rect.contains(hx, hy);
+        canvas.fill_rounded_rect(
+            refresh_rect,
+            5,
+            if refresh_hot {
+                t.accent_blue
+            } else {
+                t.panel_bg
+            },
+        );
+        canvas.draw_text_styled(
+            refresh_rect.x + 8,
+            refresh_rect.y + 4,
+            if self.mobile_env.probing {
+                self.tr("检测中...", "Probing...")
+            } else {
+                self.tr("↻ 刷新", "↻ Refresh")
+            },
+            if refresh_hot { 0xFFFFFF } else { t.text_primary },
+            refresh_rect.w - 12,
+            FontStyle::UiSmall,
+        );
+        self.hit_regions
+            .push((refresh_rect, HitAction::RefreshMobileEnv));
+
+        let mut y = popup_y + 36;
+        if missing_cnt > 0 {
+            let warn_box = Rect::new(popup_x + 10, y, popup_w - 20, 22);
+            canvas.fill_rounded_rect(warn_box, 4, blend_rgb(t.popup_bg, t.breakpoint_red, 0.22));
+            let warn_msg = match self.ui_lang {
+                UiLanguage::ZhCn => format!(
+                    "⚠ {missing_cnt} 个移动端 SDK 未安装。可点「目录」指定安装路径，或下方安装"
+                ),
+                UiLanguage::EnUs => format!(
+                    "⚠ {missing_cnt} mobile SDK(s) not installed. Set Path or install below"
+                ),
+            };
+            canvas.draw_text_styled(
+                warn_box.x + 8,
+                warn_box.y + 4,
+                &warn_msg,
+                0xF78166,
+                warn_box.w - 16,
+                FontStyle::UiSmall,
+            );
+            y += 26;
+        }
+
+        // Section 1: Connected phones & AVD emulators
+        canvas.draw_text_styled(
+            popup_x + 12,
+            y,
+            self.tr("可用真机与模拟器 (ADB / Flutter / AVD)", "Devices & Emulators (ADB / Flutter / AVD)"),
+            t.text_muted,
+            popup_w - 24,
+            FontStyle::UiSmall,
+        );
+        y += 20;
+
+        if devices.is_empty() {
+            let empty_msg = if self.mobile_env.probing {
+                self.tr("正在执行 adb devices / flutter devices 检测...", "Running adb devices / flutter devices...")
+            } else {
+                self.tr(
+                    "未发现设备：请用 USB 连接手机并开启「USB 调试」，或先安装 ADB/AVD",
+                    "No device found: connect phone via USB Debugging or launch an AVD",
+                )
+            };
+            canvas.draw_text_styled(
+                popup_x + 14,
+                y + 6,
+                empty_msg,
+                t.text_secondary,
+                popup_w - 28,
+                FontStyle::UiSmall,
+            );
+            y += 32;
+        } else {
+            for dev in devices.iter().take(5) {
+                let row = Rect::new(popup_x + 8, y, popup_w - 16, 30);
+                let is_sel = self.selected_mobile_device_id.as_deref() == Some(dev.id.as_str());
+                let row_hot = row.contains(hx, hy);
+                if is_sel || row_hot {
+                    canvas.fill_rounded_rect(
+                        row,
+                        5,
+                        if is_sel {
+                            blend_rgb(t.popup_bg, t.accent_blue, 0.25)
+                        } else {
+                            t.popup_hover_bg
+                        },
+                    );
+                }
+                let state_color = match dev.state {
+                    MobileDeviceState::Online => t.run_green,
+                    MobileDeviceState::Unauthorized => 0xE5C07B,
+                    MobileDeviceState::Offline => t.breakpoint_red,
+                    MobileDeviceState::EmulatorAvd => t.accent_blue,
+                };
+                canvas.fill_circle(row.x + 10, row.y + 15, 4, state_color);
+                let title_line = if is_sel {
+                    format!("✓ {}  ({})", dev.name, dev.detail)
+                } else {
+                    format!("{}  ({})", dev.name, dev.detail)
+                };
+                canvas.draw_text_styled(
+                    row.x + 22,
+                    row.y + 6,
+                    &title_line,
+                    if row_hot && !is_sel { 0xFFFFFF } else { t.text_primary },
+                    row.w - 92,
+                    FontStyle::UiSmall,
+                );
+                if dev.state == MobileDeviceState::EmulatorAvd {
+                    let avd_name = dev.id.strip_prefix("avd:").unwrap_or(&dev.name).to_string();
+                    let btn = Rect::new(row.x + row.w - 64, row.y + 4, 58, 22);
+                    let btn_hot = btn.contains(hx, hy);
+                    canvas.fill_rounded_rect(
+                        btn,
+                        4,
+                        if btn_hot { t.accent_blue } else { t.panel_bg },
+                    );
+                    canvas.draw_text_styled(
+                        btn.x + 8,
+                        btn.y + 3,
+                        self.tr("启动", "Launch"),
+                        if btn_hot { 0xFFFFFF } else { t.text_primary },
+                        btn.w - 12,
+                        FontStyle::UiSmall,
+                    );
+                    self.hit_regions
+                        .push((btn, HitAction::LaunchMobileEmulator(avd_name)));
+                } else if dev.state == MobileDeviceState::Unauthorized {
+                    canvas.draw_text_styled(
+                        row.x + row.w - 76,
+                        row.y + 6,
+                        self.tr("需手机授权", "Authorize"),
+                        0xE5C07B,
+                        72,
+                        FontStyle::UiSmall,
+                    );
+                } else if dev.state == MobileDeviceState::Online {
+                    self.hit_regions
+                        .push((row, HitAction::SelectMobileDevice(dev.id.clone())));
+                }
+                y += 34;
+            }
+        }
+
+        canvas.fill_rect(
+            Rect::new(popup_x + 10, y + 2, popup_w - 20, 1),
+            t.border_color,
+        );
+        y += 8;
+
+        // Section 2: Local SDK & Toolchain Status
+        canvas.draw_text_styled(
+            popup_x + 12,
+            y,
+            self.tr("本机 SDK / 编译工具链检测", "Local SDK & Toolchain Check"),
+            t.text_muted,
+            popup_w - 24,
+            FontStyle::UiSmall,
+        );
+        y += 20;
+
+        for tool in tools.iter().take(6) {
+            let row = Rect::new(popup_x + 8, y, popup_w - 16, 40);
+            if row.contains(hx, hy) {
+                canvas.fill_rounded_rect(row, 5, blend_rgb(t.popup_bg, t.panel_bg, 0.65));
+            }
+            let dot = if tool.installed {
+                t.run_green
+            } else if tool.required {
+                t.breakpoint_red
+            } else {
+                t.text_muted
+            };
+            canvas.fill_circle(row.x + 10, row.y + 12, 4, dot);
+
+            let right_reserve = if !tool.installed {
+                if tool.install_cmd.is_some() { 142 } else { 72 }
+            } else {
+                12
+            };
+            let status_head = if tool.installed {
+                let ver = if tool.version_or_detail.trim().is_empty() {
+                    self.tr("已安装", "Installed")
+                } else {
+                    tool.version_or_detail.as_str()
+                };
+                format!("{} · {ver}", tool.label)
+            } else if tool.required {
+                format!(
+                    "{} · {}",
+                    tool.label,
+                    self.tr("SDK 未安装", "SDK not installed")
+                )
+            } else {
+                format!(
+                    "{} · {}",
+                    tool.label,
+                    self.tr("SDK 未安装", "SDK not installed")
+                )
+            };
+            canvas.draw_text_styled(
+                row.x + 20,
+                row.y + 3,
+                &status_head,
+                if tool.installed {
+                    t.text_primary
+                } else if tool.required {
+                    0xF78166
+                } else {
+                    t.text_secondary
+                },
+                row.w - right_reserve - 20,
+                FontStyle::UiSmall,
+            );
+            let sub_info_owned: String;
+            let sub_info = if tool.installed {
+                sub_info_owned = tool
+                    .path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                sub_info_owned.as_str()
+            } else {
+                tool.install_hint.as_str()
+            };
+            canvas.draw_text_styled(
+                row.x + 20,
+                row.y + 20,
+                sub_info,
+                t.text_muted,
+                row.w - right_reserve - 20,
+                FontStyle::UiSmall,
+            );
+
+            if !tool.installed {
+                let mut bx = row.x + row.w - 64;
+                let dl_btn = Rect::new(bx, row.y + 9, 58, 22);
+                let dl_hot = dl_btn.contains(hx, hy);
+                canvas.fill_rounded_rect(
+                    dl_btn,
+                    4,
+                    if dl_hot { t.accent_blue } else { t.panel_bg },
+                );
+                canvas.draw_text_styled(
+                    dl_btn.x + 10,
+                    dl_btn.y + 3,
+                    self.tr("下载", "Get"),
+                    if dl_hot { 0xFFFFFF } else { t.text_primary },
+                    dl_btn.w - 12,
+                    FontStyle::UiSmall,
+                );
+                self.hit_regions.push((
+                    dl_btn,
+                    HitAction::OpenMobileDownloadUrl(tool.download_url.clone()),
+                ));
+
+                if let Some(cmd) = &tool.install_cmd {
+                    bx -= 68;
+                    let inst_btn = Rect::new(bx, row.y + 9, 64, 22);
+                    let inst_hot = inst_btn.contains(hx, hy);
+                    canvas.fill_rounded_rect(
+                        inst_btn,
+                        4,
+                        if inst_hot {
+                            t.run_green
+                        } else {
+                            blend_rgb(t.panel_bg, t.run_green, 0.25)
+                        },
+                    );
+                    canvas.draw_text_styled(
+                        inst_btn.x + 6,
+                        inst_btn.y + 3,
+                        self.tr("一键安装", "Install"),
+                        if inst_hot { 0x0B1510 } else { t.text_primary },
+                        inst_btn.w - 10,
+                        FontStyle::UiSmall,
+                    );
+                    self.hit_regions.push((
+                        inst_btn,
+                        HitAction::InstallMobileSdkCmd(tool.label.clone(), cmd.clone()),
+                    ));
+                }
+            }
+            y += 44;
+        }
+
+        canvas.fill_rect(
+            Rect::new(popup_x + 10, y + 2, popup_w - 20, 1),
+            t.border_color,
+        );
+        y += 8;
+
+        // Section 3: Quick ADB / Flutter diagnostics
+        let mut qx = popup_x + 10;
+        let logcat_cmd = if let Some(dev_id) = self.selected_mobile_device_id.as_deref() {
+            if !dev_id.starts_with("avd:") {
+                format!("adb -s {dev_id} logcat -v time")
+            } else {
+                "adb logcat -v time".to_string()
+            }
+        } else {
+            "adb logcat -v time".to_string()
+        };
+        let quick_actions: Vec<(&str, String)> = {
+            let mut v = vec![(self.tr("查看 ADB Logcat", "ADB Logcat"), logcat_cmd)];
+            if has_flutter {
+                v.push(("flutter doctor", "flutter doctor -v".to_string()));
+            }
+            v.push((
+                self.tr("重启 ADB", "Restart ADB"),
+                "adb kill-server && adb start-server && adb devices -l".to_string(),
+            ));
+            v
+        };
+        for (label, cmd) in quick_actions {
+            let (tw, _) = canvas.measure_text(label, FontStyle::UiSmall);
+            let bw = (tw + 16).min(148);
+            if qx + bw > popup_x + popup_w - 8 {
+                break;
+            }
+            let btn = Rect::new(qx, y, bw, 24);
+            let bhot = btn.contains(hx, hy);
+            canvas.fill_rounded_rect(btn, 5, if bhot { t.popup_hover_bg } else { t.panel_bg });
+            canvas.draw_text_styled(
+                btn.x + 8,
+                btn.y + 4,
+                label,
+                if bhot { 0xFFFFFF } else { t.text_secondary },
+                btn.w - 12,
+                FontStyle::UiSmall,
+            );
+            self.hit_regions
+                .push((btn, HitAction::RunMobileCommand(cmd)));
+            qx += bw + 6;
+        }
     }
 
     fn render_more_menu_popup(&mut self, canvas: &mut SurfaceCanvas, win_w: i32) {
@@ -10805,12 +14949,19 @@ impl IdeApplicationState {
                     relative_path,
                     full_path,
                 } => {
-                    canvas.draw_text_styled(
+                    let row_max_w = (mw - 42).max(60);
+                    let prefix = format!("[{file_tag}]  ");
+                    let (pw, _) = canvas.measure_text(&prefix, FontStyle::UiRegular);
+                    let name_max_w = ((row_max_w - pw) / 2).max(110);
+                    let shown_name =
+                        canvas.ellipsize_filename(&name, name_max_w, FontStyle::UiRegular);
+                    let display_row = format!("{prefix}{shown_name}   ({relative_path})");
+                    canvas.draw_text_ellipsis(
                         mx + 18,
                         ry + 3,
-                        &format!("[{}]  {}   ({})", file_tag, name, relative_path),
+                        &display_row,
                         if hovered { 0xFFFFFF } else { t.text_primary },
-                        mw - 42,
+                        row_max_w,
                         FontStyle::UiRegular,
                     );
                     self.hit_regions.push((row, HitAction::OpenFile(full_path)));
@@ -11354,6 +15505,50 @@ impl IdeApplicationState {
                     "Press Enter to create, Esc to cancel",
                 ),
             ),
+            FocusTarget::NewRunConfigModal => (
+                self.tr(
+                    "添加并运行命令行配置 (例如 npm run dev / docker compose up / ./gradlew bootRun)",
+                    "Add & Run Command Configuration (e.g. npm run dev / docker compose up)",
+                )
+                .to_string(),
+                self.tr(
+                    "输入命令后按 Enter 加入运行列表并执行，Esc 取消",
+                    "Enter command then press Enter to add & run, Esc to cancel",
+                ),
+            ),
+            FocusTarget::NewGitTagModal => (
+                self.tr(
+                    "创建新 Git Tag 标签 (Enter 创建)",
+                    "Create New Git Tag at HEAD (Enter to create)",
+                )
+                .to_string(),
+                self.tr(
+                    "按 Enter 确认创建标签，按 Esc 取消",
+                    "Press Enter to create tag, Esc to cancel",
+                ),
+            ),
+            FocusTarget::NewGitStashModal => (
+                self.tr(
+                    "暂存当前工作区修改 Stash Changes",
+                    "Stash Uncommitted Changes (includes untracked)",
+                )
+                .to_string(),
+                self.tr(
+                    "输入 Stash 说明后按 Enter 暂存，按 Esc 取消",
+                    "Enter stash message and press Enter, Esc to cancel",
+                ),
+            ),
+            FocusTarget::GitAddRemoteModal => (
+                self.tr(
+                    "添加 Git 远程仓库 (格式: <名称> <URL>)",
+                    "Add Git Remote (format: <name> <url>)",
+                )
+                .to_string(),
+                self.tr(
+                    "例如 origin https://... 后按 Enter 确认，Esc 取消",
+                    "Example: origin https://... then Enter, Esc to cancel",
+                ),
+            ),
             FocusTarget::RenamePathModal => (
                 match self.ui_lang {
                     UiLanguage::ZhCn => format!(
@@ -11424,6 +15619,455 @@ impl IdeApplicationState {
             mw - 32,
             FontStyle::UiSmall,
         );
+    }
+
+    /// 渲染 IntelliJ IDEA 风格 Git 模态操作弹窗（合并 / 变基 / 恢复 Stash / Reset HEAD / 回滚 / 远程仓库）
+    fn render_git_operation_modal(&mut self, canvas: &mut SurfaceCanvas, w: i32, h: i32) {
+        let t = self.theme;
+        let (hx, hy) = self.hover_pos;
+        let mw = 540.min((w - 36).max(320));
+        let mh = 360.min((h - 48).max(240));
+        let mx = (w - mw) / 2;
+        let my = (h - mh) / 3;
+        let modal = Rect::new(mx, my, mw, mh);
+        self.active_overlay_rects.push(modal);
+
+        canvas.fill_rounded_shadow(modal, 10);
+        canvas.stroke_rounded_rect(modal, 10, t.accent_blue, t.popup_bg);
+
+        let header = Rect::new(mx + 2, my + 2, mw - 4, 38);
+        canvas.fill_rounded_rect(header, 8, t.panel_header_bg);
+
+        let title = match self.focus {
+            FocusTarget::GitMergeModal => self.tr("Git 合并分支 (Merge)", "Git Merge Branch"),
+            FocusTarget::GitRebaseModal => self.tr("Git 变基 (Rebase)", "Git Rebase Branch"),
+            FocusTarget::GitUnstashModal => {
+                self.tr("恢复工作区暂存 (Unstash Changes)", "Unstash Changes (Stash List)")
+            }
+            FocusTarget::GitResetModal => self.tr("重置当前分支 (Reset HEAD)", "Reset HEAD"),
+            FocusTarget::GitRollbackModal => {
+                self.tr("回滚未提交变更 (Rollback Changes)", "Rollback Uncommitted Changes")
+            }
+            FocusTarget::GitRemotesModal => {
+                self.tr("管理远程仓库 (Git Remotes)", "Manage Git Remotes")
+            }
+            _ => "",
+        };
+        canvas.draw_text_ellipsis(
+            mx + 16,
+            my + 11,
+            title,
+            t.text_primary,
+            mw - 104,
+            FontStyle::UiBold,
+        );
+
+        let close_btn = Rect::new(mx + mw - 76, my + 8, 64, 24);
+        let chov = close_btn.contains(hx, hy);
+        canvas.stroke_rounded_rect(
+            close_btn,
+            5,
+            if chov { t.accent_blue } else { t.border_color },
+            if chov { t.popup_hover_bg } else { t.window_bg },
+        );
+        canvas.draw_text_centered(
+            close_btn,
+            self.tr("关闭 (Esc)", "Close"),
+            if chov { 0xFFFFFF } else { t.text_secondary },
+            FontStyle::UiSmall,
+        );
+        self.hit_regions
+            .push((close_btn, HitAction::CloseModalToEditor));
+
+        let mut y = my + 48;
+        let content_bottom = my + mh - 14;
+        match self.focus {
+            FocusTarget::GitMergeModal | FocusTarget::GitRebaseModal => {
+                let is_rebase = self.focus == FocusTarget::GitRebaseModal;
+                if is_rebase && self.git_engine.in_rebase {
+                    let cont_btn = Rect::new(mx + 16, y, 130, 26);
+                    let abort_btn = Rect::new(mx + 154, y, 130, 26);
+                    for (btn, lbl, act, col) in [
+                        (
+                            cont_btn,
+                            self.tr("继续 Rebase", "Continue Rebase"),
+                            HitAction::GitRebaseContinue,
+                            t.run_green,
+                        ),
+                        (
+                            abort_btn,
+                            self.tr("中止 Rebase", "Abort Rebase"),
+                            HitAction::GitRebaseAbort,
+                            t.breakpoint_red,
+                        ),
+                    ] {
+                        let hov = btn.contains(hx, hy);
+                        canvas.stroke_rounded_rect(btn, 5, col, t.window_bg);
+                        canvas.draw_text_centered(btn, lbl, if hov { 0xFFFFFF } else { col }, FontStyle::UiSmall);
+                        self.hit_regions.push((btn, act));
+                    }
+                    y += 34;
+                } else if !is_rebase && self.git_engine.in_merge {
+                    let abort_btn = Rect::new(mx + 16, y, 160, 26);
+                    canvas.stroke_rounded_rect(abort_btn, 5, t.breakpoint_red, t.window_bg);
+                    canvas.draw_text_centered(
+                        abort_btn,
+                        self.tr("中止当前 Merge", "Abort Active Merge"),
+                        t.breakpoint_red,
+                        FontStyle::UiSmall,
+                    );
+                    self.hit_regions.push((abort_btn, HitAction::GitMergeAbort));
+                    y += 34;
+                }
+
+                let sub = if is_rebase {
+                    format!(
+                        "{}: {}",
+                        self.tr("选择要变基到的目标分支，当前分支", "Select target branch to rebase"),
+                        self.git_engine.current_branch
+                    )
+                } else {
+                    format!(
+                        "{}: {}",
+                        self.tr("选择要合并入当前分支的来源分支", "Select branch to merge into"),
+                        self.git_engine.current_branch
+                    )
+                };
+                canvas.draw_text_ellipsis(
+                    mx + 16,
+                    y,
+                    &sub,
+                    t.text_muted,
+                    mw - 32,
+                    FontStyle::UiSmall,
+                );
+                y += 22;
+
+                let candidates: Vec<String> = self
+                    .git_engine
+                    .local_branches
+                    .iter()
+                    .filter(|b| *b != &self.git_engine.current_branch)
+                    .chain(self.git_engine.remote_branches.iter())
+                    .cloned()
+                    .collect();
+                if candidates.is_empty() {
+                    canvas.draw_text_centered(
+                        Rect::new(mx + 16, y + 20, mw - 32, 60),
+                        self.tr("当前没有其他可操作的本地或远程分支", "No other local or remote branches available"),
+                        t.text_muted,
+                        FontStyle::UiRegular,
+                    );
+                } else {
+                    for br in candidates {
+                        if y + 28 > content_bottom {
+                            break;
+                        }
+                        let row = Rect::new(mx + 16, y, mw - 32, 26);
+                        let hov = row.contains(hx, hy);
+                        canvas.stroke_rounded_rect(
+                            row,
+                            5,
+                            if hov { t.accent_blue } else { t.border_color },
+                            if hov { t.popup_hover_bg } else { t.window_bg },
+                        );
+                        canvas.draw_git_branch_icon(row.x + 8, row.y + 6, t.accent_blue);
+                        canvas.draw_text_ellipsis(
+                            row.x + 28,
+                            row.y + 4,
+                            &br,
+                            if hov { 0xFFFFFF } else { t.text_primary },
+                            row.w - 110,
+                            FontStyle::UiRegular,
+                        );
+                        let act_lbl = if is_rebase {
+                            self.tr("变基至此", "Rebase")
+                        } else {
+                            self.tr("合并入当前", "Merge")
+                        };
+                        canvas.draw_text_styled(
+                            row.x + row.w - 78,
+                            row.y + 5,
+                            act_lbl,
+                            if hov { 0xFFFFFF } else { t.accent_blue },
+                            72,
+                            FontStyle::UiSmall,
+                        );
+                        let hit = if is_rebase {
+                            HitAction::GitRebaseBranch(br)
+                        } else {
+                            HitAction::GitMergeBranch(br)
+                        };
+                        self.hit_regions.push((row, hit));
+                        y += 30;
+                    }
+                }
+            }
+            FocusTarget::GitUnstashModal => {
+                let stashes = self.git_engine.stashes.clone();
+                if stashes.is_empty() {
+                    canvas.draw_text_centered(
+                        Rect::new(mx + 16, y + 40, mw - 32, 80),
+                        self.tr("当前没有已保存的 Git Stash 暂存记录", "No Git stashes saved in this repository"),
+                        t.text_muted,
+                        FontStyle::UiRegular,
+                    );
+                } else {
+                    for st in stashes {
+                        if y + 32 > content_bottom {
+                            break;
+                        }
+                        let row = Rect::new(mx + 16, y, mw - 32, 28);
+                        canvas.stroke_rounded_rect(row, 5, t.border_color, t.window_bg);
+                        let label = format!("{}  ·  {}", st.index_ref, st.message);
+                        canvas.draw_text_ellipsis(
+                            row.x + 10,
+                            row.y + 5,
+                            &label,
+                            t.text_primary,
+                            (row.w - 186).max(40),
+                            FontStyle::UiSmall,
+                        );
+                        let drop_b = Rect::new(row.x + row.w - 54, row.y + 3, 48, 22);
+                        let apply_b = Rect::new(drop_b.x - 56, row.y + 3, 52, 22);
+                        let pop_b = Rect::new(apply_b.x - 54, row.y + 3, 50, 22);
+                        for (btn, lbl, act, col) in [
+                            (pop_b, "Pop", HitAction::GitStashPop(st.index_ref.clone()), t.run_green),
+                            (
+                                apply_b,
+                                "Apply",
+                                HitAction::GitStashApply(st.index_ref.clone()),
+                                t.accent_blue,
+                            ),
+                            (
+                                drop_b,
+                                "Drop",
+                                HitAction::GitStashDrop(st.index_ref.clone()),
+                                t.breakpoint_red,
+                            ),
+                        ] {
+                            let bhov = btn.contains(hx, hy);
+                            canvas.stroke_rounded_rect(btn, 4, col, if bhov { col } else { t.panel_bg });
+                            canvas.draw_text_centered(btn, lbl, if bhov { 0xFFFFFF } else { col }, FontStyle::UiSmall);
+                            self.hit_regions.push((btn, act));
+                        }
+                        y += 32;
+                    }
+                }
+            }
+            FocusTarget::GitResetModal => {
+                canvas.draw_text_styled(
+                    mx + 16,
+                    y,
+                    self.tr("1. 选择 Reset 模式:", "1. Select Reset Mode:"),
+                    t.text_secondary,
+                    mw - 32,
+                    FontStyle::UiSmall,
+                );
+                y += 22;
+                let modes = [
+                    (ide_git::GitResetMode::Soft, "Soft (--soft)", self.tr("保留更改在暂存区", "Keep staged")),
+                    (ide_git::GitResetMode::Mixed, "Mixed (--mixed)", self.tr("保留在工作区", "Keep in worktree")),
+                    (ide_git::GitResetMode::Hard, "Hard (--hard)", self.tr("丢弃全部本地修改", "Discard all changes")),
+                ];
+                let bw = ((mw - 48) / 3).max(90);
+                for (i, (mode, title_m, _desc)) in modes.iter().enumerate() {
+                    let btn = Rect::new(mx + 16 + (i as i32) * (bw + 8), y, bw, 28);
+                    let active = self.git_reset_mode == *mode;
+                    canvas.stroke_rounded_rect(
+                        btn,
+                        5,
+                        if active { t.accent_blue } else { t.border_color },
+                        if active {
+                            blend_rgb(t.window_bg, t.accent_blue, 0.20)
+                        } else {
+                            t.window_bg
+                        },
+                    );
+                    canvas.draw_text_centered(
+                        btn,
+                        title_m,
+                        if active { t.accent_blue } else { t.text_primary },
+                        FontStyle::UiSmall,
+                    );
+                    self.hit_regions.push((btn, HitAction::SelectGitResetMode(*mode)));
+                }
+                y += 40;
+                canvas.draw_text_styled(
+                    mx + 16,
+                    y,
+                    self.tr("2. 选择目标提交 (点击即执行 Reset):", "2. Select Target Revision:"),
+                    t.text_secondary,
+                    mw - 32,
+                    FontStyle::UiSmall,
+                );
+                y += 22;
+                let mut targets = vec![
+                    ("HEAD".to_string(), self.tr("当前提交 HEAD", "Current HEAD").to_string()),
+                    ("HEAD~1".to_string(), self.tr("上一个提交 HEAD~1", "Parent commit HEAD~1").to_string()),
+                ];
+                for c in self.git_engine.recent_commits.iter().take(5) {
+                    targets.push((c.hash.clone(), format!("{}  {}", c.hash, c.subject)));
+                }
+                for (tgt, label) in targets {
+                    if y + 28 > content_bottom {
+                        break;
+                    }
+                    let row = Rect::new(mx + 16, y, mw - 32, 26);
+                    let hov = row.contains(hx, hy);
+                    canvas.stroke_rounded_rect(
+                        row,
+                        5,
+                        if hov { t.accent_blue } else { t.border_color },
+                        if hov { t.popup_hover_bg } else { t.window_bg },
+                    );
+                    canvas.draw_text_ellipsis(
+                        row.x + 10,
+                        row.y + 4,
+                        &label,
+                        if hov { 0xFFFFFF } else { t.text_primary },
+                        row.w - 20,
+                        FontStyle::UiSmall,
+                    );
+                    self.hit_regions.push((
+                        row,
+                        HitAction::GitResetTo {
+                            target: tgt,
+                            mode: self.git_reset_mode,
+                        },
+                    ));
+                    y += 30;
+                }
+            }
+            FocusTarget::GitRollbackModal => {
+                let files = self.git_engine.changed_files.clone();
+                if files.is_empty() {
+                    canvas.draw_text_centered(
+                        Rect::new(mx + 16, y + 40, mw - 32, 80),
+                        self.tr("当前工作区干净，没有可回滚的文件", "Working tree is clean (nothing to rollback)"),
+                        t.text_muted,
+                        FontStyle::UiRegular,
+                    );
+                } else {
+                    let rb_chk = Rect::new(mx + 16, y, 180, 26);
+                    let rb_all = Rect::new(mx + 206, y, 180, 26);
+                    canvas.stroke_rounded_rect(rb_chk, 5, t.accent_blue, t.window_bg);
+                    canvas.draw_text_centered(
+                        rb_chk,
+                        self.tr("回滚已勾选变更", "Rollback Checked"),
+                        t.accent_blue,
+                        FontStyle::UiSmall,
+                    );
+                    self.hit_regions
+                        .push((rb_chk, HitAction::RollbackCheckedGitChanges));
+
+                    canvas.stroke_rounded_rect(rb_all, 5, t.breakpoint_red, t.window_bg);
+                    canvas.draw_text_centered(
+                        rb_all,
+                        self.tr("放弃全部本地修改", "Discard All Changes"),
+                        t.breakpoint_red,
+                        FontStyle::UiSmall,
+                    );
+                    self.hit_regions
+                        .push((rb_all, HitAction::GitConfirmRollbackAll));
+                    y += 34;
+
+                    for ch in files {
+                        if y + 24 > content_bottom {
+                            break;
+                        }
+                        let row = Rect::new(mx + 16, y, mw - 32, 22);
+                        canvas.draw_path_file_icon(row.x + 4, row.y + 3, &ch.path);
+                        let rel = ch
+                            .path
+                            .strip_prefix(&self.workspace_root)
+                            .unwrap_or(&ch.path)
+                            .to_string_lossy()
+                            .replace('\\', "/");
+                        canvas.draw_text_ellipsis(
+                            row.x + 24,
+                            row.y + 3,
+                            &rel,
+                            t.text_primary,
+                            row.w - 92,
+                            FontStyle::UiSmall,
+                        );
+                        let one_rb = Rect::new(row.x + row.w - 60, row.y + 1, 56, 20);
+                        canvas.stroke_rounded_rect(one_rb, 4, t.border_color, t.window_bg);
+                        canvas.draw_text_centered(
+                            one_rb,
+                            self.tr("回滚", "Revert"),
+                            t.breakpoint_red,
+                            FontStyle::UiSmall,
+                        );
+                        self.hit_regions
+                            .push((one_rb, HitAction::RollbackGitFile(ch.path)));
+                        y += 24;
+                    }
+                }
+            }
+            FocusTarget::GitRemotesModal => {
+                let add_btn = Rect::new(mx + 16, y, 160, 26);
+                let ahov = add_btn.contains(hx, hy);
+                canvas.stroke_rounded_rect(
+                    add_btn,
+                    5,
+                    t.accent_blue,
+                    if ahov {
+                        t.accent_blue
+                    } else {
+                        blend_rgb(t.window_bg, t.accent_blue, 0.16)
+                    },
+                );
+                canvas.draw_text_centered(
+                    add_btn,
+                    self.tr("+ 添加远程仓库...", "+ Add Remote..."),
+                    if ahov { 0xFFFFFF } else { t.accent_blue },
+                    FontStyle::UiSmall,
+                );
+                self.hit_regions.push((add_btn, HitAction::OpenAddRemoteModal));
+                y += 34;
+
+                let remotes = self.git_engine.remotes.clone();
+                if remotes.is_empty() {
+                    canvas.draw_text_centered(
+                        Rect::new(mx + 16, y + 30, mw - 32, 60),
+                        self.tr("当前仓库尚未配置任何远程仓库", "No Git remotes configured"),
+                        t.text_muted,
+                        FontStyle::UiRegular,
+                    );
+                } else {
+                    for rm in remotes {
+                        if y + 30 > content_bottom {
+                            break;
+                        }
+                        let row = Rect::new(mx + 16, y, mw - 32, 26);
+                        canvas.stroke_rounded_rect(row, 5, t.border_color, t.window_bg);
+                        let txt = format!("{}   {}", rm.name, rm.url);
+                        canvas.draw_text_ellipsis(
+                            row.x + 10,
+                            row.y + 4,
+                            &txt,
+                            t.text_primary,
+                            row.w - 76,
+                            FontStyle::UiSmall,
+                        );
+                        let del_b = Rect::new(row.x + row.w - 60, row.y + 2, 54, 22);
+                        canvas.stroke_rounded_rect(del_b, 4, t.breakpoint_red, t.panel_bg);
+                        canvas.draw_text_centered(
+                            del_b,
+                            self.tr("移除", "Remove"),
+                            t.breakpoint_red,
+                            FontStyle::UiSmall,
+                        );
+                        self.hit_regions
+                            .push((del_b, HitAction::GitRemoveRemote(rm.name)));
+                        y += 30;
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     fn visible_settings_nav(&self) -> Vec<SettingsNavItem> {
@@ -12293,9 +16937,23 @@ impl IdeApplicationState {
         self.settings_section(canvas, flow, x, w, title);
         for action in [
             IdeAction::GitCommitPopup,
-            IdeAction::GitPull,
             IdeAction::GitPush,
+            IdeAction::GitPull,
+            IdeAction::GitFetch,
+            IdeAction::GitMerge,
+            IdeAction::GitRebase,
+            IdeAction::GitBranches,
             IdeAction::GitNewBranch,
+            IdeAction::GitNewTag,
+            IdeAction::GitStashChanges,
+            IdeAction::GitUnstashChanges,
+            IdeAction::GitResetHead,
+            IdeAction::GitRollback,
+            IdeAction::GitShowDiff,
+            IdeAction::GitAnnotateBlame,
+            IdeAction::GitFileHistory,
+            IdeAction::GitShowLog,
+            IdeAction::GitManageRemotes,
             IdeAction::RevertLastCheckpoint,
         ] {
             if let Some(y) = flow.place(26, 2) {
@@ -12455,8 +17113,169 @@ impl IdeApplicationState {
         self.settings_kv(canvas, flow, x, w, ui_mode, "New UI / Islands");
     }
 
+    fn mobile_sdk_badge(&self, id: &str, configured: &str) -> (String, bool) {
+        if let Some(tool) = self.mobile_env.sdk_tools.iter().find(|t| t.id == id) {
+            if tool.installed {
+                return (self.tr("已安装", "Installed").to_string(), true);
+            }
+            return (self.tr("SDK 未安装", "SDK not installed").to_string(), false);
+        }
+        if self.mobile_env.probing {
+            return (self.tr("检测中", "Checking").to_string(), false);
+        }
+        if configured.trim().is_empty() {
+            (
+                self.tr("留空则自动检测", "Auto-detect when empty").to_string(),
+                false,
+            )
+        } else {
+            (self.tr("SDK 未安装", "SDK not installed").to_string(), false)
+        }
+    }
+
+    fn render_mobile_sdk_path_row(
+        &mut self,
+        canvas: &mut SurfaceCanvas,
+        flow: &mut SettingsFlow,
+        x: i32,
+        w: i32,
+        hx: i32,
+        hy: i32,
+        slot: u8,
+        title: &str,
+        tool_id: &str,
+        placeholder: &str,
+    ) {
+        let configured = match slot {
+            0 => self.mobile_sdk_flutter.as_str().to_string(),
+            1 => self.mobile_sdk_android.as_str().to_string(),
+            _ => self.mobile_sdk_jdk.as_str().to_string(),
+        };
+        let (badge, installed) = self.mobile_sdk_badge(tool_id, &configured);
+        let heading = format!("{title}  ·  {badge}");
+        self.settings_section(canvas, flow, x, w, &heading);
+        if let Some(detail) = self
+            .mobile_env
+            .sdk_tools
+            .iter()
+            .find(|tool| tool.id == tool_id)
+            .map(|tool| tool.version_or_detail.clone())
+        {
+            if !detail.is_empty() {
+                let color_note = if installed {
+                    detail
+                } else if !detail.contains("SDK 未安装") {
+                    format!("SDK 未安装：{detail}")
+                } else {
+                    detail
+                };
+                self.settings_note(canvas, flow, x, w, &color_note);
+            }
+        }
+        if let Some(y) = flow.place(32, 8) {
+            let t = self.theme;
+            let browse_w = 78;
+            let field = Rect::new(x, y, (w - browse_w - 8).max(48), 32);
+            self.mobile_sdk_field_rects[slot as usize] = field;
+            let focused =
+                self.settings_sdk_focus == Some(slot) && self.focus == FocusTarget::SettingsModal;
+            let border = if focused { t.accent_blue } else { t.border_color };
+            let editor_bg = t.editor_bg;
+            let caret_visible = self.caret_visible;
+            let text_primary = t.text_primary;
+            let text_muted = t.text_muted;
+            let selection_bg = t.editor_selection_bg;
+            let caret_color = t.accent_blue;
+            canvas.stroke_rounded_rect(field, 6, border, editor_bg);
+            let ime = self.mobile_sdk_input_mut(slot).render_singleline(
+                canvas,
+                Rect::new(field.x + 6, field.y, (field.w - 10).max(20), field.h),
+                2,
+                field.y + 7,
+                placeholder,
+                focused,
+                caret_visible,
+                text_primary,
+                text_muted,
+                selection_bg,
+                caret_color,
+                FontStyle::UiRegular,
+            );
+            if focused {
+                self.ime_spot = ime;
+            }
+            self.hit_regions
+                .push((field, HitAction::FocusMobileSdkPath(slot)));
+            let browse = Rect::new(field.x + field.w + 8, y, browse_w, 32);
+            let browse_label = self.tr("浏览…", "Browse…");
+            self.draw_settings_button(
+                canvas,
+                browse,
+                browse_label,
+                false,
+                hx,
+                hy,
+                HitAction::BrowseMobileSdkDir(slot),
+            );
+        }
+    }
+
+    fn render_settings_mobile_sdk(
+        &mut self,
+        canvas: &mut SurfaceCanvas,
+        flow: &mut SettingsFlow,
+        x: i32,
+        w: i32,
+        hx: i32,
+        hy: i32,
+    ) {
+        let intro = self.tr(
+            "指定 Flutter、Android SDK 与 JDK 的安装目录。留空时自动检测 PATH 和环境变量；目录无效时，运行和检测会提示 SDK 未安装。",
+            "Set the Flutter, Android SDK, and JDK install directories. Empty fields are auto-detected. An invalid directory is reported as SDK not installed when you run or probe a mobile project.",
+        );
+        self.settings_note(canvas, flow, x, w, intro);
+        let flutter_ph = self.tr("例如 D:\\src\\flutter", "e.g. D:\\src\\flutter");
+        self.render_mobile_sdk_path_row(
+            canvas, flow, x, w, hx, hy, 0, "Flutter SDK", "flutter", flutter_ph,
+        );
+        let android_ph = self.tr(
+            "例如 %LOCALAPPDATA%\\Android\\Sdk",
+            "e.g. %LOCALAPPDATA%\\Android\\Sdk",
+        );
+        self.render_mobile_sdk_path_row(
+            canvas, flow, x, w, hx, hy, 1, "Android SDK", "android_sdk", android_ph,
+        );
+        let jdk_ph = self.tr(
+            "例如 C:\\Program Files\\Java\\jdk-17",
+            "e.g. C:\\Program Files\\Java\\jdk-17",
+        );
+        self.render_mobile_sdk_path_row(
+            canvas, flow, x, w, hx, hy, 2, "JDK", "jdk", jdk_ph,
+        );
+        if let Some(y) = flow.place(32, 8) {
+            let label = if self.mobile_env.probing {
+                self.tr("检测中…", "Checking…")
+            } else {
+                self.tr("重新检测", "Recheck")
+            };
+            self.draw_settings_button(
+                canvas,
+                Rect::new(x, y, 120, 30),
+                label,
+                true,
+                hx,
+                hy,
+                HitAction::RefreshMobileEnv,
+            );
+        }
+    }
+
     /// IntelliJ IDEA Settings (`Ctrl+Alt+S`)：左侧树、搜索、右侧页面、确定 / 应用 / 取消。
     fn render_settings_modal(&mut self, canvas: &mut SurfaceCanvas, w: i32, h: i32) {
+        self.mobile_sdk_field_rects = [Rect::new(0, 0, 0, 0); 3];
+        if self.settings_page != SettingsPage::MobileSdk {
+            self.settings_sdk_focus = None;
+        }
         let t = self.theme;
         let (hx, hy) = self.hover_pos;
         let mw = (w - 36).clamp(560, 1080).min(w - 8);
@@ -12692,6 +17511,11 @@ impl IdeApplicationState {
                 SettingsPage::Languages => {
                     self.render_settings_languages_page(canvas, &mut flow, content_x, content_w)
                 }
+                SettingsPage::MobileSdk => {
+                    self.render_settings_mobile_sdk(
+                        canvas, &mut flow, content_x, content_w, hx, hy,
+                    )
+                }
                 SettingsPage::Advanced => {
                     self.render_settings_advanced(canvas, &mut flow, content_x, content_w)
                 }
@@ -12755,10 +17579,25 @@ impl IdeApplicationState {
     }
 }
 
+fn extract_identifier_after(line: &str, keyword: &str) -> Option<String> {
+    let idx = line.find(keyword)?;
+    let rest = line[idx + keyword.len()..].trim_start();
+    let ident: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    if ident.is_empty() {
+        None
+    } else {
+        Some(ident)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn cursor_kind_and_splitter_hit_test_cover_all_ide_regions() {
@@ -12860,6 +17699,33 @@ mod tests {
     }
 
     #[test]
+    fn last_file_closes_and_panes_can_move_with_loose_limits() {
+        let mut state = IdeApplicationState::new(PathBuf::from("."));
+        assert!(!state.open_buffers.is_empty());
+        while !state.open_buffers.is_empty() {
+            let before = state.open_buffers.len();
+            state.close_tab(0);
+            assert!(state.open_buffers.len() < before);
+        }
+        assert!(state.open_buffers.is_empty());
+        state.execute_ide_action(IdeAction::SaveActiveFile);
+        assert!(state.status_notification.contains("没有打开") || state.status_notification.contains("No file"));
+
+        let (min_l, max_l) = state.span_limits_for_drag(DockEdge::Left, 1800, 1100);
+        assert!(min_l <= 48);
+        assert!(max_l >= 900);
+        let (min_b, max_b) = state.span_limits_for_drag(DockEdge::Bottom, 1800, 1100);
+        assert!(min_b <= 40);
+        assert!(max_b >= 800);
+
+        assert_eq!(state.dock_left, DockPane::Project);
+        state.swap_dock(DockEdge::Left, DockEdge::Bottom);
+        assert_eq!(state.dock_left, DockPane::Tooling);
+        assert_eq!(state.dock_bottom, DockPane::Project);
+        assert_eq!(state.dock_right, DockPane::Agent);
+    }
+
+    #[test]
     fn render_caches_invalidate_on_buffer_edit_and_async_search_wakes_ui() {
         let root = PathBuf::from(".");
         let mut state = IdeApplicationState::new(root);
@@ -12933,6 +17799,7 @@ mod tests {
         let expected_clean = clean_workspace_path(temp_root.clone());
         assert_eq!(state.workspace_root, expected_clean);
         assert_eq!(state.workspace_name(), unique);
+        assert_eq!(state.taskbar_title(), format!("{unique} — Rust AI IDE"));
         assert!(!state.workspace_badge().is_empty());
         assert!(state.take_workspace_title_dirty());
         assert!(!state.take_workspace_title_dirty());
@@ -12947,6 +17814,32 @@ mod tests {
         state.render(&mut canvas);
 
         let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn window_caption_buttons_activate_only_when_released_on_the_same_button() {
+        let mut state = IdeApplicationState::new(PathBuf::from("."));
+        let mut canvas = SurfaceCanvas::new(1440, 900);
+        state.render(&mut canvas);
+
+        let close = state
+            .hit_regions
+            .iter()
+            .find_map(|(rect, action)| match action {
+                HitAction::WindowControl(WindowControlCmd::Close) => Some(*rect),
+                _ => None,
+            })
+            .expect("close caption button");
+        state.arm_window_control(WindowControlCmd::Close);
+        assert_eq!(
+            state.release_armed_window_control(close.x + 4, close.y + 4),
+            Some(WindowControlCmd::Close)
+        );
+        assert!(state.armed_window_control.is_none());
+
+        state.arm_window_control(WindowControlCmd::Minimize);
+        assert_eq!(state.release_armed_window_control(20, 20), None);
+        assert!(state.armed_window_control.is_none());
     }
 
     #[test]
@@ -12996,6 +17889,40 @@ mod tests {
     }
 
     #[test]
+    fn mobile_sdk_settings_page_exposes_install_directories() {
+        let mut state = IdeApplicationState::new(PathBuf::from("."));
+        let mut canvas = SurfaceCanvas::new(1440, 900);
+        state.execute_ide_action(IdeAction::OpenSettingsModal);
+        state.settings_page = SettingsPage::MobileSdk;
+        state.mobile_sdk_flutter.set_text(r"D:\missing-flutter");
+        state
+            .mobile_sdk_android
+            .set_text(r"D:\Android\Sdk-missing");
+        state.mobile_sdk_jdk.set_text(r"D:\missing-jdk");
+        state.render(&mut canvas);
+
+        assert!(state.hit_regions.iter().any(|(_, action)| {
+            matches!(action, HitAction::SelectSettingsPage(SettingsPage::MobileSdk))
+        }));
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, action)| matches!(action, HitAction::BrowseMobileSdkDir(0))));
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, action)| matches!(action, HitAction::BrowseMobileSdkDir(1))));
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, action)| matches!(action, HitAction::FocusMobileSdkPath(2))));
+        assert!(state.mobile_sdk_field_rects[1].w > 0);
+        assert!(state.commit_mobile_sdk_locations_from_inputs());
+        assert_eq!(state.mobile_sdk.android_sdk, r"D:\Android\Sdk-missing");
+        assert!(!state.commit_mobile_sdk_locations_from_inputs());
+    }
+
+    #[test]
     fn settings_dialog_follows_idea_navigation() {
         let mut state = IdeApplicationState::new(PathBuf::from("."));
         let mut canvas = SurfaceCanvas::new(1440, 900);
@@ -13041,6 +17968,41 @@ mod tests {
             matches!(
                 action,
                 HitAction::ExecuteIdeAction(IdeAction::ToggleTerminalWindow)
+            )
+        }));
+    }
+
+    #[test]
+    fn terminal_output_links_and_file_paths_are_clickable() {
+        let mut state = IdeApplicationState::new(PathBuf::from("."));
+        let rel = if std::path::Path::new("src/main.rs").is_file() {
+            "src/main.rs"
+        } else {
+            "crates/ide-app/src/main.rs"
+        };
+        assert!(
+            std::path::Path::new(rel).is_file(),
+            "fixture file missing: {rel}"
+        );
+        let line = format!("docs https://example.com/docs. and {rel}:8");
+        {
+            let pty = state.terminal.active_pty_mut();
+            pty.scroll_offset = 0;
+            let mut grid = pty.grid.lock();
+            grid.clear_all();
+            grid.push_fallback_line(&line, 0xA9B7C6);
+        }
+        state.bottom_tool = Some(ToolWindowId::Terminal);
+        let mut canvas = SurfaceCanvas::new(1440, 900);
+        state.render(&mut canvas);
+
+        assert!(state.hit_regions.iter().any(|(_, action)| {
+            matches!(action, HitAction::OpenExternalUrl(url) if url == "https://example.com/docs")
+        }));
+        assert!(state.hit_regions.iter().any(|(_, action)| {
+            matches!(
+                action,
+                HitAction::OpenFileAtLine(path, Some(8)) if path.ends_with("main.rs")
             )
         }));
     }
@@ -13334,6 +18296,7 @@ mod tests {
             checkpoint_id: None,
             patch: None,
             modified_files: vec![cargo_toml.clone()],
+            file_changes: Vec::new(),
             attachments: Vec::new(),
         });
 
@@ -13659,6 +18622,7 @@ mod tests {
                 checkpoint_id: None,
                 patch: None,
                 modified_files: Vec::new(),
+                file_changes: Vec::new(),
                 attachments: Vec::new(),
             });
         state
@@ -13672,6 +18636,7 @@ mod tests {
                 checkpoint_id: None,
                 patch: None,
                 modified_files: Vec::new(),
+                file_changes: Vec::new(),
                 attachments: Vec::new(),
             });
         state.render(&mut canvas);
@@ -13712,7 +18677,9 @@ mod tests {
         prog.reply_text = "我先看看编辑页现在怎么填这个字段。".to_string();
         prog.push_execution_step("读取 crates/ide-app/src/agent_panel.rs");
         prog.push_execution_step("搜索 BusyIndicator");
-        state.agent_hub.set_active_streaming_progress(Some(prog.clone()));
+        state
+            .agent_hub
+            .set_active_streaming_progress(Some(prog.clone()));
 
         state.render(&mut canvas);
         let rows = &state.cached_chat_rows.rows;
@@ -13757,26 +18724,34 @@ mod tests {
 
         let changed_path = state.workspace_root.join("Cargo.toml");
         let user_msg_idx = state.agent_hub.messages.len();
-        state.agent_hub.messages.push(ide_agent_hub::AgentChatMessage {
-            role: "user".to_string(),
-            agent: AgentProviderKind::CursorCli,
-            content: "修改 Cargo.toml  [@main.rs:L1]".to_string(),
-            thought: None,
-            checkpoint_id: None,
-            patch: None,
-            modified_files: Vec::new(),
-            attachments: Vec::new(),
-        });
-        state.agent_hub.messages.push(ide_agent_hub::AgentChatMessage {
-            role: "assistant".to_string(),
-            agent: AgentProviderKind::CursorCli,
-            content: "已更新依赖配置。".to_string(),
-            thought: None,
-            checkpoint_id: None,
-            patch: None,
-            modified_files: vec![changed_path.clone()],
-            attachments: Vec::new(),
-        });
+        state
+            .agent_hub
+            .messages
+            .push(ide_agent_hub::AgentChatMessage {
+                role: "user".to_string(),
+                agent: AgentProviderKind::CursorCli,
+                content: "修改 Cargo.toml  [@main.rs:L1]".to_string(),
+                thought: None,
+                checkpoint_id: None,
+                patch: None,
+                modified_files: Vec::new(),
+                file_changes: Vec::new(),
+                attachments: Vec::new(),
+            });
+        state
+            .agent_hub
+            .messages
+            .push(ide_agent_hub::AgentChatMessage {
+                role: "assistant".to_string(),
+                agent: AgentProviderKind::CursorCli,
+                content: "已更新依赖配置。".to_string(),
+                thought: None,
+                checkpoint_id: None,
+                patch: None,
+                modified_files: vec![changed_path.clone()],
+                file_changes: Vec::new(),
+                attachments: Vec::new(),
+            });
         state
             .agent_hub
             .active_session_mut()
@@ -13799,11 +18774,10 @@ mod tests {
         assert!(state.hit_regions.iter().any(
             |(_, a)| matches!(a, HitAction::StartEditSentUserMessage(idx) if *idx == user_msg_idx)
         ));
-        assert!(!state
-            .cached_chat_rows
-            .rows
-            .iter()
-            .any(|r| matches!(r, crate::agent_panel::CachedChatRow::ModifiedFileChip { .. })));
+        assert!(!state.cached_chat_rows.rows.iter().any(|r| matches!(
+            r,
+            crate::agent_panel::CachedChatRow::TurnChangedFileRow { .. }
+        )));
         assert!(!state
             .hit_regions
             .iter()
@@ -13838,14 +18812,16 @@ mod tests {
         state.submit_agent_prompt("改为仅检查 Cargo.toml".to_string());
         assert_eq!(state.focus, FocusTarget::EditMessageRewindModal);
         state.render(&mut canvas);
-        assert!(state
-            .hit_regions
-            .iter()
-            .any(|(_, a)| matches!(a, HitAction::ConfirmEditMessageRewind { revert_files: true })));
-        assert!(state
-            .hit_regions
-            .iter()
-            .any(|(_, a)| matches!(a, HitAction::ConfirmEditMessageRewind { revert_files: false })));
+        assert!(state.hit_regions.iter().any(|(_, a)| matches!(
+            a,
+            HitAction::ConfirmEditMessageRewind { revert_files: true }
+        )));
+        assert!(state.hit_regions.iter().any(|(_, a)| matches!(
+            a,
+            HitAction::ConfirmEditMessageRewind {
+                revert_files: false
+            }
+        )));
         assert!(state
             .hit_regions
             .iter()
@@ -13864,16 +18840,27 @@ mod tests {
         assert_eq!(state.agent_chat_input.as_str(), "改为仅检查 Cargo.toml");
         state.cancel_edit_sent_user_message();
 
-        // 4. 若当前 CLI 不支持回退（如 Codex），则不显示文件折叠更改与编辑回退按钮
+        // 4. 所有 CLI 均统一显示文件更改折叠栏（含统计），但不支持回退的 CLI（如 Codex）不显示回退与编辑重发按钮
         state.agent_hub.active_provider = AgentProviderKind::OpenAiCodexCli;
-        state
-            .agent_hub
-            .set_provider_capabilities(AgentProviderKind::OpenAiCodexCli, true, true, false);
+        state.agent_hub.set_provider_capabilities(
+            AgentProviderKind::OpenAiCodexCli,
+            true,
+            true,
+            false,
+        );
         state.render(&mut canvas);
-        assert!(!state
+        assert!(state
             .hit_regions
             .iter()
             .any(|(_, a)| matches!(a, HitAction::ToggleAgentChangedFilesDrawer)));
+        assert!(!state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::RevertAllAgentChangedFiles)));
+        assert!(!state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::RevertSingleAgentChangedFile(_))));
         assert!(!state
             .hit_regions
             .iter()
@@ -13912,32 +18899,40 @@ mod tests {
         state1.open_file(ws1_lib.clone());
         state1.active_buffer_mut().set_cursor(2, 4, false);
         state1.scroll_line = 1;
-        state1.agent_hub.messages.push(ide_agent_hub::AgentChatMessage {
-            role: "user".to_string(),
-            agent: AgentProviderKind::CursorCli,
-            content: "alpha session question".to_string(),
-            thought: None,
-            checkpoint_id: None,
-            patch: None,
-            modified_files: Vec::new(),
-            attachments: Vec::new(),
-        });
+        state1
+            .agent_hub
+            .messages
+            .push(ide_agent_hub::AgentChatMessage {
+                role: "user".to_string(),
+                agent: AgentProviderKind::CursorCli,
+                content: "alpha session question".to_string(),
+                thought: None,
+                checkpoint_id: None,
+                patch: None,
+                modified_files: Vec::new(),
+                file_changes: Vec::new(),
+                attachments: Vec::new(),
+            });
         state1.agent_hub.active_session_mut().draft_prompt = "alpha draft".to_string();
         state1.save_all_persisted_state();
 
         // 切换到第二个项目并保存独立对话历史与打开标签
         state1.switch_workspace(ws2.clone());
         state1.open_file(ws2_main.clone());
-        state1.agent_hub.messages.push(ide_agent_hub::AgentChatMessage {
-            role: "user".to_string(),
-            agent: AgentProviderKind::CursorCli,
-            content: "beta session question".to_string(),
-            thought: None,
-            checkpoint_id: None,
-            patch: None,
-            modified_files: Vec::new(),
-            attachments: Vec::new(),
-        });
+        state1
+            .agent_hub
+            .messages
+            .push(ide_agent_hub::AgentChatMessage {
+                role: "user".to_string(),
+                agent: AgentProviderKind::CursorCli,
+                content: "beta session question".to_string(),
+                thought: None,
+                checkpoint_id: None,
+                patch: None,
+                modified_files: Vec::new(),
+                file_changes: Vec::new(),
+                attachments: Vec::new(),
+            });
         state1.save_all_persisted_state();
 
         // 模拟应用重启：先读取全局设置恢复最后打开的项目、UI 设置、布局和最近项目列表
@@ -13947,7 +18942,10 @@ mod tests {
         assert_eq!(saved_gs.ui_lang, UiLanguage::EnUs);
         assert!((saved_gs.ui_scale - 1.25).abs() < 0.01);
         assert_eq!(saved_gs.theme_kind, ThemeKind::IslandsLight);
-        assert_eq!(saved_gs.last_workspace, Some(clean_workspace_path(ws2.clone())));
+        assert_eq!(
+            saved_gs.last_workspace,
+            Some(clean_workspace_path(ws2.clone()))
+        );
         assert!(saved_gs
             .recent_workspaces
             .contains(&clean_workspace_path(ws1.clone())));
@@ -13974,10 +18972,1036 @@ mod tests {
             .iter()
             .any(|m| m.content == "alpha session question"));
         assert_eq!(restarted.agent_chat_input.as_str(), "alpha draft");
-        assert_eq!(restarted.active_buffer().path, clean_workspace_path(ws1_lib));
+        assert_eq!(
+            restarted.active_buffer().path,
+            clean_workspace_path(ws1_lib)
+        );
         assert_eq!(restarted.active_buffer().cursor_line, 2);
         assert_eq!(restarted.active_buffer().cursor_col, 4);
 
         let _ = std::fs::remove_dir_all(&base_tmp);
+    }
+
+    #[test]
+    fn top_inline_menu_replaces_project_name_and_opens_submenu_on_hover() {
+        let mut state = IdeApplicationState::new(PathBuf::from("."));
+        let mut canvas = SurfaceCanvas::new(1560, 940);
+        state.render(&mut canvas);
+
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, act)| matches!(act, HitAction::ToggleProjectPopup)));
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, act)| matches!(act, HitAction::ToggleGitBranchPopup)));
+        assert!(state.menu_category_rects.is_empty());
+
+        // Clicking the hamburger icon expands the menu directly into the top toolbar
+        // and hides the project / git branch widgets.
+        let ham_rect = state
+            .hit_regions
+            .iter()
+            .find(|(_, act)| matches!(act, HitAction::ToggleHamburgerMenu))
+            .map(|(r, _)| *r)
+            .expect("hamburger button rect");
+        state.handle_mouse_click_with_mods(ham_rect.x + 4, ham_rect.y + 4, false, &canvas);
+        assert!(state.hamburger_menu_expanded);
+        assert!(state.active_menu_category.is_none());
+
+        state.render(&mut canvas);
+        assert!(!state
+            .hit_regions
+            .iter()
+            .any(|(_, act)| matches!(act, HitAction::ToggleProjectPopup)));
+        assert!(!state
+            .hit_regions
+            .iter()
+            .any(|(_, act)| matches!(act, HitAction::ToggleGitBranchPopup)));
+        assert!(!state.menu_category_rects.is_empty());
+
+        for &(_, r) in &state.menu_category_rects {
+            assert!(
+                r.y >= 0 && r.y + r.h <= 38,
+                "expected inline top menu item inside 38px toolbar, got {:?}",
+                r
+            );
+        }
+
+        // Moving the mouse over a category opens its submenu immediately without clicking.
+        let (first_cat, first_rect) = state.menu_category_rects[0];
+        let (second_cat, second_rect) = state.menu_category_rects[1];
+        assert!(state.handle_mouse_move(first_rect.x + 4, first_rect.y + 4));
+        assert_eq!(state.active_menu_category, Some(first_cat));
+
+        state.render(&mut canvas);
+        assert!(state
+            .active_overlay_rects
+            .iter()
+            .any(|r| r.y == 38 && r.h > 80));
+
+        assert!(state.handle_mouse_move(second_rect.x + 4, second_rect.y + 4));
+        assert_eq!(state.active_menu_category, Some(second_cat));
+        state.render(&mut canvas);
+
+        // Moving inside the opened dropdown keeps the menu active
+        let dd = state.menu_dropdown_rect;
+        assert!(dd.w > 100 && dd.h > 80);
+        state.handle_mouse_move(dd.x + 20, dd.y + 20);
+        assert!(state.hamburger_menu_expanded);
+        assert_eq!(state.active_menu_category, Some(second_cat));
+
+        // Moving mouse outside both top menu bar and dropdown restores project & branch title
+        assert!(state.handle_mouse_move(dd.x + dd.w + 40, dd.y + 40));
+        assert!(!state.hamburger_menu_expanded);
+        assert!(state.active_menu_category.is_none());
+        state.render(&mut canvas);
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, act)| matches!(act, HitAction::ToggleProjectPopup)));
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, act)| matches!(act, HitAction::ToggleGitBranchPopup)));
+
+        // Re-open menu, hover first category to open dropdown, then click an editor/menu target -> title restores
+        let ham_rect2 = state
+            .hit_regions
+            .iter()
+            .find(|(_, act)| matches!(act, HitAction::ToggleHamburgerMenu))
+            .map(|(r, _)| *r)
+            .expect("hamburger button rect");
+        state.handle_mouse_click_with_mods(ham_rect2.x + 4, ham_rect2.y + 4, false, &canvas);
+        state.render(&mut canvas);
+        let first_r = state.menu_category_rects[0].1;
+        state.handle_mouse_move(first_r.x + 4, first_r.y + 4);
+        state.render(&mut canvas);
+        assert!(state.hamburger_menu_expanded);
+
+        let ed_x = state.editor_code_rect.x + 20;
+        let ed_y = state.editor_code_rect.y + 20;
+        state.handle_mouse_click_with_mods(ed_x, ed_y, false, &canvas);
+        assert!(!state.hamburger_menu_expanded);
+        assert!(state.active_menu_category.is_none());
+    }
+
+    #[test]
+    fn editor_shows_and_drags_horizontal_scrollbar_when_lines_overflow() {
+        let mut state = IdeApplicationState::new(PathBuf::from("."));
+        let mut canvas = SurfaceCanvas::new(1200, 800);
+
+        // Short lines should not reserve or show a horizontal scrollbar
+        let short_buf = TextBuffer::from_text(PathBuf::from("short.rs"), "fn ok() {}\n");
+        state.open_buffers.push(short_buf);
+        state.active_tab = state.open_buffers.len() - 1;
+        state.render(&mut canvas);
+        assert_eq!(state.editor_horiz_scroll_info.track.w, 0);
+
+        // A very long line triggers horizontal overflow and renders a draggable track
+        let long_line = format!("let s = \"{}\";\n", "x".repeat(320));
+        let long_buf = TextBuffer::from_text(PathBuf::from("long.rs"), &long_line);
+        state.open_buffers.push(long_buf);
+        state.active_tab = state.open_buffers.len() - 1;
+        state.render(&mut canvas);
+
+        let info = state.editor_horiz_scroll_info;
+        assert!(
+            info.total > info.visible && info.track.w > 40 && info.track.h > 0,
+            "expected visible horizontal scrollbar info, got {:?}",
+            info
+        );
+        assert!(
+            info.track.y >= state.editor_pane_rect.y
+                && info.track.y + info.track.h
+                    <= state.editor_pane_rect.y + state.editor_pane_rect.h
+        );
+
+        let drag_y = info.track.y + info.track.h / 2;
+        assert!(state.try_begin_scrollbar_drag(info.track.x + info.track.w / 2, drag_y));
+        assert_eq!(
+            state.active_scrollbar_drag,
+            Some(DragScrollbar::CenterEditorHoriz)
+        );
+        assert!(state.update_scrollbar_drag(info.track.x + info.track.w - 4, drag_y));
+        assert!(
+            state.editor_scroll_x > 200,
+            "expected editor_scroll_x > 200 after dragging horizontal scrollbar, got {}",
+            state.editor_scroll_x
+        );
+        state.end_scrollbar_drag();
+
+        // Compact scrollbar tracks (e.g. 24px where max_thumb = 20px < 24px) must never panic
+        let thumb_v = canvas.draw_vertical_scrollbar(Rect::new(0, 0, 7, 24), 0, 10, 100, 0xFFFFFF);
+        assert!(thumb_v.h > 0 && thumb_v.h <= 20);
+        let thumb_h =
+            canvas.draw_horizontal_scrollbar(Rect::new(0, 0, 24, 7), 0, 10, 100, 0xFFFFFF);
+        assert!(thumb_h.w > 0 && thumb_h.w <= 20);
+        let mut tiny_canvas = SurfaceCanvas::new(420, 260);
+        state.render(&mut tiny_canvas);
+    }
+
+    #[test]
+    fn sent_user_bubble_preserves_bottom_pixels_and_disables_ctrl_k_and_alt_l_ai_actions() {
+        let mut state = IdeApplicationState::new(PathBuf::from("."));
+        state
+            .agent_hub
+            .messages
+            .push(ide_agent_hub::AgentChatMessage {
+                role: "user".to_string(),
+                agent: AgentProviderKind::CursorCli,
+                content: "测试发送文字底部不被截断 gypqj 测试".to_string(),
+                thought: None,
+                checkpoint_id: None,
+                patch: None,
+                modified_files: Vec::new(),
+                file_changes: Vec::new(),
+                attachments: Vec::new(),
+            });
+
+        let mut canvas = SurfaceCanvas::new(1400, 900);
+        state.render(&mut canvas);
+
+        // User line height and bottom cap height prevent bottom clipping
+        let user_line_idx = state
+            .cached_chat_rows
+            .rows
+            .iter()
+            .position(|r| matches!(r, crate::agent_panel::CachedChatRow::UserLine { .. }))
+            .expect("user line cached row");
+        let user_line = &state.cached_chat_rows.rows[user_line_idx];
+        let bubble_bottom = &state.cached_chat_rows.rows[user_line_idx + 1];
+        assert!(matches!(
+            bubble_bottom,
+            crate::agent_panel::CachedChatRow::UserBubbleBottom { .. }
+        ));
+        assert!(user_line.row_height() >= 24);
+        assert!(bubble_bottom.row_height() >= 9);
+
+        // Sample pixels inside the bottom 5px band of the user line and confirm
+        // glyph pixels exist (not painted over by UserBubbleBottom).
+        let (line_rect, ..) = state
+            .agent_chat_line_rects
+            .iter()
+            .find(|(_, _, gidx, _, _)| *gidx == user_line_idx)
+            .cloned()
+            .expect("user line rect recorded");
+        let t = state.theme;
+        let bg = blend_rgb(t.panel_bg, t.text_primary, 0.06);
+        let bg_r = ((bg >> 16) & 0xFF) as u8;
+        let bg_g = ((bg >> 8) & 0xFF) as u8;
+        let bg_b = (bg & 0xFF) as u8;
+        let mut non_bg_bottom_pixels = 0usize;
+        let py_start = line_rect.y + line_rect.h - 6;
+        let py_end = line_rect.y + line_rect.h - 1;
+        for py in py_start..py_end {
+            for px in (line_rect.x + 12)..(line_rect.x + line_rect.w - 12) {
+                let idx = (py as usize) * canvas.phys_width + (px as usize);
+                if let Some(&p) = canvas.pixels().get(idx) {
+                    let pr = ((p >> 16) & 0xFF) as u8;
+                    let pg = ((p >> 8) & 0xFF) as u8;
+                    let pb = (p & 0xFF) as u8;
+                    if pr.abs_diff(bg_r) > 6 || pg.abs_diff(bg_g) > 6 || pb.abs_diff(bg_b) > 6 {
+                        non_bg_bottom_pixels += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            non_bg_bottom_pixels > 0,
+            "expected glyph pixels preserved in bottom strip of UserLine"
+        );
+
+        // Ctrl+K AI edit & Alt+L ask AI actions and menu entries are disabled
+        let before_msgs = state.agent_hub.messages.len();
+        state.execute_ide_action(IdeAction::InlineAiEdit);
+        state.execute_ide_action(IdeAction::SendSelectionToAgent);
+        assert!(state.agent_hub.inline_edit.is_none());
+        assert_eq!(state.agent_hub.messages.len(), before_msgs);
+        for &cat in MainMenuCategory::all() {
+            assert!(!cat.entries().into_iter().any(|entry| matches!(
+                entry,
+                MenuEntry::Action(IdeAction::InlineAiEdit | IdeAction::SendSelectionToAgent)
+            )));
+        }
+    }
+
+    #[test]
+    fn all_clis_show_expandable_turn_file_changes_and_git_diff_opens_in_editor() {
+        let mut state = IdeApplicationState::new(PathBuf::from("."));
+        let mut canvas = SurfaceCanvas::new(1560, 940);
+        state.right_agent_open = true;
+        state.right_panel_tab = RightPanelTab::Chat;
+        // Use a non-Cursor CLI (Claude Code) where checkpoint rewind is disabled
+        state.agent_hub.active_provider = AgentProviderKind::ClaudeCodeCli;
+        state.agent_hub.set_provider_capabilities(
+            AgentProviderKind::ClaudeCodeCli,
+            true,
+            true,
+            false,
+        );
+
+        let target_path = state.workspace_root.join("Cargo.toml");
+        let turn_msg_idx = state.agent_hub.messages.len();
+        state
+            .agent_hub
+            .messages
+            .push(ide_agent_hub::AgentChatMessage {
+                role: "assistant".to_string(),
+                agent: AgentProviderKind::ClaudeCodeCli,
+                content: "已完成修改。".to_string(),
+                thought: None,
+                checkpoint_id: None,
+                patch: None,
+                modified_files: vec![target_path.clone()],
+                file_changes: vec![ide_agent_hub::TurnFileChange {
+                    path: target_path.clone(),
+                    added_lines: 3,
+                    removed_lines: 1,
+                    before_content: Some("[package]\nname = \"old\"\n".to_string()),
+                }],
+                attachments: Vec::new(),
+            });
+        state
+            .agent_hub
+            .active_session_mut()
+            .changed_files
+            .push(ide_agent_hub::SessionFileChange {
+                path: target_path.clone(),
+                added_lines: 3,
+                removed_lines: 1,
+                original_content: Some("[package]\nname = \"old\"\n".to_string()),
+                first_turn_msg_idx: 0,
+            });
+
+        state.render(&mut canvas);
+        // 1. Unified changed-files bar appears above composer even for non-Cursor CLI
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::ToggleAgentChangedFilesDrawer)));
+        // 2. Collapsible small-text per-turn file changes toggle appears after assistant reply
+        let (toggle_r, _) = state
+            .hit_regions
+            .iter()
+            .find(|(_, a)| {
+                matches!(a, HitAction::ToggleMessageFileChangesCollapse(i) if *i == turn_msg_idx)
+            })
+            .cloned()
+            .expect("per-turn file changes collapse toggle");
+        assert!(!state.cached_chat_rows.rows.iter().any(|r| matches!(
+            r,
+            crate::agent_panel::CachedChatRow::TurnChangedFileRow { .. }
+        )));
+
+        // Expanding reveals the file row with diff click target
+        state.handle_mouse_click_with_mods(toggle_r.x + 8, toggle_r.y + 6, false, &canvas);
+        state.render(&mut canvas);
+        let (diff_row_r, _) = state
+            .hit_regions
+            .iter()
+            .find(|(_, a)| matches!(
+                a,
+                HitAction::InspectAgentFileDiff { path, msg_idx: Some(i) } if path == &target_path && *i == turn_msg_idx
+            ))
+            .cloned()
+            .expect("expanded per-turn file row hit region");
+
+        // Clicking the per-turn file row opens the Diff view directly in the central editor window
+        state.handle_mouse_click_with_mods(diff_row_r.x + 12, diff_row_r.y + 6, false, &canvas);
+        assert!(state.active_editor_diff.is_some());
+        state.render(&mut canvas);
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::CloseEditorDiff)));
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::OpenDiffSourceFile(_))));
+
+        // Closing Diff returns cleanly to regular editor view
+        let (close_r, _) = state
+            .hit_regions
+            .iter()
+            .find(|(_, a)| matches!(a, HitAction::CloseEditorDiff))
+            .cloned()
+            .expect("close diff button");
+        state.handle_mouse_click_with_mods(close_r.x + 4, close_r.y + 4, false, &canvas);
+        assert!(state.active_editor_diff.is_none());
+
+        // 3. Clicking a Git working file Diff in Left Commit Panel opens editor diff WITHOUT jumping bottom_tool to GitLog
+        state.left_tool = Some(ToolWindowId::Commit);
+        state.bottom_tool = Some(ToolWindowId::Terminal);
+        state.git_engine.changed_files = vec![ide_git::GitChangedFile {
+            path: target_path.clone(),
+            status: ide_git::GitFileStatusKind::Modified,
+            staged: false,
+        }];
+        state.git_engine.working_diffs.insert(
+            target_path.clone(),
+            ide_git::compute_line_diff("a\nb\n", "a\nc\nd\n"),
+        );
+        state.render(&mut canvas);
+        let (git_diff_r, _) = state
+            .hit_regions
+            .iter()
+            .find(|(_, a)| matches!(a, HitAction::InspectGitWorkingFileDiff(p) if p == &target_path))
+            .cloned()
+            .expect("git working file diff hit region");
+        state.handle_mouse_click_with_mods(git_diff_r.x + 6, git_diff_r.y + 6, false, &canvas);
+        assert_eq!(state.bottom_tool, Some(ToolWindowId::Terminal));
+        assert!(state
+            .active_editor_diff
+            .as_ref()
+            .is_some_and(|d| d.path == target_path && d.added_lines == 2 && d.removed_lines == 1));
+    }
+
+    #[test]
+    fn test_long_filename_ellipsize_in_tabs_and_tree() {
+        let mut canvas = SurfaceCanvas::new(1280, 800);
+        let long_name =
+            "extremely_long_service_configuration_provider_implementation_details_v2.rs";
+        let ell_file = canvas.ellipsize_filename(long_name, 150, FontStyle::UiBold);
+        assert!(ell_file.contains('…'));
+        assert!(ell_file.ends_with(".rs"));
+        assert!(canvas.measure_text(&ell_file, FontStyle::UiBold).0 <= 150);
+
+        let ell_plain = canvas.ellipsize_text(
+            "src/very/deep/nested/directory/module_with_long_name/sub_handler.ts",
+            140,
+            FontStyle::UiSmall,
+        );
+        assert!(ell_plain.ends_with('…'));
+        assert!(canvas.measure_text(&ell_plain, FontStyle::UiSmall).0 <= 140);
+
+        let root = std::env::temp_dir().join(format!(
+            "ide_app_ellipsis_test_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::create_dir_all(&root);
+        let long_path = root.join(long_name);
+        std::fs::write(&long_path, "pub fn ok() {}\n").unwrap();
+
+        let mut state = IdeApplicationState::new(root.clone());
+        state.open_file(long_path);
+        state.render(&mut canvas);
+        assert!(state.tab_rects.iter().all(|(r, _)| r.w <= 220));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_open_media_files_preview_zoom_source_and_close() {
+        let root = std::env::temp_dir().join(format!(
+            "ide_app_media_tabs_test_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::create_dir_all(root.join("src"));
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+
+        let svg_path = root.join("extremely_long_vector_icon_asset_preview.svg");
+        std::fs::write(
+            &svg_path,
+            "<svg viewBox=\"0 0 24 24\"><rect x=\"2\" y=\"2\" width=\"20\" height=\"20\" fill=\"#3B82F6\"/></svg>",
+        )
+        .unwrap();
+
+        let wav_path = root.join("sample_notification_chime.wav");
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&44u32.to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&8000u32.to_le_bytes());
+        wav.extend_from_slice(&16000u32.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        for s in [0i16, 10000, -10000, 20000, -20000, 15000, -15000, 5000] {
+            wav.extend_from_slice(&s.to_le_bytes());
+        }
+        std::fs::write(&wav_path, &wav).unwrap();
+
+        let mp4_path = root.join("demo_clip_recording.mp4");
+        std::fs::write(&mp4_path, b"ftypmp42\0\0\0\0").unwrap();
+
+        let mut state = IdeApplicationState::new(root.clone());
+        let mut canvas = SurfaceCanvas::new(1720, 900);
+
+        // 1. Open SVG as visual preview tab
+        state.open_file(svg_path.clone());
+        assert_eq!(state.active_media_tab, Some(0));
+        assert_eq!(state.media_tabs.len(), 1);
+        assert!(state.media_tabs[0].preview_image.is_some());
+        state.render(&mut canvas);
+
+        let zoom_in_r = state
+            .hit_regions
+            .iter()
+            .find(|(_, a)| matches!(a, HitAction::AdjustMediaZoom(d) if *d > 0))
+            .map(|(r, _)| *r)
+            .expect("media zoom in hit region");
+        state.handle_mouse_click_with_mods(zoom_in_r.x + 4, zoom_in_r.y + 4, false, &canvas);
+        assert_eq!(state.media_tabs[0].zoom_pct, 125);
+
+        // SVG offers View Source action that opens its XML in TextBuffer
+        let source_r = state
+            .hit_regions
+            .iter()
+            .find(|(_, a)| matches!(a, HitAction::OpenMediaAsText(p) if p == &svg_path))
+            .map(|(r, _)| *r)
+            .expect("svg view source button");
+        state.handle_mouse_click_with_mods(source_r.x + 6, source_r.y + 4, false, &canvas);
+        assert!(state.active_media_tab.is_none());
+        assert_eq!(state.active_buffer().path, svg_path);
+
+        // 2. Open WAV and MP4 media preview tabs and render both cleanly
+        state.open_file(wav_path.clone());
+        assert_eq!(state.active_media_tab, Some(1));
+        assert!(!state.media_tabs[1].waveform_peaks.is_empty());
+        state.render(&mut canvas);
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::OpenExternalMedia(p) if p == &wav_path)));
+
+        state.open_file(mp4_path.clone());
+        assert_eq!(state.active_media_tab, Some(2));
+        state.render(&mut canvas);
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::OpenExternalMedia(p) if p == &mp4_path)));
+
+        // Closing a media tab updates selection cleanly
+        let close_r = state
+            .hit_regions
+            .iter()
+            .find(|(_, a)| matches!(a, HitAction::CloseMediaTab(2)))
+            .map(|(r, _)| *r)
+            .expect("close media tab button");
+        state.handle_mouse_click_with_mods(close_r.x + 4, close_r.y + 4, false, &canvas);
+        assert_eq!(state.media_tabs.len(), 2);
+        assert_eq!(state.active_media_tab, Some(1));
+
+        // Selecting a text tab switches back out of media preview
+        state.handle_mouse_click_with_mods(
+            state.tab_rects[0].0.x + 8,
+            state.tab_rects[0].0.y + 8,
+            false,
+            &canvas,
+        );
+        assert!(state.active_media_tab.is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_idea_full_git_menu_and_modals_work() {
+        let root = std::env::temp_dir().join(format!(
+            "ide_app_full_git_menu_test_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("lib.rs"), "pub fn x() -> i32 { 1 }\n").unwrap();
+
+        let mut state = IdeApplicationState::new(root.clone());
+        let mut canvas = SurfaceCanvas::new(1400, 860);
+
+        // 1. Full IDEA Git menu renders all operations cleanly
+        state.hamburger_menu_expanded = true;
+        state.active_menu_category = Some(MainMenuCategory::Git);
+        state.render(&mut canvas);
+        let expected_actions = [
+            IdeAction::GitCommitPopup,
+            IdeAction::GitPush,
+            IdeAction::GitPull,
+            IdeAction::GitFetch,
+            IdeAction::GitMerge,
+            IdeAction::GitRebase,
+            IdeAction::GitBranches,
+            IdeAction::GitNewBranch,
+            IdeAction::GitNewTag,
+            IdeAction::GitStashChanges,
+            IdeAction::GitUnstashChanges,
+            IdeAction::GitResetHead,
+            IdeAction::GitRollback,
+            IdeAction::GitShowDiff,
+            IdeAction::GitAnnotateBlame,
+            IdeAction::GitFileHistory,
+            IdeAction::GitRollbackCurrentFile,
+            IdeAction::GitShowLog,
+            IdeAction::GitManageRemotes,
+        ];
+        for act in expected_actions {
+            assert!(
+                state
+                    .hit_regions
+                    .iter()
+                    .any(|(_, a)| matches!(a, HitAction::ExecuteIdeAction(x) if *x == act)),
+                "Git menu should expose {act:?}"
+            );
+        }
+
+        // 2. Git Blame expands gutter and File History sets active file filter in GitLog
+        state.execute_ide_action(IdeAction::GitAnnotateBlame);
+        assert!(state.git_blame_visible);
+        let normal_gutter_start = state.editor_code_start_x;
+        state.render(&mut canvas);
+        assert!(state.editor_code_start_x > normal_gutter_start + 100);
+
+        state.execute_ide_action(IdeAction::GitFileHistory);
+        assert_eq!(state.bottom_tool, Some(ToolWindowId::GitLog));
+        assert!(state.git_file_history_filter.is_some());
+        state.render(&mut canvas);
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::ClearGitFileHistoryFilter)));
+
+        // 3. Operation modals (Merge / Rebase / Stash / Unstash / Reset / Rollback / Remotes / Tag) render & close
+        for (act, expected_focus) in [
+            (IdeAction::GitNewTag, FocusTarget::NewGitTagModal),
+            (IdeAction::GitStashChanges, FocusTarget::NewGitStashModal),
+            (IdeAction::GitMerge, FocusTarget::GitMergeModal),
+            (IdeAction::GitRebase, FocusTarget::GitRebaseModal),
+            (IdeAction::GitUnstashChanges, FocusTarget::GitUnstashModal),
+            (IdeAction::GitResetHead, FocusTarget::GitResetModal),
+            (IdeAction::GitRollback, FocusTarget::GitRollbackModal),
+            (IdeAction::GitManageRemotes, FocusTarget::GitRemotesModal),
+        ] {
+            state.execute_ide_action(act);
+            assert_eq!(state.focus, expected_focus);
+            state.render(&mut canvas);
+        }
+
+        state.execute_ide_action(IdeAction::GitBranches);
+        assert!(state.git_branch_popup_open);
+        state.render(&mut canvas);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_project_run_configs_cli_command_and_file_run_join_run_list_and_persist() {
+        let unique = format!(
+            "rust_ai_ide_run_configs_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let root = std::env::temp_dir().join(&unique);
+        let persist_dir = root.join(".persist");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&persist_dir).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "scripts": { "dev": "vite", "build": "vite build", "test": "vitest" } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("docker-compose.yml"),
+            "services:\n  api:\n    image: alpine\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("build.gradle.kts"),
+            "plugins { id(\"org.springframework.boot\") }\n",
+        )
+        .unwrap();
+        let py_file = root.join("worker.py");
+        std::fs::write(&py_file, "if __name__ == '__main__':\n    print('ok')\n").unwrap();
+
+        let mut state = IdeApplicationState::new(root.clone());
+        state.persistence_dir = Some(persist_dir.clone());
+
+        assert!(state
+            .run_configs
+            .iter()
+            .any(|c| c.command == "npm" && c.args == vec!["run", "dev"]));
+        assert!(state
+            .run_configs
+            .iter()
+            .any(|c| c.command == "docker" && c.args == vec!["compose", "up", "-d"]));
+        assert!(state
+            .run_configs
+            .iter()
+            .any(|c| c.command == "gradle" && c.args == vec!["bootRun"]));
+
+        // Run a file -> joins run list and becomes active
+        state.open_file(py_file.clone());
+        state.execute_ide_action(IdeAction::RunCurrentFile);
+        let py_idx = state
+            .run_configs
+            .iter()
+            .position(|c| c.command == "python" && c.args == vec!["worker.py"])
+            .expect("python file added to run list");
+        assert_eq!(state.active_run_config, py_idx);
+        assert_eq!(state.run_configs[py_idx].source, RunConfigSource::Custom);
+
+        // Add & run a custom CLI command -> joins run list without duplicates
+        state.add_and_run_command_line("docker compose up -d --build");
+        let count_before = state.run_configs.len();
+        state.add_and_run_command_line("docker compose up -d --build");
+        assert_eq!(state.run_configs.len(), count_before);
+
+        // Render popup exposes scroll/add/remove hit targets
+        state.run_config_popup_open = true;
+        let mut canvas = SurfaceCanvas::new(1440, 900);
+        state.render(&mut canvas);
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::OpenNewRunConfigModal)));
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::RemoveRunConfig(_))));
+
+        // Restore persisted custom configs in a fresh state
+        let mut restored = IdeApplicationState::new(root.clone());
+        restored.persistence_dir = Some(persist_dir.clone());
+        restored.restore_workspace_state(&persist_dir);
+        assert!(restored
+            .run_configs
+            .iter()
+            .any(|c| c.command == "python" && c.args == vec!["worker.py"]));
+        assert!(restored
+            .run_configs
+            .iter()
+            .any(|c| c.command == "docker" && c.args.contains(&"--build".to_string())));
+
+        let custom_idx = restored
+            .run_configs
+            .iter()
+            .position(|c| c.source == RunConfigSource::Custom)
+            .unwrap();
+        restored.remove_custom_run_config(custom_idx);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_single_process_new_window_queue_and_cache_trimming() {
+        let unique = format!(
+            "rust_ai_ide_multiwin_mem_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let root1 = std::env::temp_dir().join(format!("{unique}_1"));
+        let root2 = std::env::temp_dir().join(format!("{unique}_2"));
+        std::fs::create_dir_all(&root1).unwrap();
+        std::fs::create_dir_all(&root2).unwrap();
+
+        let mut state = IdeApplicationState::new(root1.clone());
+        state.open_workspace_in_new_window(root2.clone());
+        state.open_workspace_in_new_window(root2.clone());
+        assert_eq!(state.pending_new_windows.len(), 2);
+        assert!(workspace_paths_equal(
+            &state.pending_new_windows[0],
+            &clean_workspace_path(root2.clone())
+        ));
+        state.request_switch_workspace(root1.clone());
+        assert!(workspace_paths_equal(
+            state
+                .pending_switch_workspaces
+                .last()
+                .expect("switch queued"),
+            &state.workspace_root
+        ));
+
+        let now = Instant::now();
+        let mut recent: Option<(u8, u32, Instant)> = None;
+        let first = duplicate_open_count(&recent, &1u8, now);
+        assert_eq!(first, 1);
+        recent = Some((1, first, now));
+        assert_eq!(duplicate_open_count(&recent, &1u8, now), 2);
+        assert_eq!(duplicate_open_count(&recent, &2u8, now), 1);
+        assert_eq!(
+            duplicate_open_count(&recent, &1u8, now + Duration::from_secs(9)),
+            1
+        );
+        state.start_window_attention_flash();
+        assert!(state.window_attention_until.is_some());
+        assert!(state.has_active_animations());
+
+        // Image preview cache should stay bounded (<= 24) and trim when minimized
+        for i in 0..30usize {
+            let fake = DecodedPreviewImage {
+                orig_width: 16,
+                orig_height: 16,
+                width: 4,
+                height: 4,
+                rgba: vec![255; 64],
+            };
+            state.cache_decoded_image_preview(root1.join(format!("img_{i}.png")), Arc::new(fake));
+        }
+        assert!(state.image_preview_cache.len() <= 24);
+        state.trim_caches_when_minimized();
+        assert!(state.image_preview_cache.is_empty());
+
+        let _ = std::fs::remove_dir_all(&root1);
+        let _ = std::fs::remove_dir_all(&root2);
+    }
+
+    #[test]
+    fn test_per_script_run_pause_isolation() {
+        let unique = format!(
+            "rust_ai_ide_per_script_pause_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let root = std::env::temp_dir().join(&unique);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "scripts": { "dev": "node -e \"setTimeout(()=>{}, 5000)\"", "build": "node -e \"setTimeout(()=>{}, 5000)\"" } }"#,
+        )
+        .unwrap();
+
+        let mut state = IdeApplicationState::new(root.clone());
+        let dev_idx = state
+            .run_configs
+            .iter()
+            .position(|c| c.args == vec!["run", "dev"])
+            .expect("npm dev");
+        let build_idx = state
+            .run_configs
+            .iter()
+            .position(|c| c.args == vec!["build"] || c.args == vec!["run", "build"])
+            .expect("npm build");
+
+        state.toggle_run_config_execution(dev_idx);
+        assert!(state.is_run_config_running(dev_idx));
+        assert!(!state.is_run_config_running(build_idx));
+        assert!(state.active_run_config_is_running());
+
+        // Switching active dropdown selection to idle script must NOT show it as running
+        state.active_run_config = build_idx;
+        assert!(!state.active_run_config_is_running());
+
+        // Start second script independently; both run simultaneously
+        state.toggle_run_config_execution(build_idx);
+        assert!(state.is_run_config_running(dev_idx));
+        assert!(state.is_run_config_running(build_idx));
+
+        // Render popup & verify independent per-row ToggleRunConfigAt buttons
+        state.run_config_popup_open = true;
+        let mut canvas = SurfaceCanvas::new(1440, 900);
+        state.render(&mut canvas);
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::ToggleRunConfigAt(i) if *i == dev_idx)));
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::ToggleRunConfigAt(i) if *i == build_idx)));
+
+        // Pausing dev script must NOT stop build script
+        state.toggle_run_config_execution(dev_idx);
+        assert!(!state.is_run_config_running(dev_idx));
+        assert!(state.is_run_config_running(build_idx));
+
+        state.toggle_run_config_execution(build_idx);
+        assert!(!state.is_run_config_running(build_idx));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_mobile_flutter_android_toolbar_missing_sdk_and_device_selection() {
+        let unique = format!(
+            "rust_ai_ide_mobile_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let root = std::env::temp_dir().join(&unique);
+        std::fs::create_dir_all(root.join("lib")).unwrap();
+        std::fs::create_dir_all(root.join("android/app/src/main")).unwrap();
+        std::fs::write(
+            root.join("pubspec.yaml"),
+            "name: shop_mobile\ndependencies:\n  flutter:\n    sdk: flutter\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("lib/main.dart"), "void main() {}\n").unwrap();
+        std::fs::write(
+            root.join("android/app/src/main/AndroidManifest.xml"),
+            "<manifest/>\n",
+        )
+        .unwrap();
+
+        let mut state = IdeApplicationState::new(root.clone());
+        assert_eq!(
+            state.mobile_env.project_kind,
+            MobileProjectKind::FlutterAndAndroid
+        );
+        assert!(state
+            .run_configs
+            .iter()
+            .any(|c| c.command == "flutter" && c.args == vec!["run"]));
+
+        // Simulate missing Flutter & Android SDK + 1 connected online ADB device
+        let report = MobileEnvironmentReport {
+            project_kind: MobileProjectKind::FlutterAndAndroid,
+            sdk_tools: vec![
+                ide_core::SdkToolStatus {
+                    id: "flutter".into(),
+                    label: "Flutter SDK".into(),
+                    installed: false,
+                    required: true,
+                    version_or_detail: "Missing".into(),
+                    path: None,
+                    install_hint: "winget install Google.Flutter".into(),
+                    install_cmd: Some("winget install Google.Flutter".into()),
+                    download_url: "https://docs.flutter.dev/get-started/install/windows".into(),
+                },
+                ide_core::SdkToolStatus {
+                    id: "adb".into(),
+                    label: "ADB (Platform-Tools)".into(),
+                    installed: true,
+                    required: true,
+                    version_or_detail: "35.0.0".into(),
+                    path: Some(PathBuf::from("C:\\Android\\adb.exe")),
+                    install_hint: String::new(),
+                    install_cmd: None,
+                    download_url: "https://developer.android.com/tools/releases/platform-tools"
+                        .into(),
+                },
+            ],
+            devices: vec![ide_core::MobileDeviceInfo {
+                id: "R5CR80ABCDE".into(),
+                name: "SM_S9180".into(),
+                platform: "android".into(),
+                state: MobileDeviceState::Online,
+                is_emulator: false,
+                detail: "Android (USB)".into(),
+            }],
+            flutter_bin: None,
+            adb_bin: Some(PathBuf::from("C:\\Android\\adb.exe")),
+            android_sdk_root: None,
+            emulator_bin: None,
+            probing: false,
+            last_checked_note: "mock probed".into(),
+        };
+
+        state.apply_mobile_environment_report(report);
+        assert!(state.mobile_popup_open);
+        assert_eq!(state.selected_mobile_device_id.as_deref(), Some("R5CR80ABCDE"));
+
+        let mut canvas = SurfaceCanvas::new(1440, 900);
+        state.render(&mut canvas);
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::ToggleMobilePopup)));
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::SelectMobileDevice(id) if id == "R5CR80ABCDE")));
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::InstallMobileSdkCmd(n, _) if n == "Flutter SDK")));
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::OpenMobileDownloadUrl(_))));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sent_user_bubble_widens_and_contains_pasted_code_blocks() {
+        let mut state = IdeApplicationState::new(PathBuf::from("."));
+        let long_code = "fn very_long_rust_helper_function_name_for_mobile_and_desktop(parameter_one: &str, parameter_two: usize, parameter_three: bool) -> String { format!(\"{parameter_one}:{parameter_two}:{parameter_three}\") }";
+        let msg_idx = state.agent_hub.messages.len();
+        state
+            .agent_hub
+            .messages
+            .push(ide_agent_hub::AgentChatMessage {
+                role: "user".to_string(),
+                agent: AgentProviderKind::CursorCli,
+                content: format!(
+                    "请检查这段复制的代码  [@main.rs:L10]\n\n```rust\n{long_code}\nlet second = 42;\n```"
+                ),
+                thought: None,
+                checkpoint_id: None,
+                patch: None,
+                modified_files: Vec::new(),
+                file_changes: Vec::new(),
+                attachments: Vec::new(),
+            });
+
+        // Expand code block inside user message (collapsed by default) to inspect wrapped code lines
+        state.collapsed_code_blocks.insert((msg_idx, 0), false);
+        let mut canvas = SurfaceCanvas::new(1400, 900);
+        state.render(&mut canvas);
+
+        let chat_area = state.agent_chat_area_rect;
+        let expected_row_w = (chat_area.w - 20).max(136);
+        let bubble_w = state
+            .cached_chat_rows
+            .rows
+            .iter()
+            .find_map(|r| match r {
+                crate::agent_panel::CachedChatRow::UserBubbleTop { bubble_w } => Some(*bubble_w),
+                _ => None,
+            })
+            .expect("user bubble top");
+        assert!(
+            bubble_w >= expected_row_w - 2,
+            "user bubble with pasted code should widen to full chat row width (got {bubble_w}, expected >= {})",
+            expected_row_w - 2
+        );
+
+        let right_edge_x = chat_area.x + chat_area.w - 14;
+        let bubble_left = (right_edge_x - bubble_w).max(chat_area.x + 6);
+        let bubble_right = bubble_left + bubble_w;
+
+        let mut code_line_count = 0usize;
+        for (idx, row) in state.cached_chat_rows.rows.iter().enumerate() {
+            if let crate::agent_panel::CachedChatRow::CodeBlockLine {
+                text,
+                user_bubble_w,
+                ..
+            } = row
+            {
+                code_line_count += 1;
+                assert_eq!(*user_bubble_w, Some(bubble_w));
+                let (crect, text_x, ..) = state
+                    .agent_chat_line_rects
+                    .iter()
+                    .find(|(_, _, gidx, _, _)| *gidx == idx)
+                    .cloned()
+                    .expect("code line rect recorded");
+                assert!(
+                    crect.x >= bubble_left + 8 && crect.x + crect.w <= bubble_right - 8,
+                    "code card {crect:?} overflowed user bubble [{bubble_left}..{bubble_right}]"
+                );
+                let (tw, _) = canvas.measure_text(text, crate::canvas::FontStyle::ChatCode);
+                assert!(
+                    text_x + tw <= crect.x + crect.w - 8,
+                    "wrapped code segment `{text}` width {tw} overflowed code card right edge"
+                );
+            }
+        }
+        assert!(code_line_count >= 2, "long code line should wrap neatly inside wide bubble");
     }
 }

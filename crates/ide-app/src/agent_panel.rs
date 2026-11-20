@@ -1,6 +1,6 @@
 use crate::canvas::{FontStyle, Rect, SurfaceCanvas};
 use crate::ide_state::{
-    blend_rgb, write_windows_clipboard_text, FocusTarget, HitAction, IdeApplicationState,
+    blend_rgb, write_windows_clipboard_text, DockPane, FocusTarget, HitAction, IdeApplicationState,
     RightPanelTab, ScrollTrackInfo,
 };
 use ide_agent_hub::{
@@ -95,21 +95,33 @@ pub(crate) enum CachedChatRow {
         code: String,
         line_count: usize,
         collapsed: bool,
+        user_bubble_w: Option<i32>,
     },
     CodeBlockCollapsedSummary {
         msg_idx: usize,
         blk_idx: usize,
         preview: String,
         line_count: usize,
+        user_bubble_w: Option<i32>,
     },
     CodeBlockLine {
         text: String,
         lang: LanguageId,
+        user_bubble_w: Option<i32>,
     },
-    ModifiedFilesHeader(usize),
-    ModifiedFileChip {
+    TurnFilesToggle {
+        msg_idx: usize,
+        file_count: usize,
+        added_lines: usize,
+        removed_lines: usize,
+        expanded: bool,
+    },
+    TurnChangedFileRow {
+        msg_idx: usize,
         path: PathBuf,
         display: String,
+        added_lines: usize,
+        removed_lines: usize,
     },
     LiveThoughtLine(String),
     LiveStepLine(String),
@@ -138,7 +150,7 @@ impl CachedChatRow {
         match self {
             Self::UserHeader { .. } => 21,
             Self::AgentHeader { .. } => 24,
-            Self::UserBubbleTop { .. } | Self::UserBubbleBottom { .. } => 7,
+            Self::UserBubbleTop { .. } | Self::UserBubbleBottom { .. } => 9,
             Self::UserFilesRow { .. } => 26,
             Self::UserImageCard { .. } => 86,
             Self::ThoughtToggle { .. } => 22,
@@ -146,14 +158,14 @@ impl CachedChatRow {
             Self::CodeBlockHeader { .. } => 26,
             Self::CodeBlockCollapsedSummary { .. } => 24,
             Self::CodeBlockLine { .. } => 19,
-            Self::ModifiedFilesHeader(_) => 22,
-            Self::ModifiedFileChip { .. } => 24,
+            Self::TurnFilesToggle { .. } | Self::TurnChangedFileRow { .. } => 21,
             Self::PatchHeader { .. } | Self::PatchButtons { .. } => 24,
             Self::PatchDiffLine { .. } => 20,
             Self::BusyIndicator => 26,
             Self::ParaSpacer { .. } => 9,
             Self::Spacer => 14,
-            Self::UserLine { .. } | Self::AgentLine { .. } | Self::StreamingLine { .. } => 23,
+            Self::UserLine { .. } => 24,
+            Self::AgentLine { .. } | Self::StreamingLine { .. } => 23,
         }
     }
 
@@ -167,7 +179,7 @@ impl CachedChatRow {
             | Self::StreamingLine { text, .. }
             | Self::CodeBlockLine { text, .. } => Some(text.as_str()),
             Self::PatchDiffLine { text, .. } => Some(text.as_str()),
-            Self::ModifiedFileChip { display, .. } => Some(display.as_str()),
+            Self::TurnChangedFileRow { display, .. } => Some(display.as_str()),
             _ => None,
         }
     }
@@ -594,11 +606,7 @@ fn append_message_body_rows(
                 continue;
             }
             let (clean_line, line_bold, raw_spans) = parse_markdown_inline_line(raw_line);
-            let inline_code_cnt = raw_spans
-                .iter()
-                .filter(|s| matches!(s.kind, ChatSpanKind::InlineCode))
-                .count();
-            let pill_reserve = (inline_code_cnt as i32 * 12).min(48);
+            let pill_reserve = chat_inline_pill_reserve(&raw_spans);
             let base_style = if line_bold {
                 FontStyle::ChatBodyBold
             } else {
@@ -627,6 +635,12 @@ fn append_message_body_rows(
         }
     };
 
+    let user_bubble_w = if is_user { Some(bubble_w) } else { None };
+    let code_wrap_w = if is_user {
+        (bubble_w - 42).max(40)
+    } else {
+        (wrap_w - 20).max(40)
+    };
     let push_code_block = |tag: String,
                            lines: Vec<String>,
                            cur_blk_idx: usize,
@@ -650,6 +664,7 @@ fn append_message_body_rows(
             code: full_code,
             line_count,
             collapsed,
+            user_bubble_w,
         });
         if collapsed {
             let preview = lines
@@ -663,16 +678,18 @@ fn append_message_body_rows(
                 blk_idx: cur_blk_idx,
                 preview,
                 line_count,
+                user_bubble_w,
             });
         } else {
             let lang_id = language_from_fence_tag(&tag);
             for cl in &lines {
                 for (_, _, wl) in
-                    wrap_chat_line_segments(canvas, cl, (wrap_w - 20).max(40), FontStyle::ChatCode)
+                    wrap_chat_line_segments(canvas, cl, code_wrap_w, FontStyle::ChatCode)
                 {
                     out.push(CachedChatRow::CodeBlockLine {
                         text: wl,
                         lang: lang_id,
+                        user_bubble_w,
                     });
                 }
             }
@@ -708,13 +725,61 @@ fn append_message_body_rows(
     }
 }
 
+#[inline]
+fn chat_inline_pill_reserve(spans: &[ChatTextSpan]) -> i32 {
+    spans
+        .iter()
+        .map(|s| match s.kind {
+            ChatSpanKind::InlineCode => 12,
+            ChatSpanKind::FileLink { .. } => 8,
+            _ => 0,
+        })
+        .sum::<i32>()
+        .min(64)
+}
+
+#[inline]
+fn user_bubble_rect(row_rect: Rect, right_edge_x: i32, bubble_w: i32) -> Rect {
+    let bx = (right_edge_x - bubble_w).max(row_rect.x);
+    let bw = bubble_w.min(right_edge_x - bx);
+    Rect::new(bx, row_rect.y, bw, row_rect.h)
+}
+
+#[inline]
+fn code_block_row_bounds(
+    canvas: &mut SurfaceCanvas,
+    row_rect: Rect,
+    right_edge_x: i32,
+    user_bubble_w: Option<i32>,
+    user_bubble_bg: u32,
+) -> (i32, i32) {
+    if let Some(ubw) = user_bubble_w {
+        let brect = user_bubble_rect(row_rect, right_edge_x, ubw);
+        canvas.fill_rect(brect, user_bubble_bg);
+        (brect.x + 10, (brect.w - 20).max(40))
+    } else {
+        (row_rect.x + 2, (row_rect.w - 4).max(40))
+    }
+}
+
 fn measure_user_bubble_width(
     root: &std::path::Path,
     canvas: &SurfaceCanvas,
     msg: &ide_agent_hub::AgentChatMessage,
-    max_content_w: i32,
+    prose_max_content_w: i32,
+    code_max_content_w: i32,
 ) -> i32 {
-    let mut max_w = 0i32;
+    let has_code_fence = msg.content.contains("```");
+    let max_content_w = if has_code_fence {
+        code_max_content_w
+    } else {
+        prose_max_content_w
+    };
+    let mut max_w = if has_code_fence {
+        code_max_content_w
+    } else {
+        0i32
+    };
     let mut in_fence = false;
     for raw in msg.content.lines() {
         let trimmed = raw.trim_start();
@@ -727,11 +792,7 @@ fn measure_user_bubble_width(
             continue;
         }
         let (clean, line_bold, raw_spans) = parse_markdown_inline_line(raw);
-        let inline_code_cnt = raw_spans
-            .iter()
-            .filter(|s| matches!(s.kind, ChatSpanKind::InlineCode))
-            .count();
-        let pill_reserve = (inline_code_cnt as i32 * 12).min(48);
+        let pill_reserve = chat_inline_pill_reserve(&raw_spans);
         let base_style = if line_bold {
             FontStyle::ChatBodyBold
         } else {
@@ -746,7 +807,7 @@ fn measure_user_bubble_width(
         }
     }
     if !msg.attachments.is_empty() {
-        max_w = max_w.max(210.min(max_content_w));
+        max_w = max_w.max(240.min(max_content_w));
     }
     (max_w + 26).clamp(86, max_content_w + 26)
 }
@@ -1096,6 +1157,9 @@ impl IdeApplicationState {
                     cur_x += cw;
                 }
                 ChatSpanKind::InlineCode => {
+                    if right_edge - cur_x < 12 {
+                        break;
+                    }
                     let (cw, _) = canvas.measure_text(&chunk, FontStyle::ChatCode);
                     let pill_w = (cw + 8).min((right_edge - cur_x - 2).max(10));
                     let pill_h = (code_h + 3).min(row_rect.h - 2);
@@ -1112,6 +1176,9 @@ impl IdeApplicationState {
                     cur_x += cw + 12;
                 }
                 ChatSpanKind::FileLink { path, line } => {
+                    if right_edge - cur_x < 12 {
+                        break;
+                    }
                     let (lw, _) = canvas.measure_text(&chunk, FontStyle::ChatCode);
                     let pill_w = (lw + 6).min((right_edge - cur_x - 1).max(8));
                     let link_rect = Rect::new(
@@ -1225,6 +1292,7 @@ impl IdeApplicationState {
             blend_rgb(t.editor_bg, t.panel_bg, 0.25)
         };
         canvas.stroke_rounded_rect(rect, 8, t.border_color, panel_surface);
+        self.arm_pane_header_drag(canvas, rect, DockPane::Agent);
         self.agent_chat_line_rects.clear();
 
         // 顶部简洁头部底带
@@ -1235,7 +1303,7 @@ impl IdeApplicationState {
         let chg_cnt = self.git_engine.changed_files.len();
 
         // 分段 Tab：[✦ AI 助手] [± 更改 (N)]
-        let seg_bg = Rect::new(rect.x + 8, rect.y + 4, 192, 24);
+        let seg_bg = Rect::new(rect.x + 22, rect.y + 4, 192, 24);
         canvas.fill_rounded_rect(seg_bg, 6, blend_rgb(t.window_bg, panel_surface, 0.45));
 
         let tab1 = Rect::new(seg_bg.x + 2, seg_bg.y + 2, 84, 20);
@@ -1350,33 +1418,6 @@ impl IdeApplicationState {
         self.hit_regions
             .push((sync_btn, HitAction::RefreshLocalCliAgents));
 
-        let ck_btn = Rect::new(sync_btn.x - 56, rect.y + 5, 52, 22);
-        if ck_btn.x > seg_bg.x + seg_bg.w + 4 {
-            let ck_hov = ck_btn.contains(hx, hy);
-            if ck_hov {
-                canvas.fill_rounded_rect(ck_btn, 5, btn_hover_bg);
-            }
-            canvas.draw_ai_sparkle_icon(
-                ck_btn.x + 4,
-                ck_btn.y + 3,
-                if ck_hov { t.syn_function } else { t.text_muted },
-            );
-            canvas.draw_text_styled(
-                ck_btn.x + 20,
-                ck_btn.y + 3,
-                self.tr("改写", "Edit"),
-                if ck_hov {
-                    t.text_primary
-                } else {
-                    t.text_secondary
-                },
-                30,
-                FontStyle::ChatMeta,
-            );
-            self.hit_regions
-                .push((ck_btn, HitAction::TriggerCtrlKInlineEdit));
-        }
-
         canvas.fill_rect(
             Rect::new(rect.x + 1, rect.y + 33, rect.w - 2, 1),
             blend_rgb(t.border_color, panel_surface, 0.55),
@@ -1430,8 +1471,7 @@ impl IdeApplicationState {
         let mut y = list_top;
         for ch in files.iter().skip(self.agent_scroll).take(visible_rows) {
             let row = Rect::new(rect.x + 8, y, rect.w - 54, 22);
-            let lang = ide_core::LanguageId::from_path(&ch.path);
-            canvas.draw_file_type_icon(row.x + 4, y + 4, lang);
+            canvas.draw_path_file_icon(row.x + 4, y + 4, &ch.path);
             let fname = ch
                 .path
                 .file_name()
@@ -1450,7 +1490,7 @@ impl IdeApplicationState {
                 ide_git::GitFileStatusKind::Deleted => t.breakpoint_red,
                 ide_git::GitFileStatusKind::Modified => t.syn_function,
             };
-            canvas.draw_text_styled(
+            canvas.draw_text_ellipsis(
                 row.x + 22,
                 y + 3,
                 &label,
@@ -1459,7 +1499,7 @@ impl IdeApplicationState {
                 FontStyle::UiSmall,
             );
             self.hit_regions
-                .push((row, HitAction::OpenFile(ch.path.clone())));
+                .push((row, HitAction::InspectGitWorkingFileDiff(ch.path.clone())));
 
             let undo_btn = Rect::new(rect.x + rect.w - 42, y + 1, 26, 20);
             canvas.draw_rollback_icon(undo_btn.x + 5, undo_btn.y + 3, t.text_muted);
@@ -1678,11 +1718,7 @@ impl IdeApplicationState {
         );
 
         let supports_rewind = self.agent_hub.active_cli_supports_checkpoint_rewind();
-        let session_changed_files = if supports_rewind {
-            self.agent_hub.active_session_changed_files().to_vec()
-        } else {
-            Vec::new()
-        };
+        let session_changed_files = self.agent_hub.active_session_changed_files().to_vec();
         let files_drawer_h = if !session_changed_files.is_empty() {
             if self.agent_changed_files_expanded {
                 let vis_rows = session_changed_files.len().min(5) as i32;
@@ -1742,7 +1778,11 @@ impl IdeApplicationState {
                     .as_ref()
                     .map(|p| if p.applied { 1u64 << (i & 31) } else { 0 })
                     .unwrap_or(0);
-                let mf_bit = (m.modified_files.len() as u64).wrapping_mul(131);
+                let mf_bit = (m.modified_files.len() as u64).wrapping_mul(131)
+                    ^ (m.file_changes.len() as u64).wrapping_mul(523)
+                    ^ m.file_changes
+                        .iter()
+                        .fold(0u64, |a, fc| a.wrapping_add((fc.added_lines as u64) * 17 + (fc.removed_lines as u64) * 31));
                 let att_bit = (m.attachments.len() as u64).wrapping_mul(977);
                 p_bit ^ mf_bit ^ att_bit
             })
@@ -1796,7 +1836,12 @@ impl IdeApplicationState {
                 composer_rect.w,
                 files_drawer_h,
             );
-            self.render_agent_changed_files_bar(canvas, drawer_rect, &session_changed_files);
+            self.render_agent_changed_files_bar(
+                canvas,
+                drawer_rect,
+                &session_changed_files,
+                supports_rewind,
+            );
         }
 
         // 3. 绘制美观的底部 Composer 卡片（含附件托盘、图片直接缩略图预览、可折叠粘贴代码预览）
@@ -2015,8 +2060,10 @@ impl IdeApplicationState {
             && self.cached_chat_rows.is_busy == is_busy;
 
         if !cache_key_match {
-            let user_max_content_w =
-                ((wrap_w as f32 * 0.80) as i32).clamp(110, (wrap_w - 24).max(110));
+            let row_avail_w = (chat_area.w - 20).max(136);
+            let user_code_max_content_w = (row_avail_w - 26).max(110);
+            let user_prose_max_content_w = (((row_avail_w as f32) * 0.92) as i32 - 26)
+                .clamp(110, user_code_max_content_w);
             let mut rebuilt: Vec<CachedChatRow> = Vec::with_capacity(msg_count * 7 + 6);
             for (msg_idx, msg) in self.agent_hub.messages.iter().enumerate() {
                 if msg.role == "user" {
@@ -2024,7 +2071,8 @@ impl IdeApplicationState {
                         &self.workspace_root,
                         canvas,
                         msg,
-                        user_max_content_w,
+                        user_prose_max_content_w,
+                        user_code_max_content_w,
                     );
                     rebuilt.push(CachedChatRow::UserHeader { msg_idx, bubble_w });
                     rebuilt.push(CachedChatRow::UserBubbleTop { bubble_w });
@@ -2107,20 +2155,68 @@ impl IdeApplicationState {
                         &self.collapsed_code_blocks,
                         &mut rebuilt,
                     );
-                    if !msg.modified_files.is_empty()
-                        && !self.agent_hub.active_cli_supports_checkpoint_rewind()
-                    {
-                        rebuilt.push(CachedChatRow::ModifiedFilesHeader(msg.modified_files.len()));
-                        for path in &msg.modified_files {
-                            let rel = path
-                                .strip_prefix(&self.workspace_root)
-                                .unwrap_or(path)
-                                .to_string_lossy()
-                                .replace('\\', "/");
-                            rebuilt.push(CachedChatRow::ModifiedFileChip {
-                                path: path.clone(),
-                                display: rel,
+                    if msg.role == "assistant" {
+                        let turn_changes: Vec<(PathBuf, usize, usize)> =
+                            if !msg.file_changes.is_empty() {
+                                msg.file_changes
+                                    .iter()
+                                    .map(|fc| (fc.path.clone(), fc.added_lines, fc.removed_lines))
+                                    .collect()
+                            } else {
+                                msg.modified_files
+                                    .iter()
+                                    .map(|p| {
+                                        let stats = self
+                                            .agent_hub
+                                            .active_session_changed_files()
+                                            .iter()
+                                            .find(|sc| {
+                                                sc.path == *p
+                                                    || sc
+                                                        .path
+                                                        .to_string_lossy()
+                                                        .replace('/', "\\")
+                                                        .eq_ignore_ascii_case(
+                                                            &p.to_string_lossy().replace('/', "\\"),
+                                                        )
+                                            })
+                                            .map(|sc| (sc.added_lines, sc.removed_lines))
+                                            .unwrap_or((0, 0));
+                                        (p.clone(), stats.0, stats.1)
+                                    })
+                                    .collect()
+                            };
+                        if !turn_changes.is_empty() {
+                            let total_add: usize = turn_changes.iter().map(|c| c.1).sum();
+                            let total_del: usize = turn_changes.iter().map(|c| c.2).sum();
+                            let expanded = self
+                                .expanded_message_file_changes
+                                .get(&msg_idx)
+                                .copied()
+                                .unwrap_or(false);
+                            rebuilt.push(CachedChatRow::TurnFilesToggle {
+                                msg_idx,
+                                file_count: turn_changes.len(),
+                                added_lines: total_add,
+                                removed_lines: total_del,
+                                expanded,
                             });
+                            if expanded {
+                                for (path, added_lines, removed_lines) in turn_changes {
+                                    let rel = path
+                                        .strip_prefix(&self.workspace_root)
+                                        .unwrap_or(&path)
+                                        .to_string_lossy()
+                                        .replace('\\', "/");
+                                    rebuilt.push(CachedChatRow::TurnChangedFileRow {
+                                        msg_idx,
+                                        path,
+                                        display: rel,
+                                        added_lines,
+                                        removed_lines,
+                                    });
+                                }
+                            }
                         }
                     }
                     if let Some(patch) = &msg.patch {
@@ -2317,8 +2413,7 @@ impl IdeApplicationState {
                     );
                     let show_edit = self.agent_hub.active_cli_supports_checkpoint_rewind()
                         && !self.agent_hub.is_active_session_busy();
-                    let is_editing_this =
-                        show_edit && self.editing_sent_msg_idx == Some(*msg_idx);
+                    let is_editing_this = show_edit && self.editing_sent_msg_idx == Some(*msg_idx);
                     let edit_w = if is_editing_this { 46 } else { 34 };
                     let total_btn_w = if show_edit { 34 + 4 + edit_w } else { 34 };
                     let bubble_left = (right_edge_x - *bubble_w).max(row_rect.x);
@@ -2380,29 +2475,29 @@ impl IdeApplicationState {
                                 FontStyle::ChatMeta,
                             );
                             if !is_editing_this {
-                                self.hit_regions
-                                    .push((edit_btn, HitAction::StartEditSentUserMessage(*msg_idx)));
+                                self.hit_regions.push((
+                                    edit_btn,
+                                    HitAction::StartEditSentUserMessage(*msg_idx),
+                                ));
                             }
                         }
                     }
                 }
                 CachedChatRow::UserBubbleTop { bubble_w } => {
-                    let bx = (right_edge_x - *bubble_w).max(row_rect.x);
-                    let bw = (*bubble_w).min(right_edge_x - bx);
-                    let cap_h = (row_h + 10).min(chat_bottom - cy);
-                    if cap_h >= 6 {
-                        canvas.fill_rounded_rect(Rect::new(bx, cy, bw, cap_h), 10, user_bubble_bg);
-                    }
+                    let brect = user_bubble_rect(row_rect, right_edge_x, *bubble_w);
+                    canvas.fill_top_rounded_rect(
+                        Rect::new(brect.x, cy, brect.w, draw_h),
+                        9,
+                        user_bubble_bg,
+                    );
                 }
                 CachedChatRow::UserBubbleBottom { bubble_w } => {
-                    let bx = (right_edge_x - *bubble_w).max(row_rect.x);
-                    let bw = (*bubble_w).min(right_edge_x - bx);
-                    if cy > chat_area.y + 8 {
-                        let cap = Rect::new(bx, cy - 8, bw, row_h + 8);
-                        canvas.fill_rounded_rect(cap, 10, user_bubble_bg);
-                    } else {
-                        canvas.fill_rect(Rect::new(bx, cy, bw, draw_h), user_bubble_bg);
-                    }
+                    let brect = user_bubble_rect(row_rect, right_edge_x, *bubble_w);
+                    canvas.fill_bottom_rounded_rect(
+                        Rect::new(brect.x, cy, brect.w, draw_h),
+                        9,
+                        user_bubble_bg,
+                    );
                 }
                 CachedChatRow::UserLine {
                     text,
@@ -2410,31 +2505,27 @@ impl IdeApplicationState {
                     default_bold,
                     bubble_w,
                 } => {
-                    let bx = (right_edge_x - *bubble_w).max(row_rect.x);
-                    let bw = (*bubble_w).min(right_edge_x - bx);
-                    let brect = Rect::new(bx, cy, bw, row_h);
+                    let brect = user_bubble_rect(row_rect, right_edge_x, *bubble_w);
                     canvas.fill_rect(brect, user_bubble_bg);
                     self.draw_chat_line_with_spans_and_selection(
                         canvas,
                         brect,
-                        bx + 13,
+                        brect.x + 13,
                         cy + 2,
                         *global_row_idx,
                         text,
                         spans,
                         *default_bold,
                         prose_fg,
-                        (bw - 24).max(40),
+                        (brect.w - 24).max(40),
                         FontStyle::ChatBody,
                     );
                 }
                 CachedChatRow::UserFilesRow { files, bubble_w } => {
-                    let bx = (right_edge_x - *bubble_w).max(row_rect.x);
-                    let bw = (*bubble_w).min(right_edge_x - bx);
-                    let brect = Rect::new(bx, cy, bw, row_h);
+                    let brect = user_bubble_rect(row_rect, right_edge_x, *bubble_w);
                     canvas.fill_rect(brect, user_bubble_bg);
-                    let mut fx = bx + 12;
-                    let max_fx = bx + bw - 10;
+                    let mut fx = brect.x + 12;
+                    let max_fx = brect.x + brect.w - 10;
                     for (path, name) in files {
                         let (nw, _) = canvas.measure_text(name, FontStyle::ChatMeta);
                         let chip_w = (nw + 28).clamp(52, 160);
@@ -2453,11 +2544,7 @@ impl IdeApplicationState {
                             },
                             t.editor_bg,
                         );
-                        canvas.draw_file_type_icon(
-                            chip.x + 5,
-                            chip.y + 3,
-                            LanguageId::from_path(path),
-                        );
+                        canvas.draw_path_file_icon(chip.x + 5, chip.y + 3, path);
                         canvas.draw_text_styled(
                             chip.x + 21,
                             chip.y + 2,
@@ -2472,12 +2559,10 @@ impl IdeApplicationState {
                     }
                 }
                 CachedChatRow::UserImageCard { item, bubble_w } => {
-                    let bx = (right_edge_x - *bubble_w).max(row_rect.x);
-                    let bw = (*bubble_w).min(right_edge_x - bx);
-                    let brect = Rect::new(bx, cy, bw, row_h);
+                    let brect = user_bubble_rect(row_rect, right_edge_x, *bubble_w);
                     canvas.fill_rect(brect, user_bubble_bg);
                     if cy + row_h <= chat_bottom + 8 {
-                        let card = Rect::new(bx + 12, cy + 4, (bw - 24).max(60), row_h - 8);
+                        let card = Rect::new(brect.x + 12, cy + 4, (brect.w - 24).max(60), row_h - 8);
                         let hov = card.contains(hx, hy);
                         canvas.stroke_rounded_rect(
                             card,
@@ -2546,9 +2631,7 @@ impl IdeApplicationState {
                 }
                 CachedChatRow::ParaSpacer { is_user, bubble_w } => {
                     if *is_user {
-                        let bx = (right_edge_x - *bubble_w).max(row_rect.x);
-                        let bw = (*bubble_w).min(right_edge_x - bx);
-                        let brect = Rect::new(bx, cy, bw, row_h);
+                        let brect = user_bubble_rect(row_rect, right_edge_x, *bubble_w);
                         canvas.fill_rect(brect, user_bubble_bg);
                     }
                 }
@@ -2662,8 +2745,16 @@ impl IdeApplicationState {
                     code,
                     line_count,
                     collapsed,
+                    user_bubble_w,
                 } => {
-                    let hdr = Rect::new(row_rect.x + 2, cy + 1, row_rect.w - 4, row_h - 1);
+                    let (cx, cw) = code_block_row_bounds(
+                        canvas,
+                        row_rect,
+                        right_edge_x,
+                        *user_bubble_w,
+                        user_bubble_bg,
+                    );
+                    let hdr = Rect::new(cx, cy + 1, cw, row_h - 1);
                     canvas.stroke_rounded_rect(
                         hdr,
                         6,
@@ -2671,7 +2762,9 @@ impl IdeApplicationState {
                         blend_rgb(code_block_bg, t.panel_bg, 0.35),
                     );
                     let arrow = if *collapsed { "▸" } else { "▾" };
-                    let collapse_hit = Rect::new(hdr.x, hdr.y, hdr.w - 64, hdr.h);
+                    let show_fold_word = hdr.w >= 165;
+                    let title_reserve = if show_fold_word { 116 } else { 72 };
+                    let collapse_hit = Rect::new(hdr.x, hdr.y, (hdr.w - 64).max(20), hdr.h);
                     let col_hov = collapse_hit.contains(hx, hy);
                     canvas.draw_text_styled(
                         hdr.x + 10,
@@ -2682,21 +2775,23 @@ impl IdeApplicationState {
                         } else {
                             t.text_secondary
                         },
-                        hdr.w - 116,
+                        (hdr.w - title_reserve).max(24),
                         FontStyle::ChatCodeBold,
                     );
-                    canvas.draw_text_styled(
-                        hdr.x + hdr.w - 104,
-                        hdr.y + 5,
-                        if *collapsed {
-                            self.tr("展开", "Expand")
-                        } else {
-                            self.tr("折叠", "Fold")
-                        },
-                        if col_hov { t.accent_blue } else { t.text_muted },
-                        38,
-                        FontStyle::ChatMeta,
-                    );
+                    if show_fold_word {
+                        canvas.draw_text_styled(
+                            hdr.x + hdr.w - 104,
+                            hdr.y + 5,
+                            if *collapsed {
+                                self.tr("展开", "Expand")
+                            } else {
+                                self.tr("折叠", "Fold")
+                            },
+                            if col_hov { t.accent_blue } else { t.text_muted },
+                            38,
+                            FontStyle::ChatMeta,
+                        );
+                    }
                     self.hit_regions.push((
                         collapse_hit,
                         HitAction::ToggleCodeBlockCollapse(*msg_idx, *blk_idx),
@@ -2725,8 +2820,16 @@ impl IdeApplicationState {
                     blk_idx,
                     preview,
                     line_count,
+                    user_bubble_w,
                 } => {
-                    let srect = Rect::new(row_rect.x + 2, cy, row_rect.w - 4, row_h - 1);
+                    let (cx, cw) = code_block_row_bounds(
+                        canvas,
+                        row_rect,
+                        right_edge_x,
+                        *user_bubble_w,
+                        user_bubble_bg,
+                    );
+                    let srect = Rect::new(cx, cy, cw, row_h - 1);
                     let hov = srect.contains(hx, hy);
                     canvas.stroke_rounded_rect(
                         srect,
@@ -2747,7 +2850,7 @@ impl IdeApplicationState {
                         srect.y + 4,
                         &format!("{preview}  ·  {fold_lbl}"),
                         if hov { t.text_primary } else { t.text_muted },
-                        srect.w - 18,
+                        (srect.w - 18).max(20),
                         FontStyle::ChatCode,
                     );
                     self.hit_regions.push((
@@ -2755,8 +2858,19 @@ impl IdeApplicationState {
                         HitAction::ToggleCodeBlockCollapse(*msg_idx, *blk_idx),
                     ));
                 }
-                CachedChatRow::CodeBlockLine { text, lang } => {
-                    let crect = Rect::new(row_rect.x + 2, cy, row_rect.w - 4, row_h);
+                CachedChatRow::CodeBlockLine {
+                    text,
+                    lang,
+                    user_bubble_w,
+                } => {
+                    let (cx, cw) = code_block_row_bounds(
+                        canvas,
+                        row_rect,
+                        right_edge_x,
+                        *user_bubble_w,
+                        user_bubble_bg,
+                    );
+                    let crect = Rect::new(cx, cy, cw, row_h);
                     let brd = blend_rgb(t.border_color, t.panel_bg, 0.45);
                     canvas.fill_rect(crect, code_block_bg);
                     canvas.fill_rect(Rect::new(crect.x, crect.y, 1, row_h), brd);
@@ -2769,56 +2883,116 @@ impl IdeApplicationState {
                         *global_row_idx,
                         text,
                         *lang,
-                        crect.w - 20,
+                        (crect.w - 20).max(20),
                     );
                 }
-                CachedChatRow::ModifiedFilesHeader(cnt) => {
+                CachedChatRow::TurnFilesToggle {
+                    msg_idx,
+                    file_count,
+                    added_lines,
+                    removed_lines,
+                    expanded,
+                } => {
+                    let pill = Rect::new(row_rect.x + 2, cy + 1, row_rect.w - 4, row_h - 2);
+                    let hov = pill.contains(hx, hy);
+                    if hov {
+                        canvas.fill_rounded_rect(
+                            pill,
+                            4,
+                            blend_rgb(t.panel_bg, t.text_primary, 0.05),
+                        );
+                    }
+                    let glyph = if *expanded { "▾" } else { "▸" };
+                    let lbl = match self.ui_lang {
+                        UiLanguage::ZhCn => format!("{glyph}  本轮已更改 {file_count} 个文件"),
+                        UiLanguage::EnUs => format!("{glyph}  Changed {file_count} files"),
+                    };
+                    let (lw, _) = canvas.measure_text(&lbl, FontStyle::ChatMeta);
                     canvas.draw_text_styled(
-                        row_rect.x + 4,
-                        cy + 3,
-                        &format!(
-                            "▸ {} {cnt} {}",
-                            self.tr("改动 / 相关", "Modified / Related"),
-                            self.tr("个文件", "files")
-                        ),
-                        t.text_muted,
-                        row_rect.w - 8,
+                        pill.x + 4,
+                        pill.y + 2,
+                        &lbl,
+                        if hov { t.text_secondary } else { t.text_muted },
+                        (pill.w - 70).max(40),
                         FontStyle::ChatMeta,
                     );
-                }
-                CachedChatRow::ModifiedFileChip { path, display } => {
-                    let chip = Rect::new(row_rect.x + 4, cy + 1, row_rect.w - 8, row_h - 2);
-                    let hov = chip.contains(hx, hy);
-                    canvas.stroke_rounded_rect(
-                        chip,
-                        5,
-                        if hov {
-                            t.accent_blue
-                        } else {
-                            blend_rgb(t.border_color, t.panel_bg, 0.45)
-                        },
-                        if hov { t.popup_hover_bg } else { code_block_bg },
-                    );
-                    let lang = LanguageId::from_path(path);
-                    canvas.draw_file_type_icon(chip.x + 7, chip.y + 3, lang);
-                    canvas.draw_text_styled(
-                        chip.x + 25,
-                        chip.y + 3,
-                        display,
-                        if hov { 0xFFFFFF } else { t.syn_function },
-                        chip.w - 64,
-                        FontStyle::ChatCode,
-                    );
-                    canvas.draw_text_styled(
-                        chip.x + chip.w - 36,
-                        chip.y + 3,
-                        self.tr("打开 →", "Open →"),
-                        if hov { 0xFFFFFF } else { t.text_muted },
-                        32,
-                        FontStyle::ChatMeta,
-                    );
+                    let mut sx = pill.x + 4 + lw + 8;
+                    if *added_lines > 0 && sx + 26 < pill.x + pill.w {
+                        let add_s = format!("+{added_lines}");
+                        let (aw, _) = canvas.measure_text(&add_s, FontStyle::ChatMeta);
+                        canvas.draw_text_styled(
+                            sx,
+                            pill.y + 2,
+                            &add_s,
+                            t.run_green,
+                            aw + 2,
+                            FontStyle::ChatMeta,
+                        );
+                        sx += aw + 5;
+                    }
+                    if *removed_lines > 0 && sx + 26 < pill.x + pill.w {
+                        let del_s = format!("-{removed_lines}");
+                        let (dw, _) = canvas.measure_text(&del_s, FontStyle::ChatMeta);
+                        canvas.draw_text_styled(
+                            sx,
+                            pill.y + 2,
+                            &del_s,
+                            t.breakpoint_red,
+                            dw + 2,
+                            FontStyle::ChatMeta,
+                        );
+                    }
                     self.hit_regions
-                        .push((chip, HitAction::OpenFileAtLine(path.clone(), None)));
+                        .push((pill, HitAction::ToggleMessageFileChangesCollapse(*msg_idx)));
+                }
+                CachedChatRow::TurnChangedFileRow {
+                    msg_idx,
+                    path,
+                    display,
+                    added_lines,
+                    removed_lines,
+                } => {
+                    canvas.fill_rect(
+                        Rect::new(row_rect.x + 8, cy, 1, row_h),
+                        blend_rgb(t.border_color, t.panel_bg, 0.45),
+                    );
+                    let frow = Rect::new(row_rect.x + 14, cy + 1, row_rect.w - 18, row_h - 2);
+                    let hov = frow.contains(hx, hy);
+                    if hov {
+                        canvas.fill_rounded_rect(
+                            frow,
+                            4,
+                            blend_rgb(t.panel_bg, t.text_primary, 0.06),
+                        );
+                    }
+                    canvas.draw_path_file_icon(frow.x + 4, frow.y + 2, path);
+                    let stats_w = Self::draw_inline_diff_stats(
+                        canvas,
+                        frow.x + frow.w - 6,
+                        frow.y + 2,
+                        frow.x + 28,
+                        *added_lines,
+                        *removed_lines,
+                        t,
+                    );
+                    let name_max_w = (frow.w - stats_w - 30).max(32);
+                    let shown_display =
+                        canvas.ellipsize_filename(display, name_max_w, FontStyle::ChatMeta);
+                    canvas.draw_text_styled(
+                        frow.x + 22,
+                        frow.y + 2,
+                        &shown_display,
+                        if hov { t.text_primary } else { t.syn_function },
+                        name_max_w,
+                        FontStyle::ChatMeta,
+                    );
+                    self.hit_regions.push((
+                        frow,
+                        HitAction::InspectAgentFileDiff {
+                            path: path.clone(),
+                            msg_idx: Some(*msg_idx),
+                        },
+                    ));
                 }
                 CachedChatRow::LiveThoughtLine(txt) => {
                     canvas.fill_rect(
@@ -3009,11 +3183,50 @@ impl IdeApplicationState {
         );
     }
 
+    /// 在文件行右侧绘制单文件 `+N` / `-M` 变更统计，并返回占用的总宽度（自动隐藏无意义的 0 值）
+    fn draw_inline_diff_stats(
+        canvas: &mut SurfaceCanvas,
+        right_edge_x: i32,
+        y: i32,
+        min_left_x: i32,
+        added_lines: usize,
+        removed_lines: usize,
+        t: ide_core::IdeaTheme,
+    ) -> i32 {
+        let add_s = (added_lines > 0 || removed_lines == 0).then(|| format!("+{added_lines}"));
+        let del_s = (removed_lines > 0).then(|| format!("-{removed_lines}"));
+        let dw = del_s
+            .as_ref()
+            .map(|s| canvas.measure_text(s, FontStyle::ChatMeta).0)
+            .unwrap_or(0);
+        let aw = add_s
+            .as_ref()
+            .map(|s| canvas.measure_text(s, FontStyle::ChatMeta).0)
+            .unwrap_or(0);
+        let gap = if add_s.is_some() && del_s.is_some() { 5 } else { 0 };
+        let total_w = aw + gap + dw;
+        let start_x = right_edge_x - total_w;
+        if start_x <= min_left_x {
+            return total_w;
+        }
+        let mut cx = start_x;
+        if let Some(ref s) = add_s {
+            let color = if added_lines > 0 { t.run_green } else { t.text_muted };
+            canvas.draw_text_styled(cx, y, s, color, aw + 2, FontStyle::ChatMeta);
+            cx += aw + gap;
+        }
+        if let Some(ref s) = del_s {
+            canvas.draw_text_styled(cx, y, s, t.breakpoint_red, dw + 2, FontStyle::ChatMeta);
+        }
+        total_w
+    }
+
     fn render_agent_changed_files_bar(
         &mut self,
         canvas: &mut SurfaceCanvas,
         rect: Rect,
         changed_files: &[ide_agent_hub::SessionFileChange],
+        supports_rewind: bool,
     ) {
         let t = self.theme;
         let (hx, hy) = self.hover_pos;
@@ -3039,7 +3252,11 @@ impl IdeApplicationState {
 
         let hdr_rect = Rect::new(rect.x, rect.y, rect.w, 26);
         let revert_btn = Rect::new(rect.x + rect.w - 50, rect.y + 4, 44, 18);
-        let keep_btn = Rect::new(revert_btn.x - 46, rect.y + 4, 42, 18);
+        let keep_btn = if supports_rewind {
+            Rect::new(revert_btn.x - 46, rect.y + 4, 42, 18)
+        } else {
+            Rect::new(rect.x + rect.w - 50, rect.y + 4, 44, 18)
+        };
         let toggle_rect = Rect::new(
             hdr_rect.x + 2,
             hdr_rect.y + 1,
@@ -3047,11 +3264,7 @@ impl IdeApplicationState {
             24,
         );
         if toggle_rect.contains(hx, hy) {
-            canvas.fill_rounded_rect(
-                toggle_rect,
-                5,
-                blend_rgb(bar_bg, t.text_primary, 0.05),
-            );
+            canvas.fill_rounded_rect(toggle_rect, 5, blend_rgb(bar_bg, t.text_primary, 0.05));
         }
         let (tw, _) = canvas.measure_text(&title, FontStyle::ChatMetaBold);
         canvas.draw_text_styled(
@@ -3103,35 +3316,45 @@ impl IdeApplicationState {
         );
         canvas.draw_text_centered(
             keep_btn,
-            self.tr("保留", "Keep"),
-            if keep_hov { t.text_primary } else { t.text_secondary },
+            if supports_rewind {
+                self.tr("保留", "Keep")
+            } else {
+                self.tr("清除", "Clear")
+            },
+            if keep_hov {
+                t.text_primary
+            } else {
+                t.text_secondary
+            },
             FontStyle::ChatMeta,
         );
         self.hit_regions
             .push((keep_btn, HitAction::KeepAllAgentChangedFiles));
 
-        let rev_hov = revert_btn.contains(hx, hy);
-        canvas.fill_rounded_rect(
-            revert_btn,
-            4,
-            if rev_hov {
-                blend_rgb(bar_bg, t.breakpoint_red, 0.18)
-            } else {
-                blend_rgb(bar_bg, t.text_primary, 0.04)
-            },
-        );
-        canvas.draw_text_centered(
-            revert_btn,
-            self.tr("回退", "Revert"),
-            if rev_hov {
-                t.breakpoint_red
-            } else {
-                t.text_muted
-            },
-            FontStyle::ChatMeta,
-        );
-        self.hit_regions
-            .push((revert_btn, HitAction::RevertAllAgentChangedFiles));
+        if supports_rewind {
+            let rev_hov = revert_btn.contains(hx, hy);
+            canvas.fill_rounded_rect(
+                revert_btn,
+                4,
+                if rev_hov {
+                    blend_rgb(bar_bg, t.breakpoint_red, 0.18)
+                } else {
+                    blend_rgb(bar_bg, t.text_primary, 0.04)
+                },
+            );
+            canvas.draw_text_centered(
+                revert_btn,
+                self.tr("回退", "Revert"),
+                if rev_hov {
+                    t.breakpoint_red
+                } else {
+                    t.text_muted
+                },
+                FontStyle::ChatMeta,
+            );
+            self.hit_regions
+                .push((revert_btn, HitAction::RevertAllAgentChangedFiles));
+        }
 
         if !self.agent_changed_files_expanded {
             return;
@@ -3148,57 +3371,65 @@ impl IdeApplicationState {
             }
             let row_r = Rect::new(rect.x + 6, ry, rect.w - 12, 20);
             let rev_one = Rect::new(row_r.x + row_r.w - 22, ry + 1, 20, 18);
-            let rhov = rev_one.contains(hx, hy);
-            let open_r = Rect::new(row_r.x, ry, (rev_one.x - row_r.x - 4).max(40), 20);
+            let open_w = if supports_rewind {
+                (rev_one.x - row_r.x - 4).max(40)
+            } else {
+                row_r.w.max(40)
+            };
+            let open_r = Rect::new(row_r.x, ry, open_w, 20);
             if open_r.contains(hx, hy) {
                 canvas.fill_rounded_rect(open_r, 4, blend_rgb(bar_bg, t.text_primary, 0.06));
             }
-            canvas.draw_file_type_icon(
-                open_r.x + 4,
-                ry + 3,
-                LanguageId::from_path(&ch.path),
-            );
+            canvas.draw_path_file_icon(open_r.x + 4, ry + 3, &ch.path);
             let rel = ch
                 .path
                 .strip_prefix(&self.workspace_root)
                 .unwrap_or(&ch.path)
                 .to_string_lossy()
                 .replace('\\', "/");
-            let diff_txt = format!("+{} -{}", ch.added_lines, ch.removed_lines);
-            let (df_w, _) = canvas.measure_text(&diff_txt, FontStyle::ChatMeta);
-            let name_max_w = (open_r.w - df_w - 34).max(32);
+            let stats_w = Self::draw_inline_diff_stats(
+                canvas,
+                open_r.x + open_r.w - 6,
+                ry + 2,
+                open_r.x + 30,
+                ch.added_lines,
+                ch.removed_lines,
+                t,
+            );
+            let name_max_w = (open_r.w - stats_w - 30).max(32);
+            let shown_rel = canvas.ellipsize_filename(&rel, name_max_w, FontStyle::ChatMeta);
             canvas.draw_text_styled(
                 open_r.x + 22,
                 ry + 2,
-                &rel,
+                &shown_rel,
                 t.text_secondary,
                 name_max_w,
                 FontStyle::ChatMeta,
             );
-            let add_str = format!("+{}", ch.added_lines);
-            let del_str = format!("-{}", ch.removed_lines);
-            let (aw, _) = canvas.measure_text(&add_str, FontStyle::ChatMeta);
-            let (dw, _) = canvas.measure_text(&del_str, FontStyle::ChatMeta);
-            let del_x = rev_one.x - dw - 6;
-            let add_x = del_x - aw - 5;
-            if add_x > open_r.x + 30 {
-                canvas.draw_text_styled(add_x, ry + 2, &add_str, t.run_green, aw + 2, FontStyle::ChatMeta);
-                canvas.draw_text_styled(del_x, ry + 2, &del_str, t.breakpoint_red, dw + 2, FontStyle::ChatMeta);
-            }
-            self.hit_regions
-                .push((open_r, HitAction::OpenFileAtLine(ch.path.clone(), None)));
+            self.hit_regions.push((
+                open_r,
+                HitAction::InspectAgentFileDiff {
+                    path: ch.path.clone(),
+                    msg_idx: None,
+                },
+            ));
 
-            if rhov {
-                canvas.fill_rounded_rect(rev_one, 4, blend_rgb(bar_bg, t.breakpoint_red, 0.16));
+            if supports_rewind {
+                let rhov = rev_one.contains(hx, hy);
+                if rhov {
+                    canvas.fill_rounded_rect(rev_one, 4, blend_rgb(bar_bg, t.breakpoint_red, 0.16));
+                }
+                canvas.draw_text_centered(
+                    rev_one,
+                    "↶",
+                    if rhov { t.breakpoint_red } else { t.text_muted },
+                    FontStyle::ChatMeta,
+                );
+                self.hit_regions.push((
+                    rev_one,
+                    HitAction::RevertSingleAgentChangedFile(ch.path.clone()),
+                ));
             }
-            canvas.draw_text_centered(
-                rev_one,
-                "↶",
-                if rhov { t.breakpoint_red } else { t.text_muted },
-                FontStyle::ChatMeta,
-            );
-            self.hit_regions
-                .push((rev_one, HitAction::RevertSingleAgentChangedFile(ch.path.clone())));
             ry += 22;
         }
     }
@@ -3233,7 +3464,12 @@ impl IdeApplicationState {
         canvas.stroke_rounded_rect(composer_rect, 10, composer_border, composer_bg);
 
         if let Some(edit_idx) = self.editing_sent_msg_idx {
-            let banner = Rect::new(composer_rect.x + 6, composer_rect.y + 4, composer_rect.w - 12, 20);
+            let banner = Rect::new(
+                composer_rect.x + 6,
+                composer_rect.y + 4,
+                composer_rect.w - 12,
+                20,
+            );
             canvas.fill_rounded_rect(banner, 5, blend_rgb(composer_bg, t.accent_blue, 0.16));
             let banner_txt = match self.ui_lang {
                 UiLanguage::ZhCn => format!(
@@ -3261,7 +3497,11 @@ impl IdeApplicationState {
             canvas.draw_text_centered(
                 cancel_r,
                 self.tr("取消", "Cancel"),
-                if chov { t.text_primary } else { t.text_secondary },
+                if chov {
+                    t.text_primary
+                } else {
+                    t.text_secondary
+                },
                 FontStyle::ChatMeta,
             );
             self.hit_regions
@@ -3455,11 +3695,7 @@ impl IdeApplicationState {
                     if hov { t.accent_blue } else { t.border_color },
                     t.panel_bg,
                 );
-                canvas.draw_file_type_icon(
-                    chip.x + 5,
-                    chip.y + 4,
-                    LanguageId::from_path(&item.path),
-                );
+                canvas.draw_path_file_icon(chip.x + 5, chip.y + 4, &item.path);
                 canvas.draw_text_styled(
                     chip.x + 21,
                     chip.y + 3,
@@ -3984,7 +4220,7 @@ impl IdeApplicationState {
         } else {
             format!("🖼 {fname}")
         };
-        canvas.draw_text_styled(
+        canvas.draw_text_ellipsis(
             mx + 14,
             my + 10,
             &title,
@@ -4032,7 +4268,7 @@ impl IdeApplicationState {
         }
 
         let path_txt = img_path.display().to_string();
-        canvas.draw_text_styled(
+        canvas.draw_text_ellipsis(
             mx + 14,
             my + mh - 26,
             &path_txt,

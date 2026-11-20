@@ -104,6 +104,43 @@ pub struct GitCommitDetail {
     pub file_diffs: HashMap<String, Vec<DiffLine>>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitStashEntry {
+    pub index_ref: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitRemoteEntry {
+    pub name: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum GitResetMode {
+    Soft,
+    Mixed,
+    Hard,
+}
+
+impl GitResetMode {
+    pub fn as_flag(self) -> &'static str {
+        match self {
+            Self::Soft => "--soft",
+            Self::Mixed => "--mixed",
+            Self::Hard => "--hard",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitBlameLine {
+    pub commit_short: String,
+    pub author: String,
+    pub date: String,
+    pub summary: String,
+}
+
 #[derive(Debug, Clone)]
 struct GitSnapshot {
     current_branch: String,
@@ -111,6 +148,10 @@ struct GitSnapshot {
     remote_branches: Vec<String>,
     tags: Vec<String>,
     ahead_behind: (usize, usize),
+    stashes: Vec<GitStashEntry>,
+    remotes: Vec<GitRemoteEntry>,
+    in_rebase: bool,
+    in_merge: bool,
     changed_files: Vec<GitChangedFile>,
     working_diffs: HashMap<PathBuf, Vec<DiffLine>>,
     recent_commits: Vec<GitLogEntry>,
@@ -141,14 +182,40 @@ enum GitWorkerCmd {
         start_point: Option<String>,
     },
     DeleteBranch(String),
+    CreateTag {
+        name: String,
+        start_point: Option<String>,
+    },
+    DeleteTag(String),
     MergeBranch(String),
+    MergeAbort,
+    RebaseBranch(String),
+    RebaseAbort,
+    RebaseContinue,
+    StashSave {
+        message: String,
+        include_untracked: bool,
+    },
+    StashApply(String),
+    StashPop(String),
+    StashDrop(String),
+    AddRemote {
+        name: String,
+        url: String,
+    },
+    RemoveRemote(String),
     CherryPick(String),
     RevertCommit(String),
-    ResetSoft(String),
+    Reset {
+        target: String,
+        mode: GitResetMode,
+    },
     Fetch,
     Pull,
     Push,
     LoadCommitDetail(String),
+    LoadFileHistory(PathBuf),
+    LoadFileBlame(PathBuf),
     AiCommitDiff,
 }
 
@@ -162,6 +229,14 @@ enum GitWorkerEvent {
     },
     CommitDetailLoaded {
         detail: GitCommitDetail,
+    },
+    FileHistoryLoaded {
+        path: PathBuf,
+        entries: Vec<GitLogEntry>,
+    },
+    FileBlameLoaded {
+        path: PathBuf,
+        lines: Vec<GitBlameLine>,
     },
     AiDiffReady {
         snapshot: GitSnapshot,
@@ -184,12 +259,18 @@ pub struct GitEngine {
     pub remote_branches: Vec<String>,
     pub tags: Vec<String>,
     pub ahead_behind: (usize, usize),
+    pub stashes: Vec<GitStashEntry>,
+    pub remotes: Vec<GitRemoteEntry>,
+    pub in_rebase: bool,
+    pub in_merge: bool,
     pub changed_files: Vec<GitChangedFile>,
     pub commit_checked_files: HashSet<PathBuf>,
     known_changed_files: HashSet<PathBuf>,
     pub working_diffs: HashMap<PathBuf, Vec<DiffLine>>,
     pub recent_commits: Vec<GitLogEntry>,
     pub commit_details: HashMap<String, GitCommitDetail>,
+    pub file_histories: HashMap<PathBuf, Vec<GitLogEntry>>,
+    pub file_blames: HashMap<PathBuf, Vec<GitBlameLine>>,
     pub commit_message_draft: String,
     pub last_operation_output: String,
     pub has_loaded_snapshot: bool,
@@ -601,7 +682,10 @@ fn collect_snapshot(root: &Path) -> GitSnapshot {
 
         let h_status = s.spawn(|| {
             let mut changed_files = Vec::new();
-            if let Ok(output) = git_command(root).args(["status", "--porcelain"]).output() {
+            if let Ok(output) = git_command(root)
+                .args(["-c", "core.quotePath=false", "status", "--porcelain"])
+                .output()
+            {
                 if output.status.success() {
                     let text = String::from_utf8_lossy(&output.stdout);
                     for line in text.lines() {
@@ -629,8 +713,7 @@ fn collect_snapshot(root: &Path) -> GitSnapshot {
         });
 
         let h_log = s.spawn(|| {
-            let mut recent_commits = Vec::new();
-            if let Ok(output) = git_command(root)
+            let mut recent_commits = if let Ok(output) = git_command(root)
                 .args([
                     "log",
                     "-n",
@@ -642,55 +725,13 @@ fn collect_snapshot(root: &Path) -> GitSnapshot {
                 .output()
             {
                 if output.status.success() {
-                    let text = String::from_utf8_lossy(&output.stdout);
-                    for line in text.lines() {
-                        let mut parts = line.splitn(8, '|');
-                        if let (
-                            Some(h),
-                            Some(fh),
-                            Some(parents_str),
-                            Some(a),
-                            Some(ae),
-                            Some(d),
-                            Some(refs_str),
-                            Some(subj),
-                        ) = (
-                            parts.next(),
-                            parts.next(),
-                            parts.next(),
-                            parts.next(),
-                            parts.next(),
-                            parts.next(),
-                            parts.next(),
-                            parts.next(),
-                        ) {
-                            let parents: Vec<String> = parents_str
-                                .split_whitespace()
-                                .filter(|s| !s.is_empty())
-                                .map(ToOwned::to_owned)
-                                .collect();
-                            let refs: Vec<String> = refs_str
-                                .split(',')
-                                .map(|s| s.trim())
-                                .filter(|s| !s.is_empty())
-                                .map(ToOwned::to_owned)
-                                .collect();
-                            recent_commits.push(GitLogEntry {
-                                hash: h.to_string(),
-                                full_hash: fh.to_string(),
-                                parents,
-                                author: a.to_string(),
-                                author_email: ae.to_string(),
-                                date: d.to_string(),
-                                refs,
-                                subject: subj.to_string(),
-                                graph_lane: 0,
-                                is_merge: false,
-                            });
-                        }
-                    }
+                    parse_git_log_lines(&String::from_utf8_lossy(&output.stdout))
+                } else {
+                    Vec::new()
                 }
-            }
+            } else {
+                Vec::new()
+            };
             assign_commit_graph_lanes(&mut recent_commits);
             let head_detail = recent_commits
                 .first()
@@ -751,17 +792,191 @@ fn collect_snapshot(root: &Path) -> GitSnapshot {
         }
     }
 
+    let (stashes, remotes, in_rebase, in_merge) = collect_meta_extras(root);
+
     GitSnapshot {
         current_branch: branch_res.0,
         local_branches: branch_res.1,
         remote_branches: branch_res.2,
         tags: branch_res.3,
         ahead_behind: branch_res.4,
+        stashes,
+        remotes,
+        in_rebase,
+        in_merge,
         changed_files: status_res,
         working_diffs,
         recent_commits: log_res.0,
         head_detail: log_res.1,
     }
+}
+
+fn parse_git_log_lines(text: &str) -> Vec<GitLogEntry> {
+    let mut entries = Vec::new();
+    for line in text.lines() {
+        let mut parts = line.splitn(8, '|');
+        if let (
+            Some(h),
+            Some(fh),
+            Some(parents_str),
+            Some(a),
+            Some(ae),
+            Some(d),
+            Some(refs_str),
+            Some(subj),
+        ) = (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        ) {
+            let parents: Vec<String> = parents_str
+                .split_whitespace()
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
+            let refs: Vec<String> = refs_str
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
+            entries.push(GitLogEntry {
+                hash: h.to_string(),
+                full_hash: fh.to_string(),
+                parents,
+                author: a.to_string(),
+                author_email: ae.to_string(),
+                date: d.to_string(),
+                refs,
+                subject: subj.to_string(),
+                graph_lane: 0,
+                is_merge: false,
+            });
+        }
+    }
+    entries
+}
+
+fn collect_meta_extras(root: &Path) -> (Vec<GitStashEntry>, Vec<GitRemoteEntry>, bool, bool) {
+    let mut stashes = Vec::new();
+    if let Ok(out) = git_command(root)
+        .args(["stash", "list", "--pretty=format:%gd|%s"])
+        .output()
+    {
+        if out.status.success() {
+            let txt = String::from_utf8_lossy(&out.stdout);
+            for line in txt.lines().take(30) {
+                if let Some((idx_ref, msg)) = line.split_once('|') {
+                    stashes.push(GitStashEntry {
+                        index_ref: idx_ref.trim().to_string(),
+                        message: msg.trim().to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    let mut remotes = Vec::new();
+    if let Ok(out) = git_command(root).args(["remote", "-v"]).output() {
+        if out.status.success() {
+            let txt = String::from_utf8_lossy(&out.stdout);
+            for line in txt.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    let name = parts[0].to_string();
+                    let url = parts[1].to_string();
+                    if !remotes.iter().any(|r: &GitRemoteEntry| r.name == name) {
+                        remotes.push(GitRemoteEntry { name, url });
+                    }
+                }
+            }
+        }
+    }
+
+    let git_dir = root.join(".git");
+    let in_rebase = git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists();
+    let in_merge = git_dir.join("MERGE_HEAD").exists();
+    (stashes, remotes, in_rebase, in_merge)
+}
+
+fn collect_file_blame(root: &Path, file: &Path) -> Vec<GitBlameLine> {
+    let rel = file
+        .strip_prefix(root)
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| file.to_string_lossy().replace('\\', "/"));
+    let Ok(out) = git_command(root)
+        .args(["blame", "--line-porcelain", "--", &rel])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut lines_out = Vec::new();
+    let mut commit_short = String::new();
+    let mut author = String::new();
+    let mut author_time: i64 = 0;
+    let mut summary = String::new();
+    let mut meta_cache: HashMap<String, (String, i64, String)> = HashMap::new();
+
+    for raw in text.lines() {
+        if raw.starts_with('\t') {
+            if !commit_short.is_empty() {
+                meta_cache
+                    .entry(commit_short.clone())
+                    .or_insert_with(|| (author.clone(), author_time, summary.clone()));
+            }
+            let date = format_unix_ymd(author_time);
+            lines_out.push(GitBlameLine {
+                commit_short: commit_short.clone(),
+                author: author.clone(),
+                date,
+                summary: summary.clone(),
+            });
+            continue;
+        }
+        if let Some(rest) = raw.strip_prefix("author ") {
+            author = rest.trim().to_string();
+        } else if let Some(rest) = raw.strip_prefix("author-time ") {
+            author_time = rest.trim().parse::<i64>().unwrap_or(0);
+        } else if let Some(rest) = raw.strip_prefix("summary ") {
+            summary = rest.trim().to_string();
+        } else if raw.len() >= 40 && raw[..40].chars().all(|c| c.is_ascii_hexdigit()) {
+            commit_short = raw[..7].to_string();
+            if let Some((a, ts, s)) = meta_cache.get(&commit_short) {
+                author = a.clone();
+                author_time = *ts;
+                summary = s.clone();
+            }
+        }
+    }
+    lines_out
+}
+
+fn format_unix_ymd(secs: i64) -> String {
+    if secs <= 0 {
+        return "0000-00-00".to_string();
+    }
+    let days = secs.div_euclid(86_400);
+    // Howard Hinnant civil_from_days 算法
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    let yr = y + if m <= 2 { 1 } else { 0 };
+    format!("{yr:04}-{m:02}-{d:02}")
 }
 
 fn ensure_git_identity(root: &Path) {
@@ -1196,7 +1411,51 @@ fn spawn_git_worker(
                             },
                         );
                     }
+                    GitWorkerCmd::CreateTag { name, start_point } => {
+                        let mut c = git_command(&root);
+                        c.args(["tag", name.trim()]);
+                        if let Some(sp) = start_point.as_deref() {
+                            if !sp.trim().is_empty() {
+                                c.arg(sp.trim());
+                            }
+                        }
+                        let out = c.output();
+                        let snapshot = collect_snapshot(&root);
+                        let msg = match out {
+                            Ok(o) if o.status.success() => format!("Created tag '{}'", name.trim()),
+                            Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
+                            Err(e) => format!("Create tag failed: {e}"),
+                        };
+                        notify(
+                            &event_tx,
+                            GitWorkerEvent::SnapshotUpdated {
+                                snapshot,
+                                notification: Some(msg.clone()),
+                                output: Some(msg),
+                                clear_commit_input: false,
+                            },
+                        );
+                    }
+                    GitWorkerCmd::DeleteTag(name) => {
+                        let out = git_command(&root).args(["tag", "-d", name.trim()]).output();
+                        let snapshot = collect_snapshot(&root);
+                        let msg = match out {
+                            Ok(o) if o.status.success() => format!("Deleted tag '{}'", name.trim()),
+                            Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
+                            Err(e) => format!("Delete tag failed: {e}"),
+                        };
+                        notify(
+                            &event_tx,
+                            GitWorkerEvent::SnapshotUpdated {
+                                snapshot,
+                                notification: Some(msg.clone()),
+                                output: Some(msg),
+                                clear_commit_input: false,
+                            },
+                        );
+                    }
                     GitWorkerCmd::MergeBranch(branch) => {
+                        ensure_git_identity(&root);
                         let out = git_command(&root).args(["merge", &branch]).output();
                         let snapshot = collect_snapshot(&root);
                         let msg = match out {
@@ -1205,6 +1464,214 @@ fn spawn_git_worker(
                             }
                             Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
                             Err(e) => format!("Merge failed: {e}"),
+                        };
+                        notify(
+                            &event_tx,
+                            GitWorkerEvent::SnapshotUpdated {
+                                snapshot,
+                                notification: Some(msg.clone()),
+                                output: Some(msg),
+                                clear_commit_input: false,
+                            },
+                        );
+                    }
+                    GitWorkerCmd::MergeAbort => {
+                        let out = git_command(&root).args(["merge", "--abort"]).output();
+                        let snapshot = collect_snapshot(&root);
+                        let msg = match out {
+                            Ok(o) if o.status.success() => "Aborted current merge.".to_string(),
+                            Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
+                            Err(e) => format!("Merge abort failed: {e}"),
+                        };
+                        notify(
+                            &event_tx,
+                            GitWorkerEvent::SnapshotUpdated {
+                                snapshot,
+                                notification: Some(msg.clone()),
+                                output: Some(msg),
+                                clear_commit_input: false,
+                            },
+                        );
+                    }
+                    GitWorkerCmd::RebaseBranch(branch) => {
+                        ensure_git_identity(&root);
+                        let out = git_command(&root).args(["rebase", branch.trim()]).output();
+                        let snapshot = collect_snapshot(&root);
+                        let msg = match out {
+                            Ok(o) if o.status.success() => {
+                                format!("Rebased '{}' onto '{}'", snapshot.current_branch, branch.trim())
+                            }
+                            Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
+                            Err(e) => format!("Rebase failed: {e}"),
+                        };
+                        notify(
+                            &event_tx,
+                            GitWorkerEvent::SnapshotUpdated {
+                                snapshot,
+                                notification: Some(msg.clone()),
+                                output: Some(msg),
+                                clear_commit_input: false,
+                            },
+                        );
+                    }
+                    GitWorkerCmd::RebaseAbort => {
+                        let out = git_command(&root).args(["rebase", "--abort"]).output();
+                        let snapshot = collect_snapshot(&root);
+                        let msg = match out {
+                            Ok(o) if o.status.success() => "Aborted active rebase.".to_string(),
+                            Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
+                            Err(e) => format!("Rebase abort failed: {e}"),
+                        };
+                        notify(
+                            &event_tx,
+                            GitWorkerEvent::SnapshotUpdated {
+                                snapshot,
+                                notification: Some(msg.clone()),
+                                output: Some(msg),
+                                clear_commit_input: false,
+                            },
+                        );
+                    }
+                    GitWorkerCmd::RebaseContinue => {
+                        ensure_git_identity(&root);
+                        let out = git_command(&root)
+                            .env("GIT_EDITOR", "true")
+                            .args(["rebase", "--continue"])
+                            .output();
+                        let snapshot = collect_snapshot(&root);
+                        let msg = match out {
+                            Ok(o) if o.status.success() => "Continued active rebase.".to_string(),
+                            Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
+                            Err(e) => format!("Rebase continue failed: {e}"),
+                        };
+                        notify(
+                            &event_tx,
+                            GitWorkerEvent::SnapshotUpdated {
+                                snapshot,
+                                notification: Some(msg.clone()),
+                                output: Some(msg),
+                                clear_commit_input: false,
+                            },
+                        );
+                    }
+                    GitWorkerCmd::StashSave {
+                        message,
+                        include_untracked,
+                    } => {
+                        let mut c = git_command(&root);
+                        c.args(["stash", "push"]);
+                        if include_untracked {
+                            c.arg("-u");
+                        }
+                        if !message.trim().is_empty() {
+                            c.args(["-m", message.trim()]);
+                        }
+                        let out = c.output();
+                        let snapshot = collect_snapshot(&root);
+                        let msg = match out {
+                            Ok(o) if o.status.success() => {
+                                String::from_utf8_lossy(&o.stdout).trim().to_string()
+                            }
+                            Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
+                            Err(e) => format!("Stash failed: {e}"),
+                        };
+                        notify(
+                            &event_tx,
+                            GitWorkerEvent::SnapshotUpdated {
+                                snapshot,
+                                notification: Some(msg.clone()),
+                                output: Some(msg),
+                                clear_commit_input: false,
+                            },
+                        );
+                    }
+                    GitWorkerCmd::StashApply(sref) => {
+                        let out = git_command(&root).args(["stash", "apply", &sref]).output();
+                        let snapshot = collect_snapshot(&root);
+                        let msg = match out {
+                            Ok(o) if o.status.success() => format!("Applied stash {sref}"),
+                            Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
+                            Err(e) => format!("Apply stash failed: {e}"),
+                        };
+                        notify(
+                            &event_tx,
+                            GitWorkerEvent::SnapshotUpdated {
+                                snapshot,
+                                notification: Some(msg.clone()),
+                                output: Some(msg),
+                                clear_commit_input: false,
+                            },
+                        );
+                    }
+                    GitWorkerCmd::StashPop(sref) => {
+                        let out = git_command(&root).args(["stash", "pop", &sref]).output();
+                        let snapshot = collect_snapshot(&root);
+                        let msg = match out {
+                            Ok(o) if o.status.success() => format!("Popped stash {sref}"),
+                            Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
+                            Err(e) => format!("Pop stash failed: {e}"),
+                        };
+                        notify(
+                            &event_tx,
+                            GitWorkerEvent::SnapshotUpdated {
+                                snapshot,
+                                notification: Some(msg.clone()),
+                                output: Some(msg),
+                                clear_commit_input: false,
+                            },
+                        );
+                    }
+                    GitWorkerCmd::StashDrop(sref) => {
+                        let out = git_command(&root).args(["stash", "drop", &sref]).output();
+                        let snapshot = collect_snapshot(&root);
+                        let msg = match out {
+                            Ok(o) if o.status.success() => format!("Dropped stash {sref}"),
+                            Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
+                            Err(e) => format!("Drop stash failed: {e}"),
+                        };
+                        notify(
+                            &event_tx,
+                            GitWorkerEvent::SnapshotUpdated {
+                                snapshot,
+                                notification: Some(msg.clone()),
+                                output: Some(msg),
+                                clear_commit_input: false,
+                            },
+                        );
+                    }
+                    GitWorkerCmd::AddRemote { name, url } => {
+                        let out = git_command(&root)
+                            .args(["remote", "add", name.trim(), url.trim()])
+                            .output();
+                        let snapshot = collect_snapshot(&root);
+                        let msg = match out {
+                            Ok(o) if o.status.success() => {
+                                format!("Added remote '{}' -> {}", name.trim(), url.trim())
+                            }
+                            Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
+                            Err(e) => format!("Add remote failed: {e}"),
+                        };
+                        notify(
+                            &event_tx,
+                            GitWorkerEvent::SnapshotUpdated {
+                                snapshot,
+                                notification: Some(msg.clone()),
+                                output: Some(msg),
+                                clear_commit_input: false,
+                            },
+                        );
+                    }
+                    GitWorkerCmd::RemoveRemote(name) => {
+                        let out = git_command(&root)
+                            .args(["remote", "remove", name.trim()])
+                            .output();
+                        let snapshot = collect_snapshot(&root);
+                        let msg = match out {
+                            Ok(o) if o.status.success() => {
+                                format!("Removed remote '{}'", name.trim())
+                            }
+                            Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
+                            Err(e) => format!("Remove remote failed: {e}"),
                         };
                         notify(
                             &event_tx,
@@ -1266,14 +1733,14 @@ fn spawn_git_worker(
                             },
                         );
                     }
-                    GitWorkerCmd::ResetSoft(hash) => {
+                    GitWorkerCmd::Reset { target, mode } => {
                         let out = git_command(&root)
-                            .args(["reset", "--soft", &hash])
+                            .args(["reset", mode.as_flag(), target.trim()])
                             .output();
                         let snapshot = collect_snapshot(&root);
                         let msg = match out {
                             Ok(o) if o.status.success() => {
-                                format!("Soft reset HEAD to {hash}")
+                                format!("Reset HEAD ({}) to {}", mode.as_flag(), target.trim())
                             }
                             Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
                             Err(e) => format!("Reset failed: {e}"),
@@ -1354,6 +1821,42 @@ fn spawn_git_worker(
                             notify(&event_tx, GitWorkerEvent::CommitDetailLoaded { detail });
                         }
                     }
+                    GitWorkerCmd::LoadFileHistory(path) => {
+                        let rel = path
+                            .strip_prefix(&root)
+                            .map(|p| p.to_string_lossy().replace('\\', "/"))
+                            .unwrap_or_else(|_| path.to_string_lossy().replace('\\', "/"));
+                        let mut entries = if let Ok(output) = git_command(&root)
+                            .args([
+                                "log",
+                                "-n",
+                                "60",
+                                "--follow",
+                                "--date=short",
+                                "--pretty=format:%h|%H|%P|%an|%ae|%ad|%D|%s",
+                                "--",
+                                &rel,
+                            ])
+                            .output()
+                        {
+                            if output.status.success() {
+                                parse_git_log_lines(&String::from_utf8_lossy(&output.stdout))
+                            } else {
+                                Vec::new()
+                            }
+                        } else {
+                            Vec::new()
+                        };
+                        assign_commit_graph_lanes(&mut entries);
+                        notify(
+                            &event_tx,
+                            GitWorkerEvent::FileHistoryLoaded { path, entries },
+                        );
+                    }
+                    GitWorkerCmd::LoadFileBlame(path) => {
+                        let lines = collect_file_blame(&root, &path);
+                        notify(&event_tx, GitWorkerEvent::FileBlameLoaded { path, lines });
+                    }
                     GitWorkerCmd::AiCommitDiff => {
                         let (snapshot, diff_text) = thread::scope(|s| {
                             let h_snap = s.spawn(|| collect_snapshot(&root));
@@ -1371,6 +1874,10 @@ fn spawn_git_worker(
                                     remote_branches: Vec::new(),
                                     tags: Vec::new(),
                                     ahead_behind: (0, 0),
+                                    stashes: Vec::new(),
+                                    remotes: Vec::new(),
+                                    in_rebase: false,
+                                    in_merge: false,
                                     changed_files: Vec::new(),
                                     working_diffs: HashMap::new(),
                                     recent_commits: Vec::new(),
@@ -1422,12 +1929,18 @@ impl GitEngine {
             remote_branches: Vec::new(),
             tags: Vec::new(),
             ahead_behind: (0, 0),
+            stashes: Vec::new(),
+            remotes: Vec::new(),
+            in_rebase: false,
+            in_merge: false,
             changed_files: Vec::new(),
             commit_checked_files: HashSet::new(),
             known_changed_files: HashSet::new(),
             working_diffs: HashMap::new(),
             recent_commits: Vec::new(),
             commit_details: HashMap::new(),
+            file_histories: HashMap::new(),
+            file_blames: HashMap::new(),
             commit_message_draft: String::new(),
             last_operation_output: String::new(),
             has_loaded_snapshot: false,
@@ -1448,6 +1961,12 @@ impl GitEngine {
         self.remote_branches = snapshot.remote_branches;
         self.tags = snapshot.tags;
         self.ahead_behind = snapshot.ahead_behind;
+        self.stashes = snapshot.stashes;
+        self.remotes = snapshot.remotes;
+        self.in_rebase = snapshot.in_rebase;
+        self.in_merge = snapshot.in_merge;
+        self.file_blames.clear();
+        self.file_histories.clear();
 
         let current_paths: HashSet<PathBuf> = snapshot
             .changed_files
@@ -1641,10 +2160,87 @@ impl GitEngine {
             .send(GitWorkerCmd::DeleteBranch(branch.to_string()));
     }
 
+    pub fn request_create_tag(&self, name: &str, start_point: Option<&str>) {
+        if !name.trim().is_empty() {
+            let _ = self.cmd_tx.send(GitWorkerCmd::CreateTag {
+                name: name.to_string(),
+                start_point: start_point.map(ToOwned::to_owned),
+            });
+        }
+    }
+
+    pub fn request_delete_tag(&self, name: &str) {
+        if !name.trim().is_empty() {
+            let _ = self
+                .cmd_tx
+                .send(GitWorkerCmd::DeleteTag(name.to_string()));
+        }
+    }
+
     pub fn request_merge_branch(&self, branch: &str) {
         let _ = self
             .cmd_tx
             .send(GitWorkerCmd::MergeBranch(branch.to_string()));
+    }
+
+    pub fn request_merge_abort(&self) {
+        let _ = self.cmd_tx.send(GitWorkerCmd::MergeAbort);
+    }
+
+    pub fn request_rebase_branch(&self, branch: &str) {
+        let _ = self
+            .cmd_tx
+            .send(GitWorkerCmd::RebaseBranch(branch.to_string()));
+    }
+
+    pub fn request_rebase_abort(&self) {
+        let _ = self.cmd_tx.send(GitWorkerCmd::RebaseAbort);
+    }
+
+    pub fn request_rebase_continue(&self) {
+        let _ = self.cmd_tx.send(GitWorkerCmd::RebaseContinue);
+    }
+
+    pub fn request_stash_save(&self, message: &str, include_untracked: bool) {
+        let _ = self.cmd_tx.send(GitWorkerCmd::StashSave {
+            message: message.to_string(),
+            include_untracked,
+        });
+    }
+
+    pub fn request_stash_apply(&self, stash_ref: &str) {
+        let _ = self
+            .cmd_tx
+            .send(GitWorkerCmd::StashApply(stash_ref.to_string()));
+    }
+
+    pub fn request_stash_pop(&self, stash_ref: &str) {
+        let _ = self
+            .cmd_tx
+            .send(GitWorkerCmd::StashPop(stash_ref.to_string()));
+    }
+
+    pub fn request_stash_drop(&self, stash_ref: &str) {
+        let _ = self
+            .cmd_tx
+            .send(GitWorkerCmd::StashDrop(stash_ref.to_string()));
+    }
+
+    pub fn request_add_remote(&self, name: &str, url: &str) {
+        if !name.trim().is_empty() && !url.trim().is_empty() {
+            let _ = self.cmd_tx.send(GitWorkerCmd::AddRemote {
+                name: name.to_string(),
+                url: url.to_string(),
+            });
+        }
+    }
+
+    pub fn request_remove_remote(&self, name: &str) {
+        if !name.trim().is_empty() {
+            let _ = self
+                .cmd_tx
+                .send(GitWorkerCmd::RemoveRemote(name.to_string()));
+        }
     }
 
     pub fn request_cherry_pick(&self, commit_hash: &str) {
@@ -1660,9 +2256,28 @@ impl GitEngine {
     }
 
     pub fn request_reset_soft(&self, commit_hash: &str) {
+        self.request_reset(commit_hash, GitResetMode::Soft);
+    }
+
+    pub fn request_reset(&self, target: &str, mode: GitResetMode) {
+        if !target.trim().is_empty() {
+            let _ = self.cmd_tx.send(GitWorkerCmd::Reset {
+                target: target.to_string(),
+                mode,
+            });
+        }
+    }
+
+    pub fn request_load_file_history(&self, path: &Path) {
         let _ = self
             .cmd_tx
-            .send(GitWorkerCmd::ResetSoft(commit_hash.to_string()));
+            .send(GitWorkerCmd::LoadFileHistory(path.to_path_buf()));
+    }
+
+    pub fn request_load_file_blame(&self, path: &Path) {
+        let _ = self
+            .cmd_tx
+            .send(GitWorkerCmd::LoadFileBlame(path.to_path_buf()));
     }
 
     pub fn request_fetch(&self) {
@@ -1714,6 +2329,12 @@ impl GitEngine {
                 }
                 GitWorkerEvent::CommitDetailLoaded { detail } => {
                     self.commit_details.insert(detail.hash.clone(), detail);
+                }
+                GitWorkerEvent::FileHistoryLoaded { path, entries } => {
+                    self.file_histories.insert(path, entries);
+                }
+                GitWorkerEvent::FileBlameLoaded { path, lines } => {
+                    self.file_blames.insert(path, lines);
                 }
                 GitWorkerEvent::AiDiffReady {
                     snapshot,
@@ -1878,9 +2499,35 @@ impl GitEngine {
     }
 }
 
+/// 统一规范化 Diff 文本行尾（兼容 `\r\r\n` / `\r\n` / 孤立 `\r` 与文件末尾换行符差异，避免整文件误统计为 `+N -N`）
+pub fn normalize_diff_text(text: &str) -> String {
+    let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
+    let mut out = String::with_capacity(text.len() + 1);
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\r' {
+            while chars.peek() == Some(&'\r') {
+                chars.next();
+            }
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            out.push('\n');
+        } else {
+            out.push(c);
+        }
+    }
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
 /// 基于 `similar` (Myers/Patience Diff) 计算新旧文本的行级差异
 pub fn compute_line_diff(old_text: &str, new_text: &str) -> Vec<DiffLine> {
-    let diff = TextDiff::from_lines(old_text, new_text);
+    let old_norm = normalize_diff_text(old_text);
+    let new_norm = normalize_diff_text(new_text);
+    let diff = TextDiff::from_lines(&old_norm, &new_norm);
     let mut lines = Vec::new();
 
     for change in diff.iter_all_changes() {
@@ -2016,6 +2663,79 @@ mod tests {
         // Only b.txt should remain modified in working tree
         assert_eq!(engine.changed_files.len(), 1);
         assert_eq!(engine.changed_files[0].path, b_path);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_idea_git_stash_tag_remote_reset_and_blame_operations() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rust_ai_ide_full_git_suite_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let _ = git_command(&tmp).args(["init"]).output();
+        ensure_git_identity(&tmp);
+
+        let f_path = tmp.join("lib.rs");
+        fs::write(&f_path, "pub fn v() -> i32 { 1 }\n").unwrap();
+        let _ = git_command(&tmp).args(["add", "-A"]).output();
+        let _ = git_command(&tmp).args(["commit", "-m", "v1"]).output();
+
+        let mut engine = GitEngine::open(&tmp);
+        // 1. Tag creation
+        engine.request_create_tag("v1.0.0", None);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !engine.tags.contains(&"v1.0.0".to_string()) {
+            engine.poll_updates();
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(engine.tags.contains(&"v1.0.0".to_string()));
+
+        // 2. Stash & Pop
+        fs::write(&f_path, "pub fn v() -> i32 { 2 }\n").unwrap();
+        engine.request_stash_save("wip feature", false);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && engine.stashes.is_empty() {
+            engine.poll_updates();
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(engine.stashes.len(), 1);
+        assert!(engine.stashes[0].message.contains("wip feature"));
+
+        engine.request_stash_pop(&engine.stashes[0].index_ref.clone());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !engine.stashes.is_empty() {
+            engine.poll_updates();
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(engine.stashes.is_empty());
+        assert!(fs::read_to_string(&f_path).unwrap().contains("2"));
+
+        // 3. Remote add / remove
+        engine.request_add_remote("upstream", "https://example.com/repo.git");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && engine.remotes.is_empty() {
+            engine.poll_updates();
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(engine.remotes.len(), 1);
+        assert_eq!(engine.remotes[0].name, "upstream");
+
+        // 4. Blame & File history
+        engine.request_load_file_blame(&f_path);
+        engine.request_load_file_history(&f_path);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline
+            && (!engine.file_blames.contains_key(&f_path)
+                || !engine.file_histories.contains_key(&f_path))
+        {
+            engine.poll_updates();
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!engine.file_blames[&f_path].is_empty());
+        assert!(!engine.file_histories[&f_path].is_empty());
+
         let _ = fs::remove_dir_all(&tmp);
     }
 }

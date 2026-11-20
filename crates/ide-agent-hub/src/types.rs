@@ -399,7 +399,17 @@ pub struct PastedCodeSnippet {
     pub line_count: usize,
 }
 
-/// 智能体对话消息（支持携带改动文件列表、附件/图片预览、代码补丁卡片与可点击文件链接）
+/// 单轮 AI 对话产生的文件变更统计与基线快照（供每次回复下方小字折叠展示及点击查看 Diff 详情）
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TurnFileChange {
+    pub path: PathBuf,
+    pub added_lines: usize,
+    pub removed_lines: usize,
+    #[serde(default)]
+    pub before_content: Option<String>,
+}
+
+/// 智能体对话消息（支持携带改动文件列表、单轮精确 Diff 统计、附件/图片预览、代码补丁卡片与可点击文件链接）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentChatMessage {
     pub role: String,
@@ -410,6 +420,8 @@ pub struct AgentChatMessage {
     pub patch: Option<ProposedFilePatch>,
     #[serde(default)]
     pub modified_files: Vec<PathBuf>,
+    #[serde(default)]
+    pub file_changes: Vec<TurnFileChange>,
     #[serde(default)]
     pub attachments: Vec<AgentAttachedItem>,
 }

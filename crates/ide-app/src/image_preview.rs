@@ -3,10 +3,18 @@ use std::fs::{self, File};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static CLIP_IMG_SEQ: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaKind {
+    Image,
+    Svg,
+    Audio,
+    Video,
+}
 
 #[derive(Debug, Clone)]
 pub struct DecodedPreviewImage {
@@ -18,23 +26,66 @@ pub struct DecodedPreviewImage {
 }
 
 #[derive(Debug, Clone)]
+pub struct MediaPreviewTab {
+    pub path: PathBuf,
+    pub kind: MediaKind,
+    pub format_label: String,
+    pub file_size_bytes: u64,
+    pub preview_image: Option<Arc<DecodedPreviewImage>>,
+    pub orig_dimensions: Option<(u32, u32)>,
+    pub duration_secs: Option<f64>,
+    pub sample_rate_hz: Option<u32>,
+    pub channels: Option<u16>,
+    pub waveform_peaks: Vec<f32>,
+    pub zoom_pct: u32,
+}
+
+#[derive(Debug, Clone)]
 pub enum ClipboardPastePayload {
     Files(Vec<PathBuf>),
     ImageFile(PathBuf),
     Text(String),
 }
 
+pub fn detect_media_kind(path: &Path) -> Option<MediaKind> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "bmp" | "gif" | "webp" | "ico" | "tif" | "tiff" | "avif"
+        | "heic" => Some(MediaKind::Image),
+        "svg" => Some(MediaKind::Svg),
+        "mp3" | "wav" | "ogg" | "flac" | "m4a" | "aac" | "wma" | "opus" => {
+            Some(MediaKind::Audio)
+        }
+        "mp4" | "webm" | "mov" | "avi" | "mkv" | "m4v" | "wmv" | "flv" => Some(MediaKind::Video),
+        _ => None,
+    }
+}
+
 pub fn is_image_file_path(path: &Path) -> bool {
-    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
-        return false;
-    };
     matches!(
-        ext.to_ascii_lowercase().as_str(),
-        "png" | "jpg" | "jpeg" | "bmp" | "gif" | "webp" | "ico" | "tif" | "tiff"
+        detect_media_kind(path),
+        Some(MediaKind::Image | MediaKind::Svg)
     )
 }
 
 pub fn load_image_for_preview(path: &Path) -> Option<DecodedPreviewImage> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    if ext == "svg" {
+        let svg_text = fs::read_to_string(path).ok()?;
+        let (orig_w, orig_h, rgba) = crate::svg_icon::rasterize_svg_to_rgba(&svg_text, 960)?;
+        return Some(DecodedPreviewImage {
+            orig_width: orig_w,
+            orig_height: orig_h,
+            width: orig_w,
+            height: orig_h,
+            rgba,
+        });
+    }
+
     let bytes = fs::read(path).ok()?;
     let decoded = if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
         decode_png_bytes(&bytes)
@@ -43,7 +94,8 @@ pub fn load_image_for_preview(path: &Path) -> Option<DecodedPreviewImage> {
     } else {
         None
     }
-    .or_else(|| decode_with_windows_gdiplus(path));
+    .or_else(|| decode_with_windows_gdiplus(path))
+    .or_else(|| extract_windows_shell_thumbnail(path, 960, false));
 
     let (orig_w, orig_h, rgba) = decoded?;
     if orig_w == 0 || orig_h == 0 || rgba.len() < (orig_w as usize * orig_h as usize * 4) {
@@ -58,6 +110,332 @@ pub fn load_image_for_preview(path: &Path) -> Option<DecodedPreviewImage> {
         height: h,
         rgba: final_rgba,
     })
+}
+
+pub fn load_media_preview_tab(
+    path: &Path,
+    existing_image: Option<Arc<DecodedPreviewImage>>,
+) -> MediaPreviewTab {
+    let kind = detect_media_kind(path).unwrap_or(MediaKind::Image);
+    let format_label = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_uppercase())
+        .unwrap_or_else(|| "MEDIA".to_string());
+    let file_size_bytes = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+
+    let mut preview_image = existing_image;
+    let mut orig_dimensions = preview_image
+        .as_ref()
+        .map(|im| (im.orig_width, im.orig_height));
+    let mut duration_secs = None;
+    let mut sample_rate_hz = None;
+    let mut channels = None;
+    let mut waveform_peaks = Vec::new();
+
+    match kind {
+        MediaKind::Image | MediaKind::Svg => {
+            if preview_image.is_none() {
+                if let Some(im) = load_image_for_preview(path) {
+                    orig_dimensions = Some((im.orig_width, im.orig_height));
+                    preview_image = Some(Arc::new(im));
+                }
+            }
+        }
+        MediaKind::Video => {
+            if preview_image.is_none() {
+                if let Some((w, h, rgba)) = extract_windows_shell_thumbnail(path, 960, true) {
+                    orig_dimensions = Some((w, h));
+                    preview_image = Some(Arc::new(DecodedPreviewImage {
+                        orig_width: w,
+                        orig_height: h,
+                        width: w,
+                        height: h,
+                        rgba,
+                    }));
+                }
+            }
+            if file_size_bytes <= 64 * 1024 * 1024 {
+                if let Ok(bytes) = fs::read(path) {
+                    duration_secs = parse_mp4_mvhd_duration(&bytes);
+                }
+            }
+        }
+        MediaKind::Audio => {
+            if file_size_bytes <= 64 * 1024 * 1024 {
+                if let Ok(bytes) = fs::read(path) {
+                    if let Some((dur, sr, ch, peaks)) = parse_wav_info_and_peaks(&bytes) {
+                        duration_secs = Some(dur);
+                        sample_rate_hz = Some(sr);
+                        channels = Some(ch);
+                        waveform_peaks = peaks;
+                    } else if format_label == "M4A" {
+                        duration_secs = parse_mp4_mvhd_duration(&bytes);
+                    }
+                }
+            }
+        }
+    }
+
+    MediaPreviewTab {
+        path: path.to_path_buf(),
+        kind,
+        format_label,
+        file_size_bytes,
+        preview_image,
+        orig_dimensions,
+        duration_secs,
+        sample_rate_hz,
+        channels,
+        waveform_peaks,
+        zoom_pct: 100,
+    }
+}
+
+pub fn format_media_file_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.2} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+pub fn format_media_duration(secs: f64) -> String {
+    let total = secs.max(0.0).round() as u64;
+    let mins = total / 60;
+    let rem = total % 60;
+    let hrs = mins / 60;
+    if hrs > 0 {
+        format!("{hrs}:{:02}:{rem:02}", mins % 60)
+    } else {
+        format!("{mins:02}:{rem:02}")
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub fn open_media_with_system_app(path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let op: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
+    let file: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    unsafe {
+        let res = ShellExecuteW(
+            None,
+            PCWSTR(op.as_ptr()),
+            PCWSTR(file.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
+        (res.0 as isize) > 32
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn open_media_with_system_app(_path: &Path) -> bool {
+    false
+}
+
+fn parse_wav_info_and_peaks(bytes: &[u8]) -> Option<(f64, u32, u16, Vec<f32>)> {
+    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut pos = 12usize;
+    let mut channels = 0u16;
+    let mut sample_rate = 0u32;
+    let mut bits_per_sample = 0u16;
+    let mut data_slice: Option<&[u8]> = None;
+
+    while pos + 8 <= bytes.len() {
+        let id = &bytes[pos..pos + 4];
+        let size = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().ok()?) as usize;
+        let payload_start = pos + 8;
+        let payload_end = payload_start.saturating_add(size).min(bytes.len());
+        if id == b"fmt " && payload_start + 16 <= payload_end {
+            channels = u16::from_le_bytes(bytes[payload_start + 2..payload_start + 4].try_into().ok()?);
+            sample_rate =
+                u32::from_le_bytes(bytes[payload_start + 4..payload_start + 8].try_into().ok()?);
+            bits_per_sample = u16::from_le_bytes(
+                bytes[payload_start + 14..payload_start + 16].try_into().ok()?,
+            );
+        } else if id == b"data" {
+            data_slice = Some(&bytes[payload_start..payload_end]);
+        }
+        pos = payload_start.saturating_add(size + (size & 1));
+    }
+
+    if channels == 0 || sample_rate == 0 || bits_per_sample == 0 {
+        return None;
+    }
+    let data = data_slice?;
+    let bytes_per_frame = (channels as usize) * ((bits_per_sample as usize) / 8).max(1);
+    let total_frames = data.len() / bytes_per_frame.max(1);
+    let duration_secs = total_frames as f64 / sample_rate as f64;
+
+    let bars = 64usize;
+    let mut peaks = Vec::with_capacity(bars);
+    if total_frames > 0 && (bits_per_sample == 16 || bits_per_sample == 8) {
+        let frames_per_bar = (total_frames / bars).max(1);
+        for b in 0..bars {
+            let start_f = (b * total_frames) / bars;
+            let end_f = (((b + 1) * total_frames) / bars).min(total_frames);
+            let step = ((end_f - start_f) / 32).max(1);
+            let mut max_amp = 0.0f32;
+            let mut f = start_f;
+            while f < end_f {
+                let off = f * bytes_per_frame;
+                let amp = if bits_per_sample == 16 && off + 2 <= data.len() {
+                    let s = i16::from_le_bytes([data[off], data[off + 1]]);
+                    (s as f32 / 32768.0).abs()
+                } else if bits_per_sample == 8 && off < data.len() {
+                    ((data[off] as f32 - 128.0) / 128.0).abs()
+                } else {
+                    0.0
+                };
+                if amp > max_amp {
+                    max_amp = amp;
+                }
+                f += step.max(1).min(frames_per_bar);
+            }
+            peaks.push(max_amp.clamp(0.06, 1.0));
+        }
+    }
+    Some((duration_secs, sample_rate, channels, peaks))
+}
+
+fn parse_mp4_mvhd_duration(bytes: &[u8]) -> Option<f64> {
+    let idx = bytes.windows(4).position(|w| w == b"mvhd")?;
+    if idx + 24 > bytes.len() {
+        return None;
+    }
+    let version = bytes[idx + 4];
+    if version == 0 && idx + 24 <= bytes.len() {
+        let timescale = u32::from_be_bytes(bytes[idx + 16..idx + 20].try_into().ok()?);
+        let duration = u32::from_be_bytes(bytes[idx + 20..idx + 24].try_into().ok()?);
+        if timescale > 0 {
+            return Some(duration as f64 / timescale as f64);
+        }
+    } else if version == 1 && idx + 36 <= bytes.len() {
+        let timescale = u32::from_be_bytes(bytes[idx + 24..idx + 28].try_into().ok()?);
+        let duration = u64::from_be_bytes(bytes[idx + 28..idx + 36].try_into().ok()?);
+        if timescale > 0 {
+            return Some(duration as f64 / timescale as f64);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn extract_windows_shell_thumbnail(
+    path: &Path,
+    target_size: i32,
+    thumbnail_only: bool,
+) -> Option<(u32, u32, Vec<u8>)> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::SIZE;
+    use windows::Win32::Graphics::Gdi::{
+        DeleteObject, GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO,
+        BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HGDIOBJ,
+    };
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+    use windows::Win32::UI::Shell::{
+        IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_BIGGERSIZEOK,
+        SIIGBF_THUMBNAILONLY,
+    };
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    unsafe {
+        let com_hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let com_inited = com_hr.is_ok();
+        let factory_res: windows::core::Result<IShellItemImageFactory> =
+            SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None);
+        let out = (|| -> Option<(u32, u32, Vec<u8>)> {
+            let factory = factory_res.ok()?;
+            let flags = if thumbnail_only {
+                SIIGBF_BIGGERSIZEOK | SIIGBF_THUMBNAILONLY
+            } else {
+                SIIGBF_BIGGERSIZEOK
+            };
+            let hbmp = factory
+                .GetImage(
+                    SIZE {
+                        cx: target_size,
+                        cy: target_size,
+                    },
+                    flags,
+                )
+                .ok()?;
+            let mut bmp = BITMAP::default();
+            if GetObjectW(
+                HGDIOBJ(hbmp.0),
+                std::mem::size_of::<BITMAP>() as i32,
+                Some(&mut bmp as *mut _ as *mut c_void),
+            ) == 0
+            {
+                let _ = DeleteObject(HGDIOBJ(hbmp.0));
+                return None;
+            }
+            let w = bmp.bmWidth.max(0) as u32;
+            let h = bmp.bmHeight.max(0) as u32;
+            if w == 0 || h == 0 || w > 4096 || h > 4096 {
+                let _ = DeleteObject(HGDIOBJ(hbmp.0));
+                return None;
+            }
+            let mut bi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: w as i32,
+                    biHeight: -(h as i32),
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
+            let hdc = GetDC(None);
+            let lines = GetDIBits(
+                hdc,
+                hbmp,
+                0,
+                h,
+                Some(buf.as_mut_ptr() as *mut c_void),
+                &mut bi,
+                DIB_RGB_COLORS,
+            );
+            ReleaseDC(None, hdc);
+            let _ = DeleteObject(HGDIOBJ(hbmp.0));
+            if lines == 0 {
+                return None;
+            }
+            for px in buf.chunks_exact_mut(4) {
+                px.swap(0, 2); // BGRA -> RGBA
+            }
+            Some((w, h, buf))
+        })();
+        if com_inited {
+            CoUninitialize();
+        }
+        out
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn extract_windows_shell_thumbnail(
+    _path: &Path,
+    _target_size: i32,
+    _thumbnail_only: bool,
+) -> Option<(u32, u32, Vec<u8>)> {
+    None
 }
 
 fn decode_png_bytes(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
@@ -574,5 +952,57 @@ mod tests {
         let detected = detect_pasted_code_snippet(code).expect("multi-line rust code detected");
         assert_eq!(detected.1, "rust");
         assert_eq!(detected.2, 5);
+    }
+
+    #[test]
+    fn test_media_detection_svg_rasterize_and_wav_waveform_parsing() {
+        assert_eq!(detect_media_kind(Path::new("logo.svg")), Some(MediaKind::Svg));
+        assert_eq!(detect_media_kind(Path::new("pic.webp")), Some(MediaKind::Image));
+        assert_eq!(detect_media_kind(Path::new("song.mp3")), Some(MediaKind::Audio));
+        assert_eq!(detect_media_kind(Path::new("clip.mp4")), Some(MediaKind::Video));
+        assert_eq!(detect_media_kind(Path::new("main.rs")), None);
+
+        let svg_path = std::env::temp_dir().join("rust_ai_ide_media_test.svg");
+        fs::write(
+            &svg_path,
+            r##"<svg viewBox="0 0 32 32"><rect x="2" y="2" width="28" height="28" fill="#3B82F6"/></svg>"##,
+        )
+        .unwrap();
+        let tab = load_media_preview_tab(&svg_path, None);
+        assert_eq!(tab.kind, MediaKind::Svg);
+        assert!(tab.preview_image.is_some());
+        assert_eq!(tab.orig_dimensions, Some((960, 960)));
+        let _ = fs::remove_file(&svg_path);
+
+        // Minimal 16-bit mono 8kHz WAV header + 8000 samples (1.0s)
+        let num_samples = 8000u32;
+        let data_bytes = num_samples * 2;
+        let mut wav = Vec::with_capacity(44 + data_bytes as usize);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+        wav.extend_from_slice(&8000u32.to_le_bytes()); // sample rate
+        wav.extend_from_slice(&(8000u32 * 2).to_le_bytes()); // byte rate
+        wav.extend_from_slice(&2u16.to_le_bytes()); // block align
+        wav.extend_from_slice(&16u16.to_le_bytes()); // bits
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_bytes.to_le_bytes());
+        for i in 0..num_samples {
+            let v: i16 = if i % 2 == 0 { 16000 } else { -16000 };
+            wav.extend_from_slice(&v.to_le_bytes());
+        }
+        let wav_path = std::env::temp_dir().join("rust_ai_ide_media_test.wav");
+        fs::write(&wav_path, &wav).unwrap();
+        let wav_tab = load_media_preview_tab(&wav_path, None);
+        assert_eq!(wav_tab.kind, MediaKind::Audio);
+        assert_eq!(wav_tab.sample_rate_hz, Some(8000));
+        assert_eq!(wav_tab.channels, Some(1));
+        assert!((wav_tab.duration_secs.unwrap_or(0.0) - 1.0).abs() < 0.01);
+        assert_eq!(wav_tab.waveform_peaks.len(), 64);
+        let _ = fs::remove_file(&wav_path);
     }
 }

@@ -37,10 +37,14 @@ struct PtyTabBackend {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
+    shell_pid: Option<u32>,
 }
 
 impl Drop for PtyTabBackend {
     fn drop(&mut self) {
+        if let Some(pid) = self.shell_pid {
+            kill_descendant_processes(pid);
+        }
         let _ = self.child.kill();
     }
 }
@@ -66,27 +70,93 @@ pub struct LivePtyTab {
     pub scroll_offset: usize,
     pub sel_anchor: Option<(usize, usize)>,
     pub sel_cursor: Option<(usize, usize)>,
+    pub bound_run_key: Option<String>,
+    pub run_active: Arc<AtomicBool>,
+    pub run_seq: Arc<AtomicU64>,
+    on_output: Option<PtyWakeupCallback>,
+    spawn_attempted: bool,
+    pending_rows: u16,
+    pending_cols: u16,
     backend: Option<Arc<Mutex<PtyTabBackend>>>,
 }
 
 impl LivePtyTab {
-    pub fn spawn_powershell(
+    /// Creates a terminal tab lazily without spawning `powershell.exe` / ConPTY until the user
+    /// interacts with the terminal or runs a command (saves ~40-60MB per inactive window).
+    pub fn new_lazy(
         title: impl Into<String>,
         cwd: &Path,
+        on_output: Option<PtyWakeupCallback>,
+    ) -> Self {
+        Self::new_lazy_bound(title, cwd, None, on_output)
+    }
+
+    pub fn new_lazy_bound(
+        title: impl Into<String>,
+        cwd: &Path,
+        bound_run_key: Option<String>,
         on_output: Option<PtyWakeupCallback>,
     ) -> Self {
         let title = title.into();
         let cwd_buf = cwd.to_path_buf();
         let rows = 24usize;
         let cols = 120usize;
-        let grid = Arc::new(Mutex::new(TerminalGrid::new(rows, cols)));
-        let revision = Arc::new(AtomicU64::new(0));
-        let alive = Arc::new(AtomicBool::new(false));
+        let mut grid = TerminalGrid::new(rows, cols);
+        grid.push_fallback_line(
+            &format!("PS {}> (点击终端或运行命令时启动 PowerShell)", cwd_buf.display()),
+            0x818594,
+        );
+        Self {
+            title,
+            cwd: cwd_buf,
+            grid: Arc::new(Mutex::new(grid)),
+            revision: Arc::new(AtomicU64::new(0)),
+            alive: Arc::new(AtomicBool::new(false)),
+            current_input: String::new(),
+            history: Vec::new(),
+            history_cursor: None,
+            scroll_offset: 0,
+            sel_anchor: None,
+            sel_cursor: None,
+            bound_run_key,
+            run_active: Arc::new(AtomicBool::new(false)),
+            run_seq: Arc::new(AtomicU64::new(0)),
+            on_output,
+            spawn_attempted: false,
+            pending_rows: rows as u16,
+            pending_cols: cols as u16,
+            backend: None,
+        }
+    }
+
+    pub fn spawn_powershell(
+        title: impl Into<String>,
+        cwd: &Path,
+        on_output: Option<PtyWakeupCallback>,
+    ) -> Self {
+        let mut tab = Self::new_lazy(title, cwd, on_output);
+        tab.ensure_spawned();
+        tab
+    }
+
+    pub fn ensure_spawned(&mut self) {
+        if self.spawn_attempted || self.backend.is_some() {
+            return;
+        }
+        self.spawn_attempted = true;
+        self.grid.lock().clear_all();
+
+        let rows = self.pending_rows.max(6);
+        let cols = self.pending_cols.max(30);
+        let grid = self.grid.clone();
+        let revision = self.revision.clone();
+        let alive = self.alive.clone();
+        let on_output = self.on_output.clone();
 
         let pty_system = native_pty_system();
         let pair_res = pty_system.openpty(PtySize {
-            rows: rows as u16,
-            cols: cols as u16,
+            rows,
+            cols,
             pixel_width: 0,
             pixel_height: 0,
         });
@@ -101,11 +171,12 @@ impl LivePtyTab {
                 "-Command",
                 "[Console]::InputEncoding=[System.Text.UTF8Encoding]::new($false); [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false)",
             ]);
-            cmd.cwd(&cwd_buf);
+            cmd.cwd(&self.cwd);
             cmd.env("TERM", "xterm-256color");
             cmd.env("COLORTERM", "truecolor");
 
             if let Ok(child) = pair.slave.spawn_command(cmd) {
+                let shell_pid = child.process_id();
                 drop(pair.slave);
                 if let (Ok(mut reader), Ok(writer)) =
                     (pair.master.try_clone_reader(), pair.master.take_writer())
@@ -116,11 +187,14 @@ impl LivePtyTab {
                     let grid_clone = grid.clone();
                     let rev_clone = revision.clone();
                     let alive_clone = alive.clone();
+                    let run_active_clone = self.run_active.clone();
+                    let run_seq_clone = self.run_seq.clone();
                     let wakeup = on_output.clone();
 
                     thread::spawn(move || {
                         let mut buf = [0u8; 8192];
                         let mut utf8_leftover: Vec<u8> = Vec::new();
+                        let mut completion_tail = String::new();
                         let mut parser = VtStreamParser::new();
 
                         loop {
@@ -135,6 +209,7 @@ impl LivePtyTab {
                                             Ok(s) => {
                                                 let mut g = grid_clone.lock();
                                                 parser.feed_with_replies(s, &mut g, &mut replies);
+                                                append_completion_tail(&mut completion_tail, s);
                                                 pos = utf8_leftover.len();
                                                 break;
                                             }
@@ -150,6 +225,7 @@ impl LivePtyTab {
                                                             &mut g,
                                                             &mut replies,
                                                         );
+                                                        append_completion_tail(&mut completion_tail, s);
                                                     }
                                                     pos += valid;
                                                 }
@@ -163,6 +239,14 @@ impl LivePtyTab {
                                     }
                                     if pos > 0 {
                                         utf8_leftover.drain(..pos);
+                                    }
+                                    if run_active_clone.load(Ordering::SeqCst) {
+                                        let seq = run_seq_clone.load(Ordering::SeqCst);
+                                        let marker = format!("[Process finished #{seq} ");
+                                        if completion_tail.contains(&marker) {
+                                            run_active_clone.store(false, Ordering::SeqCst);
+                                            completion_tail.clear();
+                                        }
                                     }
                                     if !replies.is_empty() {
                                         let mut w = writer_for_reader.lock();
@@ -180,6 +264,7 @@ impl LivePtyTab {
                             }
                         }
                         alive_clone.store(false, Ordering::SeqCst);
+                        run_active_clone.store(false, Ordering::SeqCst);
                         rev_clone.fetch_add(1, Ordering::Relaxed);
                         if let Some(cb) = &wakeup {
                             cb();
@@ -190,6 +275,7 @@ impl LivePtyTab {
                         writer: shared_writer,
                         master: pair.master,
                         child,
+                        shell_pid,
                     })));
                 }
             }
@@ -200,28 +286,19 @@ impl LivePtyTab {
                 "Warning: Failed to attach ConPTY powershell.exe backend.",
                 0xF44747,
             );
+        } else {
+            grid.lock().resize(rows as usize, cols as usize);
         }
 
-        Self {
-            title,
-            cwd: cwd_buf,
-            grid,
-            revision,
-            alive,
-            current_input: String::new(),
-            history: Vec::new(),
-            history_cursor: None,
-            scroll_offset: 0,
-            sel_anchor: None,
-            sel_cursor: None,
-            backend: backend_opt,
-        }
+        self.backend = backend_opt;
+        self.revision.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn send_text(&mut self, text: &str) {
         if text.is_empty() {
             return;
         }
+        self.ensure_spawned();
         self.clear_selection();
         self.scroll_offset = 0;
         if let Some(b) = &self.backend {
@@ -241,6 +318,7 @@ impl LivePtyTab {
         }
         self.history_cursor = None;
         self.clear_selection();
+        self.ensure_spawned();
 
         if trimmed.eq_ignore_ascii_case("cls") || trimmed.eq_ignore_ascii_case("clear") {
             self.clear();
@@ -269,6 +347,7 @@ impl LivePtyTab {
 
     pub fn send_interrupt(&mut self) {
         self.scroll_offset = 0;
+        self.ensure_spawned();
         if let Some(b) = &self.backend {
             let guard = b.lock();
             let mut w = guard.writer.lock();
@@ -282,6 +361,7 @@ impl LivePtyTab {
             return;
         }
         self.scroll_offset = 0;
+        self.ensure_spawned();
         if let Some(b) = &self.backend {
             let guard = b.lock();
             let mut w = guard.writer.lock();
@@ -290,9 +370,28 @@ impl LivePtyTab {
         }
     }
 
-    pub fn resize_pty(&self, rows: u16, cols: u16) {
+    /// Reads the command line currently sitting at the shell prompt (e.g. `PS D:\proj> npm run dev`)
+    /// right before submitting Enter, returning `(working_dir, command_line)`.
+    pub fn record_prompt_command(&mut self) -> Option<(PathBuf, String)> {
+        let (parsed_cwd, cmd) = self.grid.lock().extract_current_prompt_command()?;
+        let trimmed = cmd.trim().to_string();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if self.history.last().map(|s| s.as_str()) != Some(trimmed.as_str()) {
+            self.history.push(trimmed.clone());
+        }
+        let cwd = parsed_cwd
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(|| self.cwd.clone());
+        Some((cwd, trimmed))
+    }
+
+    pub fn resize_pty(&mut self, rows: u16, cols: u16) {
         let r = rows.max(6);
         let c = cols.max(30);
+        self.pending_rows = r;
+        self.pending_cols = c;
         self.grid.lock().resize(r as usize, c as usize);
         if let Some(b) = &self.backend {
             let guard = b.lock();
@@ -446,6 +545,64 @@ impl LivePtyTab {
     pub fn current_revision(&self) -> u64 {
         self.revision.load(Ordering::Relaxed)
     }
+
+    pub fn is_run_active(&self) -> bool {
+        self.run_active.load(Ordering::SeqCst)
+    }
+
+    /// Starts a RunConfiguration command inside this bound tab, wrapping it with a split completion
+    /// marker so only actual completion (not stdin echo) resets `run_active`.
+    pub fn start_bound_run(&mut self, cfg: &RunConfiguration) {
+        self.ensure_spawned();
+        let seq = self.run_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        self.run_active.store(true, Ordering::SeqCst);
+
+        let mut parts = Vec::with_capacity(1 + cfg.args.len());
+        parts.push(quote_ps_arg_if_needed(&cfg.command));
+        for arg in &cfg.args {
+            parts.push(quote_ps_arg_if_needed(arg));
+        }
+        let full_cmd = parts.join(" ");
+        let body = if !cfg.cwd.as_os_str().is_empty() && cfg.cwd != self.cwd {
+            let escaped_cwd = cfg.cwd.display().to_string().replace('\'', "''");
+            format!("Set-Location -LiteralPath '{escaped_cwd}'; {full_cmd}")
+        } else {
+            full_cmd
+        };
+
+        let wrapped = format!(
+            "try {{ {body} }} finally {{ Write-Host ('[' + 'Process ' + 'finished #{seq} (exit ' + $(if ($null -eq $LASTEXITCODE) {{ if ($?) {{ 0 }} else {{ 1 }} }} else {{ $LASTEXITCODE }}) + ')') }}"
+        );
+        self.send_command(&wrapped);
+        self.revision.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Stops only this tab's active script process tree while keeping all other run tabs alive.
+    pub fn stop_active_run(&mut self) -> bool {
+        let was_active = self.run_active.swap(false, Ordering::SeqCst);
+        self.run_seq.fetch_add(1, Ordering::SeqCst);
+        if let Some(b) = &self.backend {
+            let pid = {
+                let guard = b.lock();
+                {
+                    let mut w = guard.writer.lock();
+                    let _ = w.write_all(b"\x03");
+                    let _ = w.flush();
+                }
+                guard.shell_pid
+            };
+            if let Some(root_pid) = pid {
+                kill_descendant_processes(root_pid);
+            }
+        }
+        if was_active {
+            self.grid
+                .lock()
+                .push_fallback_line("[Process stopped]", 0xE5A93B);
+            self.revision.fetch_add(1, Ordering::Relaxed);
+        }
+        was_active
+    }
 }
 
 pub struct TerminalSession {
@@ -466,7 +623,7 @@ impl TerminalSession {
         cwd: &Path,
         on_output: Option<PtyWakeupCallback>,
     ) -> Self {
-        let first_tab = LivePtyTab::spawn_powershell(title, cwd, on_output.clone());
+        let first_tab = LivePtyTab::new_lazy(title, cwd, on_output.clone());
         Self {
             tabs: vec![first_tab],
             active_tab: 0,
@@ -491,6 +648,7 @@ impl TerminalSession {
         if self.tabs.len() <= 1 || idx >= self.tabs.len() {
             return;
         }
+        self.tabs[idx].stop_active_run();
         self.tabs.remove(idx);
         if self.active_tab >= self.tabs.len() {
             self.active_tab = self.tabs.len() - 1;
@@ -506,22 +664,184 @@ impl TerminalSession {
         &mut self.tabs[idx]
     }
 
+    pub fn total_revision(&self) -> u64 {
+        self.tabs
+            .iter()
+            .fold(0u64, |acc, t| acc.wrapping_add(t.current_revision()))
+    }
+
+    pub fn any_run_active(&self) -> bool {
+        self.tabs.iter().any(|t| t.is_run_active())
+    }
+
+    pub fn is_run_config_running(&self, run_key: &str) -> bool {
+        self.tabs
+            .iter()
+            .any(|t| t.bound_run_key.as_deref() == Some(run_key) && t.is_run_active())
+    }
+
+    /// 启动与特定 RunConfiguration 绑定的独立终端标签页，支持指定绑定键与展示标题（例如注入 `-d <device>` 时仍追踪原配置）
+    pub fn start_bound_run_configuration_as(
+        &mut self,
+        run_key: &str,
+        title: &str,
+        cfg: &RunConfiguration,
+    ) {
+        let tab_idx = if let Some(existing) = self
+            .tabs
+            .iter()
+            .position(|t| t.bound_run_key.as_deref() == Some(run_key))
+        {
+            existing
+        } else {
+            let tab_title = format!("▶ {title}");
+            let tab = LivePtyTab::new_lazy_bound(
+                tab_title,
+                &self.cwd,
+                Some(run_key.to_string()),
+                self.on_output.clone(),
+            );
+            self.tabs.push(tab);
+            self.tabs.len() - 1
+        };
+        self.active_tab = tab_idx;
+        self.tabs[tab_idx].start_bound_run(cfg);
+    }
+
+    pub fn start_bound_run_configuration(&mut self, cfg: &RunConfiguration) {
+        let run_key = cfg.identity_key();
+        self.start_bound_run_configuration_as(&run_key, &cfg.name, cfg);
+    }
+
+    pub fn stop_bound_run_configuration(&mut self, run_key: &str) -> bool {
+        let mut stopped = false;
+        for tab in &mut self.tabs {
+            if tab.bound_run_key.as_deref() == Some(run_key) && tab.stop_active_run() {
+                stopped = true;
+            }
+        }
+        stopped
+    }
+
     pub fn execute_command_line(&mut self, cmd_line: &str) {
         self.active_pty_mut().send_command(cmd_line);
     }
 
     pub fn execute_run_configuration(&mut self, cfg: &RunConfiguration) {
-        let full_cmd = if cfg.args.is_empty() {
-            cfg.command.clone()
-        } else {
-            format!("{} {}", cfg.command, cfg.args.join(" "))
-        };
-        self.execute_command_line(&full_cmd);
+        self.start_bound_run_configuration(cfg);
     }
 }
 
+fn append_completion_tail(tail: &mut String, chunk: &str) {
+    if chunk.is_empty() {
+        return;
+    }
+    tail.push_str(chunk);
+    if tail.len() > 256 {
+        let cut = tail.len() - 128;
+        let boundary = tail
+            .char_indices()
+            .find(|&(idx, _)| idx >= cut)
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        tail.drain(..boundary);
+    }
+}
+
+#[cfg(windows)]
+fn kill_descendant_processes(root_pid: u32) {
+    use std::collections::{HashSet, VecDeque};
+    use std::ffi::c_void;
+
+    const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+    const PROCESS_TERMINATE: u32 = 0x0001;
+    const INVALID_HANDLE: *mut c_void = (-1isize) as *mut c_void;
+
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct PROCESSENTRY32W {
+        dwSize: u32,
+        cntUsage: u32,
+        th32ProcessID: u32,
+        th32DefaultHeapID: usize,
+        th32ModuleID: u32,
+        cntThreads: u32,
+        th32ParentProcessID: u32,
+        pcPriClassBase: i32,
+        dwFlags: u32,
+        szExeFile: [u16; 260],
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateToolhelp32Snapshot(dwFlags: u32, th32ProcessID: u32) -> *mut c_void;
+        fn Process32FirstW(hSnapshot: *mut c_void, lppe: *mut PROCESSENTRY32W) -> i32;
+        fn Process32NextW(hSnapshot: *mut c_void, lppe: *mut PROCESSENTRY32W) -> i32;
+        fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> *mut c_void;
+        fn TerminateProcess(hProcess: *mut c_void, uExitCode: u32) -> i32;
+        fn CloseHandle(hObject: *mut c_void) -> i32;
+    }
+
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap.is_null() || snap == INVALID_HANDLE {
+            return;
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut procs: Vec<(u32, u32, String)> = Vec::new();
+        if Process32FirstW(snap, &mut entry) != 0 {
+            loop {
+                let end = entry
+                    .szExeFile
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                let exe_name = String::from_utf16_lossy(&entry.szExeFile[..end]).to_ascii_lowercase();
+                procs.push((entry.th32ProcessID, entry.th32ParentProcessID, exe_name));
+                if Process32NextW(snap, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snap);
+
+        let mut descendants = Vec::new();
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::new();
+        visited.insert(root_pid);
+        queue.push_back(root_pid);
+
+        while let Some(parent) = queue.pop_front() {
+            for (pid, ppid, exe_name) in &procs {
+                if *ppid == parent
+                    && !visited.contains(pid)
+                    && exe_name != "conhost.exe"
+                    && exe_name != "openconsole.exe"
+                {
+                    visited.insert(*pid);
+                    queue.push_back(*pid);
+                    descendants.push(*pid);
+                }
+            }
+        }
+
+        // Terminate deepest children first so parent wrappers don't respawn or complain cleanly.
+        for pid in descendants.into_iter().rev() {
+            let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if !h.is_null() {
+                let _ = TerminateProcess(h, 1);
+                let _ = CloseHandle(h);
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn kill_descendant_processes(_root_pid: u32) {}
+
 const DEFAULT_FG: u32 = 0xDFE1E5;
-const MAX_SCROLLBACK: usize = 2500;
+const MAX_SCROLLBACK: usize = 1200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TermCell {
@@ -769,6 +1089,73 @@ impl TerminalGrid {
             alt_screen_active: self.alt_backup.is_some(),
         }
     }
+
+    /// Extracts `(optional_cwd, command)` from the active shell prompt line at `cursor_row`.
+    pub fn extract_current_prompt_command(&self) -> Option<(Option<PathBuf>, String)> {
+        if self.alt_backup.is_some() || self.screen.is_empty() {
+            return None;
+        }
+        let end_row = self.cursor_row.min(self.screen.len().saturating_sub(1));
+        let start_row = end_row.saturating_sub(2);
+        for r in (start_row..=end_row).rev() {
+            let line = row_to_styled_line(&self.screen[r], false).raw_text();
+            let mut combined = line.trim_end().to_string();
+            for next_r in (r + 1)..=end_row {
+                let seg = row_to_styled_line(&self.screen[next_r], false).raw_text();
+                let seg_trim = seg.trim_end();
+                if !seg_trim.is_empty() {
+                    combined.push_str(seg_trim);
+                }
+            }
+            if let Some(parsed) = parse_shell_prompt_line(&combined) {
+                return Some(parsed);
+            }
+        }
+        None
+    }
+}
+
+fn quote_ps_arg_if_needed(arg: &str) -> String {
+    if arg.is_empty()
+        || arg
+            .chars()
+            .any(|c| c.is_whitespace() || c == '\'' || c == '"')
+    {
+        format!("'{}'", arg.replace('\'', "''"))
+    } else {
+        arg.to_string()
+    }
+}
+
+fn parse_shell_prompt_line(line: &str) -> Option<(Option<PathBuf>, String)> {
+    let trimmed = line.trim();
+    if let Some(rest) = trimmed.strip_prefix("PS ") {
+        if let Some((path_part, cmd_part)) = rest.split_once("> ") {
+            let cmd = cmd_part.trim();
+            if !cmd.is_empty() {
+                let cwd = {
+                    let p = path_part.trim();
+                    if p.is_empty() {
+                        None
+                    } else {
+                        Some(PathBuf::from(p))
+                    }
+                };
+                return Some((cwd, cmd.to_string()));
+            }
+        }
+    }
+    // Also recognize classic cmd.exe path prompt e.g. `D:\work\proj> npm run dev`
+    let bytes = trimmed.as_bytes();
+    if bytes.len() >= 4 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/') {
+        if let Some((path_part, cmd_part)) = trimmed.split_once("> ") {
+            let cmd = cmd_part.trim();
+            if !cmd.is_empty() {
+                return Some((Some(PathBuf::from(path_part.trim())), cmd.to_string()));
+            }
+        }
+    }
+    None
 }
 
 fn row_to_styled_line(row: &[TermCell], preserve_empty: bool) -> StyledTerminalLine {
@@ -1353,5 +1740,68 @@ mod tests {
             tab.alive.load(Ordering::Relaxed),
             last_joined
         );
+    }
+
+    #[test]
+    fn test_extract_current_prompt_command() {
+        let mut grid = TerminalGrid::new(6, 60);
+        let mut parser = VtStreamParser::new();
+        parser.feed(
+            "\x1b[2J\x1b[2;1HPS D:\\work\\demo> docker compose up -d",
+            &mut grid,
+        );
+        let parsed = grid.extract_current_prompt_command().expect("prompt command");
+        assert_eq!(parsed.0, Some(PathBuf::from("D:\\work\\demo")));
+        assert_eq!(parsed.1, "docker compose up -d");
+    }
+
+    #[test]
+    fn test_lazy_terminal_session_defers_powershell_spawn() {
+        let sess = TerminalSession::new("Local", Path::new("."));
+        assert!(!sess.active_pty().alive.load(Ordering::Relaxed));
+        assert!(sess.active_pty().backend.is_none());
+    }
+
+    #[test]
+    fn test_bound_run_tabs_isolate_running_and_stopping_per_script() {
+        let mut sess = TerminalSession::new("Local", Path::new("."));
+        let cfg_a = RunConfiguration {
+            name: "Script A".to_string(),
+            language: ide_core::LanguageId::PlainText,
+            command: "powershell".to_string(),
+            args: vec!["-Command".to_string(), "Start-Sleep -Seconds 5".to_string()],
+            cwd: PathBuf::from("."),
+            source: ide_core::RunConfigSource::Custom,
+            target_file: None,
+        };
+        let cfg_b = RunConfiguration {
+            name: "Script B".to_string(),
+            language: ide_core::LanguageId::PlainText,
+            command: "powershell".to_string(),
+            args: vec!["-Command".to_string(), "Start-Sleep -Seconds 6".to_string()],
+            cwd: PathBuf::from("."),
+            source: ide_core::RunConfigSource::Custom,
+            target_file: None,
+        };
+        let key_a = cfg_a.identity_key();
+        let key_b = cfg_b.identity_key();
+
+        sess.start_bound_run_configuration(&cfg_a);
+        assert!(sess.is_run_config_running(&key_a));
+        assert!(!sess.is_run_config_running(&key_b));
+        assert_eq!(sess.tabs.len(), 2);
+
+        sess.start_bound_run_configuration(&cfg_b);
+        assert!(sess.is_run_config_running(&key_a));
+        assert!(sess.is_run_config_running(&key_b));
+        assert_eq!(sess.tabs.len(), 3);
+
+        // Stopping Script A leaves Script B running untouched
+        assert!(sess.stop_bound_run_configuration(&key_a));
+        assert!(!sess.is_run_config_running(&key_a));
+        assert!(sess.is_run_config_running(&key_b));
+
+        assert!(sess.stop_bound_run_configuration(&key_b));
+        assert!(!sess.is_run_config_running(&key_b));
     }
 }

@@ -19,5 +19,6 @@ pub use types::{
     AgentAttachedItem, AgentChatMessage, AgentProviderKind, AgentRegistration, AgentSession,
     AgentWakeupCallback, AgentWorkbenchMode, AiApiConfig, AiApiFormat, IdeCodeContext,
     InlineEditSession, PastedCodeSnippet, PersistedAgentHistory, ProposedFilePatch,
-    ReasoningEffort, SessionFileChange, StreamingAgentProgress, TurnSyncAnchor, WorkspaceCheckpoint,
+    ReasoningEffort, SessionFileChange, StreamingAgentProgress, TurnFileChange, TurnSyncAnchor,
+    WorkspaceCheckpoint,
 };

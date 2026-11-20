@@ -1,8 +1,6 @@
-use crate::ide_state::{RightPanelTab, SettingsPage};
-use ide_agent_hub::{
-    AgentProviderKind, AgentWorkbenchMode, AiApiConfig, ReasoningEffort,
-};
-use ide_core::{ThemeKind, ToolWindowId, UiLanguage};
+use crate::ide_state::{DockPane, RightPanelTab, SettingsPage};
+use ide_agent_hub::{AgentProviderKind, AgentWorkbenchMode, AiApiConfig, ReasoningEffort};
+use ide_core::{MobileSdkLocations, ThemeKind, ToolWindowId, UiLanguage};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -47,15 +45,17 @@ pub fn global_settings_path(storage_dir: &Path) -> PathBuf {
 }
 
 pub fn workspace_state_path(storage_dir: &Path, workspace_root: &Path) -> PathBuf {
-    storage_dir
-        .join("workspaces")
-        .join(format!("{}.workspace.json", workspace_storage_key(workspace_root)))
+    storage_dir.join("workspaces").join(format!(
+        "{}.workspace.json",
+        workspace_storage_key(workspace_root)
+    ))
 }
 
 pub fn agent_history_path(storage_dir: &Path, workspace_root: &Path) -> PathBuf {
-    storage_dir
-        .join("workspaces")
-        .join(format!("{}.agent.json", workspace_storage_key(workspace_root)))
+    storage_dir.join("workspaces").join(format!(
+        "{}.agent.json",
+        workspace_storage_key(workspace_root)
+    ))
 }
 
 pub fn load_json<T: DeserializeOwned>(path: &Path) -> Option<T> {
@@ -96,6 +96,9 @@ pub struct PersistedGlobalSettings {
     pub right_panel_tab: RightPanelTab,
     pub bottom_tool: Option<ToolWindowId>,
     pub bottom_panel_height: i32,
+    pub dock_left: DockPane,
+    pub dock_right: DockPane,
+    pub dock_bottom: DockPane,
     pub window_maximized: bool,
     pub window_width: i32,
     pub window_height: i32,
@@ -104,6 +107,7 @@ pub struct PersistedGlobalSettings {
     pub active_provider: AgentProviderKind,
     pub provider_prefs: Vec<PersistedProviderPref>,
     pub ai_api_config: Option<AiApiConfig>,
+    pub mobile_sdk: MobileSdkLocations,
 }
 
 impl Default for PersistedGlobalSettings {
@@ -122,6 +126,9 @@ impl Default for PersistedGlobalSettings {
             right_panel_tab: RightPanelTab::Chat,
             bottom_tool: None,
             bottom_panel_height: 220,
+            dock_left: DockPane::Project,
+            dock_right: DockPane::Agent,
+            dock_bottom: DockPane::Tooling,
             window_maximized: false,
             window_width: 1560,
             window_height: 940,
@@ -130,6 +137,7 @@ impl Default for PersistedGlobalSettings {
             active_provider: AgentProviderKind::CursorCli,
             provider_prefs: Vec::new(),
             ai_api_config: None,
+            mobile_sdk: MobileSdkLocations::default(),
         }
     }
 }
@@ -161,5 +169,7 @@ pub struct PersistedWorkspaceState {
     pub scroll_line: usize,
     pub editor_scroll_x: i32,
     pub active_run_config: usize,
+    pub active_run_config_name: Option<String>,
+    pub custom_run_configs: Vec<ide_core::RunConfiguration>,
     pub git_commit_draft: String,
 }

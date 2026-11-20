@@ -165,11 +165,10 @@ pub fn find_in_files_indexed(
 fn push_actions_and_agents(q: &str, max_results: usize, items: &mut Vec<SearchEverywhereItem>) {
     // 1. 匹配 IDE Actions
     let actions = [
-        IdeAction::InlineAiEdit,
-        IdeAction::SendSelectionToAgent,
-        IdeAction::ShowIntentionActions,
         IdeAction::RunActiveConfig,
+        IdeAction::RunCurrentFile,
         IdeAction::DebugActiveConfig,
+        IdeAction::CheckMobileDevicesAndSdk,
         IdeAction::ToggleBreakpoint,
         IdeAction::SaveActiveFile,
         IdeAction::ToggleProjectWindow,
@@ -198,7 +197,6 @@ fn push_actions_and_agents(q: &str, max_results: usize, items: &mut Vec<SearchEv
         ("Google Antigravity (ACP)", "Switch to Antigravity ACP Agent Session"),
         ("Claude Code CLI", "Invoke local Claude Code Agent (claude.cmd)"),
         ("OpenAI Codex CLI", "Invoke local OpenAI Codex Agent (codex.cmd)"),
-        ("Cursor Ctrl+K Inline Edit", "Edit current selection inline with Hunk Diff"),
     ];
     for (name, desc) in agents {
         if items.len() >= max_results {

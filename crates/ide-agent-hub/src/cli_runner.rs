@@ -7,7 +7,7 @@ use crate::types::{
     AgentProviderKind, AgentWakeupCallback, AgentWorkbenchMode, ReasoningEffort,
     StreamingAgentProgress,
 };
-use ide_git::{compute_line_diff, DiffLineKind};
+use ide_git::{compute_line_diff, normalize_diff_text, DiffLineKind};
 use parking_lot::Mutex;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -51,6 +51,242 @@ pub struct CliRunOutput {
     pub file_diff_stats: HashMap<PathBuf, (usize, usize)>,
 }
 
+pub(crate) fn normalize_abs_path(path: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    let stripped = raw.strip_prefix(r"\\?\").unwrap_or(raw.as_ref());
+    PathBuf::from(stripped)
+        .components()
+        .collect()
+}
+
+pub(crate) fn paths_same_file(a: &Path, b: &Path) -> bool {
+    let na = normalize_abs_path(a);
+    let nb = normalize_abs_path(b);
+    #[cfg(target_os = "windows")]
+    {
+        na.to_string_lossy()
+            .replace('/', "\\")
+            .eq_ignore_ascii_case(&nb.to_string_lossy().replace('/', "\\"))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        na == nb
+    }
+}
+
+fn strip_prefix_norm<'a>(path: &Path, base: &Path) -> Option<String> {
+    let np = normalize_abs_path(path);
+    let nb = normalize_abs_path(base);
+    if let Ok(rel) = np.strip_prefix(&nb) {
+        return Some(rel.to_string_lossy().replace('\\', "/"));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let ps = np.to_string_lossy().replace('/', "\\");
+        let bs = nb.to_string_lossy().replace('/', "\\");
+        let bs_trimmed = bs.trim_end_matches('\\');
+        if ps.len() > bs_trimmed.len()
+            && ps[..bs_trimmed.len()].eq_ignore_ascii_case(bs_trimmed)
+            && ps.as_bytes().get(bs_trimmed.len()) == Some(&b'\\')
+        {
+            return Some(ps[bs_trimmed.len() + 1..].replace('\\', "/"));
+        }
+    }
+    None
+}
+
+fn git_repo_toplevel(root: &Path) -> Option<PathBuf> {
+    let mut cmd = Command::new("git");
+    cmd.args(["rev-parse", "--show-toplevel"])
+        .current_dir(root)
+        .stdin(Stdio::null());
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(normalize_abs_path(Path::new(&s)))
+    }
+}
+
+pub(crate) fn is_mutating_tool_name(raw_name: &str) -> bool {
+    let lower = raw_name.to_ascii_lowercase();
+    if lower.contains("read")
+        || lower.contains("view")
+        || lower.contains("grep")
+        || lower.contains("search")
+        || lower.contains("find")
+        || lower.contains("glob")
+        || lower.contains("list")
+        || lower == "ls"
+        || lower.starts_with("lstool")
+        || lower.contains("web")
+        || lower.contains("fetch")
+        || lower.contains("todo")
+    {
+        return false;
+    }
+    lower.contains("write")
+        || lower.contains("edit")
+        || lower.contains("replace")
+        || lower.contains("create")
+        || lower.contains("delete")
+        || lower.contains("remove")
+        || lower.contains("patch")
+        || lower.contains("insert")
+        || lower.contains("append")
+        || lower.contains("file_change")
+        || lower.contains("notebook")
+}
+
+/// 追踪单次 AI 执行前后的工作区文件增减统计（对所有 CLI 统一生效，准确区分已存在的 Git 改动）
+#[derive(Debug, Clone)]
+pub(crate) struct TurnDiffTracker {
+    root: PathBuf,
+    mode: AgentWorkbenchMode,
+    before_snap: HashMap<PathBuf, Option<SystemTime>>,
+    before_dirty_contents: HashMap<PathBuf, Option<String>>,
+}
+
+impl TurnDiffTracker {
+    pub(crate) fn capture(root: &Path, mode: AgentWorkbenchMode) -> Self {
+        let norm_root = normalize_abs_path(root);
+        let before_snap = if mode != AgentWorkbenchMode::Ask {
+            capture_git_mtime_snapshot(&norm_root)
+        } else {
+            HashMap::new()
+        };
+        let mut before_dirty_contents = HashMap::with_capacity(before_snap.len());
+        for p in before_snap.keys() {
+            before_dirty_contents.insert(p.clone(), fs::read_to_string(p).ok());
+        }
+        Self {
+            root: norm_root,
+            mode,
+            before_snap,
+            before_dirty_contents,
+        }
+    }
+
+    pub(crate) fn finish(
+        &self,
+        extra_mutated: &[PathBuf],
+    ) -> (
+        Vec<PathBuf>,
+        HashMap<PathBuf, Option<String>>,
+        HashMap<PathBuf, (usize, usize)>,
+    ) {
+        let mut candidate_files: Vec<PathBuf> = Vec::new();
+        let mut git_changed_files: HashSet<PathBuf> = HashSet::new();
+
+        if self.mode != AgentWorkbenchMode::Ask {
+            let after_snap = capture_git_mtime_snapshot(&self.root);
+            for (p, after_t) in &after_snap {
+                let before_entry = self
+                    .before_snap
+                    .iter()
+                    .find(|(bp, _)| paths_same_file(bp, p))
+                    .map(|(_, bt)| bt);
+                let changed = match before_entry {
+                    None => true,
+                    Some(before_t) => {
+                        if before_t != after_t {
+                            true
+                        } else if let Some(prev_content) = self
+                            .before_dirty_contents
+                            .iter()
+                            .find(|(bp, _)| paths_same_file(bp, p))
+                            .map(|(_, c)| c)
+                        {
+                            let cur_content = fs::read_to_string(p).ok();
+                            prev_content.as_deref().map(normalize_diff_text)
+                                != cur_content.as_deref().map(normalize_diff_text)
+                        } else {
+                            false
+                        }
+                    }
+                };
+                if changed {
+                    git_changed_files.insert(p.clone());
+                    if !candidate_files.iter().any(|cp| paths_same_file(cp, p)) {
+                        candidate_files.push(p.clone());
+                    }
+                }
+            }
+            for p in self.before_snap.keys() {
+                if !after_snap.keys().any(|ap| paths_same_file(ap, p)) {
+                    git_changed_files.insert(p.clone());
+                    if !candidate_files.iter().any(|cp| paths_same_file(cp, p)) {
+                        candidate_files.push(p.clone());
+                    }
+                }
+            }
+        }
+
+        for raw_p in extra_mutated {
+            let p = normalize_abs_path(raw_p);
+            if !candidate_files.iter().any(|cp| paths_same_file(cp, &p)) {
+                candidate_files.push(p);
+            }
+        }
+
+        let mut modified_files = Vec::new();
+        let mut checkpoint_backups: HashMap<PathBuf, Option<String>> = HashMap::new();
+        let mut file_diff_stats: HashMap<PathBuf, (usize, usize)> = HashMap::new();
+
+        for p in candidate_files {
+            let after_content = fs::read_to_string(&p).ok();
+            let pre_dirty_entry = self
+                .before_dirty_contents
+                .iter()
+                .find(|(bp, _)| paths_same_file(bp, &p))
+                .map(|(_, c)| c.clone());
+            let had_pre_dirty = pre_dirty_entry.is_some();
+            let baseline = if let Some(prev) = pre_dirty_entry {
+                prev
+            } else if self.mode != AgentWorkbenchMode::Ask {
+                read_git_head_file(&self.root, &p)
+            } else {
+                continue;
+            };
+            let b_norm = baseline.as_deref().map(normalize_diff_text);
+            let a_norm = after_content.as_deref().map(normalize_diff_text);
+            let content_changed = match (&b_norm, &a_norm) {
+                (Some(b), Some(a)) => b != a,
+                (None, Some(_)) => {
+                    git_changed_files.iter().any(|gp| paths_same_file(gp, &p))
+                        || had_pre_dirty
+                        || extra_mutated
+                            .iter()
+                            .any(|ep| paths_same_file(ep, &p))
+                }
+                (Some(_), None) => true,
+                (None, None) => false,
+            };
+            if !content_changed {
+                continue;
+            }
+            let (added, removed) = compute_file_diff_counts(
+                baseline.as_deref().unwrap_or(""),
+                after_content.as_deref().unwrap_or(""),
+            );
+            if added == 0 && removed == 0 && b_norm.is_some() && a_norm.is_some() {
+                continue;
+            }
+            checkpoint_backups.insert(p.clone(), baseline);
+            file_diff_stats.insert(p.clone(), (added, removed));
+            modified_files.push(p);
+        }
+
+        (modified_files, checkpoint_backups, file_diff_stats)
+    }
+}
+
 pub fn execute_cli_once(
     params: &CliRunParams,
     combined_prompt: &str,
@@ -59,15 +295,7 @@ pub fn execute_cli_once(
     modified_inbox: Option<&Arc<Mutex<Vec<PathBuf>>>>,
     wakeup: Option<&AgentWakeupCallback>,
 ) -> Result<CliRunOutput, String> {
-    let before_snap = if params.mode != AgentWorkbenchMode::Ask {
-        capture_git_mtime_snapshot(&params.root)
-    } else {
-        HashMap::new()
-    };
-    let mut before_dirty_contents: HashMap<PathBuf, Option<String>> = HashMap::new();
-    for p in before_snap.keys() {
-        before_dirty_contents.insert(p.clone(), fs::read_to_string(p).ok());
-    }
+    let diff_tracker = TurnDiffTracker::capture(&params.root, params.mode);
 
     let (resolved_model, agy_effort) = match params.kind {
         AgentProviderKind::CursorCli | AgentProviderKind::CursorInlineEngine => (
@@ -236,56 +464,9 @@ pub fn execute_cli_once(
         );
     }
 
-    let mut candidate_files: Vec<PathBuf> = Vec::new();
-    let mut git_changed_files: Vec<PathBuf> = Vec::new();
-    if params.mode != AgentWorkbenchMode::Ask {
-        let after_snap = capture_git_mtime_snapshot(&params.root);
-        for (p, after_t) in &after_snap {
-            let changed = match before_snap.get(p) {
-                None => true,
-                Some(before_t) => before_t != after_t,
-            };
-            if changed {
-                git_changed_files.push(p.clone());
-                if !candidate_files.contains(p) {
-                    candidate_files.push(p.clone());
-                }
-            }
-        }
-    }
-    for p in tool_touched_files.lock().iter() {
-        if !candidate_files.contains(p) {
-            candidate_files.push(p.clone());
-        }
-    }
-
-    let mut modified_files = Vec::new();
-    let mut checkpoint_backups: HashMap<PathBuf, Option<String>> = HashMap::new();
-    let mut file_diff_stats: HashMap<PathBuf, (usize, usize)> = HashMap::new();
-
-    for p in candidate_files {
-        let after_content = fs::read_to_string(&p).ok();
-        let baseline = if let Some(prev) = before_dirty_contents.get(&p) {
-            prev.clone()
-        } else {
-            read_git_head_file(&params.root, &p)
-        };
-        let content_changed = match (&baseline, &after_content) {
-            (Some(b), Some(a)) => b != a,
-            (None, Some(_)) => git_changed_files.contains(&p) || before_dirty_contents.contains_key(&p),
-            (Some(_), None) => true,
-            (None, None) => false,
-        };
-        if content_changed || git_changed_files.contains(&p) {
-            let (added, removed) = compute_file_diff_counts(
-                baseline.as_deref().unwrap_or(""),
-                after_content.as_deref().unwrap_or(""),
-            );
-            checkpoint_backups.insert(p.clone(), baseline);
-            file_diff_stats.insert(p.clone(), (added, removed));
-            modified_files.push(p);
-        }
-    }
+    let extra_mutated = tool_touched_files.lock().clone();
+    let (modified_files, checkpoint_backups, file_diff_stats) =
+        diff_tracker.finish(&extra_mutated);
 
     if let Some(inbox) = modified_inbox {
         if !modified_files.is_empty() {
@@ -376,17 +557,14 @@ fn capture_stream_session_id(
 }
 
 fn read_git_head_file(root: &Path, full_path: &Path) -> Option<String> {
-    let rel = full_path
-        .strip_prefix(root)
-        .ok()?
-        .to_string_lossy()
-        .replace('\\', "/");
+    let git_base = git_repo_toplevel(root).unwrap_or_else(|| normalize_abs_path(root));
+    let rel = strip_prefix_norm(full_path, &git_base)?;
     if rel.is_empty() {
         return None;
     }
     let mut cmd = Command::new("git");
     cmd.args(["show", &format!("HEAD:{rel}")])
-        .current_dir(root)
+        .current_dir(&git_base)
         .stdin(Stdio::null());
     #[cfg(target_os = "windows")]
     cmd.creation_flags(CREATE_NO_WINDOW);
@@ -399,9 +577,14 @@ fn read_git_head_file(root: &Path, full_path: &Path) -> Option<String> {
 }
 
 pub(crate) fn compute_file_diff_counts(before: &str, after: &str) -> (usize, usize) {
+    let b_norm = normalize_diff_text(before);
+    let a_norm = normalize_diff_text(after);
+    if b_norm == a_norm {
+        return (0, 0);
+    }
     let mut added = 0usize;
     let mut removed = 0usize;
-    for d in compute_line_diff(before, after) {
+    for d in compute_line_diff(&b_norm, &a_norm) {
         match d.kind {
             DiffLineKind::Added => added += 1,
             DiffLineKind::Removed => removed += 1,
@@ -582,9 +765,15 @@ pub fn handle_stream_json_event(
                     }
                 }
                 "tool_call" => {
-                    extract_paths_from_json_value(root, &v["tool_call"], touched);
                     if let Some(obj) = v["tool_call"].as_object() {
                         if let Some(tool_key) = obj.keys().next() {
+                            if is_mutating_tool_name(tool_key) {
+                                extract_paths_from_json_value(
+                                    root,
+                                    &v["tool_call"][tool_key],
+                                    touched,
+                                );
+                            }
                             let step = format_tool_execution_step(root, tool_key, &v["tool_call"][tool_key]);
                             update_stream_progress(sbuf, |p| {
                                 p.phase = if sub == "completed" {
@@ -657,9 +846,11 @@ pub fn handle_stream_json_event(
                         });
                     }
                 } else {
-                    extract_paths_from_json_value(root, su, touched);
                     if !step_type.is_empty() && step_type != "user_input" {
                         let tool_name = su["tool_name"].as_str().unwrap_or(step_type);
+                        if is_mutating_tool_name(tool_name) || is_mutating_tool_name(step_type) {
+                            extract_paths_from_json_value(root, su, touched);
+                        }
                         let step = format_tool_execution_step(root, tool_name, su);
                         update_stream_progress(sbuf, |p| {
                             p.phase = "正在执行步骤...".to_string();
@@ -762,8 +953,10 @@ pub fn handle_stream_json_event(
                                     }
                                 }
                                 "tool_use" => {
-                                    extract_paths_from_json_value(root, &item["input"], touched);
                                     let name = item["name"].as_str().unwrap_or("tool");
+                                    if is_mutating_tool_name(name) {
+                                        extract_paths_from_json_value(root, &item["input"], touched);
+                                    }
                                     let step = format_tool_execution_step(root, name, &item["input"]);
                                     update_stream_progress(sbuf, |p| {
                                         p.phase = "正在执行工具...".to_string();
@@ -943,9 +1136,11 @@ fn extract_paths_from_json_value(
 
 fn capture_git_mtime_snapshot(root: &Path) -> HashMap<PathBuf, Option<SystemTime>> {
     let mut map = HashMap::new();
+    let norm_root = normalize_abs_path(root);
+    let git_base = git_repo_toplevel(&norm_root).unwrap_or_else(|| norm_root.clone());
     let mut cmd = Command::new("git");
-    cmd.args(["status", "--porcelain", "-uall"])
-        .current_dir(root)
+    cmd.args(["-c", "core.quotePath=false", "status", "--porcelain", "-uall"])
+        .current_dir(&git_base)
         .stdin(Stdio::null());
     #[cfg(target_os = "windows")]
     cmd.creation_flags(CREATE_NO_WINDOW);
@@ -955,9 +1150,19 @@ fn capture_git_mtime_snapshot(root: &Path) -> HashMap<PathBuf, Option<SystemTime
             let txt = String::from_utf8_lossy(&out.stdout);
             for line in txt.lines() {
                 if line.len() >= 4 {
-                    let raw_path = line[3..].trim().trim_matches('"');
-                    let rel = raw_path.split(" -> ").last().unwrap_or(raw_path);
-                    let full = root.join(rel);
+                    let raw_path = line[3..].trim();
+                    let rel = raw_path
+                        .split(" -> ")
+                        .last()
+                        .unwrap_or(raw_path)
+                        .trim()
+                        .trim_matches('"');
+                    let full = normalize_abs_path(&git_base.join(rel));
+                    if !paths_same_file(&git_base, &norm_root)
+                        && strip_prefix_norm(&full, &norm_root).is_none()
+                    {
+                        continue;
+                    }
                     let mtime = fs::metadata(&full).and_then(|m| m.modified()).ok();
                     map.insert(full, mtime);
                 }

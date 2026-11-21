@@ -4212,6 +4212,14 @@ impl IdeApplicationState {
             queue_rect.w - 20,
             FontStyle::UiSmall,
         );
+        #[derive(Clone, Copy)]
+        enum QueueGlyph {
+            Undo,
+            Edit,
+            Close,
+            Send,
+        }
+        let mut hover_tip: Option<(Rect, String)> = None;
         let mut qy = queue_rect.y + 22;
         for item in queued.iter().take(4) {
             let row = Rect::new(queue_rect.x + 6, qy, queue_rect.w - 12, 44);
@@ -4230,64 +4238,119 @@ impl IdeApplicationState {
             );
             let actions = [
                 (
+                    QueueGlyph::Undo,
                     self.tr("撤销", "Undo").to_string(),
                     HitAction::UndoQueuedAgentPrompt(item.id.clone()),
                 ),
                 (
-                    self.tr("退回编辑", "Edit").to_string(),
+                    QueueGlyph::Edit,
+                    self.tr("退回编辑", "Return to edit").to_string(),
                     HitAction::EditQueuedAgentPrompt(item.id.clone()),
                 ),
                 (
+                    QueueGlyph::Close,
                     self.tr("关闭", "Close").to_string(),
                     HitAction::CloseQueuedAgentPrompt(item.id.clone()),
                 ),
                 (
+                    QueueGlyph::Send,
                     self.tr("立即发送", "Send now").to_string(),
                     HitAction::SendQueuedAgentPromptNow(item.id.clone()),
                 ),
             ];
-            let mut widths = [0i32; 4];
-            let mut total = 0;
-            for (i, (label, _)) in actions.iter().enumerate() {
-                let (tw, _) = canvas.measure_text(label, FontStyle::UiSmall);
-                widths[i] = tw + 14;
-                total += widths[i] + 4;
+            let btn_size = 18;
+            let gap = 3;
+            let total = actions.len() as i32 * btn_size + (actions.len() as i32 - 1) * gap;
+            let mut bx = row.x + row.w - 2 - total;
+            if bx < row.x + 2 {
+                bx = row.x + 2;
             }
-            let mut bx = row.x + 6;
-            let max_bx = row.x + row.w - 4;
-            if bx + total > max_bx {
-                bx = (max_bx - total).max(row.x + 4);
-            }
-            let by = row.y + 20;
-            for (i, (label, action)) in actions.into_iter().enumerate() {
-                let btn = Rect::new(bx, by, widths[i], 18);
+            let by = row.y + 22;
+            for (glyph, label, action) in actions {
+                let btn = Rect::new(bx, by, btn_size, btn_size);
                 if btn.x + btn.w > row.x + row.w - 2 {
                     break;
                 }
                 let hov = btn.contains(hx, hy);
-                let send_now = matches!(action, HitAction::SendQueuedAgentPromptNow(_));
-                let fill = if send_now {
-                    if hov {
-                        t.accent_blue
-                    } else {
-                        blend_rgb(t.editor_bg, t.accent_blue, 0.55)
+                let icon_color = match glyph {
+                    QueueGlyph::Send => {
+                        if hov {
+                            0xFFFFFF
+                        } else {
+                            t.accent_blue
+                        }
                     }
-                } else if hov {
-                    blend_rgb(t.editor_bg, t.text_primary, 0.12)
-                } else {
-                    blend_rgb(t.editor_bg, t.panel_bg, 0.2)
+                    QueueGlyph::Close => {
+                        if hov {
+                            t.breakpoint_red
+                        } else {
+                            t.text_muted
+                        }
+                    }
+                    QueueGlyph::Undo | QueueGlyph::Edit => {
+                        if hov {
+                            t.text_primary
+                        } else {
+                            t.text_muted
+                        }
+                    }
                 };
-                canvas.fill_rounded_rect(btn, 4, fill);
-                canvas.draw_text_centered(
-                    btn,
-                    &label,
-                    if send_now { 0xFFFFFF } else { t.text_primary },
-                    FontStyle::UiSmall,
-                );
+                if hov || matches!(glyph, QueueGlyph::Send) {
+                    let fill = match glyph {
+                        QueueGlyph::Send => {
+                            if hov {
+                                t.accent_blue
+                            } else {
+                                blend_rgb(t.editor_bg, t.accent_blue, 0.22)
+                            }
+                        }
+                        QueueGlyph::Close => blend_rgb(t.editor_bg, t.breakpoint_red, 0.14),
+                        QueueGlyph::Undo | QueueGlyph::Edit => {
+                            blend_rgb(t.editor_bg, t.text_primary, 0.10)
+                        }
+                    };
+                    canvas.fill_rounded_rect(btn, 4, fill);
+                }
+                match glyph {
+                    QueueGlyph::Undo => {
+                        canvas.draw_rollback_icon(btn.x + 2, btn.y + 2, icon_color);
+                    }
+                    QueueGlyph::Edit => {
+                        canvas.draw_pencil_icon(btn.x + 2, btn.y + 2, icon_color);
+                    }
+                    QueueGlyph::Close => {
+                        canvas.draw_window_close_icon(btn.x + 9, btn.y + 9, icon_color);
+                    }
+                    QueueGlyph::Send => {
+                        canvas.draw_send_up_icon(btn.x + 3, btn.y + 3, icon_color);
+                    }
+                }
+                if hov {
+                    hover_tip = Some((btn, label));
+                }
                 self.hit_regions.push((btn, action));
-                bx += widths[i] + 4;
+                bx += btn_size + gap;
             }
             qy += 46;
+        }
+        if let Some((anchor, label)) = hover_tip {
+            let (tw, th) = canvas.measure_text(&label, FontStyle::UiSmall);
+            let bw = tw + 16;
+            let bh = (th + 8).max(20);
+            let mut tx = anchor.x + anchor.w / 2 - bw / 2;
+            let mut ty = anchor.y - bh - 6;
+            if ty < 4 {
+                ty = anchor.y + anchor.h + 4;
+            }
+            let min_x = queue_rect.x + 4;
+            let max_x = queue_rect.x + queue_rect.w - bw - 4;
+            if max_x >= min_x {
+                tx = tx.clamp(min_x, max_x);
+            }
+            let tip = Rect::new(tx, ty, bw, bh);
+            canvas.fill_rounded_shadow(tip, 4);
+            canvas.stroke_rounded_rect(tip, 4, t.border_color, t.popup_bg);
+            canvas.draw_text_centered(tip, &label, t.text_primary, FontStyle::UiSmall);
         }
     }
 

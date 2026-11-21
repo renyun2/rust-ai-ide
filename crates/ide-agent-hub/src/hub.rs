@@ -628,6 +628,10 @@ impl AgentHub {
             let slot = self.async_discovered_models.clone();
             let wakeup = self.wakeup.clone();
             thread::spawn(move || {
+                #[cfg(not(test))]
+                if kind == AgentProviderKind::CursorCli {
+                    crate::browser_bridge::ensure_cursor_persistent_chrome_mcp(Some(&bin));
+                }
                 let (display_models, exact_catalog) = match kind {
                     AgentProviderKind::CursorCli => probe_cursor_cli_list_models(&bin)
                         .unwrap_or_default(),

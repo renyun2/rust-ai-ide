@@ -1,4 +1,5 @@
 pub mod acp;
+pub mod browser_bridge;
 pub mod cli_discovery;
 pub mod cli_runner;
 pub mod http_fallback;
@@ -7,6 +8,7 @@ pub mod tools;
 pub mod types;
 
 pub use acp::AcpProtocol;
+pub use browser_bridge::ensure_cursor_persistent_chrome_mcp;
 pub use cli_discovery::{
     discover_local_cli_registrations, normalize_cursor_base_model,
     parse_cli_rewind_capabilities, probe_cli_rewind_capabilities, resolve_agy_model_and_effort,

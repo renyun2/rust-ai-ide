@@ -244,7 +244,7 @@ fn read_shared_local_model_catalogs(home: &Path) -> Vec<String> {
 }
 
 /// 剥离非标准 JSON 中的尾随逗号（`,}` / `,]`），兼容 `.cursor/cli-config.json` 等本地配置文件
-fn strip_json_trailing_commas(input: &str) -> String {
+pub(crate) fn strip_json_trailing_commas(input: &str) -> String {
     let chars: Vec<char> = input.chars().collect();
     let mut out = String::with_capacity(input.len());
     let mut in_str = false;

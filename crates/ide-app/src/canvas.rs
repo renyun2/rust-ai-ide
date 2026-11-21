@@ -1886,6 +1886,25 @@ impl SurfaceCanvas {
         }
     }
 
+    /// 绘制铅笔图标（编辑）
+    pub fn draw_pencil_icon(&mut self, x: i32, y: i32, color: u32) {
+        let fx = x as f32 + 0.5;
+        let fy = y as f32 + 0.5;
+        let mut pb = PathBuilder::new();
+        pb.move_to(fx + 8.8, fy + 1.6);
+        pb.line_to(fx + 12.2, fy + 5.0);
+        pb.line_to(fx + 5.2, fy + 12.0);
+        pb.line_to(fx + 2.6, fy + 12.0);
+        pb.line_to(fx + 1.8, fy + 11.2);
+        pb.line_to(fx + 1.8, fy + 8.6);
+        pb.close();
+        pb.move_to(fx + 7.6, fy + 2.8);
+        pb.line_to(fx + 11.0, fy + 6.2);
+        if let Some(path) = pb.finish() {
+            self.stroke_path_round(&path, 1.3, color);
+        }
+    }
+
     /// 绘制垂直三点 `⋮`
     pub fn draw_more_dots_icon(&mut self, x: i32, y: i32, color: u32) {
         self.fill_circle(x + 4, y + 3, 1, color);

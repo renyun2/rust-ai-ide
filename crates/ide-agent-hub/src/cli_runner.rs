@@ -1212,9 +1212,13 @@ fn spawn_cli_process(
 
     match params.kind {
         AgentProviderKind::CursorCli | AgentProviderKind::CursorInlineEngine => {
+            #[cfg(not(test))]
+            crate::browser_bridge::ensure_cursor_persistent_chrome_mcp(Some(&params.bin));
+
             let mut args = vec![
                 "-p".to_string(),
                 "--trust".to_string(),
+                "--approve-mcps".to_string(),
                 "--output-format".to_string(),
                 "stream-json".to_string(),
                 "--stream-partial-output".to_string(),

@@ -4,7 +4,8 @@ use crate::ide_state::{
     RightPanelTab, ScrollTrackInfo,
 };
 use ide_agent_hub::{
-    detect_workspace_file_references, AgentAttachedItem, AgentWorkbenchMode, StreamingAgentProgress,
+    detect_workspace_file_references, AgentAttachedItem, AgentWorkbenchMode, QueuedAgentPrompt,
+    StreamingAgentProgress,
 };
 use ide_core::{LanguageId, ThemeKind, UiLanguage};
 use ide_git::DiffLineKind;
@@ -15,6 +16,70 @@ use std::path::PathBuf;
 
 pub(crate) const AGENT_INPUT_FONT: FontStyle = FontStyle::ChatBody;
 pub(crate) const AGENT_INPUT_LINE_H: i32 = 20;
+
+/// 从 `start` 起能完整放进 `avail` 的标签数量。
+fn session_tabs_fitting(start: usize, widths: &[i32], avail: i32) -> usize {
+    if start >= widths.len() || avail <= 0 {
+        return 0;
+    }
+    let mut used = 0;
+    let mut count = 0;
+    for width in widths.iter().skip(start) {
+        let next = if count == 0 { *width } else { used + 4 + *width };
+        if count > 0 && next > avail {
+            break;
+        }
+        used = next;
+        count += 1;
+    }
+    count
+}
+
+/// 能看到最后一个标签时的起始下标。再往右滚没有更多标签。
+fn session_tab_scroll_including(target: usize, widths: &[i32], avail: i32) -> usize {
+    if widths.is_empty() || avail <= 0 {
+        return 0;
+    }
+    let target = target.min(widths.len() - 1);
+    let mut start = target;
+    let mut used = widths[target];
+    while start > 0 {
+        let prev = widths[start - 1];
+        if used + 4 + prev > avail {
+            break;
+        }
+        used += 4 + prev;
+        start -= 1;
+    }
+    start
+}
+
+/// 只在目标标签不在当前窗口里时挪动滚动。已经看得见的标签保持原位，不会被挤到最右边。
+fn session_tab_scroll_reveal(current: usize, target: usize, widths: &[i32], avail: i32) -> usize {
+    if widths.is_empty() || avail <= 0 {
+        return 0;
+    }
+    let last = widths.len() - 1;
+    let target = target.min(last);
+    let max_start = session_tab_scroll_including(last, widths, avail);
+    let current = current.min(max_start);
+    let count = session_tabs_fitting(current, widths, avail).max(1);
+    if target >= current && target < current + count {
+        return current;
+    }
+    if target < current {
+        return target;
+    }
+    let mut start = current;
+    while start < max_start {
+        start += 1;
+        let visible = session_tabs_fitting(start, widths, avail).max(1);
+        if target < start + visible {
+            return start;
+        }
+    }
+    max_start
+}
 
 fn stream_progress_signature(prog: Option<&StreamingAgentProgress>) -> u64 {
     let Some(p) = prog else {
@@ -1294,6 +1359,7 @@ impl IdeApplicationState {
         canvas.stroke_rounded_rect(rect, 8, t.border_color, panel_surface);
         self.arm_pane_header_drag(canvas, rect, DockPane::Agent);
         self.agent_chat_line_rects.clear();
+        self.agent_session_tab_strip = Rect::new(0, 0, 0, 0);
 
         // 顶部简洁头部底带
         let top_hdr = Rect::new(rect.x + 1, rect.y + 1, rect.w - 2, 32);
@@ -1539,14 +1605,16 @@ impl IdeApplicationState {
         let sess_strip = Rect::new(rect.x + 8, sess_bar_y, rect.w - 16, sess_bar_h);
 
         let all_btn_w = 40;
-        let new_btn_w = 66;
-        let all_btn = Rect::new(
-            sess_strip.x + sess_strip.w - all_btn_w,
+        let new_label = self.tr("+ 新会话", "+ New").to_string();
+        let (new_tw, _) = canvas.measure_text(&new_label, FontStyle::ChatMetaBold);
+        let new_btn_w = (new_tw + 16).clamp(72, 148);
+        let new_btn = Rect::new(
+            sess_strip.x + sess_strip.w - new_btn_w,
             sess_bar_y + 2,
-            all_btn_w,
+            new_btn_w,
             22,
         );
-        let new_btn = Rect::new(all_btn.x - new_btn_w - 4, sess_bar_y + 2, new_btn_w, 22);
+        let all_btn = Rect::new(new_btn.x - all_btn_w - 4, sess_bar_y + 2, all_btn_w, 22);
 
         let sessions_cnt = self.agent_hub.sessions.len();
         let active_sess_idx = self.agent_hub.active_session_idx;
@@ -1562,7 +1630,7 @@ impl IdeApplicationState {
         );
         canvas.draw_text_centered(
             new_btn,
-            self.tr("+ 新会话", "+ New"),
+            &new_label,
             if new_hov {
                 t.text_primary
             } else {
@@ -1589,32 +1657,57 @@ impl IdeApplicationState {
         self.hit_regions
             .push((all_btn, HitAction::ToggleAgentSessionsPopup));
 
-        // 水平渲染近期会话 Tabs（极简无重边框风格）
-        let tabs_avail_w = (new_btn.x - sess_strip.x - 6).max(40);
-        let max_tabs_fit = (tabs_avail_w / 84).max(1) as usize;
-        let window_start = if active_sess_idx >= max_tabs_fit {
-            active_sess_idx + 1 - max_tabs_fit
-        } else {
-            0
-        };
-        let sess_meta: Vec<(usize, String, bool)> = self
+        // 水平渲染会话 Tabs。标签在「新会话」左侧，滚轮可横向翻页，最新会话排在最后。
+        let tabs_avail_w = (all_btn.x - sess_strip.x - 6).max(40);
+        let tabs_fit_w = (all_btn.x - 2 - sess_strip.x).max(40);
+        self.agent_session_tab_strip = Rect::new(sess_strip.x, sess_bar_y, tabs_avail_w, sess_bar_h);
+        let tab_widths: Vec<i32> = self
+            .agent_hub
+            .sessions
+            .iter()
+            .map(|session| {
+                let (tw, _) = canvas.measure_text(&session.title, FontStyle::ChatMeta);
+                (tw + 32).clamp(64, 138)
+            })
+            .collect();
+        if let Some(reveal) = self.agent_session_tab_reveal.take() {
+            self.agent_session_tab_scroll = session_tab_scroll_reveal(
+                self.agent_session_tab_scroll,
+                reveal,
+                &tab_widths,
+                tabs_fit_w,
+            );
+        }
+        let max_scroll = session_tab_scroll_including(
+            tab_widths.len().saturating_sub(1),
+            &tab_widths,
+            tabs_fit_w,
+        );
+        self.agent_session_tab_max_scroll = max_scroll;
+        if self.agent_session_tab_scroll > max_scroll {
+            self.agent_session_tab_scroll = max_scroll;
+        }
+        let fit_count = session_tabs_fitting(self.agent_session_tab_scroll, &tab_widths, tabs_fit_w);
+        let sess_meta: Vec<(usize, String, bool, i32)> = self
             .agent_hub
             .sessions
             .iter()
             .enumerate()
-            .skip(window_start)
-            .take(max_tabs_fit)
-            .map(|(i, s)| (i, s.title.clone(), s.is_busy))
+            .skip(self.agent_session_tab_scroll)
+            .take(fit_count)
+            .map(|(i, s)| (i, s.title.clone(), s.is_busy, tab_widths[i]))
             .collect();
-        let mut sx = sess_strip.x;
-        for (idx, title, sess_busy) in sess_meta {
+        let mut used = 0;
+        for (i, (_, _, _, tab_w)) in sess_meta.iter().enumerate() {
+            used += if i == 0 { *tab_w } else { 4 + *tab_w };
+        }
+        let mut sx = (all_btn.x - 6 - used).max(sess_strip.x);
+        for (idx, title, sess_busy, tab_w) in sess_meta {
             let is_cur = idx == active_sess_idx;
-            let (tw, _) = canvas.measure_text(&title, FontStyle::ChatMeta);
-            let tab_w = (tw + 32).clamp(64, (tabs_avail_w - (sx - sess_strip.x)).max(64).min(138));
-            if sx + tab_w > new_btn.x - 2 && idx != active_sess_idx {
+            if sx + tab_w > all_btn.x - 2 {
                 break;
             }
-            let tab_rect = Rect::new(sx, sess_bar_y + 2, tab_w.min(new_btn.x - sx - 2), 22);
+            let tab_rect = Rect::new(sx, sess_bar_y + 2, tab_w, 22);
             if tab_rect.w < 38 {
                 break;
             }
@@ -1710,11 +1803,24 @@ impl IdeApplicationState {
             0
         };
         let composer_h = 125 + tray_h + drawer_h + edit_banner_h;
+        let queued_prompts = self.agent_hub.active_session().queued_prompts.clone();
+        let queue_rows = queued_prompts.len().min(4) as i32;
+        let queue_h = if queued_prompts.is_empty() {
+            0
+        } else {
+            24 + queue_rows * 46
+        };
         let composer_rect = Rect::new(
             rect.x + 10,
             rect.y + rect.h - composer_h - 10,
             rect.w - 20,
             composer_h,
+        );
+        let queue_rect = Rect::new(
+            composer_rect.x,
+            composer_rect.y - queue_h - if queue_h > 0 { 6 } else { 0 },
+            composer_rect.w,
+            queue_h,
         );
 
         let supports_rewind = self.agent_hub.active_cli_supports_checkpoint_rewind();
@@ -1729,10 +1835,15 @@ impl IdeApplicationState {
         } else {
             0
         };
-        let chat_bottom_limit = if files_drawer_h > 0 {
-            composer_rect.y - files_drawer_h - 6
+        let stack_top = if queue_h > 0 {
+            queue_rect.y
         } else {
             composer_rect.y
+        };
+        let chat_bottom_limit = if files_drawer_h > 0 {
+            stack_top - files_drawer_h - 6
+        } else {
+            stack_top
         };
 
         // 2. 中部可滚动对话区（去掉多余常驻快捷方块，保持充足阅读空间）
@@ -1832,7 +1943,7 @@ impl IdeApplicationState {
         if files_drawer_h > 0 {
             let drawer_rect = Rect::new(
                 composer_rect.x,
-                composer_rect.y - files_drawer_h - 6,
+                stack_top - files_drawer_h - 6,
                 composer_rect.w,
                 files_drawer_h,
             );
@@ -1842,6 +1953,10 @@ impl IdeApplicationState {
                 &session_changed_files,
                 supports_rewind,
             );
+        }
+
+        if queue_h > 0 {
+            self.render_agent_wait_queue(canvas, queue_rect, &queued_prompts);
         }
 
         // 3. 绘制美观的底部 Composer 卡片（含附件托盘、图片直接缩略图预览、可折叠粘贴代码预览）
@@ -4068,6 +4183,114 @@ impl IdeApplicationState {
             .push((attach_btn, HitAction::AttachActiveFileToAgent));
     }
 
+    fn render_agent_wait_queue(
+        &mut self,
+        canvas: &mut SurfaceCanvas,
+        queue_rect: Rect,
+        queued: &[QueuedAgentPrompt],
+    ) {
+        let t = self.theme;
+        let (hx, hy) = self.hover_pos;
+        canvas.fill_rounded_rect(queue_rect, 8, blend_rgb(t.editor_bg, t.panel_bg, 0.35));
+        canvas.stroke_rounded_rect(queue_rect, 8, t.border_color, t.editor_bg);
+        let extra = queued.len().saturating_sub(4);
+        let title = if extra > 0 {
+            format!(
+                "{} · {}  (+{})",
+                self.tr("等待区", "Queue"),
+                queued.len(),
+                extra
+            )
+        } else {
+            format!("{} · {}", self.tr("等待区", "Queue"), queued.len())
+        };
+        canvas.draw_text_styled(
+            queue_rect.x + 10,
+            queue_rect.y + 4,
+            &title,
+            t.text_muted,
+            queue_rect.w - 20,
+            FontStyle::UiSmall,
+        );
+        let mut qy = queue_rect.y + 22;
+        for item in queued.iter().take(4) {
+            let row = Rect::new(queue_rect.x + 6, qy, queue_rect.w - 12, 44);
+            if row.contains(hx, hy) {
+                canvas.fill_rounded_rect(row, 5, blend_rgb(t.editor_bg, t.text_primary, 0.05));
+            }
+            let preview = item.text.replace('\n', " ");
+            let mode = item.mode.label();
+            canvas.draw_text_styled(
+                row.x + 6,
+                row.y + 2,
+                &format!("{mode}  {preview}"),
+                t.text_primary,
+                (row.w - 12).max(20),
+                FontStyle::ChatMeta,
+            );
+            let actions = [
+                (
+                    self.tr("撤销", "Undo").to_string(),
+                    HitAction::UndoQueuedAgentPrompt(item.id.clone()),
+                ),
+                (
+                    self.tr("退回编辑", "Edit").to_string(),
+                    HitAction::EditQueuedAgentPrompt(item.id.clone()),
+                ),
+                (
+                    self.tr("关闭", "Close").to_string(),
+                    HitAction::CloseQueuedAgentPrompt(item.id.clone()),
+                ),
+                (
+                    self.tr("立即发送", "Send now").to_string(),
+                    HitAction::SendQueuedAgentPromptNow(item.id.clone()),
+                ),
+            ];
+            let mut widths = [0i32; 4];
+            let mut total = 0;
+            for (i, (label, _)) in actions.iter().enumerate() {
+                let (tw, _) = canvas.measure_text(label, FontStyle::UiSmall);
+                widths[i] = tw + 14;
+                total += widths[i] + 4;
+            }
+            let mut bx = row.x + 6;
+            let max_bx = row.x + row.w - 4;
+            if bx + total > max_bx {
+                bx = (max_bx - total).max(row.x + 4);
+            }
+            let by = row.y + 20;
+            for (i, (label, action)) in actions.into_iter().enumerate() {
+                let btn = Rect::new(bx, by, widths[i], 18);
+                if btn.x + btn.w > row.x + row.w - 2 {
+                    break;
+                }
+                let hov = btn.contains(hx, hy);
+                let send_now = matches!(action, HitAction::SendQueuedAgentPromptNow(_));
+                let fill = if send_now {
+                    if hov {
+                        t.accent_blue
+                    } else {
+                        blend_rgb(t.editor_bg, t.accent_blue, 0.55)
+                    }
+                } else if hov {
+                    blend_rgb(t.editor_bg, t.text_primary, 0.12)
+                } else {
+                    blend_rgb(t.editor_bg, t.panel_bg, 0.2)
+                };
+                canvas.fill_rounded_rect(btn, 4, fill);
+                canvas.draw_text_centered(
+                    btn,
+                    &label,
+                    if send_now { 0xFFFFFF } else { t.text_primary },
+                    FontStyle::UiSmall,
+                );
+                self.hit_regions.push((btn, action));
+                bx += widths[i] + 4;
+            }
+            qy += 46;
+        }
+    }
+
     pub(crate) fn render_agent_sessions_popup(&mut self, canvas: &mut SurfaceCanvas) {
         let t = self.theme;
         let (hx, hy) = self.hover_pos;
@@ -4086,6 +4309,7 @@ impl IdeApplicationState {
             })
             .collect();
         let max_show = sessions.len().clamp(1, 10);
+        let visible_start = sessions.len().saturating_sub(max_show);
         let pw = 292.min((self.right_pane_rect.w - 16).max(220));
         let ph = 38 + (max_show as i32) * 28 + 34;
         let px = self.right_pane_rect.x + self.right_pane_rect.w - pw - 10;
@@ -4105,7 +4329,7 @@ impl IdeApplicationState {
         );
 
         let mut ry = py + 32;
-        for (idx, title, msg_cnt, busy) in sessions.into_iter().take(max_show) {
+        for (idx, title, msg_cnt, busy) in sessions.into_iter().skip(visible_start) {
             let row = Rect::new(px + 6, ry, pw - 12, 26);
             let is_cur = idx == self.agent_hub.active_session_idx;
             if is_cur || row.contains(hx, hy) {
@@ -4909,5 +5133,23 @@ impl IdeApplicationState {
                 .tr("✓ 已复制整条消息到剪贴板", "✓ Copied message to clipboard")
                 .to_string();
         }
+    }
+}
+
+#[cfg(test)]
+mod session_tab_scroll_tests {
+    use super::{session_tab_scroll_including, session_tab_scroll_reveal, session_tabs_fitting};
+
+    #[test]
+    fn clicking_a_visible_tab_does_not_move_the_strip() {
+        let widths = vec![80, 80, 80, 80, 80, 80];
+        let avail = 80 + 4 + 80 + 4 + 80;
+        assert_eq!(session_tabs_fitting(1, &widths, avail), 3);
+        assert_eq!(session_tab_scroll_reveal(1, 2, &widths, avail), 1);
+        assert_eq!(session_tab_scroll_reveal(1, 3, &widths, avail), 1);
+        let shown = session_tab_scroll_reveal(1, 5, &widths, avail);
+        assert_eq!(shown, 3);
+        assert_eq!(session_tab_scroll_including(5, &widths, avail), 3);
+        assert_eq!(session_tab_scroll_reveal(1, 0, &widths, avail), 0);
     }
 }

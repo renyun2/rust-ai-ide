@@ -12,8 +12,9 @@ use crate::canvas::{
     detect_system_dpi_scale, render_ri_icon_rgba, save_ri_icon_png, SurfaceCanvas,
 };
 use crate::ide_state::{
-    duplicate_open_count, workspace_paths_equal, write_windows_clipboard_text, FocusTarget,
-    IdeApplicationState, IdeCursorKind, TextInputNavAction, WindowControlCmd,
+    duplicate_open_count, session_windows_after_close, workspace_paths_equal,
+    write_windows_clipboard_text, FocusTarget, IdeApplicationState, IdeCursorKind,
+    TextInputNavAction, WindowControlCmd,
 };
 use anyhow::Result;
 use ide_core::{IdeAction, MainMenuCategory, ToolWindowId};
@@ -100,6 +101,7 @@ struct IdeWindowHost {
     wheel_velocity_boost: f32,
     wheel_accum_y: f32,
     wheel_accum_x: f32,
+    last_ime_physical: Option<(i32, i32)>,
 }
 
 fn spawn_ide_window(
@@ -182,6 +184,7 @@ fn spawn_ide_window(
         wheel_velocity_boost: 1.0,
         wheel_accum_y: 0.0,
         wheel_accum_x: 0.0,
+        last_ime_physical: None,
     })
 }
 
@@ -189,8 +192,15 @@ fn sync_ime_position(
     window: &tao::window::Window,
     state: &IdeApplicationState,
     canvas: &SurfaceCanvas,
+    last: &mut Option<(i32, i32)>,
 ) {
     let (px, py) = canvas.to_physical_pos(state.ime_spot.0, state.ime_spot.1);
+    if let Some((lx, ly)) = *last {
+        if (px - lx).abs() <= 2 && (py - ly).abs() <= 2 {
+            return;
+        }
+    }
+    *last = Some((px, py));
     window.set_ime_position(PhysicalPosition::new(px, py));
 }
 
@@ -493,6 +503,57 @@ fn sync_window_cursor(
     }
 }
 
+fn collect_open_paths(
+    windows: &HashMap<WindowId, IdeWindowHost>,
+    order: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for path in order {
+        if windows
+            .values()
+            .any(|host| workspace_paths_equal(&host.app_state.workspace_root, path))
+            && !out.iter().any(|existing| workspace_paths_equal(existing, path))
+        {
+            out.push(path.clone());
+        }
+    }
+    for host in windows.values() {
+        let path = &host.app_state.workspace_root;
+        if !out.iter().any(|existing| workspace_paths_equal(existing, path)) {
+            out.push(path.clone());
+        }
+    }
+    out
+}
+
+fn same_session(left: &[PathBuf], right: &[PathBuf]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(a, b)| workspace_paths_equal(a, b))
+}
+
+fn remember_open_windows(storage_dir: Option<&Path>, paths: &[PathBuf]) {
+    let Some(dir) = storage_dir else {
+        return;
+    };
+    if paths.is_empty() {
+        return;
+    }
+    persistence::store_open_windows(dir, paths);
+}
+
+fn existing_session_dirs(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for path in paths {
+        if path.is_dir() && !out.iter().any(|existing| workspace_paths_equal(existing, path)) {
+            out.push(path.clone());
+        }
+    }
+    out
+}
+
 fn parse_explicit_workspace_arg(args: &[String]) -> Option<PathBuf> {
     let mut i = 1;
     while i < args.len() {
@@ -538,10 +599,17 @@ fn main() -> Result<()> {
         .as_deref()
         .and_then(|d| persistence::load_json(&persistence::global_settings_path(d)))
         .unwrap_or_default();
-    let workspace_root = parse_explicit_workspace_arg(&args)
+    let ui_test_mode = args.iter().any(|a| a == "--ui-test");
+    let explicit_workspace = parse_explicit_workspace_arg(&args);
+    let saved_session = if explicit_workspace.is_none() && !ui_test_mode {
+        existing_session_dirs(&saved_global.open_windows)
+    } else {
+        Vec::new()
+    };
+    let workspace_root = explicit_workspace
+        .or_else(|| saved_session.first().cloned())
         .or_else(|| saved_global.last_workspace.clone().filter(|p| p.is_dir()))
         .unwrap_or_else(|| parse_workspace_arg(&args));
-    let ui_test_mode = args.iter().any(|a| a == "--ui-test");
 
     if args.iter().any(|a| a == "--self-check") {
         let sys_scale = detect_system_dpi_scale();
@@ -659,8 +727,47 @@ fn main() -> Result<()> {
     let primary_window_id = initial_host.window.id();
     let mut windows: HashMap<WindowId, IdeWindowHost> = HashMap::new();
     windows.insert(primary_window_id, initial_host);
+    let mut session_order = vec![windows
+        .get(&primary_window_id)
+        .map(|host| host.app_state.workspace_root.clone())
+        .unwrap_or_default()];
+    if !ui_test_mode {
+        let primary_root = session_order[0].clone();
+        for root in saved_session {
+            if workspace_paths_equal(&root, &primary_root) {
+                continue;
+            }
+            match spawn_ide_window(
+                &event_loop,
+                &proxy,
+                root,
+                storage_dir.as_deref(),
+                shared_window_icon.clone(),
+                init_log_w,
+                init_log_h,
+                false,
+            ) {
+                Ok(host) => {
+                    session_order.push(host.app_state.workspace_root.clone());
+                    let id = host.window.id();
+                    windows.insert(id, host);
+                }
+                Err(err) => {
+                    if let Some(origin) = windows.get_mut(&primary_window_id) {
+                        origin.app_state.status_notification = format!(
+                            "{}: {err}",
+                            origin
+                                .app_state
+                                .tr("无法恢复项目窗口", "Failed to restore project window")
+                        );
+                    }
+                }
+            }
+        }
+    }
     let mut ui_test_frames: u32 = 0;
     let mut recent_reopen: Option<(WindowId, u32, Instant)> = None;
+    let mut close_burst: Option<(Instant, Vec<PathBuf>)> = None;
 
     event_loop.run(move |event, elwt, control_flow| {
         let mut any_anim = false;
@@ -814,6 +921,30 @@ fn main() -> Result<()> {
                         }
                     }
                 } else {
+                    let burst = close_burst.as_ref().map(|(started, snapshot)| {
+                        (
+                            started.elapsed() >= Duration::from_millis(800),
+                            snapshot.clone(),
+                        )
+                    });
+                    if let Some((ready, snapshot)) = burst {
+                        if ready {
+                            let still_open = collect_open_paths(&windows, &session_order);
+                            let keep = session_windows_after_close(&snapshot, &still_open);
+                            session_order = keep.clone();
+                            remember_open_windows(storage_dir.as_deref(), &keep);
+                            close_burst = None;
+                        } else {
+                            *control_flow =
+                                ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(40));
+                        }
+                    } else {
+                        let latest = collect_open_paths(&windows, &session_order);
+                        if !same_session(&latest, &session_order) {
+                            session_order = latest.clone();
+                            remember_open_windows(storage_dir.as_deref(), &latest);
+                        }
+                    }
                     for host in windows.values_mut() {
                         if host.is_minimized {
                             let _ = host.app_state.poll_background_updates();
@@ -863,10 +994,22 @@ fn main() -> Result<()> {
                     WindowCommand::None
                 };
                 if cmd == WindowCommand::CloseWindow {
+                    if close_burst.is_none() {
+                        let snapshot = collect_open_paths(&windows, &session_order);
+                        close_burst = Some((Instant::now(), snapshot));
+                    }
+                    let snapshot = close_burst
+                        .as_ref()
+                        .map(|(_, paths)| paths.clone())
+                        .unwrap_or_default();
                     if let Some(host) = windows.remove(&window_id) {
                         host.app_state.save_all_persisted_state();
                     }
                     if windows.is_empty() {
+                        let keep = session_windows_after_close(&snapshot, &[]);
+                        if !ui_test_mode {
+                            remember_open_windows(storage_dir.as_deref(), &keep);
+                        }
                         *control_flow = ControlFlow::Exit;
                     }
                 } else {
@@ -901,7 +1044,12 @@ impl IdeWindowHost {
             self.app_state.effective_scale(),
         );
         self.app_state.render(&mut self.surface_canvas);
-        sync_ime_position(&self.window, &self.app_state, &self.surface_canvas);
+        sync_ime_position(
+            &self.window,
+            &self.app_state,
+            &self.surface_canvas,
+            &mut self.last_ime_physical,
+        );
         sync_window_cursor(
             &self.window,
             &self.app_state,
@@ -953,7 +1101,6 @@ impl IdeWindowHost {
             }
             WindowEvent::ReceivedImeText(text) => {
                 self.app_state.insert_text_at_focus(&text);
-                sync_ime_position(&self.window, &self.app_state, &self.surface_canvas);
                 self.pending_redraw = true;
             }
             WindowEvent::HoveredFile(path) => {
@@ -973,7 +1120,6 @@ impl IdeWindowHost {
                 self.app_state.handle_os_dropped_file(path, pos.0, pos.1);
                 self.surface_canvas
                     .set_scale_factor(self.app_state.effective_scale());
-                sync_ime_position(&self.window, &self.app_state, &self.surface_canvas);
                 self.pending_redraw = true;
             }
             WindowEvent::ModifiersChanged(new_mods) => {
@@ -1036,9 +1182,6 @@ impl IdeWindowHost {
                         &self.surface_canvas,
                     );
                 if dragged_split || dragged_scroll || dragged_ide_file || dragged_text || dragged_dock {
-                    if dragged_text {
-                        sync_ime_position(&self.window, &self.app_state, &self.surface_canvas);
-                    }
                     self.pending_redraw = true;
                 } else if self
                     .app_state
@@ -1093,7 +1236,6 @@ impl IdeWindowHost {
                         .app_state
                         .try_begin_scrollbar_drag(self.cursor_pos.0, self.cursor_pos.1)
                     {
-                        sync_ime_position(&self.window, &self.app_state, &self.surface_canvas);
                         self.pending_redraw = true;
                         return WindowCommand::None;
                     }
@@ -1195,7 +1337,6 @@ impl IdeWindowHost {
                             }
                         }
                     }
-                    sync_ime_position(&self.window, &self.app_state, &self.surface_canvas);
                     self.pending_redraw = true;
                 }
                 ElementState::Released => {
@@ -1252,7 +1393,6 @@ impl IdeWindowHost {
                     self.cursor_pos.1,
                     &self.surface_canvas,
                 );
-                sync_ime_position(&self.window, &self.app_state, &self.surface_canvas);
                 self.pending_redraw = true;
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -1348,7 +1488,6 @@ impl IdeWindowHost {
                 self.app_state.touch_caret_activity();
                 self.surface_canvas
                     .set_scale_factor(self.app_state.effective_scale());
-                sync_ime_position(&self.window, &self.app_state, &self.surface_canvas);
                 self.pending_redraw = true;
             }
             _ => {}
@@ -1457,7 +1596,9 @@ impl IdeWindowHost {
                             }
                         }
                         Key::Character(ch) if ctrl && ch.eq_ignore_ascii_case("y") => {
-                            if app_state.agent_hub.inline_edit.is_some() {
+                            if app_state.active_text_input().is_some() {
+                                app_state.execute_ide_action(IdeAction::RedoEdit);
+                            } else if app_state.agent_hub.inline_edit.is_some() {
                                 app_state.accept_inline_diff();
                             } else {
                                 app_state.execute_ide_action(IdeAction::DeleteLine);
@@ -1806,13 +1947,6 @@ impl IdeWindowHost {
                             FocusTarget::AgentChatInput => {
                                 if shift {
                                     app_state.insert_text_at_focus("\n");
-                                } else if app_state.agent_hub.is_active_session_busy() {
-                                    app_state.status_notification = app_state
-                                        .tr(
-                                            "当前会话正在响应中，可点击 + 新建会话并行提问",
-                                            "Active session is busy; open + New to run another in parallel",
-                                        )
-                                        .to_string();
                                 } else {
                                     let prompt = app_state.agent_chat_input.take_and_push_history();
                                     let has_extras = !app_state

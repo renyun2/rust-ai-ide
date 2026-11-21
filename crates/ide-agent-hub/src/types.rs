@@ -518,6 +518,16 @@ pub struct TurnSyncAnchor {
     pub checkpoint_id: Option<String>,
 }
 
+/// 当前会话仍在生成时，用户继续发送的消息先进入等待区。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QueuedAgentPrompt {
+    pub id: String,
+    pub text: String,
+    pub mode: AgentWorkbenchMode,
+    #[serde(default)]
+    pub queued_at_ms: u64,
+}
+
 /// 独立的 AI 多会话状态容器
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSession {
@@ -535,6 +545,11 @@ pub struct AgentSession {
     pub draft_prompt: String,
     pub is_busy: bool,
     pub created_order: usize,
+    /// 最近一次用户发出消息的时间（Unix 毫秒）。会话条按此升序排列，最新的在最后。
+    #[serde(default)]
+    pub last_user_sent_ms: u64,
+    #[serde(default)]
+    pub queued_prompts: Vec<QueuedAgentPrompt>,
     #[serde(default)]
     pub cli_session_id: Option<String>,
     #[serde(default)]

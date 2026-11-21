@@ -35,6 +35,7 @@ use crate::tools::{
 use crate::types::{
     AgentAttachedItem, AgentChatMessage, AgentProviderKind, AgentRegistration, AgentSession,
     AgentWakeupCallback, AgentWorkbenchMode, AiApiConfig, IdeCodeContext, InlineEditSession,
+    QueuedAgentPrompt,
     PastedCodeSnippet, PersistedAgentHistory, ReasoningEffort, SessionFileChange,
     StreamingAgentProgress, TurnFileChange, TurnSyncAnchor, WorkspaceCheckpoint,
 };
@@ -49,6 +50,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use uuid::Uuid;
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -203,6 +211,8 @@ impl AgentHub {
             draft_prompt: String::new(),
             is_busy: false,
             created_order: 1,
+            last_user_sent_ms: unix_ms(),
+            queued_prompts: Vec::new(),
             cli_session_id: None,
             pending_fork_session: false,
             changed_files: Vec::new(),
@@ -293,7 +303,20 @@ impl AgentHub {
         for s in &mut hist.sessions {
             s.is_busy = false;
         }
-        let target_idx = hist.active_session_idx.min(hist.sessions.len() - 1);
+        let active_id = hist.sessions
+            [hist.active_session_idx.min(hist.sessions.len() - 1)]
+            .id
+            .clone();
+        hist.sessions.sort_by(|a, b| {
+            a.last_user_sent_ms
+                .cmp(&b.last_user_sent_ms)
+                .then(a.created_order.cmp(&b.created_order))
+        });
+        let target_idx = hist
+            .sessions
+            .iter()
+            .position(|s| s.id == active_id)
+            .unwrap_or(0);
         self.sessions = hist.sessions;
         self.next_session_seq = hist.next_session_seq.max(self.sessions.len() + 1);
         self.active_session_idx = target_idx;
@@ -717,16 +740,71 @@ impl AgentHub {
             draft_prompt: String::new(),
             is_busy: false,
             created_order: seq,
+            last_user_sent_ms: unix_ms(),
+            queued_prompts: Vec::new(),
             cli_session_id: None,
             pending_fork_session: false,
             changed_files: Vec::new(),
             turn_anchors: Vec::new(),
         };
         self.sessions.push(sess);
-        let new_idx = self.sessions.len() - 1;
-        self.sync_session_in(new_idx);
+        let new_id = self.sessions.last().map(|s| s.id.clone()).unwrap_or_default();
+        self.sort_sessions_by_user_send(&new_id);
+        self.sessions.iter().position(|s| s.id == new_id).unwrap_or(0)
+    }
+
+    fn sort_sessions_by_user_send(&mut self, keep_id: &str) {
+        self.sessions.sort_by(|a, b| {
+            a.last_user_sent_ms
+                .cmp(&b.last_user_sent_ms)
+                .then(a.created_order.cmp(&b.created_order))
+        });
+        let idx = self
+            .sessions
+            .iter()
+            .position(|s| s.id == keep_id)
+            .unwrap_or(0);
+        self.sync_session_in(idx);
         self.save_history();
-        new_idx
+    }
+
+    /// 按用户发出消息的时间把当前会话排到最后。
+    pub fn mark_active_session_user_sent(&mut self) {
+        let now = unix_ms();
+        let id = self.active_session().id.clone();
+        self.sync_active_session_out();
+        if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
+            session.last_user_sent_ms = now.max(session.last_user_sent_ms);
+        }
+        self.sort_sessions_by_user_send(&id);
+    }
+
+    pub fn enqueue_active_prompt(&mut self, text: String, mode: AgentWorkbenchMode) -> String {
+        let id = format!("q-{}", &Uuid::new_v4().to_string()[..8]);
+        let mode = self.normalize_mode_for_active(mode);
+        self.active_session_mut().queued_prompts.push(QueuedAgentPrompt {
+            id: id.clone(),
+            text,
+            mode,
+            queued_at_ms: unix_ms(),
+        });
+        self.mark_active_session_user_sent();
+        id
+    }
+
+    pub fn take_queued_prompt(&mut self, id: &str) -> Option<QueuedAgentPrompt> {
+        let session = self.active_session_mut();
+        let pos = session.queued_prompts.iter().position(|item| item.id == id)?;
+        Some(session.queued_prompts.remove(pos))
+    }
+
+    pub fn pop_next_queued_prompt(&mut self) -> Option<QueuedAgentPrompt> {
+        let session = self.active_session_mut();
+        if session.queued_prompts.is_empty() {
+            None
+        } else {
+            Some(session.queued_prompts.remove(0))
+        }
     }
 
     pub fn switch_session(&mut self, target_idx: usize) -> bool {
@@ -756,6 +834,9 @@ impl AgentHub {
             s.pasted_snippets.clear();
             s.draft_prompt.clear();
             s.is_busy = false;
+            s.queued_prompts.clear();
+            s.last_user_sent_ms = unix_ms();
+            s.created_order = seq;
             self.save_history();
             return true;
         }
@@ -1752,7 +1833,7 @@ impl AgentHub {
                 checkpoint_id: None,
             });
         }
-        self.save_history();
+        self.mark_active_session_user_sent();
 
         let trimmed = effective_prompt.as_str();
         if trimmed.starts_with("/check")
@@ -3222,5 +3303,29 @@ mod tests {
         assert!(hub.switch_session(1));
         hub.submit_workbench_prompt("/search AgentHub", AgentWorkbenchMode::Ask, None);
         assert!(hub.messages.iter().any(|m| m.role == "assistant"));
+    }
+
+    #[test]
+    fn user_send_moves_session_to_end_and_queue_can_be_taken() {
+        let mut hub = AgentHub::new(Path::new("."));
+        let first_id = hub.active_session().id.clone();
+        hub.new_session();
+        let second_id = hub.active_session().id.clone();
+        assert_eq!(hub.sessions.last().unwrap().id, second_id);
+        assert!(hub.switch_session(0));
+        hub.sessions
+            .iter_mut()
+            .find(|s| s.id == second_id)
+            .unwrap()
+            .last_user_sent_ms = 1;
+        hub.mark_active_session_user_sent();
+        assert_eq!(hub.sessions.last().unwrap().id, first_id);
+        assert_eq!(hub.active_session_idx, hub.sessions.len() - 1);
+
+        let qid = hub.enqueue_active_prompt("稍后发送".to_string(), AgentWorkbenchMode::Ask);
+        assert_eq!(hub.active_session().queued_prompts.len(), 1);
+        let taken = hub.take_queued_prompt(&qid).unwrap();
+        assert_eq!(taken.text, "稍后发送");
+        assert!(hub.pop_next_queued_prompt().is_none());
     }
 }

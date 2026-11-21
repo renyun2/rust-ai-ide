@@ -3,7 +3,7 @@
 
   <h1>RI — Pure Rust AI IDE</h1>
 
-  <p>A native desktop IDE written entirely in Rust.<br/>IntelliJ IDEA New UI layout and keymap, with local coding agents in the same window.</p>
+  <p>A native Windows IDE for Rust, TypeScript, JavaScript, Python, and Flutter.<br/>IntelliJ IDEA New UI layout and keymap, with local coding agents in the same window.</p>
 
   <p>
     <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a>
@@ -17,54 +17,58 @@
   </p>
 </div>
 
-RI (**R**ust **I**DE) is an early native workbench for Rust, TypeScript, JavaScript, and Python. It draws its own UI, edits text on a rope, and talks to language servers, debuggers, Git, a real terminal, and the coding-agent CLIs already installed on the machine.
-
-The desktop target today is **Windows 10/11**. Language servers and agent CLIs are discovered locally. RI does not bundle a JVM, a browser, or those tools.
+RI draws its own UI, edits text on a rope, and talks to the language servers, debuggers, Git, terminal, and coding-agent CLIs already installed on the machine. Flutter and Android projects get a device selector and SDK paths in Settings. There is no bundled JVM, Chromium, or copy of those tools.
 
 ---
 
 ## Contents
 
-- [The problem](#the-problem)
-- [Why RI](#why-ri)
+- [Highlights](#highlights)
+- [Getting started](#getting-started)
 - [Features](#features)
-- [Architecture](#architecture)
-- [Performance](#performance)
 - [Keymap](#keymap)
 - [Requirements](#requirements)
-- [Getting started](#getting-started)
+- [Architecture](#architecture)
+- [Performance](#performance)
 - [Development](#development)
 - [Releases](#releases)
 - [Project layout](#project-layout)
 - [Status](#status)
-- [Brand assets](#brand-assets)
 - [License](#license)
 
 ---
 
-## The problem
+## Highlights
 
-Daily coding still splits across a heavy editor and a pile of separate agent terminals.
-
-| Pain | What it costs |
-| --- | --- |
-| **Browser-shell IDEs** | VS Code and Cursor ship Chromium and Node. The install is large, memory is split across renderer and extension processes, and the UI is a web page hosted in a native frame. |
-| **JVM IDEs** | IntelliJ IDEA ships a full JetBrains Runtime plus a large JAR and plugin graph. Cold start and heap behavior are part of the edit loop. |
-| **Agents outside the editor** | Antigravity, Claude Code, Codex, Cursor, and Gemini each have their own CLI or product. Diffs, file context, and rollback do not share one workbench. |
-| **High-DPI redraw** | A software-rendered IDE stutters on 2K and 4K displays when every scrolled frame calls the text engine again. |
-| **Keymap tax** | People who work in the IntelliJ keymap pay a switching cost in every other editor, including the AI tools they open beside it. |
-
-RI is the attempt to put that loop back in one small native process: IDEA-shaped UI, the languages you already use, and the local agents you already installed.
+- **One native process.** Window, editor, tool windows, and the agent panel are Rust. A stripped release `ide-app` has been measured at **6.04 MB**.
+- **IDEA layout.** Islands Dark, Darcula Classic, and Islands Light, the New UI tool stripes, and the IntelliJ keymap. UI language switches with `Ctrl+Alt+U`.
+- **Local agents in the workbench.** Cursor, Antigravity (ACP), Claude Code, and Codex share sessions, inline diffs, and checkpoints.
+- **First-tier languages.** Rust, TypeScript/JavaScript, and Python use the LSP and DAP binaries on your `PATH`. JSON, TOML, and Markdown are highlighted.
+- **Flutter and Android.** The toolbar lists phones and emulators. Settings stores Flutter SDK, Android SDK, and JDK directories.
 
 ---
 
-## Why RI
+## Getting started
 
-- **One native process.** The window, editor, tool windows, and agent panel are Rust. A stripped release binary of `ide-app` has been measured at **6.04 MB** (`6,335,488` bytes) with thin LTO. There is no bundled JBR and no bundled Chromium.
-- **IDEA layout without the JVM.** Islands Dark, Darcula Classic, and Islands Light, the New UI tool stripes, and the IntelliJ keymap live in `ide-core`. The UI language switches between English and Chinese with `Ctrl+Alt+U`.
-- **Agents share the workbench.** `ide-agent-hub` drives local CLIs (Cursor, Antigravity ACP, Claude Code, Codex, Gemini) and a `Ctrl+K` inline edit path. Proposed edits are hunk diffs. A workspace checkpoint can be rolled back with `Ctrl+Alt+Z`.
-- **The language loop is explicit.** Rust, TypeScript/JavaScript, and Python are first-tier: LSP for intelligence, DAP for debug, Git for review, and ConPTY for the shell. Each server is the one on your `PATH`, not a copy vendored into RI.
-- **Scrolling is a rendering problem, treated as one.** Glyph masks, highlight spans, and text measurements are cached against the buffer revision. Frames are written straight into a `softbuffer` surface.
+```powershell
+# Open the current directory
+cargo run -p ide-app --release
+
+# Open a project
+cargo run -p ide-app --release -- --workspace D:\path\to\your\project
+
+# Render one frame off-screen and exit
+cargo run -p ide-app --release -- --self-check
+
+# Rasterize the in-app logo to a 256×256 PNG
+cargo run -p ide-app --release -- --export-icon assets/ri_icon.png
+```
+
+| Flag | Effect |
+| --- | --- |
+| `--workspace <path>` | Open this directory instead of the current one |
+| `--self-check` | Render off-screen and exit. Used by CI and local smoke tests |
+| `--export-icon <path>` | Write the RI mark as a PNG and exit |
 
 ---
 
@@ -72,102 +76,74 @@ RI is the attempt to put that loop back in one small native process: IDEA-shaped
 
 ### Workbench
 
-- Three themes, switched with `` Ctrl+` `` or from Settings (`Ctrl+Alt+S`): **JetBrains Dark (Islands)**, **Darcula Classic**, **IntelliJ Light (Islands)**.
-- System DPI detection on startup (`100%`–`400%`) and live UI zoom with `Ctrl+=`, `Ctrl+-`, and `Ctrl+0`.
-- Borderless window, Windows 11 rounded corners, workspace switcher (this window or a new window), and a Git branch popup.
-- Gutter width follows the line count, so five- and six-digit files keep their line numbers. Breakpoints and runnable gutter marks sit in that same gutter.
-- Project, Git, and agent work run off the UI thread. Loading states use a small arc spinner.
+- Themes: **JetBrains Dark (Islands)**, **Darcula Classic**, **IntelliJ Light (Islands)**. Cycle with `` Ctrl+` `` or open Settings with `Ctrl+Alt+S`.
+- Settings follow the IDEA page list: Appearance, Menus and Toolbars, System, Editor, Font, Color Scheme, Code Style, Keymap, Plugins, Git, Debugger, Terminal, Languages, **Mobile SDK**, Advanced.
+- Startup reads the system DPI (`100%`–`400%`). `Ctrl+=`, `Ctrl+-`, and `Ctrl+0` zoom the UI live.
+- Borderless window, Windows 11 rounded corners, workspace switcher (this window or a new one), and a Git branch popup.
+- Gutter width follows the line count. Breakpoints and runnable gutter marks share that gutter.
+- Project, Git, and agent work leave the UI thread.
 
 ### Editor and search
 
-- `ropey` text buffer with undo/redo, multi-caret style edits, word selection, indent, and dirty-state tracking.
-- **Search Everywhere** (`Double Shift`), **Go to File** (`Ctrl+Shift+N`), and **Find in Files** (`Ctrl+Shift+F`) on the ripgrep stack (`ignore`, `grep-searcher`, `grep-regex`).
-- Syntax color and structure for Rust, TypeScript, JavaScript, and Python. **Structure** is `Alt+7`.
+- `ropey` buffer with undo/redo, line duplicate and delete, comment toggle, reformat, rename (`Shift+F6`), and intention actions (`Alt+Enter`).
+- **Search Everywhere** (Double `Shift`), **Go to File** (`Ctrl+Shift+N`), **Find in Files** (`Ctrl+Shift+F`), and **Find Action** (`Ctrl+Shift+A`), on the ripgrep stack.
+- Syntax color and structure for Rust, TypeScript, JavaScript, Python, JSON, TOML, and Markdown. **Structure** is `Alt+7`.
 
-### Languages, debug, Git, terminal
+### Languages, run, and debug
 
-| Language | Language server | Debugger |
-| --- | --- | --- |
-| Rust | `rust-analyzer` | `codelldb` |
-| TypeScript / JavaScript | `vtsls` or `typescript-language-server` | `js-debug` |
-| Python | `pyright-langserver` or `ruff` | `debugpy` |
+| Language | Language server | Debugger | Run configurations |
+| --- | --- | --- | --- |
+| Rust | `rust-analyzer` | `codelldb` | Cargo check, test, run |
+| TypeScript / JavaScript | `vtsls` or `typescript-language-server` | `js-debug` | Detected from the project |
+| Python | `pyright-langserver` or `ruff` | `debugpy` | Python script / entry |
+| Flutter | — | device via ADB | `flutter run`, test, build apk, pub get, doctor |
 
-- **Git** (`Alt+0`): change list with stage and unstage, inline line diffs (`similar`), commit message, and a three-pane log (branch filter, graph, file diff). Repository work is done on a background worker.
-- **Terminal** (`Alt+F12`): `portable-pty` on Windows ConPTY, multiple tabs, VT100, and ANSI color. PowerShell, Cargo, and Git run as normal console programs.
+`Shift+F10` runs the active configuration. `Ctrl+Shift+F10` runs the current file. `Shift+F9` starts a debug session. `Ctrl+F8` toggles a breakpoint. Gutter `▶` marks come from the syntax crate.
 
-### Agents
+### Mobile
 
-`ide-agent-hub` is the single place those tools show up:
+Opening a Flutter or Android workspace adds a **device** control to the toolbar. RI probes Flutter, the Android SDK, ADB, JDK, phones, and emulators.
+
+`Ctrl+Alt+S` → **Mobile SDK** (or **Path** on the device popup) sets three directories:
+
+| Field | Directory contains |
+| --- | --- |
+| Flutter SDK | `bin\flutter.bat` (or `flutter` / `flutter.cmd` / `flutter.exe`) |
+| Android SDK | `platform-tools` |
+| JDK | `bin\java.exe` |
+
+Leave a field empty to detect it from `PATH`, `ANDROID_HOME` / `ANDROID_SDK_ROOT`, `JAVA_HOME`, `local.properties`, and common install folders. A filled-in path that is missing or incomplete stays on **SDK not installed** and is not replaced by another install on the machine. Run and debug then use the resolved `flutter`, `dart`, and `adb` binaries.
+
+### Git and terminal
+
+- **Commit** (`Alt+0`): change list, stage and unstage, inline diffs (`similar`), and the commit message. Diff and status work runs on a background worker.
+- **Log** (`Alt+9`): branch filter, graph, and file diff. Branches (`Ctrl+Shift+G`), new branch (`Ctrl+Alt+B`), pull (`Ctrl+T`), push (`Ctrl+Shift+K`), fetch, merge, rebase, stash, blame, and file history are on the Git menu.
+- **Terminal** (`Alt+F12`): `portable-pty` on Windows ConPTY, multiple tabs, VT100, and ANSI color.
+
+### AI assistant
+
+`ide-agent-hub` is where the local CLIs show up. Open it with `Alt+8`.
 
 | Provider | How RI talks to it |
 | --- | --- |
+| Cursor | Local CLI, plus `Ctrl+K` inline edit |
 | Google Antigravity | ACP, JSON-RPC 2.0 over stdio (`agy`) |
 | Claude Code | `claude` headless stream-JSON and an embedded PTY |
 | OpenAI Codex | `codex` exec and an embedded PTY |
-| Cursor | Local CLI, plus `Ctrl+K` inline edit |
-| Gemini | Local `gemini` CLI |
-| Custom endpoint | OpenAI-compatible HTTP fallback |
+| Custom endpoint | OpenAI-compatible or Gemini REST fallback |
 
-The agent panel keeps multiple sessions, accepts dropped or pasted images, folds fenced code into chips, and can jump to a file and line from the reply. Thinking effort and a fast mode are session settings. Inline edits use Myers and Patience hunks. Accept with `Tab`, reject with `Esc`.
+`Alt+G`, `Alt+C`, and `Alt+X` switch Antigravity, Claude Code, and Codex. Each session has **Ask**, **Edit**, and **Agent** modes, a reasoning effort, and an optional fast mode. Drop or paste images, fold fenced code into chips, and jump from a reply to a file and line. `Alt+L` sends the selection into the panel.
 
----
+**Sessions.** Tabs sit on the top of the panel. The newest conversation is last, ordered by the time you sent a message, so sending in an older session moves that tab to the end. **+ New** is pinned to the right; the session count sits just left of it. Hover the tabs and scroll with the vertical wheel, the horizontal wheel, or Shift+wheel. Clicking a tab that is already visible keeps the scroll position.
 
-## Architecture
+**Waiting area.** If the current session is still responding, Enter queues the next prompt above the composer. When the turn finishes, the oldest queued prompt is sent. Each queued item can be:
 
-Ten crates. UI state stays in `ide-app`. Protocols and buffers stay in the libraries.
+- **Undo** — put the text back into the composer, in front of any draft
+- **Return to edit** — replace the composer text and restore that item's mode
+- **Close** — discard it
+- **Send now** — cancel the in-flight turn and send this prompt immediately
 
-| Crate | Role |
-| --- | --- |
-| [`ide-core`](crates/ide-core) | Themes, `LanguageId`, run-configuration detection, actions, keymap, English/Chinese menu strings |
-| [`ide-vfs`](crates/ide-vfs) | `ropey` buffer, undo snapshots, selections, workspace file tree |
-| [`ide-syntax`](crates/ide-syntax) | Highlight spans, structure symbols, runnable gutter detection |
-| [`ide-search`](crates/ide-search) | Workspace index, Search Everywhere, Find in Files |
-| [`ide-lsp`](crates/ide-lsp) | LSP JSON-RPC client and local server discovery |
-| [`ide-dap`](crates/ide-dap) | DAP session, breakpoints, stack frames, crash context for agents |
-| [`ide-git`](crates/ide-git) | Status, stage, commit, branches, log, line diffs |
-| [`ide-terminal`](crates/ide-terminal) | ConPTY session and VT100 parser |
-| [`ide-agent-hub`](crates/ide-agent-hub) | Agent registry, sessions, ACP, CLI runners, inline edit, checkpoints |
-| [`ide-app`](crates/ide-app) | `tao` event loop and the DirectWrite + tiny-skia + softbuffer renderer |
-
-```text
-tao window
-    └── ide-app          UI, input, frame
-            ├── ide-core         theme, keymap, language id
-            ├── ide-vfs          rope buffer, file tree
-            ├── ide-syntax       color, structure
-            ├── ide-search       ripgrep index
-            ├── ide-lsp / ide-dap
-            ├── ide-git
-            ├── ide-terminal     ConPTY
-            └── ide-agent-hub    local CLIs + inline diff
-```
-
----
-
-## Performance
-
-The renderer keeps five caches and shortcuts on the hot path:
-
-1. **Glyph masks.** DirectWrite ClearType coverage is rasterized once into a compact mask and reused with integer blends.
-2. **Revision-tied spans.** Highlight spans and measured widths are cached against the buffer revision and reused while scrolling.
-3. **Scanline fills.** Common rounded rectangles are filled per scanline with a small SDF corner, instead of rebuilding a path every frame.
-4. **Direct present.** The frame is copied once into `softbuffer`. There is no second full-screen intermediate buffer.
-5. **Coalesced wheel input.** Fast scrolling is accumulated and stepped inside the frame budget.
-
-Local scroll check `fast_scrolling_and_glyph_mask_cache_achieve_high_fps`: 20 full frames of a 1560×940 IDE surface while the code view scrolls. Same machine throughout. These numbers describe this renderer. They are not a product-wide benchmark against IDEA or VS Code.
-
-| Build | 20 frames | Per frame | Equivalent rate | Versus the uncached baseline |
-| --- | ---: | ---: | ---: | ---: |
-| Baseline, DirectWrite called every frame, no glyph-mask cache | ~1191 ms | ~59.6 ms | ~17 FPS | 1.0× |
-| After the cache, debug profile (`opt-level = 2`) | 57.49 ms | 2.87 ms | ~348 FPS | ~20.7× |
-| After the cache, release (`opt-level = 3`, thin LTO) | 33.43 ms | 1.67 ms | ~598 FPS | ~35.6× |
-
-| | RI | IntelliJ IDEA | VS Code / Cursor |
-| --- | --- | --- | --- |
-| Shipping shape | One stripped native binary, measured around 6 MB | JBR plus the IDE distribution | Chromium and Node |
-| UI | `tao`, `tiny-skia`, `softbuffer`, DirectWrite | Swing on a JetBrains runtime | Blink, CSS, Skia |
-| Text | `ropey` on a Rust thread | JVM heap | Editor core in the extension host plus the renderer process |
-| Terminal | `portable-pty` / ConPTY | Pty4j | `node-pty` |
+Another session can run in parallel. Inline edits use Myers and Patience hunks: `Tab` accepts, `Esc` rejects. `Ctrl+Alt+Z` reverts the latest workspace checkpoint.
 
 ---
 
@@ -177,16 +153,18 @@ IntelliJ IDEA bindings. On Windows, `Ctrl` is the primary modifier.
 
 | Keys | Action | Keys | Action |
 | --- | --- | --- | --- |
-| `Double Shift` | Search Everywhere | `Ctrl+Alt+S` | Settings |
+| Double `Shift` | Search Everywhere | `Ctrl+Alt+S` | Settings |
 | `Ctrl+Shift+F` | Find in Files | `` Ctrl+` `` | Cycle theme |
 | `Ctrl+Shift+A` | Find Action | `Ctrl+Alt+U` | English / 中文 |
 | `Ctrl+Shift+N` | Go to File | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | Zoom in, out, reset |
 | `Ctrl+B` | Go to declaration | `Ctrl+K` | Inline AI edit |
-| `Ctrl+D` / `Ctrl+Y` | Duplicate line / delete line | `Alt+L` | Send selection to the agent panel |
+| `Ctrl+D` / `Ctrl+Y` | Duplicate line / delete line | `Alt+L` | Send selection to the agent |
 | `Ctrl+/` | Toggle line comment | `Tab` / `Esc` | Accept / reject inline diff |
 | `Ctrl+Alt+L` | Reformat | `Ctrl+Alt+Z` | Revert the latest AI checkpoint |
+| `Shift+F6` / `Alt+Enter` | Rename / intentions | `Alt+G` / `Alt+C` / `Alt+X` | Antigravity / Claude / Codex |
 | `Shift+F10` / `Shift+F9` | Run / debug | `Alt+1` | Project |
-| `Ctrl+F8` | Toggle breakpoint | `Alt+0` | Commit |
+| `Ctrl+Shift+F10` | Run current file | `Alt+0` | Commit |
+| `Ctrl+F8` | Toggle breakpoint | `Alt+9` | Git log |
 | `Ctrl+T` / `Ctrl+Shift+K` | Git pull / push | `Alt+7` / `Alt+8` / `Alt+F12` | Structure / Agents / Terminal |
 
 ---
@@ -195,34 +173,67 @@ IntelliJ IDEA bindings. On Windows, `Ctrl` is the primary modifier.
 
 - Rust stable, 2021 edition (`rustup` default is enough)
 - Windows 10 or Windows 11 (DirectWrite, ConPTY, and DWM rounded corners)
-- Optional, installed separately and picked up from `PATH`:
-  - Language servers: `rust-analyzer`, `vtsls` or `typescript-language-server`, `pyright-langserver` or `ruff`
-  - Debuggers: `codelldb`, `js-debug`, `debugpy`
-  - Agents: `agy`, `claude`, `codex`, Cursor CLI, `gemini`
+- Optional tools, installed separately and discovered on `PATH` or from Settings:
+
+| Kind | Tools |
+| --- | --- |
+| Language servers | `rust-analyzer`, `vtsls` or `typescript-language-server`, `pyright-langserver` or `ruff` |
+| Debuggers | `codelldb`, `js-debug`, `debugpy` |
+| Agents | `agy`, `claude`, `codex`, Cursor CLI |
+| Mobile | Flutter SDK, Android SDK (`platform-tools`), JDK 17 for Gradle |
 
 ---
 
-## Getting started
+## Architecture
 
-```powershell
-# Open the current directory as the workspace
-cargo run -p ide-app --release
+Ten crates. UI state stays in `ide-app`. Protocols and buffers stay in the libraries.
 
-# Open a specific project
-cargo run -p ide-app --release -- --workspace D:\path\to\your\project
+| Crate | Role |
+| --- | --- |
+| [`ide-core`](crates/ide-core) | Themes, keymap, `LanguageId`, run configurations, Flutter/Android SDK probe |
+| [`ide-vfs`](crates/ide-vfs) | `ropey` buffer, undo snapshots, workspace file tree |
+| [`ide-syntax`](crates/ide-syntax) | Highlight spans, structure symbols, runnable gutter marks |
+| [`ide-search`](crates/ide-search) | Search Everywhere and Find in Files |
+| [`ide-lsp`](crates/ide-lsp) | LSP JSON-RPC client and local server discovery |
+| [`ide-dap`](crates/ide-dap) | DAP session, breakpoints, stack frames, crash context for agents |
+| [`ide-git`](crates/ide-git) | Status, stage, commit, branches, log, line diffs |
+| [`ide-terminal`](crates/ide-terminal) | ConPTY session and VT100 parser |
+| [`ide-agent-hub`](crates/ide-agent-hub) | Agent registry, sessions, wait queue, ACP, CLI runners, inline edit, checkpoints |
+| [`ide-app`](crates/ide-app) | `tao` event loop and the DirectWrite + tiny-skia + softbuffer renderer |
 
-# Headless UI self-check: render a frame and print hit-target stats
-cargo run -p ide-app --release -- --self-check
-
-# Write the 256×256 brand icon from the in-app vector logo
-cargo run -p ide-app --release -- --export-icon assets/ri_icon.png
+```text
+tao window
+    └── ide-app
+            ├── ide-core         theme, keymap, run configs, mobile SDK
+            ├── ide-vfs          rope buffer, file tree
+            ├── ide-syntax       color, structure
+            ├── ide-search       ripgrep index
+            ├── ide-lsp / ide-dap
+            ├── ide-git
+            ├── ide-terminal     ConPTY
+            └── ide-agent-hub    local CLIs, sessions, inline diff
 ```
 
-| Flag | Effect |
-| --- | --- |
-| `--workspace <path>` | Open this directory instead of the current one |
-| `--self-check` | Render off-screen and exit. Useful in CI and local smoke tests |
-| `--export-icon <path>` | Rasterize the RI mark to a PNG and exit |
+---
+
+## Performance
+
+The renderer keeps glyph masks, highlight spans, and text measurements against the buffer revision, fills common rounded rectangles per scanline, and presents once through `softbuffer`. Wheel input is accumulated inside the frame budget.
+
+Local scroll check `fast_scrolling_and_glyph_mask_cache_achieve_high_fps`: 20 full frames of a 1560×940 IDE surface while the code view scrolls, on one machine. These numbers describe this renderer.
+
+| Build | 20 frames | Per frame | Equivalent rate | Versus the uncached baseline |
+| --- | ---: | ---: | ---: | ---: |
+| Baseline, DirectWrite every frame, no glyph-mask cache | ~1191 ms | ~59.6 ms | ~17 FPS | 1.0× |
+| After the cache, debug profile (`opt-level = 2`) | 57.49 ms | 2.87 ms | ~348 FPS | ~20.7× |
+| After the cache, release (`opt-level = 3`, thin LTO) | 33.43 ms | 1.67 ms | ~598 FPS | ~35.6× |
+
+| | RI | IntelliJ IDEA | VS Code / Cursor |
+| --- | --- | --- | --- |
+| Shipping shape | One stripped native binary, measured around 6 MB | JBR plus the IDE distribution | Chromium and Node |
+| UI | `tao`, `tiny-skia`, `softbuffer`, DirectWrite | Swing on a JetBrains runtime | Blink, CSS, Skia |
+| Text | `ropey` | JVM heap | Editor core plus a renderer process |
+| Terminal | `portable-pty` / ConPTY | Pty4j | `node-pty` |
 
 ---
 
@@ -234,29 +245,29 @@ cargo test --workspace
 cargo run -p ide-app -- --self-check
 ```
 
-Release profile (`Cargo.toml`): `opt-level = 3`, thin LTO, a single codegen unit, and stripped symbols. The dev profile opts dependencies at level 3 so the UI is usable without a full release build.
+Release profile (`Cargo.toml`): `opt-level = 3`, thin LTO, one codegen unit, stripped symbols. The dev profile optimizes dependencies at level 3 so the UI is usable without a full release build.
 
-Issues and pull requests are welcome. Please run `cargo test --workspace` and `cargo run -p ide-app -- --self-check` before sending a change. Match the surrounding crate style. Keep protocol code in its crate (`ide-lsp`, `ide-dap`, `ide-agent-hub`) and window code in `ide-app`.
+Issues and pull requests are welcome. Run `cargo test --workspace` and `cargo run -p ide-app -- --self-check` before sending a change. Keep protocol code in its crate and window code in `ide-app`.
 
 ---
 
 ## Releases
 
-GitHub Actions builds the Windows release when a version tag is pushed. The workflow file has to be in that commit. Tagging an older commit that does not contain `.github/workflows/release.yml` does not start a build.
+GitHub Actions builds the Windows release when a version tag is pushed. The workflow file has to be in that commit.
 
 ```powershell
 git tag v0.1.0
 git push origin v0.1.0
 ```
 
-[`.github/workflows/release.yml`](.github/workflows/release.yml) then runs on `windows-latest`:
+[`.github/workflows/release.yml`](.github/workflows/release.yml) on `windows-latest`:
 
 1. `cargo test --workspace`
 2. `cargo build -p ide-app --release`
 3. `ide-app.exe --self-check`
-4. Publish a GitHub Release with `RI-v0.1.0-windows-x86_64.zip` and a SHA-256 file
+4. Publish `RI-<tag>-windows-x86_64.zip` and a SHA-256 file
 
-A tag that contains a hyphen, such as `v0.2.0-rc.1`, is published as a pre-release. Pushing to `master` or `main`, and opening a pull request, runs tests only ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
+A tag that contains a hyphen, such as `v0.2.0-rc.1`, is a pre-release. Pushes to `master` or `main`, and pull requests, run tests only ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
 
 On a private repository, allow Actions to create releases: **Settings → Actions → General → Workflow permissions → Read and write permissions**.
 
@@ -267,7 +278,7 @@ On a private repository, allow Actions to create releases: **Settings → Action
 ```text
 rust-ai-ide/
 ├── crates/
-│   ├── ide-core/
+│   ├── ide-core/           # theme, keymap, run configs, mobile SDK
 │   ├── ide-vfs/
 │   ├── ide-syntax/
 │   ├── ide-search/
@@ -275,31 +286,24 @@ rust-ai-ide/
 │   ├── ide-dap/
 │   ├── ide-git/
 │   ├── ide-terminal/
-│   ├── ide-agent-hub/
+│   ├── ide-agent-hub/      # sessions, wait queue, ACP, inline edit
 │   └── ide-app/
 ├── .github/workflows/      # ci.yml, release.yml
 ├── assets/                 # ri_icon.svg, ri_icon.png
-├── Cargo.toml              # workspace, version 0.1.0
-├── README.md               # this file
+├── Cargo.toml
+├── README.md
 └── README.zh-CN.md
 ```
+
+The mark is drawn at runtime by `draw_ri_logo_to_pixmap` in [`crates/ide-app/src/canvas.rs`](crates/ide-app/src/canvas.rs). The repo also stores [`assets/ri_icon.svg`](assets/ri_icon.svg) and [`assets/ri_icon.png`](assets/ri_icon.png).
 
 ---
 
 ## Status
 
-Version **0.1.0**. The workbench, editor, search, Git tool window, terminal, and agent hub run on Windows. LSP and DAP clients expect the corresponding tools on `PATH`. Other desktop platforms are not a supported target yet: the text stack is DirectWrite and the terminal stack is ConPTY.
+Version **0.1.0**. The workbench, editor, search, Git, terminal, mobile device probe, and agent hub run on Windows. LSP and DAP clients expect the matching tools on `PATH` or, for Flutter, Android, and the JDK, in **Settings → Mobile SDK**. macOS and Linux are not supported targets: text uses DirectWrite and the terminal uses ConPTY.
 
-This repository follows the IntelliJ New UI closely in layout, color, and keymap. It is an independent implementation.
-
----
-
-## Brand assets
-
-The mark is drawn at runtime by `draw_ri_logo_to_pixmap` in [`crates/ide-app/src/canvas.rs`](crates/ide-app/src/canvas.rs) and also stored in the repo:
-
-- Vector: [`assets/ri_icon.svg`](assets/ri_icon.svg)
-- 256×256 PNG: [`assets/ri_icon.png`](assets/ri_icon.png)
+The layout, color, and keymap follow the IntelliJ New UI. The implementation is independent.
 
 ---
 
@@ -310,4 +314,4 @@ Licensed under either of
 - Apache License, Version 2.0
 - MIT license
 
-at your option. The choice is recorded on the workspace package in [`Cargo.toml`](Cargo.toml) as `MIT OR Apache-2.0`.
+at your option. The workspace package in [`Cargo.toml`](Cargo.toml) records this as `MIT OR Apache-2.0`.

@@ -17,6 +17,7 @@ pub use hub::AgentHub;
 pub use tools::{extract_enclosing_block, extract_first_fenced_code_block, load_workspace_agent_rules};
 pub use types::{
     AgentAttachedItem, AgentChatMessage, AgentProviderKind, AgentRegistration, AgentSession,
+    QueuedAgentPrompt,
     AgentWakeupCallback, AgentWorkbenchMode, AiApiConfig, AiApiFormat, IdeCodeContext,
     InlineEditSession, PastedCodeSnippet, PersistedAgentHistory, ProposedFilePatch,
     ReasoningEffort, SessionFileChange, StreamingAgentProgress, TurnFileChange, TurnSyncAnchor,

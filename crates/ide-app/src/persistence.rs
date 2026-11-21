@@ -63,6 +63,17 @@ pub fn load_json<T: DeserializeOwned>(path: &Path) -> Option<T> {
     serde_json::from_str::<T>(&raw).ok()
 }
 
+/// Remember every workspace window so the next launch can reopen them all.
+pub fn store_open_windows(storage_dir: &Path, paths: &[PathBuf]) {
+    let path = global_settings_path(storage_dir);
+    let mut gs = load_json::<PersistedGlobalSettings>(&path).unwrap_or_default();
+    gs.open_windows = paths.to_vec();
+    if let Some(first) = paths.iter().find(|p| p.is_dir()) {
+        gs.last_workspace = Some(first.clone());
+    }
+    save_json(&path, &gs);
+}
+
 pub fn save_json<T: Serialize>(path: &Path, value: &T) {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
@@ -102,6 +113,8 @@ pub struct PersistedGlobalSettings {
     pub window_maximized: bool,
     pub window_width: i32,
     pub window_height: i32,
+    /// Workspaces that were open when the app last quit. Restored together on the next launch.
+    pub open_windows: Vec<PathBuf>,
     pub attach_active_context: bool,
     pub agent_mode: AgentWorkbenchMode,
     pub active_provider: AgentProviderKind,
@@ -132,6 +145,7 @@ impl Default for PersistedGlobalSettings {
             window_maximized: false,
             window_width: 1560,
             window_height: 940,
+            open_windows: Vec::new(),
             attach_active_context: true,
             agent_mode: AgentWorkbenchMode::Agent,
             active_provider: AgentProviderKind::CursorCli,

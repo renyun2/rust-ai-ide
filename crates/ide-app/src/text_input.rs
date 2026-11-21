@@ -7,6 +7,26 @@ pub struct WrappedLineSeg {
     pub text: String,
 }
 
+const INPUT_UNDO_LIMIT: usize = 128;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputCoalesceKind {
+    None,
+    Insert,
+    DeleteBack,
+    DeleteForward,
+}
+
+#[derive(Debug, Clone)]
+struct InputEditSnapshot {
+    text: String,
+    cursor: usize,
+    selection_anchor: Option<usize>,
+    scroll_x: i32,
+    scroll_y: usize,
+    history_cursor: Option<usize>,
+}
+
 #[derive(Debug, Clone)]
 pub struct TextInputField {
     pub text: String,
@@ -17,6 +37,9 @@ pub struct TextInputField {
     pub scroll_y: usize,
     pub history: Vec<String>,
     pub history_cursor: Option<usize>,
+    undo_stack: Vec<InputEditSnapshot>,
+    redo_stack: Vec<InputEditSnapshot>,
+    coalesce: InputCoalesceKind,
 }
 
 impl TextInputField {
@@ -40,6 +63,9 @@ impl TextInputField {
             scroll_y: 0,
             history: Vec::new(),
             history_cursor: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            coalesce: InputCoalesceKind::None,
         }
     }
 
@@ -61,9 +87,18 @@ impl TextInputField {
         self.selection_anchor = None;
         self.scroll_x = 0;
         self.scroll_y = 0;
+        self.reset_edit_history();
     }
 
     pub fn clear(&mut self) {
+        if self.text.is_empty() && self.cursor == 0 && self.selection_anchor.is_none() {
+            self.scroll_x = 0;
+            self.scroll_y = 0;
+            self.history_cursor = None;
+            self.end_coalesce();
+            return;
+        }
+        self.note_edit_boundary(InputCoalesceKind::None);
         self.text.clear();
         self.cursor = 0;
         self.selection_anchor = None;
@@ -73,12 +108,19 @@ impl TextInputField {
     }
 
     pub fn take_and_push_history(&mut self) -> String {
+        if !self.text.is_empty() || self.cursor != 0 || self.selection_anchor.is_some() {
+            self.note_edit_boundary(InputCoalesceKind::None);
+        }
         let taken = std::mem::take(&mut self.text);
         let trimmed = taken.trim();
         if !trimmed.is_empty() && self.history.last().map(|s| s.as_str()) != Some(trimmed) {
             self.history.push(trimmed.to_string());
         }
-        self.clear();
+        self.cursor = 0;
+        self.selection_anchor = None;
+        self.scroll_x = 0;
+        self.scroll_y = 0;
+        self.history_cursor = None;
         taken
     }
 
@@ -91,9 +133,12 @@ impl TextInputField {
             Some(0) => 0,
             Some(i) => i - 1,
         };
-        self.history_cursor = Some(next);
         let item = self.history[next].clone();
-        self.set_text(&item);
+        if self.history_cursor == Some(next) && self.text == item {
+            return true;
+        }
+        self.replace_text_as_edit(&item);
+        self.history_cursor = Some(next);
         true
     }
 
@@ -102,16 +147,34 @@ impl TextInputField {
             return false;
         };
         if idx + 1 >= self.history.len() {
+            self.replace_text_as_edit("");
             self.history_cursor = None;
-            self.text.clear();
-            self.cursor = 0;
-            self.selection_anchor = None;
         } else {
             let next = idx + 1;
-            self.history_cursor = Some(next);
             let item = self.history[next].clone();
-            self.set_text(&item);
+            self.replace_text_as_edit(&item);
+            self.history_cursor = Some(next);
         }
+        true
+    }
+
+    pub fn undo_edit(&mut self) -> bool {
+        let Some(prev) = self.undo_stack.pop() else {
+            self.end_coalesce();
+            return false;
+        };
+        self.redo_stack.push(self.capture_snapshot());
+        self.restore_snapshot(prev);
+        true
+    }
+
+    pub fn redo_edit(&mut self) -> bool {
+        let Some(next) = self.redo_stack.pop() else {
+            self.end_coalesce();
+            return false;
+        };
+        self.undo_stack.push(self.capture_snapshot());
+        self.restore_snapshot(next);
         true
     }
 
@@ -130,6 +193,7 @@ impl TextInputField {
     }
 
     pub fn select_all(&mut self) {
+        self.end_coalesce();
         let len = self.char_len();
         if len == 0 {
             self.selection_anchor = None;
@@ -141,6 +205,7 @@ impl TextInputField {
     }
 
     pub fn clear_selection(&mut self) {
+        self.end_coalesce();
         self.selection_anchor = None;
     }
 
@@ -149,6 +214,19 @@ impl TextInputField {
         if norm.is_empty() {
             return;
         }
+        let replacing = self.selected_range().is_some();
+        let single_ascii = !replacing
+            && norm.chars().count() == 1
+            && norm
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii() && !c.is_control() && c != '\n');
+        let kind = if single_ascii {
+            InputCoalesceKind::Insert
+        } else {
+            InputCoalesceKind::None
+        };
+        self.note_edit_boundary(kind);
         self.delete_selection_internal();
         let byte_idx = char_to_byte_idx(&self.text, self.cursor);
         self.text.insert_str(byte_idx, &norm);
@@ -158,10 +236,16 @@ impl TextInputField {
     }
 
     pub fn backspace(&mut self) {
-        if self.delete_selection_internal() {
+        let replacing = self.selected_range().is_some();
+        if !replacing && self.cursor == 0 {
             return;
         }
-        if self.cursor == 0 {
+        self.note_edit_boundary(if replacing {
+            InputCoalesceKind::None
+        } else {
+            InputCoalesceKind::DeleteBack
+        });
+        if self.delete_selection_internal() {
             return;
         }
         let end_b = char_to_byte_idx(&self.text, self.cursor);
@@ -172,11 +256,16 @@ impl TextInputField {
     }
 
     pub fn delete_forward(&mut self) {
-        if self.delete_selection_internal() {
+        let replacing = self.selected_range().is_some();
+        if !replacing && self.cursor >= self.char_len() {
             return;
         }
-        let len = self.char_len();
-        if self.cursor >= len {
+        self.note_edit_boundary(if replacing {
+            InputCoalesceKind::None
+        } else {
+            InputCoalesceKind::DeleteForward
+        });
+        if self.delete_selection_internal() {
             return;
         }
         let start_b = char_to_byte_idx(&self.text, self.cursor);
@@ -186,10 +275,11 @@ impl TextInputField {
     }
 
     pub fn delete_word_backward(&mut self) {
-        if self.delete_selection_internal() {
+        if self.selected_range().is_none() && self.cursor == 0 {
             return;
         }
-        if self.cursor == 0 {
+        self.note_edit_boundary(InputCoalesceKind::None);
+        if self.delete_selection_internal() {
             return;
         }
         let target = self.prev_word_boundary(self.cursor);
@@ -201,11 +291,11 @@ impl TextInputField {
     }
 
     pub fn delete_word_forward(&mut self) {
-        if self.delete_selection_internal() {
+        if self.selected_range().is_none() && self.cursor >= self.char_len() {
             return;
         }
-        let len = self.char_len();
-        if self.cursor >= len {
+        self.note_edit_boundary(InputCoalesceKind::None);
+        if self.delete_selection_internal() {
             return;
         }
         let target = self.next_word_boundary(self.cursor);
@@ -217,11 +307,13 @@ impl TextInputField {
 
     pub fn cut_selected(&mut self) -> Option<String> {
         let text = self.selected_text()?;
+        self.note_edit_boundary(InputCoalesceKind::None);
         self.delete_selection_internal();
         Some(text)
     }
 
     pub fn move_left(&mut self, extend: bool) {
+        self.end_coalesce();
         if !extend {
             if let Some((s, _)) = self.selected_range() {
                 self.cursor = s;
@@ -238,6 +330,7 @@ impl TextInputField {
     }
 
     pub fn move_right(&mut self, extend: bool) {
+        self.end_coalesce();
         let len = self.char_len();
         if !extend {
             if let Some((_, e)) = self.selected_range() {
@@ -255,6 +348,7 @@ impl TextInputField {
     }
 
     pub fn move_word_left(&mut self, extend: bool) {
+        self.end_coalesce();
         if extend && self.selection_anchor.is_none() {
             self.selection_anchor = Some(self.cursor);
         }
@@ -265,6 +359,7 @@ impl TextInputField {
     }
 
     pub fn move_word_right(&mut self, extend: bool) {
+        self.end_coalesce();
         if extend && self.selection_anchor.is_none() {
             self.selection_anchor = Some(self.cursor);
         }
@@ -275,6 +370,7 @@ impl TextInputField {
     }
 
     pub fn move_home(&mut self, extend: bool) {
+        self.end_coalesce();
         if extend && self.selection_anchor.is_none() {
             self.selection_anchor = Some(self.cursor);
         }
@@ -294,6 +390,7 @@ impl TextInputField {
     }
 
     pub fn move_end(&mut self, extend: bool) {
+        self.end_coalesce();
         if extend && self.selection_anchor.is_none() {
             self.selection_anchor = Some(self.cursor);
         }
@@ -320,6 +417,7 @@ impl TextInputField {
         max_width: i32,
         style: FontStyle,
     ) -> bool {
+        self.end_coalesce();
         let segs = self.compute_wrapped_lines(canvas, max_width, style);
         if segs.is_empty() {
             return false;
@@ -344,6 +442,7 @@ impl TextInputField {
     }
 
     pub fn set_cursor_at(&mut self, char_idx: usize, extend: bool) {
+        self.end_coalesce();
         let clamped = char_idx.min(self.char_len());
         if extend {
             if self.selection_anchor.is_none() {
@@ -356,6 +455,7 @@ impl TextInputField {
     }
 
     pub fn select_word_at(&mut self, char_idx: usize) {
+        self.end_coalesce();
         let chars: Vec<char> = self.text.chars().collect();
         if chars.is_empty() {
             self.cursor = 0;
@@ -779,6 +879,73 @@ impl TextInputField {
         ime
     }
 
+    fn capture_snapshot(&self) -> InputEditSnapshot {
+        InputEditSnapshot {
+            text: self.text.clone(),
+            cursor: self.cursor,
+            selection_anchor: self.selection_anchor,
+            scroll_x: self.scroll_x,
+            scroll_y: self.scroll_y,
+            history_cursor: self.history_cursor,
+        }
+    }
+
+    fn restore_snapshot(&mut self, snap: InputEditSnapshot) {
+        self.text = snap.text;
+        let len = self.char_len();
+        self.cursor = snap.cursor.min(len);
+        self.selection_anchor = snap.selection_anchor.map(|a| a.min(len));
+        if self.selection_anchor == Some(self.cursor) {
+            self.selection_anchor = None;
+        }
+        self.scroll_x = snap.scroll_x;
+        self.scroll_y = snap.scroll_y;
+        self.history_cursor = snap.history_cursor;
+        self.coalesce = InputCoalesceKind::None;
+    }
+
+    fn reset_edit_history(&mut self) {
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.coalesce = InputCoalesceKind::None;
+    }
+
+    fn end_coalesce(&mut self) {
+        self.coalesce = InputCoalesceKind::None;
+    }
+
+    fn note_edit_boundary(&mut self, kind: InputCoalesceKind) {
+        let continue_group = kind != InputCoalesceKind::None && self.coalesce == kind;
+        if !continue_group {
+            self.undo_stack.push(self.capture_snapshot());
+            if self.undo_stack.len() > INPUT_UNDO_LIMIT {
+                let drop_n = self.undo_stack.len() - INPUT_UNDO_LIMIT;
+                self.undo_stack.drain(0..drop_n);
+            }
+        }
+        self.redo_stack.clear();
+        self.coalesce = kind;
+    }
+
+    fn replace_text_as_edit(&mut self, s: &str) {
+        let norm = normalize_input(s, self.multiline);
+        let len = norm.chars().count();
+        if self.text == norm
+            && self.cursor == len
+            && self.selection_anchor.is_none()
+            && self.scroll_x == 0
+            && self.scroll_y == 0
+        {
+            return;
+        }
+        self.note_edit_boundary(InputCoalesceKind::None);
+        self.text = norm;
+        self.cursor = len;
+        self.selection_anchor = None;
+        self.scroll_x = 0;
+        self.scroll_y = 0;
+    }
+
     fn delete_selection_internal(&mut self) -> bool {
         let Some((s, e)) = self.selected_range() else {
             return false;
@@ -908,6 +1075,59 @@ mod tests {
         f.select_all();
         f.backspace();
         assert!(f.is_empty());
+    }
+
+    #[test]
+    fn text_input_undo_redo_coalesces_typing() {
+        let mut f = TextInputField::single_line();
+        f.insert_str("a");
+        f.insert_str("b");
+        f.insert_str("c");
+        assert!(f.undo_edit());
+        assert_eq!(f.as_str(), "");
+        assert!(f.redo_edit());
+        assert_eq!(f.as_str(), "abc");
+
+        f.insert_str("你");
+        f.insert_str("好");
+        assert!(f.undo_edit());
+        assert_eq!(f.as_str(), "abc你");
+        assert!(f.undo_edit());
+        assert_eq!(f.as_str(), "abc");
+        assert!(f.redo_edit());
+        assert_eq!(f.as_str(), "abc你");
+        f.undo_edit();
+
+        f.insert_str("xy");
+        f.backspace();
+        f.backspace();
+        assert_eq!(f.as_str(), "abc");
+        assert!(f.undo_edit());
+        assert_eq!(f.as_str(), "abcxy");
+        assert!(f.undo_edit());
+        assert_eq!(f.as_str(), "abc");
+
+        f.insert_str("z");
+        f.move_left(false);
+        f.insert_str("q");
+        assert_eq!(f.as_str(), "abcqz");
+        assert!(f.undo_edit());
+        assert_eq!(f.as_str(), "abcz");
+        assert_eq!(f.cursor, 3);
+        assert!(f.undo_edit());
+        assert_eq!(f.as_str(), "abc");
+
+        f.insert_str("hi");
+        f.set_text("kept");
+        assert!(!f.undo_edit());
+        assert_eq!(f.as_str(), "kept");
+
+        f.insert_str("!");
+        let sent = f.take_and_push_history();
+        assert_eq!(sent, "kept!");
+        assert!(f.is_empty());
+        assert!(f.undo_edit());
+        assert_eq!(f.as_str(), "kept!");
     }
 
     #[test]

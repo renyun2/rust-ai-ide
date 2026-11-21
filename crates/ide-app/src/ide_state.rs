@@ -121,6 +121,19 @@ pub(crate) fn duplicate_open_count<K: PartialEq>(
     }
 }
 
+/// Paths to reopen next launch. Closing the final window keeps the whole set
+/// that was open when the close started, instead of saving an empty session.
+pub(crate) fn session_windows_after_close(
+    open_at_burst_start: &[PathBuf],
+    still_open: &[PathBuf],
+) -> Vec<PathBuf> {
+    if still_open.is_empty() {
+        open_at_burst_start.to_vec()
+    } else {
+        still_open.to_vec()
+    }
+}
+
 #[cfg(target_os = "windows")]
 pub fn pick_folder_windows(initial_dir: Option<&Path>) -> Option<PathBuf> {
     use std::os::windows::ffi::OsStrExt;
@@ -820,6 +833,10 @@ pub enum HitAction {
     SelectAgentSession(usize),
     CloseAgentSession(usize),
     ToggleAgentSessionsPopup,
+    UndoQueuedAgentPrompt(String),
+    EditQueuedAgentPrompt(String),
+    CloseQueuedAgentPrompt(String),
+    SendQueuedAgentPromptNow(String),
     ToggleCodeBlockCollapse(usize, usize),
     ToggleMessageThoughtCollapse(usize),
     ToggleMessageFileChangesCollapse(usize),
@@ -978,6 +995,11 @@ pub struct IdeApplicationState {
     pub editor_scroll_x: i32,
     pub tree_scroll: usize,
     pub agent_scroll: usize,
+    pub agent_session_tab_scroll: usize,
+    pub agent_session_tab_max_scroll: usize,
+    pub agent_session_tab_strip: Rect,
+    agent_session_tab_wheel_px: i32,
+    pub(crate) agent_session_tab_reveal: Option<usize>,
     pub git_changes_scroll: usize,
     pub git_amend_commit: bool,
     pub git_log_scroll: usize,
@@ -1646,6 +1668,11 @@ impl IdeApplicationState {
             editor_scroll_x: 0,
             tree_scroll: 0,
             agent_scroll: usize::MAX,
+            agent_session_tab_scroll: 0,
+            agent_session_tab_max_scroll: 0,
+            agent_session_tab_strip: Rect::new(0, 0, 0, 0),
+            agent_session_tab_wheel_px: 0,
+            agent_session_tab_reveal: None,
             git_changes_scroll: 0,
             git_amend_commit: false,
             git_log_scroll: 0,
@@ -2012,6 +2039,10 @@ impl IdeApplicationState {
             }
         }
         recent.truncate(10);
+        let settings_path = persistence::global_settings_path(dir);
+        let preserved_open_windows = persistence::load_json::<PersistedGlobalSettings>(&settings_path)
+            .map(|gs| gs.open_windows)
+            .unwrap_or_default();
         let gs = PersistedGlobalSettings {
             ui_lang: self.ui_lang,
             ui_scale: self.ui_scale,
@@ -2032,6 +2063,7 @@ impl IdeApplicationState {
             window_maximized: self.window_maximized,
             window_width: win_w,
             window_height: win_h,
+            open_windows: preserved_open_windows,
             attach_active_context: self.attach_active_context,
             agent_mode: self.agent_mode,
             active_provider: self.agent_hub.active_provider,
@@ -2039,7 +2071,7 @@ impl IdeApplicationState {
             ai_api_config: Some(self.agent_hub.api_config.clone()),
             mobile_sdk: self.mobile_sdk.clone(),
         };
-        persistence::save_json(&persistence::global_settings_path(dir), &gs);
+        persistence::save_json(&settings_path, &gs);
     }
 
     pub fn save_workspace_state(&self) {
@@ -3136,6 +3168,9 @@ impl IdeApplicationState {
                 self.close_tab(idx);
             }
             IdeAction::UndoEdit => {
+                if self.apply_focused_input_undo(false) {
+                    return;
+                }
                 if self.abort_without_open_file() {
                     return;
                 }
@@ -3146,6 +3181,9 @@ impl IdeApplicationState {
                     .to_string();
             }
             IdeAction::RedoEdit => {
+                if self.apply_focused_input_undo(true) {
+                    return;
+                }
                 if self.abort_without_open_file() {
                     return;
                 }
@@ -4696,8 +4734,24 @@ impl IdeApplicationState {
             None
         };
         self.expanded_composer_snippet_id = None;
+        if self.agent_hub.is_active_session_busy() {
+            self.agent_hub
+                .enqueue_active_prompt(prompt, self.agent_mode);
+            self.reveal_active_session_tab();
+            self.right_agent_open = true;
+            self.right_panel_tab = RightPanelTab::Chat;
+            self.agent_chat_signature_salt = self.agent_chat_signature_salt.wrapping_add(1);
+            self.status_notification = self
+                .tr(
+                    "当前会话正在处理，消息已进入等待区",
+                    "Session is busy. Message queued in the waiting area",
+                )
+                .to_string();
+            return;
+        }
         self.agent_hub
             .submit_workbench_prompt(&prompt, self.agent_mode, ctx.as_ref());
+        self.reveal_active_session_tab();
         self.agent_busy_started_at = if self.agent_hub.is_active_session_busy() {
             Some(Instant::now())
         } else {
@@ -4733,6 +4787,7 @@ impl IdeApplicationState {
         self.right_agent_open = true;
         self.right_panel_tab = RightPanelTab::Chat;
         self.agent_scroll = 0;
+        self.reveal_active_session_tab();
         self.agent_chat_signature_salt = self.agent_chat_signature_salt.wrapping_add(1);
         self.focus = FocusTarget::AgentChatInput;
         self.touch_caret_activity();
@@ -4769,6 +4824,7 @@ impl IdeApplicationState {
                 None
             };
             self.agent_scroll = usize::MAX;
+            self.reveal_active_session_tab();
             self.agent_chat_signature_salt = self.agent_chat_signature_salt.wrapping_add(1);
             self.focus = FocusTarget::AgentChatInput;
             self.touch_caret_activity();
@@ -4795,9 +4851,94 @@ impl IdeApplicationState {
                 None
             };
             self.agent_scroll = usize::MAX;
+            self.reveal_active_session_tab();
             self.agent_chat_signature_salt = self.agent_chat_signature_salt.wrapping_add(1);
             self.status_notification = format!("已关闭会话 · 当前: {title}");
         }
+    }
+
+    fn reveal_active_session_tab(&mut self) {
+        self.agent_session_tab_reveal = Some(self.agent_hub.active_session_idx);
+    }
+
+    fn restore_queued_prompt_to_input(&mut self, text: &str, replace: bool) {
+        let current = self.agent_chat_input.as_str().trim().to_string();
+        if replace || current.is_empty() {
+            self.agent_chat_input.set_text(text);
+        } else {
+            self.agent_chat_input
+                .set_text(&format!("{text}\n{current}"));
+        }
+        self.agent_hub.active_session_mut().draft_prompt = self.agent_chat_input.as_str().to_string();
+        self.focus = FocusTarget::AgentChatInput;
+        self.touch_caret_activity();
+    }
+
+    fn send_queued_prompt_now(&mut self, id: &str) {
+        let Some(item) = self.agent_hub.take_queued_prompt(id) else {
+            return;
+        };
+        if self.agent_hub.is_active_session_busy() {
+            self.agent_hub.cancel_active_request();
+            self.agent_busy_started_at = None;
+        }
+        let ctx = if self.attach_active_context {
+            self.build_active_ide_code_context()
+        } else {
+            None
+        };
+        self.agent_hub
+            .submit_workbench_prompt(&item.text, item.mode, ctx.as_ref());
+        self.reveal_active_session_tab();
+        self.agent_busy_started_at = if self.agent_hub.is_active_session_busy() {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        self.agent_mode = item.mode;
+        self.right_agent_open = true;
+        self.right_panel_tab = RightPanelTab::Chat;
+        self.agent_scroll = usize::MAX;
+        self.agent_chat_signature_salt = self.agent_chat_signature_salt.wrapping_add(1);
+        self.status_notification = self
+            .tr(
+                "已中断当前会话并立即发送等待中的消息",
+                "Interrupted the current turn and sent the queued message",
+            )
+            .to_string();
+    }
+
+    fn pump_agent_wait_queue(&mut self) {
+        if self.agent_hub.is_active_session_busy()
+            || self.agent_hub.active_session().queued_prompts.is_empty()
+        {
+            return;
+        }
+        let Some(item) = self.agent_hub.pop_next_queued_prompt() else {
+            return;
+        };
+        let ctx = if self.attach_active_context {
+            self.build_active_ide_code_context()
+        } else {
+            None
+        };
+        self.agent_mode = self.agent_hub.normalize_mode_for_active(item.mode);
+        self.agent_hub
+            .submit_workbench_prompt(&item.text, self.agent_mode, ctx.as_ref());
+        self.reveal_active_session_tab();
+        self.agent_busy_started_at = if self.agent_hub.is_active_session_busy() {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        self.agent_scroll = usize::MAX;
+        self.agent_chat_signature_salt = self.agent_chat_signature_salt.wrapping_add(1);
+        self.status_notification = self
+            .tr(
+                "等待区的下一条消息已开始发送",
+                "Sending the next queued message",
+            )
+            .to_string();
     }
 
     pub fn get_or_load_image_preview(&mut self, path: &Path) -> Option<Arc<DecodedPreviewImage>> {
@@ -5610,6 +5751,11 @@ impl IdeApplicationState {
             self.agent_scroll = usize::MAX;
             changed = true;
         }
+        let queued_before = self.agent_hub.active_session().queued_prompts.len();
+        if queued_before > 0 && !self.agent_hub.is_active_session_busy() {
+            self.pump_agent_wait_queue();
+            changed = true;
+        }
         let mobile_report = self
             .mobile_probe_rx
             .as_ref()
@@ -5841,6 +5987,32 @@ impl IdeApplicationState {
             }
             _ => {}
         }
+    }
+
+    /// 焦点在任意输入框时，Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y 只作用于该输入框。
+    fn apply_focused_input_undo(&mut self, redo: bool) -> bool {
+        if self.active_text_input().is_none() {
+            return false;
+        }
+        let changed = if let Some(field) = self.active_text_input_mut() {
+            if redo {
+                field.redo_edit()
+            } else {
+                field.undo_edit()
+            }
+        } else {
+            false
+        };
+        if changed {
+            self.on_active_input_mutated();
+            self.status_notification = if redo {
+                self.tr("已重做输入", "Redid input").to_string()
+            } else {
+                self.tr("已撤销输入", "Undid input").to_string()
+            };
+        }
+        self.touch_caret_activity();
+        true
     }
 
     /// 统一处理输入法提交文本 (`ReceivedImeText`) 与普通字符/空格输入，确保中文拼音/搜狗/微软输入法在所有焦点控件中稳定工作
@@ -6533,6 +6705,31 @@ impl IdeApplicationState {
                     self.tree_scroll = (self.tree_scroll + lines_delta as usize).min(max_t);
                 }
             }
+        } else if self.agent_session_tab_strip.w > 0
+            && self.agent_session_tab_strip.contains(x, y)
+        {
+            let tab_delta = if horiz_px_delta != 0 {
+                self.agent_session_tab_wheel_px += horiz_px_delta;
+                let step = self.agent_session_tab_wheel_px / 36;
+                if step != 0 {
+                    self.agent_session_tab_wheel_px -= step * 36;
+                }
+                step
+            } else {
+                self.agent_session_tab_wheel_px = 0;
+                lines_delta
+            };
+            if tab_delta < 0 {
+                self.agent_session_tab_scroll = self
+                    .agent_session_tab_scroll
+                    .saturating_sub((-tab_delta) as usize);
+            } else if tab_delta > 0 {
+                self.agent_session_tab_scroll = (self.agent_session_tab_scroll
+                    + tab_delta as usize)
+                    .min(self.agent_session_tab_max_scroll);
+            }
+            self.agent_session_tab_reveal = None;
+            return;
         } else if self.right_agent_open && self.right_pane_rect.contains(x, y) {
             let max_r = self
                 .right_scroll_info
@@ -7953,6 +8150,36 @@ impl IdeApplicationState {
             }
             HitAction::CloseAgentSession(idx) => {
                 self.close_agent_session(idx);
+            }
+            HitAction::UndoQueuedAgentPrompt(id) => {
+                if let Some(item) = self.agent_hub.take_queued_prompt(&id) {
+                    self.restore_queued_prompt_to_input(&item.text, false);
+                    self.agent_chat_signature_salt = self.agent_chat_signature_salt.wrapping_add(1);
+                    self.status_notification = self
+                        .tr("已撤销等待中的消息", "Undid the queued message")
+                        .to_string();
+                }
+            }
+            HitAction::EditQueuedAgentPrompt(id) => {
+                if let Some(item) = self.agent_hub.take_queued_prompt(&id) {
+                    self.restore_queued_prompt_to_input(&item.text, true);
+                    self.agent_mode = item.mode;
+                    self.agent_chat_signature_salt = self.agent_chat_signature_salt.wrapping_add(1);
+                    self.status_notification = self
+                        .tr("已退回输入框，可继续编辑", "Returned to the input for editing")
+                        .to_string();
+                }
+            }
+            HitAction::CloseQueuedAgentPrompt(id) => {
+                if self.agent_hub.take_queued_prompt(&id).is_some() {
+                    self.agent_chat_signature_salt = self.agent_chat_signature_salt.wrapping_add(1);
+                    self.status_notification = self
+                        .tr("已关闭等待中的消息", "Closed the queued message")
+                        .to_string();
+                }
+            }
+            HitAction::SendQueuedAgentPromptNow(id) => {
+                self.send_queued_prompt_now(&id);
             }
             HitAction::ToggleAgentSessionsPopup => {
                 self.agent_sessions_popup_open = !self.agent_sessions_popup_open;
@@ -15527,7 +15754,7 @@ impl IdeApplicationState {
         let cfgs = self.run_configs.clone();
         let max_visible = 9usize;
         let total = cfgs.len();
-        let visible_rows = total.clamp(1, max_visible);
+        let visible_rows = total.min(max_visible);
         let max_scroll = total.saturating_sub(max_visible);
         if self.run_config_popup_scroll > max_scroll {
             self.run_config_popup_scroll = max_scroll;
@@ -15536,9 +15763,13 @@ impl IdeApplicationState {
 
         let active_path = self.active_buffer().path.clone();
         let can_run_current_file = RunConfiguration::for_file(&active_path, &self.workspace_root).is_some();
-        let footer_h = if can_run_current_file { 132 } else { 104 };
+        let header_h = 32;
+        let list_h = (visible_rows as i32) * 40;
+        let divider_h = 7;
+        let footer_rows = if can_run_current_file { 4 } else { 3 };
+        let footer_h = divider_h + footer_rows * 28 + 6;
         let popup_w = 378;
-        let popup_h = (visible_rows as i32) * 40 + footer_h;
+        let popup_h = header_h + list_h + footer_h;
         let popup_x = (win_w - 490).clamp(180, win_w - popup_w - 8);
         let popup_y = 40;
         let popup_rect = Rect::new(popup_x, popup_y, popup_w, popup_h);
@@ -15562,8 +15793,7 @@ impl IdeApplicationState {
             FontStyle::UiBold,
         );
 
-        let list_top = popup_y + 32;
-        let list_h = (visible_rows as i32) * 40;
+        let list_top = popup_y + header_h;
         let has_scrollbar = total > max_visible;
         let row_w = if has_scrollbar { popup_w - 20 } else { popup_w - 12 };
 
@@ -15729,7 +15959,7 @@ impl IdeApplicationState {
             } else {
                 t.text_primary
             },
-            popup_w - 36,
+            popup_w - 40,
             FontStyle::UiRegular,
         );
         self.hit_regions.push((run_row, HitAction::RunActiveConfig));
@@ -15750,7 +15980,7 @@ impl IdeApplicationState {
                 canvas.fill_rounded_rect(file_row, 5, t.popup_hover_bg);
             }
             canvas.draw_path_file_icon(file_row.x + 6, y + 5, &active_path);
-            canvas.draw_text_styled(
+            canvas.draw_text_ellipsis(
                 file_row.x + 26,
                 y + 4,
                 &file_label,
@@ -15759,7 +15989,7 @@ impl IdeApplicationState {
                 } else {
                     t.text_primary
                 },
-                popup_w - 36,
+                popup_w - 40,
                 FontStyle::UiRegular,
             );
             self.hit_regions
@@ -15792,7 +16022,7 @@ impl IdeApplicationState {
             } else {
                 t.text_primary
             },
-            popup_w - 36,
+            popup_w - 40,
             FontStyle::UiRegular,
         );
         self.hit_regions
@@ -15817,7 +16047,7 @@ impl IdeApplicationState {
             } else {
                 t.text_primary
             },
-            popup_w - 36,
+            popup_w - 40,
             FontStyle::UiRegular,
         );
         self.hit_regions
@@ -21276,6 +21506,23 @@ mod tests {
         assert!(state.window_attention_until.is_some());
         assert!(state.has_active_animations());
 
+        let open_set = vec![
+            clean_workspace_path(root1.clone()),
+            clean_workspace_path(root2.clone()),
+        ];
+        assert_eq!(session_windows_after_close(&open_set, &[]), open_set);
+        assert_eq!(
+            session_windows_after_close(&open_set, &open_set[1..]),
+            open_set[1..].to_vec()
+        );
+        state.persistence_dir = Some(root1.clone());
+        persistence::store_open_windows(&root1, &open_set);
+        state.save_global_settings();
+        let saved: persistence::PersistedGlobalSettings =
+            persistence::load_json(&persistence::global_settings_path(&root1))
+                .expect("session windows saved");
+        assert_eq!(saved.open_windows, open_set);
+
         // Image preview cache should stay bounded (<= 24) and trim when minimized
         for i in 0..30usize {
             let fake = DecodedPreviewImage {
@@ -21358,6 +21605,79 @@ mod tests {
 
         state.toggle_run_config_execution(build_idx);
         assert!(!state.is_run_config_running(build_idx));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_run_config_popup_card_contains_all_footer_rows() {
+        let unique = format!(
+            "rust_ai_ide_run_popup_bounds_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let root = std::env::temp_dir().join(&unique);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{ "scripts": { "dev": "vite", "build": "vite build" } }"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("readme.md"), "# demo\n").unwrap();
+        std::fs::write(root.join("script.py"), "print('hi')\n").unwrap();
+
+        let mut state = IdeApplicationState::new(root.clone());
+        state.open_file(root.join("readme.md"));
+        state.run_config_popup_open = true;
+
+        let mut canvas = SurfaceCanvas::new(1440, 900);
+        // Case 1: without runnable current file (active buffer is readme.md)
+        state.render(&mut canvas);
+        let card = state.run_config_popup_rect;
+        let dbg_rect = state
+            .hit_regions
+            .iter()
+            .rev()
+            .find_map(|(r, a)| matches!(a, HitAction::DebugActiveConfig).then_some(*r))
+            .expect("debug row hit region");
+        assert!(dbg_rect.x >= card.x + 6);
+        assert!(dbg_rect.x + dbg_rect.w <= card.x + card.w - 6);
+        assert!(dbg_rect.y + dbg_rect.h <= card.y + card.h - 6);
+
+        // Case 2: with runnable current file (script.py)
+        state.open_file(root.join("script.py"));
+        state.run_config_popup_open = true;
+        state.render(&mut canvas);
+        let card_with_file = state.run_config_popup_rect;
+        assert_eq!(card_with_file.h, card.h + 28);
+        for action_check in [
+            state
+                .hit_regions
+                .iter()
+                .rev()
+                .find_map(|(r, a)| matches!(a, HitAction::RunActiveConfig).then_some(*r)),
+            state.hit_regions.iter().rev().find_map(|(r, a)| {
+                matches!(a, HitAction::ExecuteIdeAction(IdeAction::RunCurrentFile)).then_some(*r)
+            }),
+            state
+                .hit_regions
+                .iter()
+                .rev()
+                .find_map(|(r, a)| matches!(a, HitAction::OpenNewRunConfigModal).then_some(*r)),
+            state
+                .hit_regions
+                .iter()
+                .rev()
+                .find_map(|(r, a)| matches!(a, HitAction::DebugActiveConfig).then_some(*r)),
+        ] {
+            let r = action_check.expect("footer row hit region");
+            assert!(r.x >= card_with_file.x + 6);
+            assert!(r.x + r.w <= card_with_file.x + card_with_file.w - 6);
+            assert!(r.y >= card_with_file.y + 32);
+            assert!(r.y + r.h <= card_with_file.y + card_with_file.h - 6);
+        }
 
         let _ = std::fs::remove_dir_all(&root);
     }

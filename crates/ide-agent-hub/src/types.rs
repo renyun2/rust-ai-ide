@@ -553,6 +553,10 @@ pub struct AgentSession {
     #[serde(default)]
     pub cli_session_id: Option<String>,
     #[serde(default)]
+    pub cli_session_mode: Option<AgentWorkbenchMode>,
+    #[serde(default)]
+    pub cli_session_provider: Option<AgentProviderKind>,
+    #[serde(default)]
     pub pending_fork_session: bool,
     #[serde(default)]
     pub changed_files: Vec<SessionFileChange>,

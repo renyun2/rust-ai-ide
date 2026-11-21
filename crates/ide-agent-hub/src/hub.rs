@@ -93,6 +93,8 @@ struct CliTurnSyncUpdate {
     session_id: String,
     user_msg_idx: usize,
     cli_session_id: Option<String>,
+    turn_mode: AgentWorkbenchMode,
+    provider_kind: AgentProviderKind,
     checkpoint_backups: HashMap<PathBuf, Option<String>>,
     file_diff_stats: HashMap<PathBuf, (usize, usize)>,
 }
@@ -214,6 +216,8 @@ impl AgentHub {
             last_user_sent_ms: unix_ms(),
             queued_prompts: Vec::new(),
             cli_session_id: None,
+            cli_session_mode: None,
+            cli_session_provider: None,
             pending_fork_session: false,
             changed_files: Vec::new(),
             turn_anchors: Vec::new(),
@@ -743,6 +747,8 @@ impl AgentHub {
             last_user_sent_ms: unix_ms(),
             queued_prompts: Vec::new(),
             cli_session_id: None,
+            cli_session_mode: None,
+            cli_session_provider: None,
             pending_fork_session: false,
             changed_files: Vec::new(),
             turn_anchors: Vec::new(),
@@ -835,6 +841,12 @@ impl AgentHub {
             s.draft_prompt.clear();
             s.is_busy = false;
             s.queued_prompts.clear();
+            s.cli_session_id = None;
+            s.cli_session_mode = None;
+            s.cli_session_provider = None;
+            s.pending_fork_session = false;
+            s.changed_files.clear();
+            s.turn_anchors.clear();
             s.last_user_sent_ms = unix_ms();
             s.created_order = seq;
             self.save_history();
@@ -1184,6 +1196,8 @@ impl AgentHub {
         if let Some(sess) = self.sessions.iter_mut().find(|s| s.id == sync.session_id) {
             if let Some(sid) = sync.cli_session_id {
                 sess.cli_session_id = Some(sid);
+                sess.cli_session_mode = Some(sync.turn_mode);
+                sess.cli_session_provider = Some(sync.provider_kind);
             }
             if let Some(cid) = ckpt_id {
                 if let Some(anchor) = sess
@@ -1398,10 +1412,14 @@ impl AgentHub {
         sess.turn_anchors.retain(|a| a.user_msg_idx < user_msg_idx);
         if effective == AgentProviderKind::ClaudeCodeCli {
             sess.cli_session_id = pre_turn_sid.clone();
+            sess.cli_session_mode = None;
+            sess.cli_session_provider = pre_turn_sid.as_ref().map(|_| effective);
             sess.pending_fork_session = pre_turn_sid.is_some();
         } else {
             // Cursor CLI 等无独立 --fork 参数的客户端：开启与回退后消息栈一致的同步新会话
             sess.cli_session_id = None;
+            sess.cli_session_mode = None;
+            sess.cli_session_provider = None;
             sess.pending_fork_session = false;
         }
 
@@ -1493,7 +1511,7 @@ impl AgentHub {
         user_prompt: &str,
     ) -> &InlineEditSession {
         let prompt_trimmed = user_prompt.trim();
-        let backend = self.resolve_execution_backend(AgentWorkbenchMode::Ask);
+        let backend = self.resolve_execution_backend_for(AgentWorkbenchMode::Ask, false);
         if prompt_trimmed.is_empty() {
             let mut s = InlineEditSession::pending(
                 file_path,
@@ -1619,7 +1637,7 @@ impl AgentHub {
     }
 
     pub fn request_ai_commit_message(&mut self, diff_text: String, changed_files: Vec<String>) {
-        let backend = self.resolve_execution_backend(AgentWorkbenchMode::Ask);
+        let backend = self.resolve_execution_backend_for(AgentWorkbenchMode::Ask, false);
         if matches!(backend, ExecutionBackend::LocalOffline) {
             *self.async_commit_msg.lock() = Some(Err(
                 "未检测到可用的本地 AI CLI（cursor-agent / agy / claude / codex），请点击右上角 ↻ 刷新 CLI 状态"
@@ -1686,13 +1704,47 @@ impl AgentHub {
         });
     }
 
-    fn resolve_execution_backend(&self, mode: AgentWorkbenchMode) -> ExecutionBackend {
+    /// Cursor CLI 在 `--resume` 时会沿用会话库里上一次持久化的 mode（如 `ask`/`plan`），
+    /// 且 CLI 自身没有 `--mode agent` 参数将其切回。因此当需要以非 Ask 模式执行 Cursor CLI，
+    /// 而现有 `cli_session_id` 曾处于 Ask（或旧版未记录模式）或属于其他 CLI 时，需重置以开启干净会话。
+    fn should_reset_cli_session_for_turn(
+        kind: AgentProviderKind,
+        sess: &AgentSession,
+        target_mode: AgentWorkbenchMode,
+    ) -> bool {
+        if sess.cli_session_id.is_none() {
+            return false;
+        }
+        if sess.cli_session_provider.is_some_and(|p| p != kind) {
+            return true;
+        }
+        if matches!(
+            kind,
+            AgentProviderKind::CursorCli | AgentProviderKind::CursorInlineEngine
+        ) && target_mode != AgentWorkbenchMode::Ask
+        {
+            return !matches!(
+                sess.cli_session_mode,
+                Some(AgentWorkbenchMode::Agent | AgentWorkbenchMode::Edit)
+            );
+        }
+        false
+    }
+
+    fn resolve_execution_backend_for(
+        &self,
+        mode: AgentWorkbenchMode,
+        allow_session_resume: bool,
+    ) -> ExecutionBackend {
         let target = self.effective_provider_kind();
         let active_sess = self.active_session();
         let make_params = |kind: AgentProviderKind| -> Option<CliRunParams> {
             let reg = self.providers.iter().find(|p| p.kind == kind)?;
             let bin = reg.binary_path.clone()?;
-            let use_resume = kind == target && reg.supports_session_resume;
+            let use_resume = allow_session_resume
+                && kind == target
+                && reg.supports_session_resume
+                && !Self::should_reset_cli_session_for_turn(kind, active_sess, mode);
             Some(CliRunParams {
                 kind,
                 bin,
@@ -1879,8 +1931,24 @@ impl AgentHub {
             return;
         }
 
+        let effective_kind = self.effective_provider_kind();
+        if Self::should_reset_cli_session_for_turn(effective_kind, self.active_session(), mode) {
+            let sess = self.active_session_mut();
+            sess.cli_session_id = None;
+            sess.cli_session_mode = None;
+            sess.cli_session_provider = None;
+            sess.pending_fork_session = false;
+            if let Some(anchor) = sess
+                .turn_anchors
+                .iter_mut()
+                .find(|a| a.user_msg_idx == user_msg_idx)
+            {
+                anchor.pre_turn_cli_session_id = None;
+            }
+        }
+
         let target_session_id = self.active_session().id.clone();
-        match self.resolve_execution_backend(mode) {
+        match self.resolve_execution_backend_for(mode, true) {
             ExecutionBackend::Cli(params) => {
                 self.active_session_mut().pending_fork_session = false;
                 self.dispatch_cli_async(
@@ -2237,6 +2305,8 @@ impl AgentHub {
                         session_id: target_session_id.clone(),
                         user_msg_idx,
                         cli_session_id: None,
+                        turn_mode: AgentWorkbenchMode::Agent,
+                        provider_kind: provider,
                         checkpoint_backups: ckpt_backups.clone(),
                         file_diff_stats,
                     });
@@ -2372,6 +2442,8 @@ impl AgentHub {
                         session_id: target_session_id.clone(),
                         user_msg_idx,
                         cli_session_id: None,
+                        turn_mode: mode,
+                        provider_kind: provider,
                         checkpoint_backups,
                         file_diff_stats,
                     });
@@ -2450,6 +2522,8 @@ impl AgentHub {
             cb();
         }
 
+        let params_mode = params.mode;
+        let params_kind = params.kind;
         thread::spawn(move || {
             let run_res = execute_cli_once(
                 &params,
@@ -2473,6 +2547,8 @@ impl AgentHub {
                             session_id: target_session_id.clone(),
                             user_msg_idx,
                             cli_session_id: out.cli_session_id,
+                            turn_mode: params_mode,
+                            provider_kind: params_kind,
                             checkpoint_backups: out.checkpoint_backups,
                             file_diff_stats: out.file_diff_stats,
                         });
@@ -3053,6 +3129,8 @@ mod tests {
                 session_id: sid.clone(),
                 user_msg_idx: 2,
                 cli_session_id: Some("claude-sid-turn-2".to_string()),
+                turn_mode: AgentWorkbenchMode::Agent,
+                provider_kind: AgentProviderKind::ClaudeCodeCli,
                 checkpoint_backups: backups,
                 file_diff_stats: stats,
             },
@@ -3327,5 +3405,105 @@ mod tests {
         let taken = hub.take_queued_prompt(&qid).unwrap();
         assert_eq!(taken.text, "稍后发送");
         assert!(hub.pop_next_queued_prompt().is_none());
+    }
+
+    #[test]
+    fn cursor_cli_resets_ask_or_legacy_session_on_agent_mode_and_stateless_helpers_never_resume() {
+        let mut hub = AgentHub::new(Path::new("."));
+        hub.active_provider = AgentProviderKind::CursorCli;
+        if let Some(reg) = hub
+            .providers
+            .iter_mut()
+            .find(|p| p.kind == AgentProviderKind::CursorCli)
+        {
+            reg.binary_path = Some(PathBuf::from("cursor-agent"));
+            reg.available = true;
+            reg.supports_session_resume = true;
+        }
+
+        let sid = hub.active_session().id.clone();
+
+        // 1. Cursor session running in Agent mode records cli_session_mode = Agent and resumes normally
+        hub.apply_cli_turn_sync_update(
+            CliTurnSyncUpdate {
+                session_id: sid.clone(),
+                user_msg_idx: 0,
+                cli_session_id: Some("cursor-agent-sid".to_string()),
+                turn_mode: AgentWorkbenchMode::Agent,
+                provider_kind: AgentProviderKind::CursorCli,
+                checkpoint_backups: HashMap::new(),
+                file_diff_stats: HashMap::new(),
+            },
+            &sid,
+        );
+        match hub.resolve_execution_backend_for(AgentWorkbenchMode::Agent, true) {
+            ExecutionBackend::Cli(p) => {
+                assert_eq!(p.resume_session_id.as_deref(), Some("cursor-agent-sid"));
+                assert_eq!(p.mode, AgentWorkbenchMode::Agent);
+            }
+            _ => panic!("expected CLI backend"),
+        }
+
+        // 2. Stateless Ask helpers (Ctrl+K / AI commit message) MUST NOT resume active chat session
+        match hub.resolve_execution_backend_for(AgentWorkbenchMode::Ask, false) {
+            ExecutionBackend::Cli(p) => {
+                assert_eq!(p.resume_session_id, None);
+                assert_eq!(p.mode, AgentWorkbenchMode::Ask);
+            }
+            _ => panic!("expected CLI backend"),
+        }
+
+        // 3. After an Ask turn, Cursor's store.db persists Ask mode, so switching back to Agent MUST reset cli_session_id
+        hub.apply_cli_turn_sync_update(
+            CliTurnSyncUpdate {
+                session_id: sid.clone(),
+                user_msg_idx: 1,
+                cli_session_id: Some("cursor-ask-tainted-sid".to_string()),
+                turn_mode: AgentWorkbenchMode::Ask,
+                provider_kind: AgentProviderKind::CursorCli,
+                checkpoint_backups: HashMap::new(),
+                file_diff_stats: HashMap::new(),
+            },
+            &sid,
+        );
+        // Staying in Ask mode can still resume
+        match hub.resolve_execution_backend_for(AgentWorkbenchMode::Ask, true) {
+            ExecutionBackend::Cli(p) => {
+                assert_eq!(p.resume_session_id.as_deref(), Some("cursor-ask-tainted-sid"));
+            }
+            _ => panic!("expected CLI backend"),
+        }
+        // Switching to Agent mode refuses to resume the Ask-tainted Cursor session
+        match hub.resolve_execution_backend_for(AgentWorkbenchMode::Agent, true) {
+            ExecutionBackend::Cli(p) => {
+                assert_eq!(p.resume_session_id, None);
+                assert_eq!(p.mode, AgentWorkbenchMode::Agent);
+            }
+            _ => panic!("expected CLI backend"),
+        }
+
+        // 4. Legacy persisted session (cli_session_id present, cli_session_mode == None) also resets once for Agent mode
+        {
+            let sess = hub.active_session_mut();
+            sess.cli_session_id = Some("legacy-unknown-mode-sid".to_string());
+            sess.cli_session_mode = None;
+            sess.cli_session_provider = None;
+        }
+        match hub.resolve_execution_backend_for(AgentWorkbenchMode::Agent, true) {
+            ExecutionBackend::Cli(p) => assert_eq!(p.resume_session_id, None),
+            _ => panic!("expected CLI backend"),
+        }
+
+        // 5. Provider mismatch also refuses to pass another CLI's session id to Cursor
+        {
+            let sess = hub.active_session_mut();
+            sess.cli_session_id = Some("claude-sid".to_string());
+            sess.cli_session_mode = Some(AgentWorkbenchMode::Agent);
+            sess.cli_session_provider = Some(AgentProviderKind::ClaudeCodeCli);
+        }
+        match hub.resolve_execution_backend_for(AgentWorkbenchMode::Agent, true) {
+            ExecutionBackend::Cli(p) => assert_eq!(p.resume_session_id, None),
+            _ => panic!("expected CLI backend"),
+        }
     }
 }

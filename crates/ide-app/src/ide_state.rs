@@ -1220,6 +1220,8 @@ pub struct IdeApplicationState {
     pub is_indexing_workspace: Arc<AtomicBool>,
     pub anim_start: Instant,
     pub last_anim_tick: Instant,
+    pub startup_anim_started_at: Option<Instant>,
+    pub startup_anim_alpha: f32,
     pub startup_loading_until: Instant,
     pub startup_load_alpha: f32,
     pub git_load_alpha: f32,
@@ -1899,8 +1901,10 @@ impl IdeApplicationState {
             is_indexing_workspace,
             anim_start: now,
             last_anim_tick: now,
+            startup_anim_started_at: if wakeup_enabled { Some(now) } else { None },
+            startup_anim_alpha: if wakeup_enabled { 1.0 } else { 0.0 },
             startup_loading_until: if wakeup_enabled {
-                now + Duration::from_millis(650)
+                now + Duration::from_millis(750)
             } else {
                 now
             },
@@ -2485,6 +2489,33 @@ impl IdeApplicationState {
     }
 
     #[inline]
+    pub fn restart_startup_animation(&mut self) {
+        let now = Instant::now();
+        self.anim_start = now;
+        self.last_anim_tick = now;
+        if self.wakeup_enabled {
+            self.startup_anim_started_at = Some(now);
+            self.startup_anim_alpha = 1.0;
+            self.startup_loading_until = now + Duration::from_millis(750);
+            self.startup_load_alpha = 0.85;
+            self.git_load_alpha = 0.85;
+            self.tree_load_alpha = 0.85;
+        }
+    }
+
+    #[inline]
+    pub fn dismiss_startup_animation(&mut self) {
+        const STARTUP_HOLD_SECS: f32 = 0.42;
+        if let Some(started) = self.startup_anim_started_at {
+            let now = Instant::now();
+            if now.saturating_duration_since(started).as_secs_f32() < STARTUP_HOLD_SECS {
+                self.startup_anim_started_at =
+                    Some(now - Duration::from_secs_f32(STARTUP_HOLD_SECS));
+            }
+        }
+    }
+
+    #[inline]
     pub fn has_active_animations(&self) -> bool {
         let now = Instant::now();
         let startup_busy = self.wakeup_enabled
@@ -2498,7 +2529,9 @@ impl IdeApplicationState {
         let attention = self
             .window_attention_until
             .is_some_and(|until| now < until);
-        startup_busy
+        self.startup_anim_started_at.is_some()
+            || self.startup_anim_alpha > 0.01
+            || startup_busy
             || git_busy
             || search_busy
             || agent_busy
@@ -2509,12 +2542,32 @@ impl IdeApplicationState {
     }
 
     pub fn step_animations(&mut self) -> bool {
+        const STARTUP_HOLD_SECS: f32 = 0.42;
+        const STARTUP_FADE_SECS: f32 = 0.34;
+        const STARTUP_TOTAL_SECS: f32 = STARTUP_HOLD_SECS + STARTUP_FADE_SECS;
+
         let now = Instant::now();
         let dt = now
             .duration_since(self.last_anim_tick)
             .as_secs_f32()
             .clamp(0.001, 0.05);
         self.last_anim_tick = now;
+
+        if let Some(started) = self.startup_anim_started_at {
+            let elapsed = now.saturating_duration_since(started).as_secs_f32();
+            if elapsed >= STARTUP_TOTAL_SECS {
+                self.startup_anim_started_at = None;
+                self.startup_anim_alpha = 0.0;
+            } else if elapsed <= STARTUP_HOLD_SECS {
+                self.startup_anim_alpha = 1.0;
+            } else {
+                let t = ((elapsed - STARTUP_HOLD_SECS) / STARTUP_FADE_SECS).clamp(0.0, 1.0);
+                let smoothstep = t * t * (3.0 - 2.0 * t);
+                self.startup_anim_alpha = (1.0 - smoothstep).clamp(0.0, 1.0);
+            }
+        } else {
+            self.startup_anim_alpha = 0.0;
+        }
 
         let startup_target = if self.wakeup_enabled
             && (now < self.startup_loading_until
@@ -10021,7 +10074,104 @@ impl IdeApplicationState {
         if !self.window_maximized {
             canvas.stroke_rect_border(Rect::new(0, 0, w, h), t.border_color);
         }
+        self.render_startup_animation_overlay(canvas, w, h);
         self.render_window_attention_flash(canvas, w, h);
+    }
+
+    fn render_startup_animation_overlay(&self, canvas: &mut SurfaceCanvas, w: i32, h: i32) {
+        if self.startup_anim_alpha <= 0.01 {
+            return;
+        }
+        let t = self.theme;
+        let a = self.startup_anim_alpha.clamp(0.0, 1.0);
+        let elapsed = self
+            .startup_anim_started_at
+            .map(|s| Instant::now().saturating_duration_since(s).as_secs_f32())
+            .unwrap_or(0.5);
+        let enter_t = (elapsed / 0.24).clamp(0.0, 1.0);
+        let enter_ease = 1.0 - (1.0 - enter_t).powi(3);
+        let content_alpha = a * enter_ease;
+
+        // 1. Islands 深色柔和过渡遮罩（在已加载完毕的工作区上方淡出，不遮挡也不会白屏）
+        let veil_alpha = (a * 226.0).round() as u8;
+        canvas.fill_rect_alpha(Rect::new(0, 0, w, h), t.window_bg, veil_alpha);
+
+        // 2. 居中的 Islands 启动品牌卡片（带入场微位移、RI 徽标缩放淡入与进度扫光）
+        let card_w = 340.min((w - 32).max(200));
+        let card_h = 168;
+        let slide_y = ((1.0 - enter_ease) * 10.0).round() as i32;
+        let card = Rect::new(
+            (w - card_w) / 2,
+            ((h - card_h) / 2 + slide_y).max(16),
+            card_w,
+            card_h,
+        );
+
+        canvas.fill_rounded_rect_alpha(
+            Rect::new(card.x - 2, card.y + 4, card.w + 4, card.h + 4),
+            16,
+            0x000000,
+            (a * 40.0).round() as u8,
+        );
+        canvas.fill_rounded_rect_alpha(card, 14, t.border_color, (a * 210.0).round() as u8);
+        canvas.fill_rounded_rect_alpha(
+            Rect::new(card.x + 1, card.y + 1, card.w - 2, card.h - 2),
+            13,
+            t.panel_bg,
+            (a * 248.0).round() as u8,
+        );
+
+        let logo_side = (46.0 + 10.0 * enter_ease).round() as i32;
+        let logo_rect = Rect::new(
+            card.x + (card.w - logo_side) / 2,
+            card.y + 22 + (56 - logo_side) / 2,
+            logo_side,
+            logo_side,
+        );
+        canvas.draw_ri_logo_icon_alpha(logo_rect, content_alpha);
+
+        let title_color = blend_rgb(t.panel_bg, t.text_primary, content_alpha);
+        let sub_color = blend_rgb(t.panel_bg, t.text_secondary, content_alpha);
+        canvas.draw_text_centered(
+            Rect::new(card.x + 16, card.y + 88, card.w - 32, 22),
+            "Rust AI IDE",
+            title_color,
+            FontStyle::UiBold,
+        );
+        let subtitle = format!("{}  ·  Islands UI", self.workspace_name());
+        canvas.draw_text_centered(
+            Rect::new(card.x + 16, card.y + 111, card.w - 32, 18),
+            &subtitle,
+            sub_color,
+            FontStyle::UiSmall,
+        );
+
+        let bar_w = 196.min((card.w - 48).max(80));
+        let bar_h = 4;
+        let bar_x = card.x + (card.w - bar_w) / 2;
+        let bar_y = card.y + 141;
+        canvas.fill_rounded_rect_alpha(
+            Rect::new(bar_x, bar_y, bar_w, bar_h),
+            2,
+            t.border_color,
+            (content_alpha * 165.0).round() as u8,
+        );
+        let prog_t = (elapsed / 0.56).clamp(0.0, 1.0);
+        let prog_ease = 1.0 - (1.0 - prog_t).powi(3);
+        let fill_w = ((bar_w as f32 * prog_ease).round() as i32).max(12).min(bar_w);
+        canvas.fill_rounded_rect_alpha(
+            Rect::new(bar_x, bar_y, fill_w, bar_h),
+            2,
+            t.accent_blue,
+            (content_alpha * 245.0).round() as u8,
+        );
+        let glow_w = 24.min(fill_w);
+        canvas.fill_rounded_rect_alpha(
+            Rect::new(bar_x + fill_w - glow_w, bar_y, glow_w, bar_h),
+            2,
+            0x56A8F5,
+            (content_alpha * 210.0).round() as u8,
+        );
     }
 
     fn render_window_attention_flash(&self, canvas: &mut SurfaceCanvas, w: i32, h: i32) {
@@ -20138,6 +20288,16 @@ mod tests {
         assert_eq!(state.startup_load_alpha, 0.0);
         assert_eq!(state.git_load_alpha, 0.0);
         assert!(!state.has_active_animations());
+
+        // 4. Startup reveal animation renders cleanly and eases to 0 after completion
+        state.startup_anim_started_at = Some(Instant::now() - Duration::from_millis(120));
+        state.startup_anim_alpha = 1.0;
+        state.render(&mut canvas);
+        assert!(state.has_active_animations());
+        state.startup_anim_started_at = Some(Instant::now() - Duration::from_millis(900));
+        state.step_animations();
+        assert_eq!(state.startup_anim_alpha, 0.0);
+        assert!(state.startup_anim_started_at.is_none());
     }
 
     #[test]

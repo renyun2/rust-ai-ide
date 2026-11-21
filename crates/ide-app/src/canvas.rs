@@ -1764,6 +1764,33 @@ impl SurfaceCanvas {
         draw_ri_logo_to_pixmap(&mut self.pixmap, ox, oy, side);
     }
 
+    /// 按指定不透明度绘制 **RI** 品牌徽标（用于启动过渡动画淡入淡出）
+    pub fn draw_ri_logo_icon_alpha(&mut self, rect: Rect, alpha: f32) {
+        let a = alpha.clamp(0.0, 1.0);
+        if a <= 0.01 || rect.w <= 0 || rect.h <= 0 {
+            return;
+        }
+        if a >= 0.995 {
+            self.draw_ri_logo_icon(rect);
+            return;
+        }
+        let s = self.scale_factor;
+        let side = (rect.w.min(rect.h) as f32 * s).round().max(1.0) as u32;
+        let Some(mut tmp) = Pixmap::new(side, side) else {
+            return;
+        };
+        draw_ri_logo_to_pixmap(&mut tmp, 0.0, 0.0, side as f32);
+        let ox = (rect.x as f32 * s + ((rect.w as f32 * s - side as f32) * 0.5)).round() as i32;
+        let oy = (rect.y as f32 * s + ((rect.h as f32 * s - side as f32) * 0.5)).round() as i32;
+        let paint = tiny_skia::PixmapPaint {
+            opacity: a,
+            blend_mode: tiny_skia::BlendMode::SourceOver,
+            quality: tiny_skia::FilterQuality::Nearest,
+        };
+        self.pixmap
+            .draw_pixmap(ox, oy, tmp.as_ref(), &paint, Transform::identity(), None);
+    }
+
     /// 绘制新建文件图标
     pub fn draw_new_file_icon(&mut self, x: i32, y: i32, color: u32) {
         let fx = x as f32 + 0.5;
@@ -2825,6 +2852,107 @@ pub fn save_ri_icon_png(path: &Path, size: u32) -> Result<()> {
         }
     }
     pixmap.save_png(path)?;
+    Ok(())
+}
+
+/// 将矢量 **RI** 品牌图标编码为包含多分辨率（16~256px）的 Windows `.ico` 字节数组
+pub fn encode_ri_icon_ico() -> Result<Vec<u8>> {
+    const SIZES: &[u32] = &[16, 24, 32, 48, 64, 128, 256];
+    let mut frames: Vec<(u32, Vec<u8>)> = Vec::with_capacity(SIZES.len());
+
+    for &sz in SIZES {
+        if sz <= 64 {
+            // 32-bit BGRA BMP DIB (with 1-bpp AND mask) for universal Windows shell & rc.exe support
+            let rgba = render_ri_icon_rgba(sz);
+            let and_stride = ((sz + 31) / 32) * 4;
+            let pixel_bytes = (sz * sz * 4) as usize;
+            let and_bytes = (and_stride * sz) as usize;
+            let mut dib = Vec::with_capacity(40 + pixel_bytes + and_bytes);
+            // BITMAPINFOHEADER (40 bytes)
+            dib.extend_from_slice(&40u32.to_le_bytes());
+            dib.extend_from_slice(&(sz as i32).to_le_bytes());
+            dib.extend_from_slice(&((sz * 2) as i32).to_le_bytes());
+            dib.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
+            dib.extend_from_slice(&32u16.to_le_bytes()); // biBitCount
+            dib.extend_from_slice(&0u32.to_le_bytes()); // biCompression = BI_RGB
+            dib.extend_from_slice(&((pixel_bytes + and_bytes) as u32).to_le_bytes());
+            dib.extend_from_slice(&0i32.to_le_bytes());
+            dib.extend_from_slice(&0i32.to_le_bytes());
+            dib.extend_from_slice(&0u32.to_le_bytes());
+            dib.extend_from_slice(&0u32.to_le_bytes());
+
+            // Bottom-up BGRA XOR mask
+            for y in (0..sz).rev() {
+                let row_start = (y * sz * 4) as usize;
+                for x in 0..sz {
+                    let idx = row_start + (x as usize) * 4;
+                    dib.push(rgba[idx + 2]);
+                    dib.push(rgba[idx + 1]);
+                    dib.push(rgba[idx]);
+                    dib.push(rgba[idx + 3]);
+                }
+            }
+
+            // Bottom-up 1-bpp AND mask
+            for y in (0..sz).rev() {
+                let row_start = (y * sz * 4) as usize;
+                let mut row_mask = vec![0u8; and_stride as usize];
+                for x in 0..sz {
+                    let alpha = rgba[row_start + (x as usize) * 4 + 3];
+                    if alpha == 0 {
+                        row_mask[(x / 8) as usize] |= 0x80 >> (x % 8);
+                    }
+                }
+                dib.extend_from_slice(&row_mask);
+            }
+            frames.push((sz, dib));
+        } else {
+            // Vista+ PNG-encoded ICO frame for 128x128 & 256x256
+            let mut pixmap = Pixmap::new(sz, sz)
+                .ok_or_else(|| anyhow::anyhow!("Failed to allocate {}x{} Pixmap", sz, sz))?;
+            draw_ri_logo_to_pixmap(&mut pixmap, 0.0, 0.0, sz as f32);
+            let png_bytes = pixmap.encode_png()?;
+            frames.push((sz, png_bytes));
+        }
+    }
+
+    let count = frames.len() as u16;
+    let header_len = 6 + frames.len() * 16;
+    let total_payload: usize = frames.iter().map(|(_, d)| d.len()).sum();
+    let mut ico = Vec::with_capacity(header_len + total_payload);
+    // ICONDIR
+    ico.extend_from_slice(&0u16.to_le_bytes());
+    ico.extend_from_slice(&1u16.to_le_bytes());
+    ico.extend_from_slice(&count.to_le_bytes());
+
+    let mut offset = header_len as u32;
+    for (sz, data) in &frames {
+        let dim = if *sz >= 256 { 0u8 } else { *sz as u8 };
+        ico.push(dim);
+        ico.push(dim);
+        ico.push(0); // bColorCount
+        ico.push(0); // bReserved
+        ico.extend_from_slice(&1u16.to_le_bytes());
+        ico.extend_from_slice(&32u16.to_le_bytes());
+        ico.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        ico.extend_from_slice(&offset.to_le_bytes());
+        offset += data.len() as u32;
+    }
+    for (_, data) in frames {
+        ico.extend_from_slice(&data);
+    }
+    Ok(ico)
+}
+
+/// 将矢量 **RI** 品牌图标保存为多分辨率 Windows `.ico` 文件
+pub fn save_ri_icon_ico(path: &Path) -> Result<()> {
+    let bytes = encode_ri_icon_ico()?;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::write(path, bytes)?;
     Ok(())
 }
 
@@ -3894,5 +4022,26 @@ mod file_icon_tests {
 
         c1.trim_text_caches();
         c1.draw_text_styled(4, 4, "hello", 0xFFFFFF, 100, super::FontStyle::UiRegular);
+    }
+
+    #[test]
+    fn ri_icon_ico_contains_valid_multires_frames() {
+        let bytes = super::encode_ri_icon_ico().expect("encode ico");
+        assert!(bytes.len() > 1024);
+        assert_eq!(&bytes[0..6], &[0, 0, 1, 0, 7, 0]);
+        let expected_dims: &[u8] = &[16, 24, 32, 48, 64, 128, 0];
+        for (idx, &dim) in expected_dims.iter().enumerate() {
+            let entry = &bytes[6 + idx * 16..6 + (idx + 1) * 16];
+            assert_eq!(entry[0], dim);
+            assert_eq!(entry[1], dim);
+            let data_len = u32::from_le_bytes(entry[8..12].try_into().unwrap()) as usize;
+            let data_off = u32::from_le_bytes(entry[12..16].try_into().unwrap()) as usize;
+            let payload = &bytes[data_off..data_off + data_len];
+            if idx < 5 {
+                assert_eq!(&payload[0..4], &40u32.to_le_bytes());
+            } else {
+                assert_eq!(&payload[0..8], b"\x89PNG\r\n\x1a\n");
+            }
+        }
     }
 }

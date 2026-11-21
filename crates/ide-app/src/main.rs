@@ -11,7 +11,8 @@ mod text_cosmic;
 mod text_input;
 
 use crate::canvas::{
-    detect_system_dpi_scale, render_ri_icon_rgba, save_ri_icon_png, SurfaceCanvas,
+    detect_system_dpi_scale, render_ri_icon_rgba, save_ri_icon_ico, save_ri_icon_png,
+    SurfaceCanvas,
 };
 use crate::ide_state::{
     duplicate_open_count, session_windows_after_close, workspace_paths_equal,
@@ -19,7 +20,7 @@ use crate::ide_state::{
     TextInputNavAction, WindowControlCmd,
 };
 use anyhow::Result;
-use ide_core::{IdeAction, MainMenuCategory, ToolWindowId};
+use ide_core::{IdeAction, IdeaTheme, MainMenuCategory, ThemeKind, ToolWindowId};
 use softbuffer::{Context, Surface};
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -32,7 +33,7 @@ use tao::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use tao::event::{ElementState, Event, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget};
 use tao::keyboard::{Key, ModifiersState};
-use tao::window::{CursorIcon, Icon, ResizeDirection, Window, WindowBuilder, WindowId};
+use tao::window::{CursorIcon, Icon, ResizeDirection, Window, WindowBuilder, WindowId, RGBA};
 
 #[cfg(target_os = "windows")]
 fn cursor_pos_in_window(
@@ -136,6 +137,17 @@ struct IdeWindowHost {
     wheel_accum_y: f32,
     wheel_accum_x: f32,
     last_ime_physical: Option<(i32, i32)>,
+    last_bg_rgb: u32,
+}
+
+#[inline]
+fn rgb_to_tao_rgba(rgb: u32) -> RGBA {
+    (
+        ((rgb >> 16) & 0xFF) as u8,
+        ((rgb >> 8) & 0xFF) as u8,
+        (rgb & 0xFF) as u8,
+        255,
+    )
 }
 
 fn spawn_ide_window(
@@ -144,28 +156,38 @@ fn spawn_ide_window(
     workspace_root: PathBuf,
     storage_dir: Option<&Path>,
     window_icon: Option<Icon>,
+    taskbar_icon: Option<Icon>,
+    initial_theme: IdeaTheme,
     init_log_w: f64,
     init_log_h: f64,
     init_maximized: bool,
 ) -> Result<IdeWindowHost> {
-    let window = Rc::new(
-        WindowBuilder::new()
-            .with_title(format!(
-                "{} — Rust AI IDE",
-                workspace_root
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("RI")
-            ))
-            .with_window_icon(window_icon)
-            .with_decorations(false)
-            .with_resizable(true)
-            .with_maximized(init_maximized)
-            .with_inner_size(LogicalSize::new(init_log_w, init_log_h))
-            .build(elwt)?,
-    );
-    apply_windows11_rounded_corners(&window);
+    let builder = WindowBuilder::new()
+        .with_title(format!(
+            "{} — Rust AI IDE",
+            workspace_root
+                .file_name()
+                .and_then(|n| n.to_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("RI")
+        ))
+        .with_visible(false)
+        .with_background_color(rgb_to_tao_rgba(initial_theme.window_bg))
+        .with_window_icon(window_icon)
+        .with_decorations(false)
+        .with_resizable(true)
+        .with_maximized(init_maximized)
+        .with_inner_size(LogicalSize::new(init_log_w, init_log_h));
+    #[cfg(target_os = "windows")]
+    let builder = {
+        use tao::platform::windows::WindowBuilderExtWindows;
+        builder.with_taskbar_icon(taskbar_icon)
+    };
+    #[cfg(not(target_os = "windows"))]
+    let _ = taskbar_icon;
+    let window = Rc::new(builder.build(elwt)?);
+    apply_windows_class_icons(&window);
+    apply_windows11_window_style(&window, initial_theme.kind != ThemeKind::IslandsLight);
 
     let context = Context::new(window.clone())
         .map_err(|e| anyhow::anyhow!("Failed to initialize softbuffer context: {e}"))?;
@@ -182,6 +204,9 @@ fn spawn_ide_window(
     if let Some(dir) = storage_dir {
         app_state.restore_from_persistence_dir(dir.to_path_buf());
     }
+    let last_bg_rgb = app_state.theme.window_bg;
+    window.set_background_color(Some(rgb_to_tao_rgba(last_bg_rgb)));
+    apply_windows11_window_style(&window, app_state.theme.kind != ThemeKind::IslandsLight);
     let _ = app_state.take_workspace_title_dirty();
     window.set_title(&app_state.taskbar_title());
     let init_os_scale = (window.scale_factor() as f32).clamp(0.75, 4.0);
@@ -223,7 +248,17 @@ fn spawn_ide_window(
         wheel_accum_y: 0.0,
         wheel_accum_x: 0.0,
         last_ime_physical: None,
+        last_bg_rgb,
     })
+}
+
+fn reveal_ide_window(host: &mut IdeWindowHost, play_startup_anim: bool) {
+    if play_startup_anim {
+        host.app_state.restart_startup_animation();
+    }
+    host.window.set_visible(true);
+    host.render_frame();
+    host.window.request_redraw();
 }
 
 fn sync_ime_position(
@@ -242,13 +277,76 @@ fn sync_ime_position(
     window.set_ime_position(PhysicalPosition::new(px, py));
 }
 
-fn load_ri_window_icon() -> Option<Icon> {
-    let rgba = render_ri_icon_rgba(128);
+fn load_ri_icon_sized(size: u32) -> Option<Icon> {
+    let px = size.max(16);
+    #[cfg(target_os = "windows")]
+    {
+        use tao::platform::windows::IconExtWindows;
+        if let Ok(icon) = Icon::from_resource(1, Some(PhysicalSize::new(px, px))) {
+            return Some(icon);
+        }
+    }
+    let rgba = render_ri_icon_rgba(px);
     if rgba.is_empty() {
         return None;
     }
-    Icon::from_rgba(rgba, 128, 128).ok()
+    Icon::from_rgba(rgba, px, px).ok()
 }
+
+#[cfg(target_os = "windows")]
+fn apply_windows_class_icons(window: &tao::window::Window) {
+    use core::ffi::c_void;
+    use tao::platform::windows::WindowExtWindows;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetModuleHandleW(lp_module_name: *const u16) -> *mut c_void;
+    }
+    #[link(name = "user32")]
+    extern "system" {
+        fn LoadImageW(
+            h_inst: *mut c_void,
+            name: *const u16,
+            r#type: u32,
+            cx: i32,
+            cy: i32,
+            fu_load: u32,
+        ) -> *mut c_void;
+        fn GetSystemMetrics(n_index: i32) -> i32;
+        #[cfg(target_pointer_width = "64")]
+        fn SetClassLongPtrW(hwnd: *mut c_void, n_index: i32, dw_new_long: isize) -> isize;
+        #[cfg(target_pointer_width = "32")]
+        #[link_name = "SetClassLongW"]
+        fn SetClassLongPtrW(hwnd: *mut c_void, n_index: i32, dw_new_long: isize) -> isize;
+    }
+
+    const IMAGE_ICON: u32 = 1;
+    const LR_DEFAULTSIZE: u32 = 0x0040;
+    const LR_SHARED: u32 = 0x8000;
+    const GCLP_HICON: i32 = -14;
+    const GCLP_HICONSM: i32 = -34;
+    const SM_CXSMICON: i32 = 49;
+    const SM_CYSMICON: i32 = 50;
+
+    let hwnd = window.hwnd() as *mut c_void;
+    let res_id = 1usize as *const u16;
+    unsafe {
+        let hinst = GetModuleHandleW(std::ptr::null());
+        let h_big = LoadImageW(hinst, res_id, IMAGE_ICON, 0, 0, LR_DEFAULTSIZE | LR_SHARED);
+        if !h_big.is_null() {
+            SetClassLongPtrW(hwnd, GCLP_HICON, h_big as isize);
+        }
+        let sm_w = GetSystemMetrics(SM_CXSMICON).max(16);
+        let sm_h = GetSystemMetrics(SM_CYSMICON).max(16);
+        let h_small = LoadImageW(hinst, res_id, IMAGE_ICON, sm_w, sm_h, LR_SHARED);
+        if !h_small.is_null() {
+            SetClassLongPtrW(hwnd, GCLP_HICONSM, h_small as isize);
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn apply_windows_class_icons(_window: &tao::window::Window) {}
 
 fn sync_window_title(window: &tao::window::Window, state: &mut IdeApplicationState) {
     if state.take_workspace_title_dirty() {
@@ -445,14 +543,16 @@ fn schedule_attention_frames(
 }
 
 #[cfg(target_os = "windows")]
-fn apply_windows11_rounded_corners(window: &tao::window::Window) {
+fn apply_windows11_window_style(window: &tao::window::Window, dark_mode: bool) {
     use tao::platform::windows::WindowExtWindows;
     use windows::Win32::Foundation::HWND;
     use windows::Win32::Graphics::Dwm::{
-        DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+        DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
+        DWMWCP_ROUND,
     };
     let hwnd = HWND(window.hwnd() as *mut core::ffi::c_void);
     let pref = DWMWCP_ROUND.0 as u32;
+    let dark: i32 = if dark_mode { 1 } else { 0 };
     unsafe {
         let _ = DwmSetWindowAttribute(
             hwnd,
@@ -460,11 +560,17 @@ fn apply_windows11_rounded_corners(window: &tao::window::Window) {
             &pref as *const u32 as *const core::ffi::c_void,
             std::mem::size_of::<u32>() as u32,
         );
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            &dark as *const i32 as *const core::ffi::c_void,
+            std::mem::size_of::<i32>() as u32,
+        );
     }
 }
 
 #[cfg(not(target_os = "windows"))]
-fn apply_windows11_rounded_corners(_window: &tao::window::Window) {}
+fn apply_windows11_window_style(_window: &tao::window::Window, _dark_mode: bool) {}
 
 fn detect_resize_direction(x: i32, y: i32, w: i32, h: i32) -> Option<ResizeDirection> {
     const EDGE: i32 = 6;
@@ -628,8 +734,17 @@ fn main() -> Result<()> {
             .get(pos + 1)
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("assets/ri_icon.png"));
-        save_ri_icon_png(&out_path, 256)?;
-        println!("Exported RI icon PNG: {}", out_path.display());
+        let is_ico = out_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("ico"));
+        if is_ico {
+            save_ri_icon_ico(&out_path)?;
+            println!("Exported RI icon ICO: {}", out_path.display());
+        } else {
+            save_ri_icon_png(&out_path, 256)?;
+            println!("Exported RI icon PNG: {}", out_path.display());
+        }
         return Ok(());
     }
     let storage_dir = persistence::default_storage_dir();
@@ -751,13 +866,17 @@ fn main() -> Result<()> {
             (1560.0, 940.0)
         };
 
-    let shared_window_icon = load_ri_window_icon();
+    let initial_theme = IdeaTheme::from_kind(saved_global.theme_kind);
+    let shared_window_icon = load_ri_icon_sized(48);
+    let shared_taskbar_icon = load_ri_icon_sized(128);
     let initial_host = spawn_ide_window(
         &event_loop,
         &proxy,
         workspace_root,
         storage_dir.as_deref(),
         shared_window_icon.clone(),
+        shared_taskbar_icon.clone(),
+        initial_theme,
         init_log_w,
         init_log_h,
         saved_global.window_maximized,
@@ -781,6 +900,8 @@ fn main() -> Result<()> {
                 root,
                 storage_dir.as_deref(),
                 shared_window_icon.clone(),
+                shared_taskbar_icon.clone(),
+                initial_theme,
                 init_log_w,
                 init_log_h,
                 false,
@@ -805,6 +926,22 @@ fn main() -> Result<()> {
             }
         }
         trim_process_working_set();
+    }
+    let secondary_ids: Vec<WindowId> = windows
+        .keys()
+        .copied()
+        .filter(|&id| id != primary_window_id)
+        .collect();
+    for id in secondary_ids {
+        if let Some(host) = windows.get_mut(&id) {
+            reveal_ide_window(host, !ui_test_mode);
+        }
+    }
+    if let Some(host) = windows.get_mut(&primary_window_id) {
+        reveal_ide_window(host, !ui_test_mode);
+        if !ui_test_mode {
+            host.window.set_focus();
+        }
     }
     let mut ui_test_frames: u32 = 0;
     let mut recent_reopen: Option<(WindowId, u32, Instant)> = None;
@@ -869,14 +1006,15 @@ fn main() -> Result<()> {
                     target_path.clone(),
                     storage_dir.as_deref(),
                     shared_window_icon.clone(),
+                    shared_taskbar_icon.clone(),
+                    initial_theme,
                     init_log_w,
                     init_log_h,
                     false,
                 ) {
                     Ok(mut new_host) => {
                         let new_id = new_host.window.id();
-                        new_host.window.request_redraw();
-                        new_host.pending_redraw = false;
+                        reveal_ide_window(&mut new_host, !ui_test_mode);
                         windows.insert(new_id, new_host);
                         created_this_batch.insert(new_id);
                         if let Some(origin) = windows.get_mut(&origin_id) {
@@ -1116,6 +1254,15 @@ impl IdeWindowHost {
         let height = size.height.max(1);
         self.app_state.system_dpi_scale = (self.window.scale_factor() as f32).clamp(0.75, 4.0);
         self.app_state.window_maximized = self.window.is_maximized();
+        if self.app_state.theme.window_bg != self.last_bg_rgb {
+            self.last_bg_rgb = self.app_state.theme.window_bg;
+            self.window
+                .set_background_color(Some(rgb_to_tao_rgba(self.last_bg_rgb)));
+            apply_windows11_window_style(
+                &self.window,
+                self.app_state.theme.kind != ThemeKind::IslandsLight,
+            );
+        }
 
         self.surface_canvas.resize_physical(
             width as usize,
@@ -1348,6 +1495,7 @@ impl IdeWindowHost {
                 ..
             } => match state {
                 ElementState::Pressed => {
+                    self.app_state.dismiss_startup_animation();
                     self.left_mouse_down = true;
                     let win_w = self.surface_canvas.width as i32;
                     let win_h = self.surface_canvas.height as i32;

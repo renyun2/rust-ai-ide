@@ -201,6 +201,7 @@ impl CosmicTextEngine {
             borrowed.set_wrap(Wrap::None);
             borrowed.set_size(None, None);
             borrowed.set_text(text, &attrs, Shaping::Advanced, None);
+            borrowed.shape_until_scroll(false);
         }
 
         let mut phys_w = 0.0f32;

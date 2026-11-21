@@ -19,16 +19,16 @@ use ide_core::{
     MenuEntry, MobileDeviceState, MobileEnvironmentReport, MobileProjectKind, MobileSdkLocations,
     RunConfigSource, RunConfiguration, ThemeKind, ToolWindowId, UiLanguage,
 };
-use ide_dap::DapDebugEngine;
+use ide_dap::{DapDebugEngine, DebugSessionState};
 use ide_git::{DiffLineKind, GitEngine};
-use ide_lsp::LspHub;
+use ide_lsp::{DiagnosticSeverityLevel, LspHub};
 use ide_search::{
     find_in_files, find_in_files_indexed, index_workspace_files, search_everywhere,
     search_everywhere_indexed, ContentSearchHit, SearchEverywhereItem, WorkspaceFileEntry,
 };
 use ide_syntax::{
-    detect_runnable_gutter_entries, extract_structure_symbols, highlight_line, HighlightSpan,
-    RunnableGutterEntry, StructureSymbol, TokenKind,
+    detect_runnable_gutter_entries, extract_structure_symbols, find_symbol_definition,
+    highlight_line, HighlightSpan, RunnableGutterEntry, StructureSymbol, TokenKind,
 };
 use ide_terminal::TerminalSession;
 use ide_vfs::{ProjectTreeState, TextBuffer};
@@ -341,6 +341,7 @@ pub enum ContextMenuAction {
     GitCopyText(String),
     AgentCopySelection,
     AgentCopyAllChat,
+    FixLineDiagnosticWithAgent(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -876,6 +877,27 @@ pub enum HitAction {
     ToggleSearchEverywhere,
     ToggleBreakpointAtLine(usize),
     RunGutterEntry(usize),
+    // 编辑器内查找替换栏 (Ctrl+F / Ctrl+R)
+    OpenEditorFindBar { with_replace: bool },
+    CloseEditorFindBar,
+    FocusEditorFindInput,
+    FocusEditorReplaceInput,
+    EditorFindNext,
+    EditorFindPrev,
+    EditorReplaceOne,
+    EditorReplaceAll,
+    // 问题诊断面板 (LSP Problems) 与 DAP 调试器交互
+    RefreshLspDiagnostics,
+    SendDiagnosticsToAgent,
+    DebugStepOver,
+    DebugStepInto,
+    DebugStepOut,
+    DebugContinue,
+    DebugStop,
+    SelectDebugFrame(usize),
+    OpenAddDebugWatchModal,
+    RemoveDebugWatch(usize),
+    SendDebugContextToAgent,
     // 设置、语言、DPI 缩放、工作区与主题切换
     SelectTheme(ThemeKind),
     SetUiLanguage(UiLanguage),
@@ -919,6 +941,11 @@ pub enum FocusTarget {
     GitRollbackModal,
     GitRemotesModal,
     RenamePathModal,
+    RenameSymbolModal,
+    GoToLineModal,
+    AddDebugWatchModal,
+    EditorFindInput,
+    EditorReplaceInput,
     SettingsModal,
     AiConfigModal(usize),
     OpenProjectChoiceModal,
@@ -1068,6 +1095,16 @@ pub struct IdeApplicationState {
     pub active_overlay_rects: Vec<Rect>,
     pub overlay_hit_start: usize,
     pub rename_target_path: Option<PathBuf>,
+    pub rename_symbol_target: Option<String>,
+    pub editor_find_open: bool,
+    pub editor_replace_open: bool,
+    pub editor_find_input: TextInputField,
+    pub editor_replace_input: TextInputField,
+    pub editor_find_input_rect: Rect,
+    pub editor_replace_input_rect: Rect,
+    pub editor_find_match_idx: usize,
+    pub problems_scroll: usize,
+    pub problems_scroll_info: ScrollTrackInfo,
     // 子系统引擎
     pub run_configs: Vec<RunConfiguration>,
     pub active_run_config: usize,
@@ -1558,7 +1595,7 @@ impl IdeApplicationState {
         let project_tree = ProjectTreeState::new(&workspace_root);
         let run_configs = RunConfiguration::detect_for_workspace(&workspace_root);
         let mobile_kind = detect_mobile_project(&workspace_root);
-        let lsp_hub = LspHub::new(&workspace_root);
+        let lsp_hub = LspHub::new_with_wakeup(&workspace_root, wakeup.clone());
         let dap_engine = DapDebugEngine::new();
         let git_engine = if wakeup_enabled {
             GitEngine::open_with_wakeup(&workspace_root, wakeup.clone())
@@ -1722,6 +1759,16 @@ impl IdeApplicationState {
             active_overlay_rects: Vec::new(),
             overlay_hit_start: usize::MAX,
             rename_target_path: None,
+            rename_symbol_target: None,
+            editor_find_open: false,
+            editor_replace_open: false,
+            editor_find_input: TextInputField::single_line(),
+            editor_replace_input: TextInputField::single_line(),
+            editor_find_input_rect: Rect::new(0, 0, 0, 0),
+            editor_replace_input_rect: Rect::new(0, 0, 0, 0),
+            editor_find_match_idx: 0,
+            problems_scroll: 0,
+            problems_scroll_info: ScrollTrackInfo::default(),
             run_configs,
             active_run_config: 0,
             run_config_popup_scroll: 0,
@@ -2439,8 +2486,11 @@ impl IdeApplicationState {
         self.project_tree = ProjectTreeState::new(&clean);
         self.run_configs = RunConfiguration::detect_for_workspace(&clean);
         self.active_run_config = 0;
-        self.lsp_hub = LspHub::new(&clean);
+        self.lsp_hub = LspHub::new_with_wakeup(&clean, self.wakeup.clone());
         self.dap_engine = DapDebugEngine::new();
+        self.problems_scroll = 0;
+        self.editor_find_open = false;
+        self.editor_replace_open = false;
         self.git_engine = if self.wakeup_enabled {
             GitEngine::open_with_wakeup(&clean, self.wakeup.clone())
         } else {
@@ -3036,21 +3086,10 @@ impl IdeApplicationState {
                 self.touch_caret_activity();
             }
             IdeAction::GoToDeclaration => {
-                let first_sym = self
-                    .ensure_structure_symbols_cached()
-                    .first()
-                    .map(|s| (s.name.clone(), s.line));
-                if let Some((name, line)) = first_sym {
-                    self.active_buffer_mut().set_cursor(line, 0, false);
-                    self.scroll_line = line.saturating_sub(3);
-                    self.status_notification = format!(
-                        "{}: {} ({} {})",
-                        self.tr("已跳转至符号定义", "Navigated to symbol"),
-                        name,
-                        self.tr("第", "Line"),
-                        line + 1
-                    );
+                if self.abort_without_open_file() {
+                    return;
                 }
+                self.navigate_to_declaration_or_usages();
             }
             IdeAction::NewFileInProject => {
                 self.modal_text_input.set_text("new_module.rs");
@@ -3086,6 +3125,7 @@ impl IdeApplicationState {
                     return;
                 }
                 if self.active_buffer_mut().save().is_ok() {
+                    self.refresh_active_buffer_diagnostics();
                     self.git_engine.request_refresh();
                     self.status_notification =
                         self.tr("已保存当前文档", "Saved current file").to_string();
@@ -3153,6 +3193,7 @@ impl IdeApplicationState {
                 }
                 self.active_buffer_mut().reformat_basic();
                 let _ = self.active_buffer_mut().save();
+                self.refresh_active_buffer_diagnostics();
                 self.ensure_editor_cursor_visible();
                 self.status_notification = self
                     .tr(
@@ -3161,10 +3202,46 @@ impl IdeApplicationState {
                     )
                     .to_string();
             }
-            IdeAction::RenameSymbol
-            | IdeAction::ShowIntentionActions
-            | IdeAction::InlineAiEdit
-            | IdeAction::SendSelectionToAgent => {}
+            IdeAction::RenameSymbol => {
+                if !self.open_buffers.is_empty() {
+                    if let Some(ident) = self.active_buffer().word_at_cursor() {
+                        self.rename_symbol_target = Some(ident.clone());
+                        self.modal_text_input.set_text(&ident);
+                        self.modal_text_input.select_all();
+                        self.focus = FocusTarget::RenameSymbolModal;
+                        self.touch_caret_activity();
+                        return;
+                    }
+                }
+                if let Some(sel_path) = self.project_tree.selected_path.clone() {
+                    if sel_path != self.workspace_root {
+                        let name = sel_path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("")
+                            .to_string();
+                        self.rename_target_path = Some(sel_path);
+                        self.modal_text_input.set_text(&name);
+                        self.modal_text_input.select_all();
+                        self.focus = FocusTarget::RenamePathModal;
+                        self.touch_caret_activity();
+                        return;
+                    }
+                }
+                self.status_notification = self
+                    .tr(
+                        "请将光标置于要重命名的符号上 (Shift+F6)",
+                        "Place caret on an identifier to rename (Shift+F6)",
+                    )
+                    .to_string();
+            }
+            IdeAction::ShowIntentionActions => {
+                if self.abort_without_open_file() {
+                    return;
+                }
+                self.open_editor_intention_actions_menu();
+            }
+            IdeAction::InlineAiEdit | IdeAction::SendSelectionToAgent => {}
             IdeAction::AcceptInlineDiff => self.accept_inline_diff(),
             IdeAction::RejectInlineDiff => self.reject_inline_diff(),
             IdeAction::RevertLastCheckpoint => self.revert_last_checkpoint(),
@@ -3205,8 +3282,17 @@ impl IdeApplicationState {
                     return;
                 }
                 let buf = self.active_buffer().clone();
-                self.dap_engine
-                    .start_debug_session(buf.language, &buf.path, buf.cursor_line);
+                let src = buf.text();
+                self.dap_engine.start_debug_session_with_source(
+                    buf.language,
+                    &buf.path,
+                    buf.cursor_line,
+                    &src,
+                );
+                if let DebugSessionState::PausedAtBreakpoint { line, .. } = self.dap_engine.state {
+                    self.active_buffer_mut().set_cursor(line, 0, false);
+                    self.ensure_editor_cursor_visible();
+                }
                 self.bottom_tool = Some(ToolWindowId::Debug);
                 self.status_notification = format!(
                     "{} ({})",
@@ -3476,6 +3562,507 @@ impl IdeApplicationState {
             diagnostics_summary: diag_summary,
             git_changed_count: self.git_engine.changed_files.len(),
         })
+    }
+
+    pub fn refresh_active_buffer_diagnostics(&mut self) {
+        if self.open_buffers.is_empty() {
+            return;
+        }
+        let (path, lang, text) = {
+            let buf = self.active_buffer();
+            (buf.path.clone(), buf.language, buf.text())
+        };
+        self.lsp_hub.refresh_buffer_diagnostics(&path, lang, &text);
+    }
+
+    /// IDEA `Ctrl+B`: 转到当前光标下符号的声明/定义；若已位于定义处则查找全工作区引用 (Usages)
+    pub fn navigate_to_declaration_or_usages(&mut self) {
+        let symbol = self.active_buffer().word_at_cursor().or_else(|| {
+            self.ensure_structure_symbols_cached()
+                .first()
+                .map(|s| s.name.clone())
+        });
+        let Some(sym) = symbol else {
+            self.status_notification = self
+                .tr(
+                    "未识别到光标处的符号名称 (Ctrl+B)",
+                    "No symbol found at cursor (Ctrl+B)",
+                )
+                .to_string();
+            return;
+        };
+
+        let (active_path, active_lang, active_text, cur_line) = {
+            let buf = self.active_buffer();
+            (buf.path.clone(), buf.language, buf.text(), buf.cursor_line)
+        };
+
+        // 1. 当前文件内查找符号定义
+        if let Some((def_line, def_col)) = find_symbol_definition(&active_text, active_lang, &sym) {
+            if def_line != cur_line {
+                self.active_buffer_mut().set_cursor(def_line, def_col, false);
+                self.scroll_line = def_line.saturating_sub(4);
+                self.ensure_editor_cursor_visible();
+                self.status_notification = format!(
+                    "{}: {} ({} {})",
+                    self.tr("已跳转至符号定义", "Navigated to symbol"),
+                    sym,
+                    self.tr("第", "Line"),
+                    def_line + 1
+                );
+                return;
+            }
+        }
+
+        // 2. 在已打开的其他标签页或工作区索引文件中查找符号定义
+        for buf in &self.open_buffers {
+            if buf.path == active_path {
+                continue;
+            }
+            if let Some((def_line, def_col)) = find_symbol_definition(&buf.text(), buf.language, &sym) {
+                let target_path = buf.path.clone();
+                self.open_file(target_path.clone());
+                self.active_buffer_mut().set_cursor(def_line, def_col, false);
+                self.scroll_line = def_line.saturating_sub(4);
+                self.ensure_editor_cursor_visible();
+                self.status_notification = format!(
+                    "{}: {} ({}:{})",
+                    self.tr("已跨文件跳转至符号定义", "Navigated to definition"),
+                    sym,
+                    target_path.file_name().and_then(|n| n.to_str()).unwrap_or("file"),
+                    def_line + 1
+                );
+                return;
+            }
+        }
+
+        let candidate_files: Vec<PathBuf> = if let Ok(guard) = self.workspace_files_cache.try_read() {
+            guard
+                .as_ref()
+                .map(|list| list.iter().map(|f| f.full_path.clone()).collect())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        for path in candidate_files.into_iter().take(180) {
+            if path == active_path {
+                continue;
+            }
+            let lang = ide_core::LanguageId::from_path(&path);
+            if !matches!(
+                lang,
+                ide_core::LanguageId::Rust
+                    | ide_core::LanguageId::TypeScript
+                    | ide_core::LanguageId::JavaScript
+                    | ide_core::LanguageId::Python
+            ) {
+                continue;
+            }
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if !content.contains(&sym) {
+                    continue;
+                }
+                if let Some((def_line, def_col)) = find_symbol_definition(&content, lang, &sym) {
+                    self.open_file(path.clone());
+                    self.active_buffer_mut().set_cursor(def_line, def_col, false);
+                    self.scroll_line = def_line.saturating_sub(4);
+                    self.ensure_editor_cursor_visible();
+                    self.status_notification = format!(
+                        "{}: {} ({}:{})",
+                        self.tr("已跨文件跳转至符号定义", "Navigated to definition"),
+                        sym,
+                        path.file_name().and_then(|n| n.to_str()).unwrap_or("file"),
+                        def_line + 1
+                    );
+                    return;
+                }
+            }
+        }
+
+        // 3. 若光标已在定义处，或未找到单独声明，则自动查找全工作区用法 (Usages)
+        if let Some(first_sym) = self
+            .ensure_structure_symbols_cached()
+            .first()
+            .map(|s| (s.name.clone(), s.line))
+        {
+            if first_sym.1 != cur_line && self.active_buffer().word_at_cursor().is_none() {
+                self.active_buffer_mut().set_cursor(first_sym.1, 0, false);
+                self.scroll_line = first_sym.1.saturating_sub(3);
+                self.status_notification = format!(
+                    "{}: {} ({} {})",
+                    self.tr("已跳转至符号定义", "Navigated to symbol"),
+                    first_sym.0,
+                    self.tr("第", "Line"),
+                    first_sym.1 + 1
+                );
+                return;
+            }
+        }
+        self.search_query_input.set_text(&sym);
+        self.search_query_input.select_all();
+        self.focus = FocusTarget::FindInFilesModal;
+        self.trigger_find_in_files(25);
+        self.touch_caret_activity();
+        self.status_notification = format!(
+            "{}: {}",
+            self.tr("正在检索符号在工作区中的全部用法", "Searching workspace usages for"),
+            sym
+        );
+    }
+
+    /// IDEA `Alt+Enter`: 在当前光标位置弹出上下文意图与快速修复菜单
+    pub fn open_editor_intention_actions_menu(&mut self) {
+        let (path, cur_line) = {
+            let buf = self.active_buffer();
+            (buf.path.clone(), buf.cursor_line)
+        };
+        let mut items = Vec::new();
+        if let Some(diag) = self.lsp_hub.diagnostic_at_line(&path, cur_line) {
+            let label = match &diag.quick_fix_suggestion {
+                Some(fix) => format!("✨ {}: {}", self.tr("AI 快速修复", "AI Quick Fix"), fix),
+                None => format!(
+                    "✨ {}: {}",
+                    self.tr("发送此行诊断给 AI 修复", "Ask AI to Fix"),
+                    diag.message
+                ),
+            };
+            items.push(ContextMenuItem {
+                label,
+                shortcut: "Alt+Enter".to_string(),
+                action: ContextMenuAction::FixLineDiagnosticWithAgent(cur_line),
+                separator_before: false,
+            });
+        }
+        items.push(ContextMenuItem {
+            label: self
+                .tr("转到声明或用法", "Go to Declaration or Usages")
+                .to_string(),
+            shortcut: "Ctrl+B".to_string(),
+            action: ContextMenuAction::Ide(IdeAction::GoToDeclaration),
+            separator_before: !items.is_empty(),
+        });
+        items.push(ContextMenuItem {
+            label: self.tr("重命名符号...", "Rename Symbol...").to_string(),
+            shortcut: "Shift+F6".to_string(),
+            action: ContextMenuAction::Ide(IdeAction::RenameSymbol),
+            separator_before: false,
+        });
+        items.push(ContextMenuItem {
+            label: self.tr("切换行注释", "Toggle Line Comment").to_string(),
+            shortcut: "Ctrl+/".to_string(),
+            action: ContextMenuAction::Ide(IdeAction::ToggleLineComment),
+            separator_before: true,
+        });
+        items.push(ContextMenuItem {
+            label: self.tr("重新格式化代码", "Reformat Code").to_string(),
+            shortcut: "Ctrl+Alt+L".to_string(),
+            action: ContextMenuAction::Ide(IdeAction::ReformatCode),
+            separator_before: false,
+        });
+
+        let (cx, cy) = self.ime_spot;
+        self.context_menu = Some(ContextMenuState {
+            x: cx.max(120),
+            y: cy.max(80),
+            items,
+        });
+    }
+
+    pub fn open_editor_find_bar(&mut self, with_replace: bool) {
+        if self.abort_without_open_file() {
+            return;
+        }
+        self.editor_find_open = true;
+        if with_replace {
+            self.editor_replace_open = true;
+        }
+        if let Some(word) = self.active_buffer().word_at_cursor() {
+            self.editor_find_input.set_text(&word);
+        }
+        self.editor_find_input.select_all();
+        self.editor_find_match_idx = 0;
+        self.focus = if with_replace && !self.editor_find_input.is_empty() {
+            self.editor_replace_input.select_all();
+            FocusTarget::EditorReplaceInput
+        } else {
+            FocusTarget::EditorFindInput
+        };
+        self.jump_to_current_find_match(false);
+        self.touch_caret_activity();
+    }
+
+    pub fn close_editor_find_bar(&mut self) {
+        self.editor_find_open = false;
+        self.editor_replace_open = false;
+        if matches!(
+            self.focus,
+            FocusTarget::EditorFindInput | FocusTarget::EditorReplaceInput
+        ) {
+            self.focus = FocusTarget::Editor;
+        }
+        self.touch_caret_activity();
+    }
+
+    pub fn current_editor_find_matches(&self) -> Vec<(usize, usize, usize)> {
+        if !self.editor_find_open || self.open_buffers.is_empty() {
+            return Vec::new();
+        }
+        let q = self.editor_find_input.as_str();
+        if q.is_empty() {
+            return Vec::new();
+        }
+        self.active_buffer().find_all_matches(q, false)
+    }
+
+    fn jump_to_current_find_match(&mut self, select_in_editor: bool) {
+        let matches = self.current_editor_find_matches();
+        if matches.is_empty() {
+            self.editor_find_match_idx = 0;
+            return;
+        }
+        if self.editor_find_match_idx >= matches.len() {
+            self.editor_find_match_idx = 0;
+        }
+        let (line, sc, ec) = matches[self.editor_find_match_idx];
+        let buf = self.active_buffer_mut();
+        if select_in_editor {
+            buf.selection_anchor = Some((line, sc));
+            buf.cursor_line = line;
+            buf.cursor_col = ec;
+        } else {
+            buf.set_cursor(line, sc, false);
+        }
+        self.ensure_editor_cursor_visible();
+    }
+
+    pub fn editor_find_next(&mut self) {
+        let matches = self.current_editor_find_matches();
+        if matches.is_empty() {
+            return;
+        }
+        self.editor_find_match_idx = (self.editor_find_match_idx + 1) % matches.len();
+        self.jump_to_current_find_match(true);
+    }
+
+    pub fn editor_find_prev(&mut self) {
+        let matches = self.current_editor_find_matches();
+        if matches.is_empty() {
+            return;
+        }
+        if self.editor_find_match_idx == 0 {
+            self.editor_find_match_idx = matches.len() - 1;
+        } else {
+            self.editor_find_match_idx -= 1;
+        }
+        self.jump_to_current_find_match(true);
+    }
+
+    pub fn editor_replace_one(&mut self) {
+        let matches = self.current_editor_find_matches();
+        if matches.is_empty() {
+            return;
+        }
+        let idx = self.editor_find_match_idx.min(matches.len() - 1);
+        let (line, sc, ec) = matches[idx];
+        let rep = self.editor_replace_input.as_str().to_string();
+        if self.active_buffer_mut().replace_range_on_line(line, sc, ec, &rep) {
+            self.refresh_active_buffer_diagnostics();
+            let remaining = self.current_editor_find_matches().len();
+            if remaining > 0 {
+                self.editor_find_match_idx = idx.min(remaining - 1);
+                self.jump_to_current_find_match(true);
+            } else {
+                self.editor_find_match_idx = 0;
+            }
+            self.status_notification = self
+                .tr("已替换当前匹配项", "Replaced current match")
+                .to_string();
+        }
+    }
+
+    pub fn editor_replace_all(&mut self) {
+        let q = self.editor_find_input.as_str().to_string();
+        if q.is_empty() || self.open_buffers.is_empty() {
+            return;
+        }
+        let rep = self.editor_replace_input.as_str().to_string();
+        let count = self
+            .active_buffer_mut()
+            .replace_all_matches(&q, &rep, false);
+        self.refresh_active_buffer_diagnostics();
+        self.editor_find_match_idx = 0;
+        self.status_notification = format!(
+            "{}: {} {}",
+            self.tr("已完成全部替换", "Replaced all matches"),
+            count,
+            self.tr("处", "occurrences")
+        );
+    }
+
+    pub fn open_go_to_line_modal(&mut self) {
+        if self.abort_without_open_file() {
+            return;
+        }
+        let (l, c) = {
+            let buf = self.active_buffer();
+            (buf.cursor_line + 1, buf.cursor_col + 1)
+        };
+        self.modal_text_input.set_text(&format!("{l}:{c}"));
+        self.modal_text_input.select_all();
+        self.focus = FocusTarget::GoToLineModal;
+        self.touch_caret_activity();
+    }
+
+    pub fn submit_go_to_line(&mut self) {
+        let raw = self.modal_text_input.as_str().trim().to_string();
+        self.focus = FocusTarget::Editor;
+        if raw.is_empty() || self.open_buffers.is_empty() {
+            return;
+        }
+        let mut parts = raw.split(':');
+        let line_1 = parts
+            .next()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1);
+        let col_1 = parts
+            .next()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1);
+        self.active_buffer_mut()
+            .set_cursor(line_1 - 1, col_1 - 1, false);
+        self.ensure_editor_cursor_visible();
+        self.touch_caret_activity();
+        self.status_notification = format!(
+            "{} {}:{}",
+            self.tr("已跳转至行列", "Jumped to line:column"),
+            line_1,
+            col_1
+        );
+    }
+
+    pub fn submit_rename_symbol(&mut self) {
+        let new_name = self.modal_text_input.as_str().trim().to_string();
+        let old_name = self.rename_symbol_target.take().unwrap_or_default();
+        self.focus = FocusTarget::Editor;
+        if old_name.is_empty() || new_name.is_empty() || old_name == new_name {
+            return;
+        }
+        let count = self
+            .active_buffer_mut()
+            .rename_identifier_in_buffer(&old_name, &new_name);
+        self.refresh_active_buffer_diagnostics();
+        self.touch_caret_activity();
+        self.status_notification = format!(
+            "{} `{}` -> `{}` ({} {})",
+            self.tr("已重命名符号", "Renamed symbol"),
+            old_name,
+            new_name,
+            count,
+            self.tr("处", "occurrences")
+        );
+    }
+
+    pub fn submit_add_debug_watch(&mut self) {
+        let expr = self.modal_text_input.as_str().trim().to_string();
+        self.focus = FocusTarget::Editor;
+        if !expr.is_empty() {
+            self.dap_engine.add_watch(expr.clone());
+            self.bottom_tool = Some(ToolWindowId::Debug);
+            self.status_notification = format!(
+                "{}: `{expr}`",
+                self.tr("已添加调试监视表达式", "Added debug watch")
+            );
+        }
+    }
+
+    pub fn send_diagnostics_to_agent(&mut self) {
+        let summary: Vec<String> = self
+            .lsp_hub
+            .diagnostics
+            .iter()
+            .take(8)
+            .map(|d| {
+                format!(
+                    "- [{:?}] `{}:{}:{}`: {}{}",
+                    d.severity,
+                    d.file_path.display(),
+                    d.line,
+                    d.column,
+                    d.message,
+                    d.quick_fix_suggestion
+                        .as_ref()
+                        .map(|q| format!(" (Hint: {q})"))
+                        .unwrap_or_default()
+                )
+            })
+            .collect();
+        let prompt = format!(
+            "请分析并修复当前工作区的以下 LSP / 编译器诊断问题：\n{}",
+            summary.join("\n")
+        );
+        self.right_agent_open = true;
+        self.right_panel_tab = RightPanelTab::Chat;
+        self.submit_agent_prompt(prompt);
+    }
+
+    pub fn send_debug_context_to_agent(&mut self) {
+        let snap = self.dap_engine.export_ai_debug_context();
+        let prompt = format!(
+            "请根据以下 DAP 调试器断点调用栈、局部变量与监视表达式快照，分析当前程序状态并排查潜在问题：\n\n{snap}"
+        );
+        self.right_agent_open = true;
+        self.right_panel_tab = RightPanelTab::Chat;
+        self.submit_agent_prompt(prompt);
+    }
+
+    fn sync_editor_to_dap_paused_line(&mut self) {
+        if let DebugSessionState::PausedAtBreakpoint { file, line } = self.dap_engine.state.clone() {
+            self.open_file_at_line(file, Some(line + 1));
+        }
+    }
+
+    pub fn debug_step_over(&mut self) {
+        if self.dap_engine.state == DebugSessionState::Inactive {
+            self.execute_ide_action(IdeAction::DebugActiveConfig);
+            return;
+        }
+        self.dap_engine.step_over();
+        self.sync_editor_to_dap_paused_line();
+    }
+
+    pub fn debug_step_into(&mut self) {
+        if self.dap_engine.state == DebugSessionState::Inactive {
+            self.execute_ide_action(IdeAction::DebugActiveConfig);
+            return;
+        }
+        self.dap_engine.step_into();
+        self.sync_editor_to_dap_paused_line();
+    }
+
+    pub fn debug_step_out(&mut self) {
+        if self.dap_engine.state == DebugSessionState::Inactive {
+            return;
+        }
+        self.dap_engine.step_out();
+        self.sync_editor_to_dap_paused_line();
+    }
+
+    pub fn debug_continue(&mut self) {
+        if self.dap_engine.state == DebugSessionState::Inactive {
+            self.execute_ide_action(IdeAction::DebugActiveConfig);
+            return;
+        }
+        self.dap_engine.continue_execution();
+        self.sync_editor_to_dap_paused_line();
+    }
+
+    pub fn debug_stop(&mut self) {
+        self.dap_engine.stop();
+        self.status_notification = self
+            .tr("已停止 DAP 调试会话", "Stopped DAP debug session")
+            .to_string();
     }
 
     fn strip_ide_context_tag(raw: &str) -> String {
@@ -4971,6 +5558,18 @@ impl IdeApplicationState {
         if git_outcome.changed {
             changed = true;
         }
+        if self.lsp_hub.poll_updates() {
+            let (err_cnt, warn_cnt, _) = self.lsp_hub.diagnostic_counts();
+            self.status_notification = format!(
+                "{}: {} {}, {} {}",
+                self.tr("LSP 工作区检查完成", "LSP workspace check finished"),
+                err_cnt,
+                self.tr("个错误", "errors"),
+                warn_cnt,
+                self.tr("个警告", "warnings")
+            );
+            changed = true;
+        }
         if git_outcome.clear_commit_input {
             self.git_commit_input.clear();
             self.git_amend_commit = false;
@@ -5133,6 +5732,8 @@ impl IdeApplicationState {
     pub fn active_text_input(&self) -> Option<&TextInputField> {
         match self.focus {
             FocusTarget::CtrlKPrompt => Some(&self.ctrl_k_input),
+            FocusTarget::EditorFindInput => Some(&self.editor_find_input),
+            FocusTarget::EditorReplaceInput => Some(&self.editor_replace_input),
             FocusTarget::AgentChatInput => Some(&self.agent_chat_input),
             FocusTarget::GitCommitInput => Some(&self.git_commit_input),
             FocusTarget::GitLogSearchInput => Some(&self.git_log_search_input),
@@ -5146,7 +5747,10 @@ impl IdeApplicationState {
             | FocusTarget::NewGitTagModal
             | FocusTarget::NewGitStashModal
             | FocusTarget::GitAddRemoteModal
-            | FocusTarget::RenamePathModal => Some(&self.modal_text_input),
+            | FocusTarget::RenamePathModal
+            | FocusTarget::RenameSymbolModal
+            | FocusTarget::GoToLineModal
+            | FocusTarget::AddDebugWatchModal => Some(&self.modal_text_input),
             FocusTarget::SettingsModal => match self.settings_sdk_focus {
                 Some(0) => Some(&self.mobile_sdk_flutter),
                 Some(1) => Some(&self.mobile_sdk_android),
@@ -5163,6 +5767,8 @@ impl IdeApplicationState {
     pub fn active_text_input_mut(&mut self) -> Option<&mut TextInputField> {
         match self.focus {
             FocusTarget::CtrlKPrompt => Some(&mut self.ctrl_k_input),
+            FocusTarget::EditorFindInput => Some(&mut self.editor_find_input),
+            FocusTarget::EditorReplaceInput => Some(&mut self.editor_replace_input),
             FocusTarget::AgentChatInput => Some(&mut self.agent_chat_input),
             FocusTarget::GitCommitInput => Some(&mut self.git_commit_input),
             FocusTarget::GitLogSearchInput => Some(&mut self.git_log_search_input),
@@ -5176,7 +5782,10 @@ impl IdeApplicationState {
             | FocusTarget::NewGitTagModal
             | FocusTarget::NewGitStashModal
             | FocusTarget::GitAddRemoteModal
-            | FocusTarget::RenamePathModal => Some(&mut self.modal_text_input),
+            | FocusTarget::RenamePathModal
+            | FocusTarget::RenameSymbolModal
+            | FocusTarget::GoToLineModal
+            | FocusTarget::AddDebugWatchModal => Some(&mut self.modal_text_input),
             FocusTarget::SettingsModal => match self.settings_sdk_focus {
                 Some(0) => Some(&mut self.mobile_sdk_flutter),
                 Some(1) => Some(&mut self.mobile_sdk_android),
@@ -5205,6 +5814,10 @@ impl IdeApplicationState {
             }
             FocusTarget::GitLogSearchInput => {
                 self.git_log_scroll = 0;
+            }
+            FocusTarget::EditorFindInput => {
+                self.editor_find_match_idx = 0;
+                self.jump_to_current_find_match(false);
             }
             FocusTarget::SettingsModal => {
                 if self.settings_sdk_focus.is_some() {
@@ -5251,6 +5864,7 @@ impl IdeApplicationState {
                 return;
             }
             self.active_buffer_mut().insert_str_at_cursor(text);
+            self.refresh_active_buffer_diagnostics();
             self.ensure_editor_cursor_visible();
             self.touch_caret_activity();
         }
@@ -5270,6 +5884,7 @@ impl IdeApplicationState {
         }
         if self.focus == FocusTarget::Editor {
             self.active_buffer_mut().backspace_at_cursor();
+            self.refresh_active_buffer_diagnostics();
             self.ensure_editor_cursor_visible();
             self.touch_caret_activity();
         }
@@ -5519,6 +6134,30 @@ impl IdeApplicationState {
                 self.touch_caret_activity();
                 return true;
             }
+            FocusTarget::EditorFindInput => {
+                let start_x = self.editor_find_input_rect.x + 22;
+                let idx = self.editor_find_input.hit_test_singleline(
+                    canvas,
+                    x,
+                    start_x,
+                    FontStyle::CodeMono,
+                );
+                self.editor_find_input.set_cursor_at(idx, true);
+                self.touch_caret_activity();
+                return true;
+            }
+            FocusTarget::EditorReplaceInput => {
+                let start_x = self.editor_replace_input_rect.x + 22;
+                let idx = self.editor_replace_input.hit_test_singleline(
+                    canvas,
+                    x,
+                    start_x,
+                    FontStyle::CodeMono,
+                );
+                self.editor_replace_input.set_cursor_at(idx, true);
+                self.touch_caret_activity();
+                return true;
+            }
             FocusTarget::GitCommitInput => {
                 let start_x = self.git_commit_input_box_rect.x + 8;
                 let idx = self.git_commit_input.hit_test_singleline(
@@ -5561,7 +6200,10 @@ impl IdeApplicationState {
             | FocusTarget::NewGitTagModal
             | FocusTarget::NewGitStashModal
             | FocusTarget::GitAddRemoteModal
-            | FocusTarget::RenamePathModal => {
+            | FocusTarget::RenamePathModal
+            | FocusTarget::RenameSymbolModal
+            | FocusTarget::GoToLineModal
+            | FocusTarget::AddDebugWatchModal => {
                 let start_x = self.prompt_modal_input_rect.x + 8;
                 let idx = self.modal_text_input.hit_test_singleline(
                     canvas,
@@ -5795,6 +6437,8 @@ impl IdeApplicationState {
                 self.select_line_in_agent_chat(x, y, canvas)
             }
             FocusTarget::CtrlKPrompt
+            | FocusTarget::EditorFindInput
+            | FocusTarget::EditorReplaceInput
             | FocusTarget::GitCommitInput
             | FocusTarget::GitLogSearchInput
             | FocusTarget::SearchEverywhereModal
@@ -5807,6 +6451,9 @@ impl IdeApplicationState {
             | FocusTarget::NewGitStashModal
             | FocusTarget::GitAddRemoteModal
             | FocusTarget::RenamePathModal
+            | FocusTarget::RenameSymbolModal
+            | FocusTarget::GoToLineModal
+            | FocusTarget::AddDebugWatchModal
             | FocusTarget::AiConfigModal(_)
             | FocusTarget::SettingsModal => self.select_all_at_focus(),
             _ => false,
@@ -5943,6 +6590,15 @@ impl IdeApplicationState {
                         self.git_log_scroll =
                             (self.git_log_scroll + lines_delta as usize).min(max_c);
                     }
+                }
+            } else if self.bottom_tool == Some(ToolWindowId::Problems) {
+                let max_p = self.lsp_hub.diagnostics.len().saturating_sub(3);
+                if lines_delta < 0 {
+                    self.problems_scroll =
+                        self.problems_scroll.saturating_sub((-lines_delta) as usize);
+                } else if lines_delta > 0 {
+                    self.problems_scroll =
+                        (self.problems_scroll + lines_delta as usize).min(max_p);
                 }
             } else {
                 let pty = self.terminal.active_pty_mut();
@@ -7611,6 +8267,96 @@ impl IdeApplicationState {
             HitAction::RunGutterEntry(line) => {
                 self.run_gutter_entry_in_terminal(line);
             }
+            HitAction::OpenEditorFindBar { with_replace } => {
+                self.open_editor_find_bar(with_replace);
+            }
+            HitAction::CloseEditorFindBar => {
+                self.close_editor_find_bar();
+            }
+            HitAction::FocusEditorFindInput => {
+                self.focus = FocusTarget::EditorFindInput;
+                let start_x = self.editor_find_input_rect.x + 22;
+                let idx = self.editor_find_input.hit_test_singleline(
+                    canvas,
+                    x,
+                    start_x,
+                    FontStyle::CodeMono,
+                );
+                self.editor_find_input.set_cursor_at(idx, shift);
+                self.mouse_drag_target = Some(FocusTarget::EditorFindInput);
+                self.touch_caret_activity();
+            }
+            HitAction::FocusEditorReplaceInput => {
+                self.editor_replace_open = true;
+                self.focus = FocusTarget::EditorReplaceInput;
+                let start_x = self.editor_replace_input_rect.x + 22;
+                let idx = self.editor_replace_input.hit_test_singleline(
+                    canvas,
+                    x,
+                    start_x,
+                    FontStyle::CodeMono,
+                );
+                self.editor_replace_input.set_cursor_at(idx, shift);
+                self.mouse_drag_target = Some(FocusTarget::EditorReplaceInput);
+                self.touch_caret_activity();
+            }
+            HitAction::EditorFindNext => {
+                self.editor_find_next();
+            }
+            HitAction::EditorFindPrev => {
+                self.editor_find_prev();
+            }
+            HitAction::EditorReplaceOne => {
+                self.editor_replace_one();
+            }
+            HitAction::EditorReplaceAll => {
+                self.editor_replace_all();
+            }
+            HitAction::RefreshLspDiagnostics => {
+                self.refresh_active_buffer_diagnostics();
+                self.lsp_hub.request_workspace_check();
+                self.status_notification = self
+                    .tr(
+                        "正在后台运行 LSP 与编译器诊断检查...",
+                        "Running workspace LSP & compiler diagnostics...",
+                    )
+                    .to_string();
+            }
+            HitAction::SendDiagnosticsToAgent => {
+                self.send_diagnostics_to_agent();
+            }
+            HitAction::DebugStepOver => {
+                self.debug_step_over();
+            }
+            HitAction::DebugStepInto => {
+                self.debug_step_into();
+            }
+            HitAction::DebugStepOut => {
+                self.debug_step_out();
+            }
+            HitAction::DebugContinue => {
+                self.debug_continue();
+            }
+            HitAction::DebugStop => {
+                self.debug_stop();
+            }
+            HitAction::SelectDebugFrame(idx) => {
+                if let Some((file, line_1)) = self.dap_engine.select_frame(idx) {
+                    self.open_file_at_line(file, Some(line_1));
+                }
+            }
+            HitAction::OpenAddDebugWatchModal => {
+                self.modal_text_input.set_text("breakpoint_line");
+                self.modal_text_input.select_all();
+                self.focus = FocusTarget::AddDebugWatchModal;
+                self.touch_caret_activity();
+            }
+            HitAction::RemoveDebugWatch(idx) => {
+                self.dap_engine.remove_watch(idx);
+            }
+            HitAction::SendDebugContextToAgent => {
+                self.send_debug_context_to_agent();
+            }
             HitAction::SelectTheme(kind) => {
                 self.theme = IdeaTheme::from_kind(kind);
                 self.status_notification = format!(
@@ -8563,6 +9309,22 @@ impl IdeApplicationState {
                         .to_string();
                 }
             }
+            ContextMenuAction::FixLineDiagnosticWithAgent(line_0) => {
+                let path = self.active_buffer().path.clone();
+                if let Some(diag) = self.lsp_hub.diagnostic_at_line(&path, line_0).cloned() {
+                    let line_text = self.active_buffer().line_text(line_0);
+                    let prompt = format!(
+                        "请修复 `{}:{}` 的诊断问题：\n- 诊断：`{}`\n- 当前代码行：`{}`",
+                        diag.file_path.display(),
+                        diag.line,
+                        diag.message,
+                        line_text.trim()
+                    );
+                    self.right_agent_open = true;
+                    self.right_panel_tab = RightPanelTab::Chat;
+                    self.submit_agent_prompt(prompt);
+                }
+            }
         }
     }
 
@@ -8901,7 +9663,10 @@ impl IdeApplicationState {
             | FocusTarget::NewGitTagModal
             | FocusTarget::NewGitStashModal
             | FocusTarget::GitAddRemoteModal
-            | FocusTarget::RenamePathModal => {
+            | FocusTarget::RenamePathModal
+            | FocusTarget::RenameSymbolModal
+            | FocusTarget::GoToLineModal
+            | FocusTarget::AddDebugWatchModal => {
                 self.render_input_prompt_modal(canvas, w, h);
             }
             FocusTarget::GitMergeModal
@@ -9413,7 +10178,24 @@ impl IdeApplicationState {
             match id {
                 ToolWindowId::GitLog => canvas.draw_git_branch_icon(ix + 2, iy + 1, icon_color),
                 ToolWindowId::Terminal => canvas.draw_terminal_icon(ix, iy, icon_color),
-                ToolWindowId::Problems => canvas.draw_problems_icon(ix, iy, icon_color),
+                ToolWindowId::Problems => {
+                    canvas.draw_problems_icon(ix, iy, icon_color);
+                    let (err_cnt, warn_cnt, _) = self.lsp_hub.diagnostic_counts();
+                    let prob_cnt = err_cnt + warn_cnt;
+                    if prob_cnt > 0 {
+                        let badge_cutout = if active || hovered {
+                            t.panel_bg
+                        } else {
+                            t.tool_stripe_bg
+                        };
+                        let badge_bg = if err_cnt > 0 {
+                            t.breakpoint_red
+                        } else {
+                            t.warning_yellow
+                        };
+                        canvas.draw_count_badge(btn, prob_cnt, badge_bg, 0xFFFFFF, badge_cutout);
+                    }
+                }
                 ToolWindowId::Debug => canvas.draw_debug_bug_outline_icon(ix + 1, iy, icon_color),
                 _ => {}
             }
@@ -11036,6 +11818,204 @@ impl IdeApplicationState {
             }
         }
 
+        // 3.5 IDEA 风格编辑器内查找与替换栏 (Ctrl+F / Ctrl+R)
+        if self.editor_find_open {
+            let find_matches = self.current_editor_find_matches();
+            let bar_h = if self.editor_replace_open { 62 } else { 32 };
+            let bar_rect = Rect::new(rect.x + 12, code_top_y + 2, (rect.w - 24).max(200), bar_h);
+            canvas.stroke_rounded_rect(bar_rect, 6, t.border_color, t.panel_bg);
+
+            let input_w = (bar_rect.w - 310).clamp(140, 340);
+            let find_box = Rect::new(bar_rect.x + 8, bar_rect.y + 4, input_w, 24);
+            self.editor_find_input_rect = find_box;
+            let find_focused = self.focus == FocusTarget::EditorFindInput;
+            canvas.stroke_rounded_rect(
+                find_box,
+                4,
+                if find_focused {
+                    t.accent_blue
+                } else {
+                    t.border_color
+                },
+                t.editor_bg,
+            );
+            canvas.draw_search_icon(
+                find_box.x + 5,
+                find_box.y + 5,
+                if find_focused {
+                    t.accent_blue
+                } else {
+                    t.text_muted
+                },
+            );
+            let find_text_rect = Rect::new(
+                find_box.x + 22,
+                find_box.y,
+                (find_box.w - 28).max(40),
+                find_box.h,
+            );
+            let find_ph = self.tr("在当前文件中查找 (Ctrl+F)...", "Find in file (Ctrl+F)...");
+            let ime = self.editor_find_input.render_singleline(
+                canvas,
+                find_text_rect,
+                0,
+                find_box.y + 3,
+                find_ph,
+                find_focused,
+                self.caret_visible,
+                t.text_primary,
+                t.text_muted,
+                t.editor_selection_bg,
+                t.accent_blue,
+                FontStyle::CodeMono,
+            );
+            if find_focused {
+                self.ime_spot = ime;
+            }
+            self.hit_regions
+                .push((find_box, HitAction::FocusEditorFindInput));
+
+            let count_str = if self.editor_find_input.is_empty() {
+                "0/0".to_string()
+            } else if find_matches.is_empty() {
+                self.tr("无匹配", "0 results").to_string()
+            } else {
+                format!(
+                    "{}/{}",
+                    (self.editor_find_match_idx + 1).min(find_matches.len()),
+                    find_matches.len()
+                )
+            };
+            canvas.draw_text_styled(
+                find_box.x + find_box.w + 8,
+                find_box.y + 4,
+                &count_str,
+                if !self.editor_find_input.is_empty() && find_matches.is_empty() {
+                    t.breakpoint_red
+                } else {
+                    t.text_secondary
+                },
+                72,
+                FontStyle::UiSmall,
+            );
+
+            let mut bx = find_box.x + find_box.w + 78;
+            for (lbl, w_btn, act) in [
+                ("▲", 26, HitAction::EditorFindPrev),
+                ("▼", 26, HitAction::EditorFindNext),
+                (
+                    self.tr("替换 ▾", "Replace ▾"),
+                    64,
+                    HitAction::OpenEditorFindBar {
+                        with_replace: !self.editor_replace_open,
+                    },
+                ),
+            ] {
+                let b = Rect::new(bx, bar_rect.y + 4, w_btn, 24);
+                let bhov = b.contains(hx, hy);
+                canvas.stroke_rounded_rect(
+                    b,
+                    4,
+                    if bhov { t.accent_blue } else { t.border_color },
+                    if bhov { t.popup_hover_bg } else { t.window_bg },
+                );
+                canvas.draw_text_centered(
+                    b,
+                    lbl,
+                    if bhov { 0xFFFFFF } else { t.text_primary },
+                    FontStyle::UiSmall,
+                );
+                self.hit_regions.push((b, act));
+                bx += w_btn + 4;
+            }
+
+            let close_find_btn =
+                Rect::new(bar_rect.x + bar_rect.w - 28, bar_rect.y + 4, 22, 24);
+            let cf_hov = close_find_btn.contains(hx, hy);
+            if cf_hov {
+                canvas.fill_rounded_rect(close_find_btn, 4, t.popup_hover_bg);
+            }
+            canvas.draw_text_centered(
+                close_find_btn,
+                "×",
+                if cf_hov { 0xFFFFFF } else { t.text_muted },
+                FontStyle::UiRegular,
+            );
+            self.hit_regions
+                .push((close_find_btn, HitAction::CloseEditorFindBar));
+
+            if self.editor_replace_open {
+                let rep_box = Rect::new(bar_rect.x + 8, bar_rect.y + 33, input_w, 24);
+                self.editor_replace_input_rect = rep_box;
+                let rep_focused = self.focus == FocusTarget::EditorReplaceInput;
+                canvas.stroke_rounded_rect(
+                    rep_box,
+                    4,
+                    if rep_focused {
+                        t.accent_blue
+                    } else {
+                        t.border_color
+                    },
+                    t.editor_bg,
+                );
+                let rep_text_rect = Rect::new(
+                    rep_box.x + 22,
+                    rep_box.y,
+                    (rep_box.w - 28).max(40),
+                    rep_box.h,
+                );
+                let rep_ph = self.tr("替换为 (Ctrl+R)...", "Replace with (Ctrl+R)...");
+                let rep_ime = self.editor_replace_input.render_singleline(
+                    canvas,
+                    rep_text_rect,
+                    0,
+                    rep_box.y + 3,
+                    rep_ph,
+                    rep_focused,
+                    self.caret_visible,
+                    t.text_primary,
+                    t.text_muted,
+                    t.editor_selection_bg,
+                    t.accent_blue,
+                    FontStyle::CodeMono,
+                );
+                if rep_focused {
+                    self.ime_spot = rep_ime;
+                }
+                self.hit_regions
+                    .push((rep_box, HitAction::FocusEditorReplaceInput));
+
+                let mut rbx = rep_box.x + rep_box.w + 8;
+                for (lbl, w_btn, act) in [
+                    (self.tr("替换", "Replace"), 66, HitAction::EditorReplaceOne),
+                    (
+                        self.tr("全部替换", "Replace All"),
+                        82,
+                        HitAction::EditorReplaceAll,
+                    ),
+                ] {
+                    let b = Rect::new(rbx, bar_rect.y + 33, w_btn, 24);
+                    let bhov = b.contains(hx, hy);
+                    canvas.stroke_rounded_rect(
+                        b,
+                        4,
+                        if bhov { t.accent_blue } else { t.border_color },
+                        if bhov { t.popup_hover_bg } else { t.window_bg },
+                    );
+                    canvas.draw_text_centered(
+                        b,
+                        lbl,
+                        if bhov { 0xFFFFFF } else { t.text_primary },
+                        FontStyle::UiSmall,
+                    );
+                    self.hit_regions.push((b, act));
+                    rbx += w_btn + 6;
+                }
+            }
+
+            code_top_y += bar_h + 6;
+        }
+
         // 4. 代码编辑器 Gutter (动态适配 4/5/6+ 位数行号无截断 + Git 行级修改标记 + 断点 + 运行入口)
         let (buf_path, buf_lang, buf_rev, total_lines, cursor_line, cursor_col, sel_range) = {
             let buf = self.active_buffer();
@@ -11122,6 +12102,16 @@ impl IdeApplicationState {
         );
 
         let file_working_diff = self.git_engine.working_diffs.get(&buf_path);
+        let active_find_matches = self.current_editor_find_matches();
+        let matching_brackets = self
+            .active_buffer()
+            .find_matching_bracket(cursor_line, cursor_col);
+        let dap_paused_line = match &self.dap_engine.state {
+            DebugSessionState::PausedAtBreakpoint { file, line } if file == &buf_path => {
+                Some(*line)
+            }
+            _ => None,
+        };
         let file_blame_lines = if self.git_blame_visible {
             self.git_engine.file_blames.get(&buf_path).cloned()
         } else {
@@ -11138,8 +12128,15 @@ impl IdeApplicationState {
         for (vis_idx, (line_idx, line_str)) in visible_lines.iter().enumerate() {
             let line_idx = *line_idx;
             let row_y = code_top_y + (vis_idx as i32) * line_h;
+            let is_dap_paused_line = dap_paused_line == Some(line_idx);
+            let line_diag = self.lsp_hub.diagnostic_at_line(&buf_path, line_idx).cloned();
 
-            if line_idx == cursor_line {
+            if is_dap_paused_line {
+                canvas.fill_rect(
+                    Rect::new(rect.x + gutter_w + 1, row_y, rect.w - gutter_w - 12, line_h),
+                    blend_rgb(t.editor_bg, t.debug_orange, 0.24),
+                );
+            } else if line_idx == cursor_line {
                 canvas.fill_rect(
                     Rect::new(rect.x + gutter_w + 1, row_y, rect.w - gutter_w - 12, line_h),
                     t.editor_current_line_bg,
@@ -11155,7 +12152,9 @@ impl IdeApplicationState {
                 rect.x + 8,
                 row_y + 2,
                 &lineno_str,
-                if line_idx == cursor_line {
+                if is_dap_paused_line {
+                    t.debug_orange
+                } else if line_idx == cursor_line {
                     t.text_primary
                 } else {
                     t.text_muted
@@ -11167,6 +12166,13 @@ impl IdeApplicationState {
             let bp_cx = rect.x + 8 + lineno_col_w + 5;
             if self.dap_engine.has_breakpoint(&buf_path, line_idx) {
                 canvas.fill_circle(bp_cx, row_y + 11, 5, t.breakpoint_red);
+            } else if let Some(ref diag) = line_diag {
+                let d_col = match diag.severity {
+                    DiagnosticSeverityLevel::Error => t.breakpoint_red,
+                    DiagnosticSeverityLevel::Warning => t.warning_yellow,
+                    _ => t.accent_blue,
+                };
+                canvas.fill_circle(bp_cx, row_y + 11, 4, d_col);
             }
 
             if self.git_blame_visible {
@@ -11232,6 +12238,49 @@ impl IdeApplicationState {
             self.hit_regions
                 .push((code_row, HitAction::ClickEditorLine));
 
+            // Ctrl+F 查找匹配高亮与配对括号高亮
+            for &(m_line, m_sc, m_ec) in &active_find_matches {
+                if m_line == line_idx && m_ec > m_sc {
+                    let p0: String = line_str.chars().take(m_sc).collect();
+                    let p1: String = line_str.chars().take(m_ec).collect();
+                    let (w0, _) = canvas.measure_text(&p0, FontStyle::CodeMono);
+                    let (w1, _) = canvas.measure_text(&p1, FontStyle::CodeMono);
+                    let cx0 = (code_start_x - self.editor_scroll_x + w0)
+                        .clamp(code_body_rect.x, right_limit);
+                    let cx1 = (code_start_x - self.editor_scroll_x + w1)
+                        .clamp(code_body_rect.x, right_limit);
+                    if cx1 > cx0 {
+                        canvas.fill_rounded_rect(
+                            Rect::new(cx0, row_y + 2, cx1 - cx0, line_h - 4),
+                            3,
+                            blend_rgb(t.editor_bg, t.warning_yellow, 0.32),
+                        );
+                    }
+                }
+            }
+            if let Some((b_open, b_close)) = matching_brackets {
+                for (bl, bc) in [b_open, b_close] {
+                    if bl == line_idx {
+                        let p0: String = line_str.chars().take(bc).collect();
+                        let p1: String = line_str.chars().take(bc + 1).collect();
+                        let (w0, _) = canvas.measure_text(&p0, FontStyle::CodeMono);
+                        let (w1, _) = canvas.measure_text(&p1, FontStyle::CodeMono);
+                        let cx0 = (code_start_x - self.editor_scroll_x + w0)
+                            .clamp(code_body_rect.x, right_limit);
+                        let cx1 = (code_start_x - self.editor_scroll_x + w1)
+                            .clamp(code_body_rect.x, right_limit);
+                        if cx1 > cx0 {
+                            canvas.stroke_rounded_rect(
+                                Rect::new(cx0, row_y + 2, (cx1 - cx0).max(6), line_h - 4),
+                                2,
+                                t.accent_blue,
+                                blend_rgb(t.editor_bg, t.accent_blue, 0.18),
+                            );
+                        }
+                    }
+                }
+            }
+
             // 字符级选区高亮渲染
             if let Some(((sl, sc), (el, ec))) = sel_range {
                 if line_idx >= sl && line_idx <= el {
@@ -11283,6 +12332,24 @@ impl IdeApplicationState {
                         code_clip_rect,
                         font_style,
                     );
+                }
+                if let Some(ref diag) = line_diag {
+                    if code_x + 36 < right_limit {
+                        let lens_col = match diag.severity {
+                            DiagnosticSeverityLevel::Error => t.breakpoint_red,
+                            DiagnosticSeverityLevel::Warning => t.warning_yellow,
+                            _ => t.text_muted,
+                        };
+                        let lens_txt = format!("  // [{}] {}", diag.severity.badge(), diag.message);
+                        canvas.draw_text_clipped(
+                            code_x + 12,
+                            row_y + 2,
+                            &lens_txt,
+                            blend_rgb(t.editor_bg, lens_col, 0.78),
+                            code_clip_rect,
+                            FontStyle::CodeMono,
+                        );
+                    }
                 }
             }
 
@@ -12391,61 +13458,495 @@ impl IdeApplicationState {
                 );
             }
             ToolWindowId::Problems => {
-                for diag in &self.lsp_hub.diagnostics {
-                    if y + 20 > content_rect.y + content_rect.h {
-                        break;
-                    }
-                    canvas.draw_text_styled(
-                        content_rect.x + 14,
-                        y,
-                        &format!(
-                            "[{:?}] {}:{} — {}",
-                            diag.severity,
-                            diag.file_path.display(),
-                            diag.line,
-                            diag.message
-                        ),
-                        t.warning_yellow,
-                        content_rect.w - 28,
-                        FontStyle::CodeMono,
-                    );
-                    y += 21;
-                }
-                for srv in &self.lsp_hub.servers {
-                    if y + 20 > content_rect.y + content_rect.h {
-                        break;
-                    }
-                    canvas.draw_text_styled(
-                        content_rect.x + 14,
-                        y,
-                        &format!(
-                            "LSP [{}] -> {} ({})",
-                            srv.language.display_name(),
-                            srv.binary_name,
-                            srv.state_label
-                        ),
+                let (err_cnt, warn_cnt, info_cnt) = self.lsp_hub.diagnostic_counts();
+                let tb_rect = Rect::new(
+                    content_rect.x + 6,
+                    content_rect.y + 4,
+                    content_rect.w - 12,
+                    28,
+                );
+                canvas.fill_rounded_rect(tb_rect, 5, t.panel_bg);
+
+                let mut bx = tb_rect.x + 8;
+                let summary_str = format!(
+                    "✕ {} {}   ⚠ {} {}   ℹ {} {}",
+                    err_cnt,
+                    self.tr("错误", "Errors"),
+                    warn_cnt,
+                    self.tr("警告", "Warnings"),
+                    info_cnt,
+                    self.tr("提示", "Infos")
+                );
+                let (sum_w, _) = canvas.measure_text(&summary_str, FontStyle::UiSmall);
+                canvas.draw_text_styled(
+                    bx,
+                    tb_rect.y + 6,
+                    &summary_str,
+                    if err_cnt > 0 {
+                        t.breakpoint_red
+                    } else if warn_cnt > 0 {
+                        t.warning_yellow
+                    } else {
+                        t.text_secondary
+                    },
+                    sum_w + 12,
+                    FontStyle::UiSmall,
+                );
+                bx += sum_w + 18;
+
+                let is_checking = self
+                    .lsp_hub
+                    .is_checking
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let check_lbl = if is_checking {
+                    self.tr("检查中...", "Checking...")
+                } else {
+                    self.tr("↻ 检查工作区", "↻ Check Workspace")
+                };
+                let check_btn = Rect::new(bx, tb_rect.y + 3, 108, 22);
+                let chov = check_btn.contains(hx, hy);
+                canvas.stroke_rounded_rect(
+                    check_btn,
+                    4,
+                    if chov { t.accent_blue } else { t.border_color },
+                    if chov { t.popup_hover_bg } else { t.window_bg },
+                );
+                canvas.draw_text_centered(
+                    check_btn,
+                    check_lbl,
+                    if chov { 0xFFFFFF } else { t.text_primary },
+                    FontStyle::UiSmall,
+                );
+                self.hit_regions
+                    .push((check_btn, HitAction::RefreshLspDiagnostics));
+                bx += 116;
+
+                let ai_btn = Rect::new(bx, tb_rect.y + 3, 126, 22);
+                let ahov = ai_btn.contains(hx, hy);
+                canvas.stroke_rounded_rect(
+                    ai_btn,
+                    4,
+                    t.accent_blue,
+                    if ahov {
+                        t.accent_blue
+                    } else {
+                        blend_rgb(t.window_bg, t.accent_blue, 0.18)
+                    },
+                );
+                canvas.draw_text_centered(
+                    ai_btn,
+                    self.tr("✨ 发送给 AI 修复", "✨ Ask AI to Fix"),
+                    if ahov { 0xFFFFFF } else { t.text_primary },
+                    FontStyle::UiSmall,
+                );
+                self.hit_regions
+                    .push((ai_btn, HitAction::SendDiagnosticsToAgent));
+                bx += 136;
+
+                // 右侧展示已探测到的 LSP 服务状态徽章
+                let srv_summary: String = self
+                    .lsp_hub
+                    .servers
+                    .iter()
+                    .map(|s| {
+                        let st = if s.resolved_path.is_some() {
+                            "Active"
+                        } else {
+                            "Built-in AST"
+                        };
+                        format!("{}: {} ({})", s.language.display_name(), s.binary_name, st)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("  |  ");
+                if bx + 80 < tb_rect.x + tb_rect.w {
+                    canvas.draw_text_ellipsis(
+                        bx,
+                        tb_rect.y + 6,
+                        &srv_summary,
                         t.syn_type,
-                        content_rect.w - 28,
+                        tb_rect.x + tb_rect.w - bx - 8,
+                        FontStyle::UiSmall,
+                    );
+                }
+
+                let list_top = tb_rect.y + tb_rect.h + 6;
+                let row_h = 24;
+                let avail_h = (content_rect.y + content_rect.h - list_top - 4).max(row_h);
+                let max_rows = (avail_h / row_h).max(1) as usize;
+                let total_diags = self.lsp_hub.diagnostics.len();
+                let max_scroll = total_diags.saturating_sub(max_rows);
+                if self.problems_scroll > max_scroll {
+                    self.problems_scroll = max_scroll;
+                }
+
+                let mut ry = list_top;
+                let diags: Vec<ide_lsp::IdeDiagnostic> = self
+                    .lsp_hub
+                    .diagnostics
+                    .iter()
+                    .skip(self.problems_scroll)
+                    .take(max_rows)
+                    .cloned()
+                    .collect();
+                for diag in diags {
+                    let row = Rect::new(
+                        content_rect.x + 8,
+                        ry,
+                        content_rect.w - 22,
+                        row_h - 2,
+                    );
+                    let hov = row.contains(hx, hy);
+                    canvas.fill_rounded_rect(
+                        row,
+                        4,
+                        if hov {
+                            t.popup_hover_bg
+                        } else {
+                            t.editor_current_line_bg
+                        },
+                    );
+                    let sev_col = match diag.severity {
+                        DiagnosticSeverityLevel::Error => t.breakpoint_red,
+                        DiagnosticSeverityLevel::Warning => t.warning_yellow,
+                        DiagnosticSeverityLevel::Information => t.accent_blue,
+                        DiagnosticSeverityLevel::Hint => t.text_muted,
+                    };
+                    let badge_r = Rect::new(row.x + 6, row.y + 3, 18, 16);
+                    canvas.fill_rounded_rect(badge_r, 3, blend_rgb(t.window_bg, sev_col, 0.25));
+                    canvas.draw_text_centered(
+                        badge_r,
+                        diag.severity.badge(),
+                        sev_col,
+                        FontStyle::UiBold,
+                    );
+
+                    let rel_path = diag
+                        .file_path
+                        .strip_prefix(&self.workspace_root)
+                        .unwrap_or(&diag.file_path)
+                        .to_string_lossy();
+                    let hint_str = diag
+                        .quick_fix_suggestion
+                        .as_ref()
+                        .map(|h| format!("  💡 {h}"))
+                        .unwrap_or_default();
+                    let line_txt = format!(
+                        "{}:{}:{}  —  {}  [{}]{}",
+                        rel_path, diag.line, diag.column, diag.message, diag.source, hint_str
+                    );
+                    canvas.draw_text_ellipsis(
+                        row.x + 30,
+                        row.y + 2,
+                        &line_txt,
+                        if hov { 0xFFFFFF } else { t.text_primary },
+                        row.w - 38,
                         FontStyle::CodeMono,
                     );
-                    y += 20;
+                    self.hit_regions.push((
+                        row,
+                        HitAction::OpenFileAtLine(diag.file_path.clone(), Some(diag.line)),
+                    ));
+                    ry += row_h;
                 }
+
+                let track = Rect::new(
+                    content_rect.x + content_rect.w - 9,
+                    list_top,
+                    6,
+                    avail_h,
+                );
+                self.problems_scroll_info = ScrollTrackInfo {
+                    track,
+                    visible: max_rows,
+                    total: total_diags,
+                };
+                canvas.draw_vertical_scrollbar(
+                    track,
+                    self.problems_scroll,
+                    max_rows,
+                    total_diags,
+                    t.border_color,
+                );
             }
             ToolWindowId::Debug => {
-                let summary = self.dap_engine.export_ai_debug_context();
-                for line in summary.lines() {
-                    if y + 20 > content_rect.y + content_rect.h {
+                let tb_rect = Rect::new(
+                    content_rect.x + 6,
+                    content_rect.y + 4,
+                    content_rect.w - 12,
+                    28,
+                );
+                canvas.fill_rounded_rect(tb_rect, 5, t.panel_bg);
+
+                let mut bx = tb_rect.x + 6;
+                let is_active = self.dap_engine.state != DebugSessionState::Inactive;
+                for (lbl, w_btn, act, col) in [
+                    (
+                        if is_active {
+                            self.tr("▶ 继续 (F9)", "▶ Resume (F9)")
+                        } else {
+                            self.tr("▶ 启动调试", "▶ Start Debug")
+                        },
+                        94,
+                        HitAction::DebugContinue,
+                        t.run_green,
+                    ),
+                    (
+                        self.tr("↷ 步过 (F8)", "↷ Step Over"),
+                        86,
+                        HitAction::DebugStepOver,
+                        t.accent_blue,
+                    ),
+                    (
+                        self.tr("↓ 步入 (F7)", "↓ Step Into"),
+                        86,
+                        HitAction::DebugStepInto,
+                        t.accent_blue,
+                    ),
+                    (
+                        self.tr("↑ 步出", "↑ Step Out"),
+                        68,
+                        HitAction::DebugStepOut,
+                        t.accent_blue,
+                    ),
+                    (
+                        self.tr("■ 停止", "■ Stop"),
+                        64,
+                        HitAction::DebugStop,
+                        t.breakpoint_red,
+                    ),
+                    (
+                        self.tr("+ 监视", "+ Watch"),
+                        64,
+                        HitAction::OpenAddDebugWatchModal,
+                        t.syn_function,
+                    ),
+                    (
+                        self.tr("✨ AI 分析断点", "✨ AI Analyze"),
+                        106,
+                        HitAction::SendDebugContextToAgent,
+                        t.debug_orange,
+                    ),
+                ] {
+                    let b = Rect::new(bx, tb_rect.y + 3, w_btn, 22);
+                    let bhov = b.contains(hx, hy);
+                    canvas.stroke_rounded_rect(
+                        b,
+                        4,
+                        if bhov { col } else { t.border_color },
+                        if bhov {
+                            t.popup_hover_bg
+                        } else {
+                            t.window_bg
+                        },
+                    );
+                    canvas.draw_text_centered(
+                        b,
+                        lbl,
+                        if bhov { 0xFFFFFF } else { col },
+                        FontStyle::UiSmall,
+                    );
+                    self.hit_regions.push((b, act));
+                    bx += w_btn + 6;
+                }
+
+                let state_str = match &self.dap_engine.state {
+                    DebugSessionState::Inactive => format!(
+                        "{} ({})",
+                        self.tr("未启动 — 点击 ▶ 或按 Shift+F9 启动", "Inactive — Press Shift+F9"),
+                        self.dap_engine.active_adapter
+                    ),
+                    DebugSessionState::Running => {
+                        format!("Running ({})", self.dap_engine.active_adapter)
+                    }
+                    DebugSessionState::PausedAtBreakpoint { file, line } => format!(
+                        "Paused at {}:{} ({})",
+                        file.file_name().and_then(|n| n.to_str()).unwrap_or("file"),
+                        line + 1,
+                        self.dap_engine.active_adapter
+                    ),
+                };
+                if bx + 80 < tb_rect.x + tb_rect.w {
+                    canvas.draw_text_ellipsis(
+                        bx + 4,
+                        tb_rect.y + 6,
+                        &state_str,
+                        t.debug_orange,
+                        tb_rect.x + tb_rect.w - bx - 10,
+                        FontStyle::UiSmall,
+                    );
+                }
+
+                // 三栏 IDEA 调试器视图：[Frames & Breakpoints] | [Variables] | [Watches]
+                let panes_top = tb_rect.y + tb_rect.h + 6;
+                let panes_h = (content_rect.y + content_rect.h - panes_top - 6).max(40);
+                let total_w = (content_rect.w - 20).max(180);
+                let col1_w = total_w * 34 / 100;
+                let col2_w = total_w * 36 / 100;
+                let col3_w = (total_w - col1_w - col2_w).max(60);
+
+                let frames_box = Rect::new(content_rect.x + 6, panes_top, col1_w, panes_h);
+                let vars_box =
+                    Rect::new(frames_box.x + frames_box.w + 4, panes_top, col2_w, panes_h);
+                let watches_box =
+                    Rect::new(vars_box.x + vars_box.w + 4, panes_top, col3_w, panes_h);
+
+                for (pane_r, hdr) in [
+                    (
+                        frames_box,
+                        self.tr("调用栈与断点 (Frames & Breakpoints)", "Frames & Breakpoints"),
+                    ),
+                    (
+                        vars_box,
+                        self.tr("局部变量 (Variables)", "Local Variables"),
+                    ),
+                    (
+                        watches_box,
+                        self.tr("监视表达式 (Watches)", "Watches"),
+                    ),
+                ] {
+                    canvas.stroke_rounded_rect(pane_r, 5, t.border_color, t.panel_bg);
+                    canvas.draw_text_ellipsis(
+                        pane_r.x + 8,
+                        pane_r.y + 5,
+                        hdr,
+                        t.text_secondary,
+                        pane_r.w - 16,
+                        FontStyle::UiBold,
+                    );
+                    canvas.fill_rect(
+                        Rect::new(pane_r.x + 2, pane_r.y + 24, pane_r.w - 4, 1),
+                        t.border_color,
+                    );
+                }
+
+                // 1) 调用栈与断点列表
+                let mut fy = frames_box.y + 28;
+                let frames = self.dap_engine.call_stack.clone();
+                let sel_frame = self.dap_engine.selected_frame;
+                for (f_idx, frame) in frames.iter().enumerate() {
+                    if fy + 20 > frames_box.y + frames_box.h {
                         break;
                     }
-                    canvas.draw_text_styled(
-                        content_rect.x + 14,
-                        y,
-                        line,
-                        t.debug_orange,
-                        content_rect.w - 28,
+                    let frow = Rect::new(frames_box.x + 4, fy, frames_box.w - 8, 20);
+                    let is_sel = f_idx == sel_frame;
+                    let fhov = frow.contains(hx, hy);
+                    if is_sel || fhov {
+                        canvas.fill_rounded_rect(
+                            frow,
+                            3,
+                            if is_sel {
+                                t.editor_selection_bg
+                            } else {
+                                t.popup_hover_bg
+                            },
+                        );
+                    }
+                    let fname = frame
+                        .file
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("file");
+                    canvas.draw_text_ellipsis(
+                        frow.x + 6,
+                        fy + 1,
+                        &format!("#{} {}  ({}:{})", frame.id, frame.name, fname, frame.line),
+                        if is_sel || fhov {
+                            0xFFFFFF
+                        } else {
+                            t.text_primary
+                        },
+                        frow.w - 12,
                         FontStyle::CodeMono,
                     );
-                    y += 20;
+                    self.hit_regions
+                        .push((frow, HitAction::SelectDebugFrame(f_idx)));
+                    fy += 21;
+                }
+                for (bp_file, bp_line) in self.dap_engine.all_breakpoints() {
+                    if fy + 20 > frames_box.y + frames_box.h {
+                        break;
+                    }
+                    let brow = Rect::new(frames_box.x + 4, fy, frames_box.w - 8, 20);
+                    let bhov = brow.contains(hx, hy);
+                    if bhov {
+                        canvas.fill_rounded_rect(brow, 3, t.popup_hover_bg);
+                    }
+                    canvas.fill_circle(brow.x + 10, fy + 10, 4, t.breakpoint_red);
+                    let fname = bp_file
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("file");
+                    canvas.draw_text_ellipsis(
+                        brow.x + 20,
+                        fy + 1,
+                        &format!("BP  {}:{}", fname, bp_line + 1),
+                        if bhov { 0xFFFFFF } else { t.text_secondary },
+                        brow.w - 26,
+                        FontStyle::CodeMono,
+                    );
+                    self.hit_regions.push((
+                        brow,
+                        HitAction::OpenFileAtLine(bp_file, Some(bp_line + 1)),
+                    ));
+                    fy += 21;
+                }
+
+                // 2) 局部变量列表
+                let mut vy = vars_box.y + 28;
+                if self.dap_engine.variables.is_empty() {
+                    canvas.draw_text_ellipsis(
+                        vars_box.x + 10,
+                        vy + 4,
+                        self.tr("启动调试后展示当前栈帧变量", "Start debugger to inspect variables"),
+                        t.text_muted,
+                        vars_box.w - 20,
+                        FontStyle::UiSmall,
+                    );
+                } else {
+                    for var in &self.dap_engine.variables {
+                        if vy + 20 > vars_box.y + vars_box.h {
+                            break;
+                        }
+                        canvas.draw_text_ellipsis(
+                            vars_box.x + 8,
+                            vy + 1,
+                            &format!("{}: {} = {}", var.name, var.type_name, var.value),
+                            t.syn_function,
+                            vars_box.w - 16,
+                            FontStyle::CodeMono,
+                        );
+                        vy += 21;
+                    }
+                }
+
+                // 3) 监视表达式列表
+                let mut wy = watches_box.y + 28;
+                let watches = self.dap_engine.watches.clone();
+                for (w_idx, w_expr) in watches.iter().enumerate() {
+                    if wy + 20 > watches_box.y + watches_box.h {
+                        break;
+                    }
+                    let val = self.dap_engine.evaluate_watch(w_expr);
+                    canvas.draw_text_ellipsis(
+                        watches_box.x + 8,
+                        wy + 1,
+                        &format!("{w_expr} = {val}"),
+                        t.syn_string,
+                        watches_box.w - 30,
+                        FontStyle::CodeMono,
+                    );
+                    let del_r =
+                        Rect::new(watches_box.x + watches_box.w - 22, wy + 2, 16, 16);
+                    let dhov = del_r.contains(hx, hy);
+                    canvas.draw_text_centered(
+                        del_r,
+                        "×",
+                        if dhov { t.breakpoint_red } else { t.text_muted },
+                        FontStyle::UiSmall,
+                    );
+                    self.hit_regions
+                        .push((del_r, HitAction::RemoveDebugWatch(w_idx)));
+                    wy += 21;
                 }
             }
             ToolWindowId::GitLog => {
@@ -15571,6 +17072,44 @@ impl IdeApplicationState {
                 self.tr(
                     "按 Enter 确认重命名，按 Esc 关闭弹窗",
                     "Press Enter to rename, Esc to cancel",
+                ),
+            ),
+            FocusTarget::RenameSymbolModal => (
+                match self.ui_lang {
+                    UiLanguage::ZhCn => format!(
+                        "重构：重命名符号 `{}` (Shift+F6)",
+                        self.rename_symbol_target.as_deref().unwrap_or("")
+                    ),
+                    UiLanguage::EnUs => format!(
+                        "Refactor: Rename Symbol `{}` (Shift+F6)",
+                        self.rename_symbol_target.as_deref().unwrap_or("")
+                    ),
+                },
+                self.tr(
+                    "按 Enter 在当前文件中批量重命名该标识符（支持 Ctrl+Z 撤销），按 Esc 取消",
+                    "Press Enter to rename all identifier occurrences (Undo supported), Esc to cancel",
+                ),
+            ),
+            FocusTarget::GoToLineModal => (
+                self.tr(
+                    "转到行:列 Go to Line:Column (Ctrl+G)",
+                    "Go to Line:Column (Ctrl+G)",
+                )
+                .to_string(),
+                self.tr(
+                    "输入格式 `<行号>` 或 `<行号>:<列号>` 后按 Enter 跳转，Esc 取消",
+                    "Enter `<line>` or `<line>:<column>` then press Enter, Esc to cancel",
+                ),
+            ),
+            FocusTarget::AddDebugWatchModal => (
+                self.tr(
+                    "添加 DAP 调试器监视表达式 (Add Watch Expression)",
+                    "Add DAP Debugger Watch Expression",
+                )
+                .to_string(),
+                self.tr(
+                    "输入变量名或表达式后按 Enter 加入监视列表，Esc 取消",
+                    "Enter variable or expression then press Enter to watch, Esc to cancel",
                 ),
             ),
             _ => (
@@ -20003,5 +21542,88 @@ mod tests {
             }
         }
         assert!(code_line_count >= 2, "long code line should wrap neatly inside wide bubble");
+    }
+
+    #[test]
+    fn test_lsp_problems_dap_debugger_and_editor_find_rename_goto() {
+        let mut state = IdeApplicationState::new(PathBuf::from("."));
+        let demo_path = state.workspace_root.join("src/demo_lsp_dap.rs");
+        let demo_src = "pub fn compute_value(base: i32) -> i32 {\n    let mut total = base + 10;\n    total = total * 2;\n    todo!(\"finish later\");\n}\n\nfn main() {\n    let ans = compute_value(5);\n    println!(\"{ans}\");\n}\n";
+        state.open_buffers = vec![TextBuffer::from_text(demo_path.clone(), demo_src)];
+        state.active_tab = 0;
+
+        // 1. Live LSP diagnostics detection (todo! warning) & interactive Problems panel
+        state.refresh_active_buffer_diagnostics();
+        let (errs, warns, _) = state.lsp_hub.diagnostic_counts();
+        assert_eq!(errs, 0);
+        assert!(warns >= 1);
+        state.bottom_tool = Some(ToolWindowId::Problems);
+        let mut canvas = SurfaceCanvas::new(1440, 900);
+        state.render(&mut canvas);
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::RefreshLspDiagnostics)));
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::OpenFileAtLine(p, Some(4)) if p == &demo_path)));
+
+        // 2. Go to Declaration (Ctrl+B) from usage at line 7 (`compute_value(5)`) -> line 0
+        state.active_buffer_mut().set_cursor(7, 16, false);
+        state.execute_ide_action(IdeAction::GoToDeclaration);
+        assert_eq!(state.active_buffer().cursor_line, 0);
+
+        // 3. Refactor Rename Symbol (Shift+F6) on `total`
+        state.active_buffer_mut().set_cursor(1, 13, false);
+        state.execute_ide_action(IdeAction::RenameSymbol);
+        assert_eq!(state.focus, FocusTarget::RenameSymbolModal);
+        assert_eq!(state.rename_symbol_target.as_deref(), Some("total"));
+        state.modal_text_input.set_text("accumulated");
+        state.submit_rename_symbol();
+        assert!(state.active_buffer().text().contains("let mut accumulated = base + 10;"));
+        assert!(state.active_buffer().text().contains("accumulated = accumulated * 2;"));
+
+        // 4. In-editor Find & Replace bar (Ctrl+F / Ctrl+R)
+        state.open_editor_find_bar(true);
+        assert!(state.editor_find_open && state.editor_replace_open);
+        state.editor_find_input.set_text("accumulated");
+        assert_eq!(state.current_editor_find_matches().len(), 3);
+        state.editor_replace_input.set_text("result_sum");
+        state.editor_replace_all();
+        assert_eq!(state.current_editor_find_matches().len(), 0);
+        assert!(state.active_buffer().text().contains("let mut result_sum = base + 10;"));
+        state.close_editor_find_bar();
+
+        // 5. Go to Line:Column (Ctrl+G)
+        state.open_go_to_line_modal();
+        assert_eq!(state.focus, FocusTarget::GoToLineModal);
+        state.modal_text_input.set_text("3:5");
+        state.submit_go_to_line();
+        assert_eq!(state.active_buffer().cursor_line, 2);
+        assert_eq!(state.active_buffer().cursor_col, 4);
+
+        // 6. Interactive DAP Debugger (Shift+F9, Step Over, Watches)
+        state.dap_engine.toggle_breakpoint(&demo_path, 1);
+        state.execute_ide_action(IdeAction::DebugActiveConfig);
+        assert_eq!(state.bottom_tool, Some(ToolWindowId::Debug));
+        assert!(state
+            .dap_engine
+            .variables
+            .iter()
+            .any(|v| v.name == "result_sum"));
+        state.render(&mut canvas);
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::DebugStepOver)));
+        state.debug_step_over();
+        assert_eq!(
+            state.dap_engine.state,
+            DebugSessionState::PausedAtBreakpoint {
+                file: demo_path,
+                line: 2
+            }
+        );
     }
 }

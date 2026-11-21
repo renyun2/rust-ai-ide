@@ -206,6 +206,254 @@ impl TextBuffer {
         self.sync_selection_lines();
     }
 
+    /// 获取指定行列位置处的标识符/单词及其在当前行中的 `[start_col, end_col)` 范围
+    pub fn word_at_pos(&self, line: usize, col: usize) -> Option<(String, usize, usize)> {
+        let (l, c) = self.clamp_pos(line, col);
+        let chars: Vec<char> = self.line_text(l).chars().collect();
+        if chars.is_empty() {
+            return None;
+        }
+        let probe = if c < chars.len() && char_word_kind(chars[c]) == WordCharKind::Word {
+            c
+        } else if c > 0 && char_word_kind(chars[c - 1]) == WordCharKind::Word {
+            c - 1
+        } else {
+            return None;
+        };
+        let mut start = probe;
+        while start > 0 && char_word_kind(chars[start - 1]) == WordCharKind::Word {
+            start -= 1;
+        }
+        let mut end = probe + 1;
+        while end < chars.len() && char_word_kind(chars[end]) == WordCharKind::Word {
+            end += 1;
+        }
+        let word: String = chars[start..end].iter().collect();
+        if word.is_empty() {
+            None
+        } else {
+            Some((word, start, end))
+        }
+    }
+
+    /// 获取当前光标下的标识符（若有单行选区且为合法标识符则优先返回选区）
+    pub fn word_at_cursor(&self) -> Option<String> {
+        if let Some(sel) = self.selected_text() {
+            let trimmed = sel.trim();
+            if !trimmed.is_empty()
+                && !trimmed.contains('\n')
+                && trimmed.chars().all(|ch| ch.is_alphanumeric() || ch == '_')
+            {
+                return Some(trimmed.to_string());
+            }
+        }
+        self.word_at_pos(self.cursor_line, self.cursor_col)
+            .map(|(w, _, _)| w)
+    }
+
+    /// 查找当前文档中所有匹配的 `(line, start_col, end_col)`
+    pub fn find_all_matches(&self, query: &str, case_sensitive: bool) -> Vec<(usize, usize, usize)> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let q_chars: Vec<char> = if case_sensitive {
+            query.chars().collect()
+        } else {
+            query.to_lowercase().chars().collect()
+        };
+        let q_len = q_chars.len();
+        if q_len == 0 {
+            return Vec::new();
+        }
+        let mut matches = Vec::new();
+        for line_idx in 0..self.line_count() {
+            let line_str = self.line_text(line_idx);
+            let l_chars: Vec<char> = if case_sensitive {
+                line_str.chars().collect()
+            } else {
+                line_str.to_lowercase().chars().collect()
+            };
+            if l_chars.len() < q_len {
+                continue;
+            }
+            let mut col = 0;
+            while col + q_len <= l_chars.len() {
+                if l_chars[col..col + q_len] == q_chars[..] {
+                    matches.push((line_idx, col, col + q_len));
+                    col += q_len;
+                } else {
+                    col += 1;
+                }
+            }
+        }
+        matches
+    }
+
+    /// 替换指定行与列区间的文本（带 Undo 记录）
+    pub fn replace_range_on_line(
+        &mut self,
+        line: usize,
+        start_col: usize,
+        end_col: usize,
+        replacement: &str,
+    ) -> bool {
+        if line >= self.line_count() || start_col > end_col {
+            return false;
+        }
+        let line_len = self.line_len_chars(line);
+        let sc = start_col.min(line_len);
+        let ec = end_col.min(line_len);
+        let start_char = self.rope.line_to_char(line) + sc;
+        let end_char = self.rope.line_to_char(line) + ec;
+        self.push_undo();
+        if start_char < end_char {
+            self.rope.remove(start_char..end_char);
+        }
+        self.rope.insert(start_char, replacement);
+        self.cursor_line = line;
+        self.cursor_col = sc + replacement.chars().count();
+        self.clear_selection();
+        self.mark_modified();
+        true
+    }
+
+    /// 一次性替换文档中所有匹配项（单步 Undo）
+    pub fn replace_all_matches(
+        &mut self,
+        query: &str,
+        replacement: &str,
+        case_sensitive: bool,
+    ) -> usize {
+        let matches = self.find_all_matches(query, case_sensitive);
+        if matches.is_empty() {
+            return 0;
+        }
+        self.push_undo();
+        for &(line, sc, ec) in matches.iter().rev() {
+            let line_start = self.rope.line_to_char(line);
+            let start_char = line_start + sc;
+            let end_char = line_start + ec;
+            if start_char < end_char {
+                self.rope.remove(start_char..end_char);
+            }
+            self.rope.insert(start_char, replacement);
+        }
+        let count = matches.len();
+        let (cl, cc) = self.clamp_pos(self.cursor_line, self.cursor_col);
+        self.cursor_line = cl;
+        self.cursor_col = cc;
+        self.clear_selection();
+        self.mark_modified();
+        count
+    }
+
+    /// 重命名当前缓冲区中所有完整单词匹配的标识符（`Shift+F6` Refactor Rename，支持单步 Undo）
+    pub fn rename_identifier_in_buffer(&mut self, old_name: &str, new_name: &str) -> usize {
+        let old_trimmed = old_name.trim();
+        let new_trimmed = new_name.trim();
+        if old_trimmed.is_empty() || new_trimmed.is_empty() || old_trimmed == new_trimmed {
+            return 0;
+        }
+        let all_hits = self.find_all_matches(old_trimmed, true);
+        let mut word_hits = Vec::new();
+        for (line, sc, ec) in all_hits {
+            let chars: Vec<char> = self.line_text(line).chars().collect();
+            let prev_is_word = sc > 0
+                && chars
+                    .get(sc - 1)
+                    .is_some_and(|c| char_word_kind(*c) == WordCharKind::Word);
+            let next_is_word = chars
+                .get(ec)
+                .is_some_and(|c| char_word_kind(*c) == WordCharKind::Word);
+            if !prev_is_word && !next_is_word {
+                word_hits.push((line, sc, ec));
+            }
+        }
+        if word_hits.is_empty() {
+            return 0;
+        }
+        self.push_undo();
+        for &(line, sc, ec) in word_hits.iter().rev() {
+            let line_start = self.rope.line_to_char(line);
+            self.rope.remove((line_start + sc)..(line_start + ec));
+            self.rope.insert(line_start + sc, new_trimmed);
+        }
+        let count = word_hits.len();
+        let (cl, cc) = self.clamp_pos(self.cursor_line, self.cursor_col);
+        self.cursor_line = cl;
+        self.cursor_col = cc;
+        self.clear_selection();
+        self.mark_modified();
+        count
+    }
+
+    /// 查找光标处或紧邻处的匹配括号 `()` / `{}` / `[]` 位置 `((open_l, open_c), (close_l, close_c))`
+    pub fn find_matching_bracket(&self, line: usize, col: usize) -> Option<((usize, usize), (usize, usize))> {
+        let (l, c) = self.clamp_pos(line, col);
+        let chars: Vec<char> = self.line_text(l).chars().collect();
+        if chars.is_empty() {
+            return None;
+        }
+        let (target_col, ch) = if c < chars.len() && is_bracket_char(chars[c]) {
+            (c, chars[c])
+        } else if c > 0 && c - 1 < chars.len() && is_bracket_char(chars[c - 1]) {
+            (c - 1, chars[c - 1])
+        } else {
+            return None;
+        };
+
+        let (pair, forward) = match ch {
+            '(' => (')', true),
+            '[' => (']', true),
+            '{' => ('}', true),
+            ')' => ('(', false),
+            ']' => ('[', false),
+            '}' => ('{', false),
+            _ => return None,
+        };
+
+        let max_scan_lines = 400usize;
+        let mut depth = 0i32;
+        if forward {
+            let end_line = (l + max_scan_lines).min(self.line_count().saturating_sub(1));
+            for cur_l in l..=end_line {
+                let l_chars: Vec<char> = self.line_text(cur_l).chars().collect();
+                let start_c = if cur_l == l { target_col } else { 0 };
+                for (cur_c, &cur_ch) in l_chars.iter().enumerate().skip(start_c) {
+                    if cur_ch == ch {
+                        depth += 1;
+                    } else if cur_ch == pair {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(((l, target_col), (cur_l, cur_c)));
+                        }
+                    }
+                }
+            }
+        } else {
+            let start_line = l.saturating_sub(max_scan_lines);
+            for cur_l in (start_line..=l).rev() {
+                let l_chars: Vec<char> = self.line_text(cur_l).chars().collect();
+                let end_c = if cur_l == l {
+                    target_col + 1
+                } else {
+                    l_chars.len()
+                };
+                for (cur_c, &cur_ch) in l_chars[..end_c.min(l_chars.len())].iter().enumerate().rev() {
+                    if cur_ch == ch {
+                        depth += 1;
+                    } else if cur_ch == pair {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(((cur_l, cur_c), (l, target_col)));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     pub fn select_line(&mut self, line: usize) {
         let (l, _) = self.clamp_pos(line, 0);
         let total = self.line_count();
@@ -875,6 +1123,10 @@ enum WordCharKind {
     Word,
     Space,
     Punct,
+}
+
+fn is_bracket_char(ch: char) -> bool {
+    matches!(ch, '(' | ')' | '[' | ']' | '{' | '}')
 }
 
 fn char_word_kind(ch: char) -> WordCharKind {

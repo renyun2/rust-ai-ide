@@ -277,96 +277,141 @@ pub fn extract_structure_symbols(source: &str, lang: LanguageId) -> Vec<Structur
             LanguageId::Rust => {
                 if let Some(rest) = line
                     .strip_prefix("pub fn ")
+                    .or_else(|| line.strip_prefix("pub(crate) fn "))
+                    .or_else(|| line.strip_prefix("pub(super) fn "))
                     .or_else(|| line.strip_prefix("pub async fn "))
+                    .or_else(|| line.strip_prefix("pub(crate) async fn "))
+                    .or_else(|| line.strip_prefix("pub const fn "))
+                    .or_else(|| line.strip_prefix("const fn "))
                     .or_else(|| line.strip_prefix("async fn "))
                     .or_else(|| line.strip_prefix("fn "))
                 {
-                    if let Some(name) = rest.split(['(', '<']).next() {
-                        symbols.push(StructureSymbol {
-                            name: name.trim().to_string(),
-                            kind: SymbolKind::Function,
-                            line: line_idx,
-                        });
+                    if let Some(name) = rest.split(['(', '<', ' ']).next() {
+                        if !name.trim().is_empty() {
+                            symbols.push(StructureSymbol {
+                                name: name.trim().to_string(),
+                                kind: SymbolKind::Function,
+                                line: line_idx,
+                            });
+                        }
                     }
                 } else if let Some(rest) = line
                     .strip_prefix("pub struct ")
+                    .or_else(|| line.strip_prefix("pub(crate) struct "))
                     .or_else(|| line.strip_prefix("struct "))
                 {
-                    if let Some(name) = rest.split(['{', '(', '<', ' ']).next() {
-                        symbols.push(StructureSymbol {
-                            name: name.trim().to_string(),
-                            kind: SymbolKind::Struct,
-                            line: line_idx,
-                        });
+                    if let Some(name) = rest.split(['{', '(', '<', ';', ' ']).next() {
+                        if !name.trim().is_empty() {
+                            symbols.push(StructureSymbol {
+                                name: name.trim().to_string(),
+                                kind: SymbolKind::Struct,
+                                line: line_idx,
+                            });
+                        }
                     }
                 } else if let Some(rest) = line
                     .strip_prefix("pub enum ")
+                    .or_else(|| line.strip_prefix("pub(crate) enum "))
                     .or_else(|| line.strip_prefix("enum "))
                 {
                     if let Some(name) = rest.split(['{', '<', ' ']).next() {
-                        symbols.push(StructureSymbol {
-                            name: name.trim().to_string(),
-                            kind: SymbolKind::Enum,
-                            line: line_idx,
-                        });
+                        if !name.trim().is_empty() {
+                            symbols.push(StructureSymbol {
+                                name: name.trim().to_string(),
+                                kind: SymbolKind::Enum,
+                                line: line_idx,
+                            });
+                        }
                     }
                 } else if let Some(rest) = line
                     .strip_prefix("pub trait ")
+                    .or_else(|| line.strip_prefix("pub(crate) trait "))
                     .or_else(|| line.strip_prefix("trait "))
                 {
-                    if let Some(name) = rest.split(['{', '<', ':']).next() {
-                        symbols.push(StructureSymbol {
-                            name: name.trim().to_string(),
-                            kind: SymbolKind::Trait,
-                            line: line_idx,
-                        });
+                    if let Some(name) = rest.split(['{', '<', ':', ' ']).next() {
+                        if !name.trim().is_empty() {
+                            symbols.push(StructureSymbol {
+                                name: name.trim().to_string(),
+                                kind: SymbolKind::Trait,
+                                line: line_idx,
+                            });
+                        }
+                    }
+                } else if let Some(rest) = line
+                    .strip_prefix("pub const ")
+                    .or_else(|| line.strip_prefix("pub(crate) const "))
+                    .or_else(|| line.strip_prefix("const "))
+                    .or_else(|| line.strip_prefix("pub static "))
+                    .or_else(|| line.strip_prefix("static "))
+                {
+                    if let Some(name) = rest.split([':', '=', ' ']).next() {
+                        let n = name.trim();
+                        if !n.is_empty() && n != "fn" && n != "mut" {
+                            symbols.push(StructureSymbol {
+                                name: n.to_string(),
+                                kind: SymbolKind::Constant,
+                                line: line_idx,
+                            });
+                        }
                     }
                 } else if let Some(rest) = line.strip_prefix("impl") {
-                    let title = rest.trim_end_matches('{').trim();
-                    if !title.is_empty() {
-                        symbols.push(StructureSymbol {
-                            name: format!("impl {title}"),
-                            kind: SymbolKind::Impl,
-                            line: line_idx,
-                        });
+                    if rest.starts_with(' ') || rest.starts_with('<') {
+                        let title = rest.trim_end_matches('{').trim();
+                        if !title.is_empty() {
+                            symbols.push(StructureSymbol {
+                                name: format!("impl {title}"),
+                                kind: SymbolKind::Impl,
+                                line: line_idx,
+                            });
+                        }
                     }
                 }
             }
             LanguageId::TypeScript | LanguageId::JavaScript => {
                 if let Some(rest) = line
                     .strip_prefix("export function ")
+                    .or_else(|| line.strip_prefix("export default function "))
                     .or_else(|| line.strip_prefix("export async function "))
                     .or_else(|| line.strip_prefix("async function "))
                     .or_else(|| line.strip_prefix("function "))
                 {
-                    if let Some(name) = rest.split(['(', '<']).next() {
-                        symbols.push(StructureSymbol {
-                            name: name.trim().to_string(),
-                            kind: SymbolKind::Function,
-                            line: line_idx,
-                        });
+                    if let Some(name) = rest.split(['(', '<', ' ']).next() {
+                        if !name.trim().is_empty() {
+                            symbols.push(StructureSymbol {
+                                name: name.trim().to_string(),
+                                kind: SymbolKind::Function,
+                                line: line_idx,
+                            });
+                        }
                     }
                 } else if let Some(rest) = line
                     .strip_prefix("export class ")
+                    .or_else(|| line.strip_prefix("export default class "))
                     .or_else(|| line.strip_prefix("class "))
                 {
                     if let Some(name) = rest.split(['{', ' ', '<']).next() {
-                        symbols.push(StructureSymbol {
-                            name: name.trim().to_string(),
-                            kind: SymbolKind::Class,
-                            line: line_idx,
-                        });
+                        if !name.trim().is_empty() {
+                            symbols.push(StructureSymbol {
+                                name: name.trim().to_string(),
+                                kind: SymbolKind::Class,
+                                line: line_idx,
+                            });
+                        }
                     }
                 } else if let Some(rest) = line
                     .strip_prefix("export interface ")
                     .or_else(|| line.strip_prefix("interface "))
+                    .or_else(|| line.strip_prefix("export type "))
+                    .or_else(|| line.strip_prefix("type "))
                 {
-                    if let Some(name) = rest.split(['{', ' ', '<']).next() {
-                        symbols.push(StructureSymbol {
-                            name: name.trim().to_string(),
-                            kind: SymbolKind::Interface,
-                            line: line_idx,
-                        });
+                    if let Some(name) = rest.split(['{', ' ', '<', '=']).next() {
+                        if !name.trim().is_empty() {
+                            symbols.push(StructureSymbol {
+                                name: name.trim().to_string(),
+                                kind: SymbolKind::Interface,
+                                line: line_idx,
+                            });
+                        }
                     }
                 }
             }
@@ -376,19 +421,23 @@ pub fn extract_structure_symbols(source: &str, lang: LanguageId) -> Vec<Structur
                     .or_else(|| line.strip_prefix("async def "))
                 {
                     if let Some(name) = rest.split('(').next() {
-                        symbols.push(StructureSymbol {
-                            name: name.trim().to_string(),
-                            kind: SymbolKind::Function,
-                            line: line_idx,
-                        });
+                        if !name.trim().is_empty() {
+                            symbols.push(StructureSymbol {
+                                name: name.trim().to_string(),
+                                kind: SymbolKind::Function,
+                                line: line_idx,
+                            });
+                        }
                     }
                 } else if let Some(rest) = line.strip_prefix("class ") {
                     if let Some(name) = rest.split(['(', ':']).next() {
-                        symbols.push(StructureSymbol {
-                            name: name.trim().to_string(),
-                            kind: SymbolKind::Class,
-                            line: line_idx,
-                        });
+                        if !name.trim().is_empty() {
+                            symbols.push(StructureSymbol {
+                                name: name.trim().to_string(),
+                                kind: SymbolKind::Class,
+                                line: line_idx,
+                            });
+                        }
                     }
                 }
             }
@@ -397,6 +446,84 @@ pub fn extract_structure_symbols(source: &str, lang: LanguageId) -> Vec<Structur
     }
 
     symbols
+}
+
+/// 在源码中精确定位给定符号名 `symbol` 的声明/定义位置，返回 0-based `(line, col)`
+pub fn find_symbol_definition(
+    source: &str,
+    lang: LanguageId,
+    symbol: &str,
+) -> Option<(usize, usize)> {
+    let target = symbol.trim();
+    if target.is_empty() {
+        return None;
+    }
+
+    // 1. 优先匹配顶层与成员结构符号（fn / struct / enum / trait / const / class / interface / def）
+    for sym in extract_structure_symbols(source, lang) {
+        if sym.name == target {
+            let col = source
+                .lines()
+                .nth(sym.line)
+                .and_then(|l| l.find(target))
+                .unwrap_or(0);
+            return Some((sym.line, col));
+        }
+    }
+
+    // 2. 匹配 type alias、mod、局部变量绑定 (let / let mut / const / var / 参数或赋值定义)
+    let prefixes: &[&str] = match lang {
+        LanguageId::Rust => &[
+            "pub type ",
+            "pub(crate) type ",
+            "type ",
+            "pub mod ",
+            "mod ",
+            "let mut ",
+            "let ",
+            "for ",
+        ],
+        LanguageId::TypeScript | LanguageId::JavaScript => &[
+            "export const ",
+            "export let ",
+            "const ",
+            "let ",
+            "var ",
+        ],
+        LanguageId::Python => &[""],
+        _ => &[],
+    };
+
+    for (line_idx, raw_line) in source.lines().enumerate() {
+        let trimmed = raw_line.trim_start();
+        if trimmed.starts_with("//") || trimmed.starts_with('#') {
+            continue;
+        }
+        if lang == LanguageId::Python {
+            if let Some(rest) = trimmed.strip_prefix(target) {
+                let after = rest.trim_start();
+                if after.starts_with('=') && !after.starts_with("==") {
+                    let col = raw_line.find(target).unwrap_or(0);
+                    return Some((line_idx, col));
+                }
+            }
+            continue;
+        }
+        for prefix in prefixes {
+            if let Some(rest) = trimmed.strip_prefix(prefix) {
+                let ident: String = rest
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if ident == target {
+                    let col = raw_line.find(target).unwrap_or(0);
+                    return Some((line_idx, col));
+                }
+            }
+        }
+    }
+
+    None
 }
 
 /// 识别源码中的可直接运行入口（IDEA 编辑器行号旁的绿色三角 ▶ 按钮）

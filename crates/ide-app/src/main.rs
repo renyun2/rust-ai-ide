@@ -1401,6 +1401,20 @@ impl IdeWindowHost {
                         Key::Character(ch) if ctrl && !alt && !shift && ch.eq_ignore_ascii_case("o") => {
                             app_state.execute_ide_action(IdeAction::OpenFolder);
                         }
+                        Key::Character(ch) if ctrl && !alt && !shift && ch.eq_ignore_ascii_case("f") => {
+                            app_state.open_editor_find_bar(false);
+                        }
+                        Key::Character(ch)
+                            if ctrl
+                                && !alt
+                                && !shift
+                                && (ch.eq_ignore_ascii_case("r") || ch.eq_ignore_ascii_case("h")) =>
+                        {
+                            app_state.open_editor_find_bar(true);
+                        }
+                        Key::Character(ch) if ctrl && !alt && !shift && ch.eq_ignore_ascii_case("g") => {
+                            app_state.open_go_to_line_modal();
+                        }
                         Key::Character(ch) if ctrl && !alt && !shift && ch.eq_ignore_ascii_case("a") => {
                             let _ = app_state.select_all_at_focus();
                         }
@@ -1499,11 +1513,26 @@ impl IdeWindowHost {
                         Key::F4 if ctrl => {
                             app_state.execute_ide_action(IdeAction::CloseActiveTab);
                         }
+                        Key::F6 if shift => {
+                            app_state.execute_ide_action(IdeAction::RenameSymbol);
+                        }
+                        Key::F7 if !ctrl && !alt && !shift => {
+                            app_state.debug_step_into();
+                        }
                         Key::F8 if ctrl => {
                             app_state.execute_ide_action(IdeAction::ToggleBreakpoint);
                         }
+                        Key::F8 if shift => {
+                            app_state.debug_step_out();
+                        }
+                        Key::F8 if !ctrl && !alt && !shift => {
+                            app_state.debug_step_over();
+                        }
                         Key::F9 if shift => {
                             app_state.execute_ide_action(IdeAction::DebugActiveConfig);
+                        }
+                        Key::F9 if !ctrl && !alt && !shift => {
+                            app_state.debug_continue();
                         }
                         Key::F10 if ctrl && shift => {
                             app_state.execute_ide_action(IdeAction::RunCurrentFile);
@@ -1541,6 +1570,11 @@ impl IdeWindowHost {
                         Key::Tab => {
                             if let FocusTarget::AiConfigModal(fi) = app_state.focus {
                                 app_state.focus = FocusTarget::AiConfigModal((fi + 1) % 3);
+                            } else if app_state.focus == FocusTarget::EditorFindInput {
+                                app_state.editor_replace_open = true;
+                                app_state.focus = FocusTarget::EditorReplaceInput;
+                            } else if app_state.focus == FocusTarget::EditorReplaceInput {
+                                app_state.focus = FocusTarget::EditorFindInput;
                             } else if app_state.agent_hub.inline_edit.is_some() {
                                 app_state.accept_inline_diff();
                             } else if app_state.focus == FocusTarget::TerminalInput {
@@ -1551,6 +1585,7 @@ impl IdeWindowHost {
                                 } else {
                                     app_state.active_buffer_mut().indent_selection_or_line();
                                 }
+                                app_state.refresh_active_buffer_diagnostics();
                                 app_state.ensure_editor_cursor_visible();
                             }
                         }
@@ -1580,6 +1615,12 @@ impl IdeWindowHost {
                                 // 首次 Esc 优先关闭上下文菜单或弹出下拉框
                             } else if app_state.focus == FocusTarget::ImagePreviewModal {
                                 app_state.close_image_preview();
+                            } else if matches!(
+                                app_state.focus,
+                                FocusTarget::EditorFindInput | FocusTarget::EditorReplaceInput
+                            ) || app_state.editor_find_open
+                            {
+                                app_state.close_editor_find_bar();
                             } else if app_state.clear_active_input_selection() {
                                 // 首次 Esc 仅取消当前文本选区，保持焦点流畅
                             } else if matches!(app_state.focus, FocusTarget::AiConfigModal(_)) {
@@ -1735,6 +1776,29 @@ impl IdeWindowHost {
                                     }
                                 }
                                 app_state.focus = FocusTarget::Editor;
+                            }
+                            FocusTarget::RenameSymbolModal => {
+                                app_state.submit_rename_symbol();
+                            }
+                            FocusTarget::GoToLineModal => {
+                                app_state.submit_go_to_line();
+                            }
+                            FocusTarget::AddDebugWatchModal => {
+                                app_state.submit_add_debug_watch();
+                            }
+                            FocusTarget::EditorFindInput => {
+                                if shift {
+                                    app_state.editor_find_prev();
+                                } else {
+                                    app_state.editor_find_next();
+                                }
+                            }
+                            FocusTarget::EditorReplaceInput => {
+                                if shift {
+                                    app_state.editor_replace_all();
+                                } else {
+                                    app_state.editor_replace_one();
+                                }
                             }
                             FocusTarget::CtrlKPrompt => {
                                 app_state.trigger_ctrl_k_inline_edit();

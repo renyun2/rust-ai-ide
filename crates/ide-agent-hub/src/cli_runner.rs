@@ -53,12 +53,39 @@ pub struct CliRunOutput {
     pub file_diff_stats: HashMap<PathBuf, (usize, usize)>,
 }
 
-pub(crate) fn normalize_abs_path(path: &Path) -> PathBuf {
+fn strip_verbatim_and_clean(path: &Path) -> PathBuf {
     let raw = path.to_string_lossy();
     let stripped = raw.strip_prefix(r"\\?\").unwrap_or(raw.as_ref());
-    PathBuf::from(stripped)
-        .components()
-        .collect()
+    PathBuf::from(stripped).components().collect()
+}
+
+pub(crate) fn normalize_abs_path(path: &Path) -> PathBuf {
+    let normalized = strip_verbatim_and_clean(path);
+    // Git on Windows often returns the long path while Rust's temp dir is the
+    // 8.3 form (`RUNNER~1`) or a junction. Compare the resolved path, falling
+    // back to the nearest existing ancestor for deleted or new files.
+    if normalized.is_absolute() {
+        if let Ok(canon) = normalized.canonicalize() {
+            return strip_verbatim_and_clean(&canon);
+        }
+        let mut suffix = Vec::new();
+        let mut cur = normalized.as_path();
+        while let Some(name) = cur.file_name() {
+            suffix.push(name.to_os_string());
+            let Some(parent) = cur.parent() else {
+                break;
+            };
+            if let Ok(canon_parent) = parent.canonicalize() {
+                let mut resolved = strip_verbatim_and_clean(&canon_parent);
+                for part in suffix.into_iter().rev() {
+                    resolved.push(part);
+                }
+                return resolved.components().collect();
+            }
+            cur = parent;
+        }
+    }
+    normalized
 }
 
 pub(crate) fn paths_same_file(a: &Path, b: &Path) -> bool {
@@ -1435,4 +1462,29 @@ pub fn parse_path_and_line_token(token: &str) -> Option<(&str, Option<usize>)> {
         }
     }
     Some((token, None))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[test]
+    fn normalize_abs_path_resolves_ancestors_for_missing_files() {
+        let base = std::env::temp_dir().join(format!("rust_ai_ide_norm_{}", Uuid::new_v4()));
+        let sub = base.join("nested");
+        fs::create_dir_all(&sub).unwrap();
+
+        let canonical_base = normalize_abs_path(&base);
+        let uncanonical = sub.join("..").join("deleted_dir").join("missing.rs");
+        let expected = canonical_base.join("deleted_dir").join("missing.rs");
+
+        assert!(paths_same_file(&uncanonical, &expected));
+        assert_eq!(
+            strip_prefix_norm(&uncanonical, &base).as_deref(),
+            Some("deleted_dir/missing.rs")
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
 }

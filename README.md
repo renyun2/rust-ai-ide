@@ -253,23 +253,22 @@ Issues and pull requests are welcome. Run `cargo test --workspace` and `cargo ru
 
 ## Releases
 
-GitHub Actions builds the Windows release when a version tag is pushed. The workflow file has to be in that commit.
+Publishing a GitHub Release starts the Windows build. Actions uses the workflow on `master`, then checks out the tag you selected.
 
-```powershell
-git tag v0.1.0
-git push origin v0.1.0
-```
+1. Open [Releases](https://github.com/renyun2/rust-ai-ide/releases) and draft a new release.
+2. Choose or create a tag such as `v0.1.0`.
+3. Mark it as a pre-release if needed, then publish.
 
 [`.github/workflows/release.yml`](.github/workflows/release.yml) on `windows-latest`:
 
 1. `cargo test --workspace`
 2. `cargo build -p ide-app --release`
 3. `ide-app.exe --self-check`
-4. Publish `RI-<tag>-windows-x86_64.zip` and a SHA-256 file
+4. Attach `RI-<tag>-windows-x86_64.zip` and a SHA-256 file to that release
 
-A tag that contains a hyphen, such as `v0.2.0-rc.1`, is a pre-release. Pushes to `master` or `main`, and pull requests, run tests only ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
+Pushes to `master` or `main`, and pull requests, run tests only ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)). Pushing a tag without publishing a release does not build a binary.
 
-On a private repository, allow Actions to create releases: **Settings → Actions → General → Workflow permissions → Read and write permissions**.
+On a private repository, allow Actions to upload release assets: **Settings → Actions → General → Workflow permissions → Read and write permissions**.
 
 ---
 

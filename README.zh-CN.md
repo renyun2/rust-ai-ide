@@ -253,23 +253,22 @@ cargo run -p ide-app -- --self-check
 
 ## 发行版
 
-推送版本标签后，GitHub Actions 会构建 Windows 发行包。工作流文件必须包含在那个提交里。
+在 GitHub 上发布 Release 后，Actions 会开始构建 Windows 发行包。用的是 `master` 上的工作流，检出的是你选中的标签。
 
-```powershell
-git tag v0.1.0
-git push origin v0.1.0
-```
+1. 打开 [Releases](https://github.com/renyun2/rust-ai-ide/releases)，新建一个 Release。
+2. 选择或创建标签，例如 `v0.1.0`。
+3. 需要预发布就勾选，然后点击发布。
 
 [`.github/workflows/release.yml`](.github/workflows/release.yml) 在 `windows-latest` 上依次执行：
 
 1. `cargo test --workspace`
 2. `cargo build -p ide-app --release`
 3. `ide-app.exe --self-check`
-4. 发布 `RI-<tag>-windows-x86_64.zip` 和 SHA-256 校验文件
+4. 把 `RI-<标签>-windows-x86_64.zip` 和 SHA-256 校验文件挂到这个 Release 上
 
-标签名里带连字符时（例如 `v0.2.0-rc.1`）会标成预发布。推送到 `master` 或 `main`，以及打开 Pull Request，只跑测试（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）。
+推送到 `master` 或 `main`，以及打开 Pull Request，只跑测试（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）。只推送标签、不发布 Release，不会构建二进制。
 
-私有仓库需要允许 Actions 创建 Release：**Settings → Actions → General → Workflow permissions → Read and write permissions**。
+私有仓库需要允许 Actions 写入 Release：**Settings → Actions → General → Workflow permissions → Read and write permissions**。
 
 ---
 

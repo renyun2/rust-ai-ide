@@ -22,9 +22,8 @@ impl SharedFontContext {
         let sans_candidates: &[&str] = if cfg!(target_os = "macos") {
             &[
                 "SF Pro Text",
-                ".AppleSystemUIFont",
-                "PingFang SC",
                 "Helvetica Neue",
+                "PingFang SC",
                 "Arial",
             ]
         } else {
@@ -200,7 +199,7 @@ impl CosmicTextEngine {
             let mut borrowed = buffer.borrow_with(&mut fonts.font_system);
             borrowed.set_wrap(Wrap::None);
             borrowed.set_size(None, None);
-            borrowed.set_text(text, &attrs, Shaping::Advanced, None);
+            borrowed.set_text(text, &attrs, Shaping::Advanced);
             borrowed.shape_until_scroll(false);
         }
 
@@ -208,17 +207,25 @@ impl CosmicTextEngine {
         let mut phys_h = phys_line_height;
         let mut glyphs = Vec::new();
         if let Some(run) = buffer.layout_runs().next() {
-            phys_w = run.line_w;
-            phys_h = run.line_height.max(1.0);
+            phys_w = if run.line_w.is_finite() { run.line_w } else { 0.0 };
+            phys_h = if run.line_height.is_finite() {
+                run.line_height.max(1.0)
+            } else {
+                phys_line_height
+            };
+            let safe_line_y = if run.line_y.is_finite() { run.line_y } else { phys_font_size };
             glyphs.reserve(run.glyphs.len());
             for g in run.glyphs.iter() {
+                if !g.x.is_finite() || !g.w.is_finite() || g.x.abs() > 1_000_000.0 || g.w.abs() > 1_000_000.0 {
+                    continue;
+                }
                 glyphs.push(CachedGlyph {
                     start: g.start,
                     end: g.end,
                     x: g.x,
                     w: g.w,
                     is_rtl: g.level.is_rtl(),
-                    physical: g.physical((0.0, run.line_y), 1.0),
+                    physical: g.physical((0.0, safe_line_y), 1.0),
                 });
             }
         }
@@ -417,8 +424,9 @@ impl CosmicTextEngine {
         } = &mut *fonts;
 
         for g in &shaped.glyphs {
-            let approx_gx0 = phys_x + g.physical.x - 4;
-            let approx_gx1 = phys_x + g.physical.x + (g.w.ceil() as i32) + 8;
+            let gw_ceil = g.w.ceil().clamp(0.0, 1_000_000.0) as i32;
+            let approx_gx0 = phys_x.saturating_add(g.physical.x).saturating_sub(4);
+            let approx_gx1 = phys_x.saturating_add(g.physical.x).saturating_add(gw_ceil).saturating_add(8);
             if approx_gx1 <= clip_x0 || approx_gx0 >= clip_x1 {
                 continue;
             }

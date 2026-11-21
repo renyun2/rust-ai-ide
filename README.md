@@ -311,7 +311,9 @@ The layout, color, and keymap follow the IntelliJ New UI. The implementation is 
 
 Licensed under either of
 
-- Apache License, Version 2.0
-- MIT license
+- [Apache License, Version 2.0](LICENSE-APACHE)
+- [MIT license](LICENSE-MIT)
 
 at your option. The workspace package in [`Cargo.toml`](Cargo.toml) records this as `MIT OR Apache-2.0`.
+
+File-type icons keep the separate MIT terms in [`crates/ide-app/assets/file-icons/NOTICE.md`](crates/ide-app/assets/file-icons/NOTICE.md).

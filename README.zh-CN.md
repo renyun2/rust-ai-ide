@@ -311,7 +311,9 @@ rust-ai-ide/
 
 可任选其一：
 
-- Apache License 2.0
-- MIT license
+- [Apache License 2.0](LICENSE-APACHE)
+- [MIT license](LICENSE-MIT)
 
 该选择写在 [`Cargo.toml`](Cargo.toml) 的 workspace package 上：`MIT OR Apache-2.0`。
+
+文件类型图标沿用 [`crates/ide-app/assets/file-icons/NOTICE.md`](crates/ide-app/assets/file-icons/NOTICE.md) 中单独的 MIT 条款。

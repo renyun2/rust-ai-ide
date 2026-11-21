@@ -13,6 +13,7 @@ use ide_syntax::{highlight_line, TokenKind};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 pub(crate) const AGENT_INPUT_FONT: FontStyle = FontStyle::ChatBody;
 pub(crate) const AGENT_INPUT_LINE_H: i32 = 20;
@@ -157,7 +158,7 @@ pub(crate) enum CachedChatRow {
         msg_idx: usize,
         blk_idx: usize,
         lang: String,
-        code: String,
+        code: Arc<str>,
         line_count: usize,
         collapsed: bool,
         user_bubble_w: Option<i32>,
@@ -726,7 +727,7 @@ fn append_message_body_rows(
             msg_idx,
             blk_idx: cur_blk_idx,
             lang: lang_label,
-            code: full_code,
+            code: Arc::from(full_code),
             line_count,
             collapsed,
             user_bubble_w,

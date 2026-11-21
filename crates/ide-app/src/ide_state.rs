@@ -21200,8 +21200,9 @@ mod tests {
         assert!(user_line.row_height() >= 24);
         assert!(bubble_bottom.row_height() >= 9);
 
-        // Sample pixels inside the bottom 5px band of the user line and confirm
-        // glyph pixels exist (not painted over by UserBubbleBottom).
+        // Sample pixels inside the bottom 7px band of the user line (covering the
+        // `cy - 8` overlap region previously overwritten by UserBubbleBottom) and
+        // confirm glyph descender pixels exist across DirectWrite and cosmic-text fonts.
         let (line_rect, ..) = state
             .agent_chat_line_rects
             .iter()
@@ -21214,7 +21215,7 @@ mod tests {
         let bg_g = ((bg >> 8) & 0xFF) as u8;
         let bg_b = (bg & 0xFF) as u8;
         let mut non_bg_bottom_pixels = 0usize;
-        let py_start = line_rect.y + line_rect.h - 6;
+        let py_start = line_rect.y + line_rect.h - 8;
         let py_end = line_rect.y + line_rect.h - 1;
         for py in py_start..py_end {
             for px in (line_rect.x + 12)..(line_rect.x + line_rect.w - 12) {

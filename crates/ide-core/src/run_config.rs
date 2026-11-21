@@ -1846,13 +1846,13 @@ fn normalize_for_prefix(path: &Path) -> PathBuf {
 }
 
 fn relative_display_path(file_path: &Path, workspace_root: &Path) -> String {
-    if let Ok(rel) = file_path.strip_prefix(workspace_root) {
-        return rel.to_string_lossy().replace('\\', "/");
-    }
     let norm_file = normalize_for_prefix(file_path);
     let norm_root = normalize_for_prefix(workspace_root);
-    norm_file
-        .strip_prefix(&norm_root)
+    if let Ok(rel) = norm_file.strip_prefix(&norm_root) {
+        return rel.to_string_lossy().replace('\\', "/");
+    }
+    file_path
+        .strip_prefix(workspace_root)
         .unwrap_or(file_path)
         .to_string_lossy()
         .replace('\\', "/")

@@ -1,32 +1,33 @@
 use anyhow::Result;
-use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
-use std::ffi::c_void;
 use std::path::Path;
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 use tiny_skia::{
     Color, FillRule, GradientStop, LineCap, LineJoin, LinearGradient, Paint, Path as SkiaPath,
     PathBuilder, Pixmap, Point, PremultipliedColorU8, Rect as SkiaRect, SpreadMode, Stroke,
     Transform,
 };
-use windows::core::{implement, IUnknown, Interface, Ref, Result as WinResult, BOOL, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, DWRITE_E_NOCOLOR, FALSE};
-use windows::Win32::Graphics::DirectWrite::{
-    DWriteCreateFactory, IDWriteBitmapRenderTarget, IDWriteFactory, IDWriteFactory2,
-    IDWriteGdiInterop, IDWriteInlineObject, IDWritePixelSnapping_Impl, IDWriteRenderingParams,
-    IDWriteTextFormat, IDWriteTextLayout, IDWriteTextRenderer, IDWriteTextRenderer_Impl,
-    DWRITE_COLOR_F, DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL,
-    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL,
-    DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_GLYPH_RUN, DWRITE_GLYPH_RUN_DESCRIPTION,
-    DWRITE_HIT_TEST_METRICS, DWRITE_MATRIX, DWRITE_MEASURING_MODE, DWRITE_STRIKETHROUGH,
-    DWRITE_TEXT_METRICS, DWRITE_UNDERLINE, DWRITE_WORD_WRAPPING_NO_WRAP,
-};
-use windows::Win32::Graphics::Gdi::{
-    GetCurrentObject, GetDC, GetDeviceCaps, GetObjectW, ReleaseDC, DIBSECTION, LOGPIXELSX,
-    OBJ_BITMAP,
-};
+#[cfg(target_os = "windows")]
+use windows::Win32::Graphics::Gdi::{GetDC, GetDeviceCaps, ReleaseDC, LOGPIXELSX};
 
-/// 检测当前 Windows 系统的原生显示器 DPI 缩放倍率（例如 96 DPI -> 1.0, 120 DPI -> 1.25, 144 DPI -> 1.5, 192 DPI -> 2.0）
+#[cfg(target_os = "windows")]
+type PlatformTextEngine = DWriteTextEngine;
+#[cfg(not(target_os = "windows"))]
+type PlatformTextEngine = crate::text_cosmic::CosmicTextEngine;
+
+#[inline]
+fn shared_text_engine_for_scale(scale: f32) -> Rc<PlatformTextEngine> {
+    #[cfg(target_os = "windows")]
+    {
+        shared_dwrite_for_scale(scale)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        crate::text_cosmic::shared_text_engine_for_scale(scale)
+    }
+}
+
+/// 检测当前系统的原生显示器 DPI 缩放倍率（例如 96 DPI -> 1.0, 120 DPI -> 1.25, 144 DPI -> 1.5, 192 DPI -> 2.0）
+#[cfg(target_os = "windows")]
 pub fn detect_system_dpi_scale() -> f32 {
     unsafe {
         let hdc = GetDC(None);
@@ -41,6 +42,20 @@ pub fn detect_system_dpi_scale() -> f32 {
             1.0
         }
     }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn detect_system_dpi_scale() -> f32 {
+    for key in ["GDK_SCALE", "QT_SCALE_FACTOR"] {
+        if let Ok(val) = std::env::var(key) {
+            if let Ok(scale) = val.trim().parse::<f32>() {
+                if scale.is_finite() && scale > 0.0 {
+                    return scale.clamp(1.0, 4.0);
+                }
+            }
+        }
+    }
+    1.0
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -91,7 +106,7 @@ pub struct SurfaceCanvas {
     pixmap: Pixmap,
     #[cfg(test)]
     present_buf: Vec<u32>,
-    dwrite: Rc<DWriteTextEngine>,
+    text_engine: Rc<PlatformTextEngine>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -724,7 +739,7 @@ impl SurfaceCanvas {
             Pixmap::new(pw as u32, ph as u32).expect("Failed to allocate tiny-skia Pixmap");
         #[cfg(test)]
         let present_buf = vec![0u32; pw * ph];
-        let dwrite = shared_dwrite_for_scale(scale);
+        let text_engine = shared_text_engine_for_scale(scale);
         Self {
             width: lw,
             height: lh,
@@ -734,14 +749,14 @@ impl SurfaceCanvas {
             pixmap,
             #[cfg(test)]
             present_buf,
-            dwrite,
+            text_engine,
         }
     }
 
     pub fn set_scale_factor(&mut self, scale_factor: f32) {
         let scale = scale_factor.clamp(0.75, 4.0);
         if (self.scale_factor - scale).abs() > 0.005 {
-            self.dwrite = shared_dwrite_for_scale(scale);
+            self.text_engine = shared_text_engine_for_scale(scale);
         }
         self.scale_factor = scale;
         self.width = ((self.phys_width as f32) / scale).round().max(1.0) as usize;
@@ -764,12 +779,16 @@ impl SurfaceCanvas {
         let lw = ((pw as f32) / scale).round().max(1.0) as usize;
         let lh = ((ph as f32) / scale).round().max(1.0) as usize;
         if (self.scale_factor - scale).abs() > 0.005 {
-            self.dwrite = shared_dwrite_for_scale(scale);
+            self.text_engine = shared_text_engine_for_scale(scale);
         }
         self.scale_factor = scale;
         self.width = lw;
         self.height = lh;
-        if pw == self.phys_width && ph == self.phys_height {
+        if pw == self.phys_width
+            && ph == self.phys_height
+            && self.pixmap.width() as usize == pw
+            && self.pixmap.height() as usize == ph
+        {
             return;
         }
         self.pixmap = Pixmap::new(pw as u32, ph as u32).expect("Failed to resize tiny-skia Pixmap");
@@ -781,7 +800,7 @@ impl SurfaceCanvas {
 
     /// Shrinks the window's RGBA framebuffer to 1x1 while minimized to release ~10-30MB immediately.
     pub fn shrink_for_minimized(&mut self) {
-        if self.phys_width <= 1 && self.phys_height <= 1 {
+        if self.pixmap.width() <= 1 && self.pixmap.height() <= 1 && self.phys_width <= 1 {
             return;
         }
         if let Some(tiny) = Pixmap::new(1, 1) {
@@ -793,6 +812,22 @@ impl SurfaceCanvas {
             self.width = 1;
             self.height = 1;
         }
+    }
+
+    /// 释放非活跃后台窗口的 `tiny-skia` 离屏像素缓冲（保留逻辑尺寸以维持点击/悬停坐标计算），
+    /// 下次 `render_frame` 时按需重新分配；单个 1.5x/2x 窗口可立即回收 13–33 MB。
+    pub fn release_idle_framebuffer(&mut self) {
+        if self.pixmap.width() <= 1 && self.pixmap.height() <= 1 {
+            return;
+        }
+        if let Some(tiny) = Pixmap::new(1, 1) {
+            self.pixmap = tiny;
+        }
+    }
+
+    /// 清理字体排版与字形掩码缓存（供最小化或内存回收时调用）
+    pub fn trim_text_caches(&self) {
+        self.text_engine.trim_caches();
     }
 
     #[inline]
@@ -2247,12 +2282,12 @@ impl SurfaceCanvas {
 
     /// 精确测量文本在指定字体下的像素宽高 `(width, height)`
     pub fn measure_text(&self, text: &str, style: FontStyle) -> (i32, i32) {
-        self.dwrite.measure_text(text, style)
+        self.text_engine.measure_text(text, style)
     }
 
-    /// 根据鼠标点击相对于行首的 X 偏移量计算最接近的字符列号（基于 DirectWrite 原生 `HitTestPoint` O(1) 命中测试）
+    /// 根据鼠标点击相对于行首的 X 偏移量计算最接近的字符列号（基于原生命中测试 O(1) 计算）
     pub fn measure_caret_col_in_line(&self, line: &str, rel_x: i32, style: FontStyle) -> usize {
-        self.dwrite.hit_test_col(line, rel_x, style)
+        self.text_engine.hit_test_col(line, rel_x, style)
     }
 
     /// 按最大像素宽度对文本执行末尾省略号截断（超出时显示 `…` 而非硬裁剪）
@@ -2341,7 +2376,7 @@ impl SurfaceCanvas {
         max_width: i32,
         style: FontStyle,
     ) -> i32 {
-        self.dwrite
+        self.text_engine
             .draw_text(&mut self.pixmap, x, y, text, color, max_width, style)
     }
 
@@ -2355,7 +2390,7 @@ impl SurfaceCanvas {
         clip_rect: Rect,
         style: FontStyle,
     ) -> i32 {
-        self.dwrite
+        self.text_engine
             .draw_text_clipped(&mut self.pixmap, x, y, text, color, clip_rect, style)
     }
 
@@ -2394,7 +2429,7 @@ impl SurfaceCanvas {
                     wrapped.push(rem.to_string());
                     break;
                 }
-                let mut split_chars = self.dwrite.hit_test_col(rem, max_w, style).max(1);
+                let mut split_chars = self.text_engine.hit_test_col(rem, max_w, style).max(1);
                 let total_chars = rem.chars().count();
                 if split_chars >= total_chars {
                     split_chars = total_chars.saturating_sub(1).max(1);
@@ -2797,11 +2832,39 @@ pub fn save_ri_icon_png(path: &Path, size: u32) -> Result<()> {
 // DirectWrite 文字引擎（借鉴 WindUI `text/dwrite.rs` 的真背景 ClearType 合成）
 // =============================================================================
 
-const MEASURE_CACHE_CAP: usize = 4096;
-const LAYOUT_CACHE_CAP: usize = 256;
-const MASK_CACHE_CAP: usize = 2048;
+#[cfg(target_os = "windows")]
+mod dwrite_backend {
+use super::{FontStyle, Rect};
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::ffi::c_void;
+use std::rc::{Rc, Weak};
+use tiny_skia::{Pixmap, PremultipliedColorU8};
+use windows::core::{implement, IUnknown, Interface, Ref, Result as WinResult, BOOL, PCWSTR};
+use windows::Win32::Foundation::{COLORREF, DWRITE_E_NOCOLOR, FALSE};
+use windows::Win32::Graphics::DirectWrite::{
+    DWriteCreateFactory, IDWriteBitmapRenderTarget, IDWriteFactory, IDWriteFactory2,
+    IDWriteGdiInterop, IDWriteInlineObject, IDWritePixelSnapping_Impl, IDWriteRenderingParams,
+    IDWriteTextFormat, IDWriteTextLayout, IDWriteTextRenderer, IDWriteTextRenderer_Impl,
+    DWRITE_COLOR_F, DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL,
+    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL,
+    DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_GLYPH_RUN, DWRITE_GLYPH_RUN_DESCRIPTION,
+    DWRITE_HIT_TEST_METRICS, DWRITE_MATRIX, DWRITE_MEASURING_MODE, DWRITE_STRIKETHROUGH,
+    DWRITE_TEXT_METRICS, DWRITE_UNDERLINE, DWRITE_WORD_WRAPPING_NO_WRAP,
+};
+use windows::Win32::Graphics::Gdi::{
+    GetCurrentObject, GetObjectW, DIBSECTION, OBJ_BITMAP,
+};
 
-fn shared_dwrite_for_scale(scale: f32) -> Rc<DWriteTextEngine> {
+const MEASURE_CACHE_CAP: usize = 3072;
+const LAYOUT_CACHE_CAP: usize = 192;
+const MASK_CACHE_CAP: usize = 1024;
+const MASK_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CACHED_TEXT_BYTES: usize = 300;
+const MAX_PERSISTENT_BITMAP_W: i32 = 2400;
+const MAX_PERSISTENT_BITMAP_H: i32 = 256;
+
+pub fn shared_dwrite_for_scale(scale: f32) -> Rc<DWriteTextEngine> {
     thread_local! {
         static SHARED_DWRITE_ENGINES: RefCell<HashMap<u32, Weak<DWriteTextEngine>>> =
             RefCell::new(HashMap::new());
@@ -2820,8 +2883,8 @@ fn shared_dwrite_for_scale(scale: f32) -> Rc<DWriteTextEngine> {
 }
 
 /// 预光栅化的 DirectWrite ClearType 亚像素覆盖率掩码缓存项：
-/// 将昂贵的 COM `IDWriteTextLayout::Draw` 转化为内存紧凑的 `u32` 亚像素覆盖率数组，
-/// 使代码编辑器、项目树、终端与菜单滚动帧耗时从 ~35ms 降至 < 1ms。
+/// 使用紧凑的 RGB 3 字节/像素存储（相比 `u32` 节省 25% 内存），
+/// 并受条目数与总字节预算双重约束，防止超长代码行撑爆内存。
 struct CachedGlyphMask {
     log_mw: i32,
     min_x: usize,
@@ -2829,7 +2892,8 @@ struct CachedGlyphMask {
     min_y: usize,
     max_y: usize,
     row_w: usize,
-    subpixel_mask: Vec<u32>,
+    /// Packed RGB subpixel coverage bytes (`row_w * (max_y - min_y) * 3`)
+    subpixel_mask: Vec<u8>,
     has_color_glyphs: bool,
 }
 
@@ -2839,6 +2903,7 @@ struct DWriteState {
     measure_cache: HashMap<FontStyle, HashMap<String, (i32, i32)>>,
     layout_cache: HashMap<FontStyle, HashMap<String, (IDWriteTextLayout, i32, i32, i32, i32)>>,
     mask_cache: HashMap<FontStyle, HashMap<String, Rc<CachedGlyphMask>>>,
+    mask_cache_bytes: usize,
     bitmap_target: Option<IDWriteBitmapRenderTarget>,
     bitmap_w: i32,
     bitmap_h: i32,
@@ -2846,7 +2911,7 @@ struct DWriteState {
     bitmap_stride_px: i32,
 }
 
-struct DWriteTextEngine {
+pub struct DWriteTextEngine {
     factory: IDWriteFactory,
     gdi_interop: IDWriteGdiInterop,
     renderer: IDWriteTextRenderer,
@@ -2874,6 +2939,7 @@ impl DWriteTextEngine {
                     measure_cache: HashMap::new(),
                     layout_cache: HashMap::new(),
                     mask_cache: HashMap::new(),
+                    mask_cache_bytes: 0,
                     bitmap_target: None,
                     bitmap_w: 0,
                     bitmap_h: 0,
@@ -2884,7 +2950,7 @@ impl DWriteTextEngine {
         }
     }
 
-    fn hit_test_col(&self, line: &str, log_rel_x: i32, style: FontStyle) -> usize {
+    pub fn hit_test_col(&self, line: &str, log_rel_x: i32, style: FontStyle) -> usize {
         if log_rel_x <= 0 || line.is_empty() {
             return 0;
         }
@@ -2969,6 +3035,21 @@ impl DWriteTextEngine {
         }
     }
 
+    pub fn trim_caches(&self) {
+        let mut st = self.state.borrow_mut();
+        st.layout_cache.clear();
+        st.mask_cache.clear();
+        st.mask_cache_bytes = 0;
+        if st.measure_cache.values().map(|m| m.len()).sum::<usize>() > 1024 {
+            st.measure_cache.clear();
+        }
+        st.bitmap_target = None;
+        st.bitmap_w = 0;
+        st.bitmap_h = 0;
+        st.bitmap_bits = std::ptr::null_mut();
+        st.bitmap_stride_px = 0;
+    }
+
     fn get_or_create_layout(
         &self,
         text: &str,
@@ -2976,9 +3057,11 @@ impl DWriteTextEngine {
     ) -> Option<(IDWriteTextLayout, i32, i32, i32, i32)> {
         let scale = {
             let st = self.state.borrow();
-            if let Some(by_text) = st.layout_cache.get(&style) {
-                if let Some((layout, log_mw, log_th, phys_mw, phys_th)) = by_text.get(text) {
-                    return Some((layout.clone(), *log_mw, *log_th, *phys_mw, *phys_th));
+            if text.len() <= MAX_CACHED_TEXT_BYTES {
+                if let Some(by_text) = st.layout_cache.get(&style) {
+                    if let Some((layout, log_mw, log_th, phys_mw, phys_th)) = by_text.get(text) {
+                        return Some((layout.clone(), *log_mw, *log_th, *phys_mw, *phys_th));
+                    }
                 }
             }
             st.scale_factor
@@ -2993,53 +3076,64 @@ impl DWriteTextEngine {
         let log_mw = ((metrics.widthIncludingTrailingWhitespace / scale).round() as i32).max(1);
         let log_th = ((metrics.height / scale).round() as i32).max(1);
 
-        let mut st = self.state.borrow_mut();
-        let total_cached: usize = st.layout_cache.values().map(|m| m.len()).sum();
-        if total_cached >= LAYOUT_CACHE_CAP {
-            st.layout_cache.clear();
+        if text.len() <= MAX_CACHED_TEXT_BYTES {
+            let mut st = self.state.borrow_mut();
+            let total_cached: usize = st.layout_cache.values().map(|m| m.len()).sum();
+            if total_cached >= LAYOUT_CACHE_CAP {
+                st.layout_cache.clear();
+            }
+            st.layout_cache.entry(style).or_default().insert(
+                text.to_string(),
+                (layout.clone(), log_mw, log_th, phys_mw, phys_th),
+            );
         }
-        st.layout_cache.entry(style).or_default().insert(
-            text.to_string(),
-            (layout.clone(), log_mw, log_th, phys_mw, phys_th),
-        );
         Some((layout, log_mw, log_th, phys_mw, phys_th))
     }
 
+    fn create_dib_target(&self, nw: i32, nh: i32) -> Option<(IDWriteBitmapRenderTarget, *mut u32, i32)> {
+        let brt = unsafe {
+            self.gdi_interop
+                .CreateBitmapRenderTarget(None, nw as u32, nh as u32)
+                .ok()?
+        };
+        unsafe {
+            let _ = brt.SetPixelsPerDip(1.0);
+        }
+        let dc = unsafe { brt.GetMemoryDC() };
+        let hbm = unsafe { GetCurrentObject(dc, OBJ_BITMAP) };
+        let mut ds = DIBSECTION::default();
+        let got = unsafe {
+            GetObjectW(
+                hbm,
+                std::mem::size_of::<DIBSECTION>() as i32,
+                Some(&mut ds as *mut _ as *mut c_void),
+            )
+        };
+        if got == 0 || ds.dsBm.bmBits.is_null() {
+            return None;
+        }
+        Some((brt, ds.dsBm.bmBits as *mut u32, ds.dsBm.bmWidthBytes / 4))
+    }
+
     fn ensure_bitmap(&self, w: i32, h: i32) -> Option<(IDWriteBitmapRenderTarget, *mut u32, i32)> {
+        // 超宽/超大单次文本使用临时位图，避免常驻 DIB 永久膨胀
+        if w > MAX_PERSISTENT_BITMAP_W || h > MAX_PERSISTENT_BITMAP_H {
+            return self.create_dib_target(w.max(64), h.max(32));
+        }
         let mut st = self.state.borrow_mut();
         if st.bitmap_target.is_none()
             || st.bitmap_bits.is_null()
             || w > st.bitmap_w
             || h > st.bitmap_h
         {
-            let nw = w.max(st.bitmap_w).max(64);
-            let nh = h.max(st.bitmap_h).max(32);
-            let brt = unsafe {
-                self.gdi_interop
-                    .CreateBitmapRenderTarget(None, nw as u32, nh as u32)
-                    .ok()?
-            };
-            unsafe {
-                let _ = brt.SetPixelsPerDip(1.0);
-            }
-            let dc = unsafe { brt.GetMemoryDC() };
-            let hbm = unsafe { GetCurrentObject(dc, OBJ_BITMAP) };
-            let mut ds = DIBSECTION::default();
-            let got = unsafe {
-                GetObjectW(
-                    hbm,
-                    std::mem::size_of::<DIBSECTION>() as i32,
-                    Some(&mut ds as *mut _ as *mut c_void),
-                )
-            };
-            if got == 0 || ds.dsBm.bmBits.is_null() {
-                return None;
-            }
+            let nw = w.max(st.bitmap_w).max(64).min(MAX_PERSISTENT_BITMAP_W);
+            let nh = h.max(st.bitmap_h).max(32).min(MAX_PERSISTENT_BITMAP_H);
+            let (brt, bits, stride_px) = self.create_dib_target(nw, nh)?;
             st.bitmap_target = Some(brt);
             st.bitmap_w = nw;
             st.bitmap_h = nh;
-            st.bitmap_bits = ds.dsBm.bmBits as *mut u32;
-            st.bitmap_stride_px = ds.dsBm.bmWidthBytes / 4;
+            st.bitmap_bits = bits;
+            st.bitmap_stride_px = stride_px;
         }
         Some((
             st.bitmap_target.clone()?,
@@ -3048,7 +3142,7 @@ impl DWriteTextEngine {
         ))
     }
 
-    fn measure_text(&self, text: &str, style: FontStyle) -> (i32, i32) {
+    pub fn measure_text(&self, text: &str, style: FontStyle) -> (i32, i32) {
         if text.is_empty() {
             return (0, 18);
         }
@@ -3076,7 +3170,7 @@ impl DWriteTextEngine {
         res
     }
 
-    fn draw_text(
+    pub fn draw_text(
         &self,
         pixmap: &mut Pixmap,
         x: i32,
@@ -3096,7 +3190,7 @@ impl DWriteTextEngine {
         x + mw.min(max_width)
     }
 
-    fn draw_text_clipped(
+    pub fn draw_text_clipped(
         &self,
         pixmap: &mut Pixmap,
         x: i32,
@@ -3210,12 +3304,14 @@ impl DWriteTextEngine {
         let (row_w, subpixel_mask) = if !has_color_glyphs && max_x > min_x && max_y > min_y {
             let rw = max_x - min_x;
             let rh = max_y - min_y;
-            let mut buf = Vec::with_capacity(rw * rh);
+            let mut buf = Vec::with_capacity(rw * rh * 3);
             for row in min_y..max_y {
                 let src_row =
                     unsafe { std::slice::from_raw_parts(bits.add(row * stride_usize + min_x), rw) };
                 for &px in src_row {
-                    buf.push(px & 0x00FFFFFF);
+                    buf.push(((px >> 16) & 0xFF) as u8);
+                    buf.push(((px >> 8) & 0xFF) as u8);
+                    buf.push((px & 0xFF) as u8);
                 }
             }
             (rw, buf)
@@ -3227,6 +3323,7 @@ impl DWriteTextEngine {
             (0, Vec::new())
         };
 
+        let mask_bytes = subpixel_mask.len() + text.len();
         let mask_rc = Rc::new(CachedGlyphMask {
             log_mw,
             min_x,
@@ -3238,15 +3335,24 @@ impl DWriteTextEngine {
             has_color_glyphs,
         });
 
-        let mut st = self.state.borrow_mut();
-        let total_cached: usize = st.mask_cache.values().map(|m| m.len()).sum();
-        if total_cached >= MASK_CACHE_CAP {
-            st.mask_cache.clear();
+        if text.len() <= MAX_CACHED_TEXT_BYTES
+            && phys_mw <= MAX_PERSISTENT_BITMAP_W
+            && mask_bytes <= 256 * 1024
+        {
+            let mut st = self.state.borrow_mut();
+            let total_cached: usize = st.mask_cache.values().map(|m| m.len()).sum();
+            if total_cached >= MASK_CACHE_CAP
+                || st.mask_cache_bytes.saturating_add(mask_bytes) > MASK_CACHE_MAX_BYTES
+            {
+                st.mask_cache.clear();
+                st.mask_cache_bytes = 0;
+            }
+            st.mask_cache
+                .entry(style)
+                .or_default()
+                .insert(text.to_string(), Rc::clone(&mask_rc));
+            st.mask_cache_bytes = st.mask_cache_bytes.saturating_add(mask_bytes);
         }
-        st.mask_cache
-            .entry(style)
-            .or_default()
-            .insert(text.to_string(), Rc::clone(&mask_rc));
         Some(mask_rc)
     }
 
@@ -3305,16 +3411,16 @@ impl DWriteTextEngine {
 
             for vy in vy0..vy1 {
                 let mask_r = (vy - dst_y0) as usize;
-                let m_start = mask_r * mask.row_w + mask_c0;
-                let mask_row = &mask.subpixel_mask[m_start..m_start + cw];
+                let m_start = (mask_r * mask.row_w + mask_c0) * 3;
+                let mask_row = &mask.subpixel_mask[m_start..m_start + cw * 3];
                 let d_start = (vy as usize) * pw_usize + (vx0 as usize);
                 let dst_row = &mut px[d_start..d_start + cw];
 
-                for (dst, &m) in dst_row.iter_mut().zip(mask_row.iter()) {
-                    if m != 0 {
-                        let ar = (m >> 16) & 0xFF;
-                        let ag = (m >> 8) & 0xFF;
-                        let ab = m & 0xFF;
+                for (dst, rgb) in dst_row.iter_mut().zip(mask_row.chunks_exact(3)) {
+                    let ar = rgb[0] as u32;
+                    let ag = rgb[1] as u32;
+                    let ab = rgb[2] as u32;
+                    if (ar | ag | ab) != 0 {
                         let br = dst.red() as u32;
                         let bg = dst.green() as u32;
                         let bb = dst.blue() as u32;
@@ -3602,6 +3708,10 @@ impl IDWritePixelSnapping_Impl for GlyphRenderer_Impl {
         Ok(1.0)
     }
 }
+} // mod dwrite_backend
+
+#[cfg(target_os = "windows")]
+use dwrite_backend::{shared_dwrite_for_scale, DWriteTextEngine};
 
 #[cfg(test)]
 mod file_icon_tests {
@@ -3760,10 +3870,10 @@ mod file_icon_tests {
     }
 
     #[test]
-    fn shared_dwrite_engine_and_minimized_shrink() {
+    fn shared_text_engine_and_minimized_shrink() {
         let mut c1 = SurfaceCanvas::new_with_scale(800, 600, 1.25);
         let c2 = SurfaceCanvas::new_with_scale(1024, 768, 1.25);
-        assert!(std::rc::Rc::ptr_eq(&c1.dwrite, &c2.dwrite));
+        assert!(std::rc::Rc::ptr_eq(&c1.text_engine, &c2.text_engine));
 
         c1.shrink_for_minimized();
         assert_eq!(c1.phys_width, 1);
@@ -3772,6 +3882,17 @@ mod file_icon_tests {
         c1.resize_physical(800, 600, 1.25);
         assert_eq!(c1.phys_width, 800);
         assert_eq!(c1.phys_height, 600);
-        assert!(std::rc::Rc::ptr_eq(&c1.dwrite, &c2.dwrite));
+        assert!(std::rc::Rc::ptr_eq(&c1.text_engine, &c2.text_engine));
+
+        c1.release_idle_framebuffer();
+        assert_eq!(c1.width, 640);
+        assert_eq!(c1.height, 480);
+        assert_eq!((c1.pixmap.width(), c1.pixmap.height()), (1, 1));
+
+        c1.resize_physical(800, 600, 1.25);
+        assert_eq!((c1.pixmap.width(), c1.pixmap.height()), (800, 600));
+
+        c1.trim_text_caches();
+        c1.draw_text_styled(4, 4, "hello", 0xFFFFFF, 100, super::FontStyle::UiRegular);
     }
 }

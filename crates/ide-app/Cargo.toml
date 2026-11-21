@@ -17,10 +17,18 @@ anyhow.workspace = true
 tao.workspace = true
 softbuffer.workspace = true
 tiny-skia.workspace = true
-windows.workspace = true
-windows-core.workspace = true
 png.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows.workspace = true
+windows-core.workspace = true
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+cosmic-text.workspace = true
+arboard.workspace = true
+rfd.workspace = true
+image.workspace = true

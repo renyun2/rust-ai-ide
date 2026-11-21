@@ -173,6 +173,188 @@ pub(crate) fn is_mutating_tool_name(raw_name: &str) -> bool {
         || lower.contains("notebook")
 }
 
+/// 单个文件快照最大允许字节数（512 KB）：防止将二进制、压缩包、大型构建产物或 minified bundle 写入内存与 `.agent.json`
+pub(crate) const MAX_SNAPSHOT_FILE_BYTES: usize = 512 * 1024;
+const MAX_RAW_STDOUT_BYTES: usize = 256 * 1024;
+const MAX_STDERR_BYTES: usize = 128 * 1024;
+
+pub(crate) fn is_snapshot_eligible_path(path: &Path) -> bool {
+    for comp in path.components() {
+        if let Some(name) = comp.as_os_str().to_str() {
+            let lower = name.to_ascii_lowercase();
+            if matches!(
+                lower.as_str(),
+                ".git"
+                    | "target"
+                    | "node_modules"
+                    | "dist"
+                    | "build"
+                    | "out"
+                    | ".next"
+                    | ".nuxt"
+                    | "__pycache__"
+                    | ".venv"
+                    | "venv"
+                    | ".gradle"
+                    | ".dart_tool"
+                    | ".cache"
+                    | ".turbo"
+                    | "coverage"
+                    | "vendor"
+            ) {
+                return false;
+            }
+        }
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if file_name.ends_with(".min.js")
+        || file_name.ends_with("-min.js")
+        || file_name.ends_with(".min.css")
+        || file_name.ends_with("-min.css")
+        || file_name.ends_with(".bundle.js")
+        || file_name.ends_with("-bundle.js")
+        || file_name.ends_with(".chunk.js")
+        || file_name.ends_with("-lock.json")
+        || file_name.ends_with("-lock.yaml")
+        || matches!(
+            file_name.as_str(),
+            "cargo.lock" | "package-lock.json" | "pnpm-lock.yaml" | "yarn.lock" | "poetry.lock"
+        )
+    {
+        return false;
+    }
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        let ext_low = ext.to_ascii_lowercase();
+        if matches!(
+            ext_low.as_str(),
+            "exe"
+                | "dll"
+                | "so"
+                | "dylib"
+                | "pdb"
+                | "rlib"
+                | "rmeta"
+                | "o"
+                | "obj"
+                | "a"
+                | "lib"
+                | "class"
+                | "wasm"
+                | "bin"
+                | "msi"
+                | "dmg"
+                | "iso"
+                | "zip"
+                | "tar"
+                | "gz"
+                | "tgz"
+                | "bz2"
+                | "xz"
+                | "7z"
+                | "rar"
+                | "jar"
+                | "war"
+                | "apk"
+                | "ipa"
+                | "png"
+                | "jpg"
+                | "jpeg"
+                | "gif"
+                | "webp"
+                | "bmp"
+                | "ico"
+                | "tif"
+                | "tiff"
+                | "avif"
+                | "heic"
+                | "mp3"
+                | "wav"
+                | "ogg"
+                | "flac"
+                | "aac"
+                | "m4a"
+                | "mp4"
+                | "webm"
+                | "mov"
+                | "avi"
+                | "mkv"
+                | "pdf"
+                | "ttf"
+                | "otf"
+                | "woff"
+                | "woff2"
+                | "eot"
+                | "db"
+                | "sqlite"
+                | "sqlite3"
+                | "lock"
+                | "map"
+                | "pyc"
+                | "pyo"
+                | "ilk"
+                | "exp"
+                | "idb"
+                | "pch"
+                | "gch"
+                | "node"
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
+pub(crate) fn is_valid_text_snapshot(s: &str) -> bool {
+    if s.len() > MAX_SNAPSHOT_FILE_BYTES {
+        return false;
+    }
+    if s.as_bytes().contains(&0) {
+        return false;
+    }
+    let sample_len = s.len().min(8192);
+    let mut end = sample_len;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let sample = &s[..end];
+    let mut total_chars = 0usize;
+    let mut bad_chars = 0usize;
+    for ch in sample.chars() {
+        total_chars += 1;
+        if ch == '\u{FFFD}' || (ch.is_control() && !matches!(ch, '\n' | '\r' | '\t')) {
+            bad_chars += 1;
+        }
+    }
+    if total_chars >= 32 && bad_chars * 50 > total_chars {
+        return false;
+    }
+    true
+}
+
+pub(crate) fn read_text_snapshot_bounded(path: &Path) -> Option<String> {
+    if !is_snapshot_eligible_path(path) {
+        return None;
+    }
+    let meta = fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_SNAPSHOT_FILE_BYTES as u64 {
+        return None;
+    }
+    let bytes = fs::read(path).ok()?;
+    if bytes.len() > MAX_SNAPSHOT_FILE_BYTES || bytes.contains(&0) {
+        return None;
+    }
+    let text = String::from_utf8(bytes).ok()?;
+    if is_valid_text_snapshot(&text) {
+        Some(text)
+    } else {
+        None
+    }
+}
+
 /// 追踪单次 AI 执行前后的工作区文件增减统计（对所有 CLI 统一生效，准确区分已存在的 Git 改动）
 #[derive(Debug, Clone)]
 pub(crate) struct TurnDiffTracker {
@@ -192,7 +374,9 @@ impl TurnDiffTracker {
         };
         let mut before_dirty_contents = HashMap::with_capacity(before_snap.len());
         for p in before_snap.keys() {
-            before_dirty_contents.insert(p.clone(), fs::read_to_string(p).ok());
+            if is_snapshot_eligible_path(p) {
+                before_dirty_contents.insert(p.clone(), read_text_snapshot_bounded(p));
+            }
         }
         Self {
             root: norm_root,
@@ -216,6 +400,9 @@ impl TurnDiffTracker {
         if self.mode != AgentWorkbenchMode::Ask {
             let after_snap = capture_git_mtime_snapshot(&self.root);
             for (p, after_t) in &after_snap {
+                if !is_snapshot_eligible_path(p) {
+                    continue;
+                }
                 let before_entry = self
                     .before_snap
                     .iter()
@@ -232,7 +419,7 @@ impl TurnDiffTracker {
                             .find(|(bp, _)| paths_same_file(bp, p))
                             .map(|(_, c)| c)
                         {
-                            let cur_content = fs::read_to_string(p).ok();
+                            let cur_content = read_text_snapshot_bounded(p);
                             prev_content.as_deref().map(normalize_diff_text)
                                 != cur_content.as_deref().map(normalize_diff_text)
                         } else {
@@ -248,6 +435,9 @@ impl TurnDiffTracker {
                 }
             }
             for p in self.before_snap.keys() {
+                if !is_snapshot_eligible_path(p) {
+                    continue;
+                }
                 if !after_snap.keys().any(|ap| paths_same_file(ap, p)) {
                     git_changed_files.insert(p.clone());
                     if !candidate_files.iter().any(|cp| paths_same_file(cp, p)) {
@@ -259,6 +449,9 @@ impl TurnDiffTracker {
 
         for raw_p in extra_mutated {
             let p = normalize_abs_path(raw_p);
+            if !is_snapshot_eligible_path(&p) {
+                continue;
+            }
             if !candidate_files.iter().any(|cp| paths_same_file(cp, &p)) {
                 candidate_files.push(p);
             }
@@ -269,7 +462,10 @@ impl TurnDiffTracker {
         let mut file_diff_stats: HashMap<PathBuf, (usize, usize)> = HashMap::new();
 
         for p in candidate_files {
-            let after_content = fs::read_to_string(&p).ok();
+            if !is_snapshot_eligible_path(&p) {
+                continue;
+            }
+            let after_content = read_text_snapshot_bounded(&p);
             let pre_dirty_entry = self
                 .before_dirty_contents
                 .iter()
@@ -294,7 +490,7 @@ impl TurnDiffTracker {
                             .iter()
                             .any(|ep| paths_same_file(ep, &p))
                 }
-                (Some(_), None) => true,
+                (Some(_), None) => !p.exists(),
                 (None, None) => false,
             };
             if !content_changed {
@@ -399,7 +595,12 @@ pub fn execute_cli_once(
                     auth_flag.store(true, Ordering::SeqCst);
                     break;
                 }
-                raw_acc.lock().push_str(&clean);
+                if !is_json_stream || reply_acc.lock().is_empty() {
+                    let mut raw = raw_acc.lock();
+                    if raw.len() < MAX_RAW_STDOUT_BYTES {
+                        raw.push_str(&clean);
+                    }
+                }
 
                 if is_json_stream {
                     let trimmed = clean.trim();
@@ -451,7 +652,12 @@ pub fn execute_cli_once(
                     auth_flag.store(true, Ordering::SeqCst);
                     break;
                 }
-                acc.lock().push_str(&clean);
+                {
+                    let mut err_buf = acc.lock();
+                    if err_buf.len() < MAX_STDERR_BYTES {
+                        err_buf.push_str(&clean);
+                    }
+                }
                 line.clear();
             }
         })
@@ -586,6 +792,9 @@ fn capture_stream_session_id(
 }
 
 fn read_git_head_file(root: &Path, full_path: &Path) -> Option<String> {
+    if !is_snapshot_eligible_path(full_path) {
+        return None;
+    }
     let git_base = git_repo_toplevel(root).unwrap_or_else(|| normalize_abs_path(root));
     let rel = strip_prefix_norm(full_path, &git_base)?;
     if rel.is_empty() {
@@ -598,8 +807,15 @@ fn read_git_head_file(root: &Path, full_path: &Path) -> Option<String> {
     #[cfg(target_os = "windows")]
     cmd.creation_flags(CREATE_NO_WINDOW);
     let out = cmd.output().ok()?;
-    if out.status.success() {
-        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    if !out.status.success()
+        || out.stdout.len() > MAX_SNAPSHOT_FILE_BYTES
+        || out.stdout.contains(&0)
+    {
+        return None;
+    }
+    let text = String::from_utf8(out.stdout).ok()?;
+    if is_valid_text_snapshot(&text) {
+        Some(text)
     } else {
         None
     }

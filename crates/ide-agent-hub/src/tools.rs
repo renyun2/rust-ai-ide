@@ -260,9 +260,13 @@ pub fn execute_workspace_tool(
                     "Error: old_text matched {matches_cnt} times; provide more surrounding context."
                 );
             }
-            ckpt_backups
-                .entry(path.clone())
-                .or_insert_with(|| Some(content.clone()));
+            if crate::cli_runner::is_snapshot_eligible_path(&path)
+                && crate::cli_runner::is_valid_text_snapshot(&content)
+            {
+                ckpt_backups
+                    .entry(path.clone())
+                    .or_insert_with(|| Some(content.clone()));
+            }
             let updated = content.replacen(old_text, new_text, 1);
             match fs::write(&path, updated) {
                 Ok(()) => {
@@ -279,9 +283,11 @@ pub fn execute_workspace_tool(
                 Ok(p) => p,
                 Err(e) => return e,
             };
-            ckpt_backups
-                .entry(path.clone())
-                .or_insert_with(|| fs::read_to_string(&path).ok());
+            if crate::cli_runner::is_snapshot_eligible_path(&path) {
+                ckpt_backups
+                    .entry(path.clone())
+                    .or_insert_with(|| crate::cli_runner::read_text_snapshot_bounded(&path));
+            }
             if let Some(parent) = path.parent() {
                 let _ = fs::create_dir_all(parent);
             }

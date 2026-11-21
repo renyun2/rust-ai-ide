@@ -42,11 +42,16 @@ impl TextBuffer {
 
     pub fn from_text(path: PathBuf, text: &str) -> Self {
         let language = LanguageId::from_path(&path);
-        let normalized = text.replace("\r\n", "\n");
+        let rope = if text.contains("\r\n") {
+            let normalized = text.replace("\r\n", "\n");
+            Rope::from_str(&normalized)
+        } else {
+            Rope::from_str(text)
+        };
         Self {
             path,
             language,
-            rope: Rope::from_str(&normalized),
+            rope,
             dirty: false,
             cursor_line: 0,
             cursor_col: 0,
@@ -1104,7 +1109,7 @@ impl TextBuffer {
     }
 
     fn push_undo(&mut self) {
-        if self.undo_stack.len() >= 200 {
+        if self.undo_stack.len() >= 100 {
             self.undo_stack.remove(0);
         }
         self.undo_stack.push(UndoSnapshot {
@@ -1115,6 +1120,9 @@ impl TextBuffer {
             revision: self.revision,
         });
         self.redo_stack.clear();
+        if self.redo_stack.capacity() > 16 {
+            self.redo_stack.shrink_to_fit();
+        }
     }
 }
 

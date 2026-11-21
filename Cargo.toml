@@ -49,9 +49,13 @@ tree-sitter-typescript = "0.23"
 tree-sitter-javascript = "0.25"
 tree-sitter-python = "0.25"
 tao = "0.37"
-softbuffer = { version = "0.4", default-features = false }
+softbuffer = { version = "0.4", default-features = false, features = ["x11", "x11-dlopen", "wayland", "wayland-dlopen"] }
 png = "0.18"
 tiny-skia = "0.12"
+cosmic-text = "0.19"
+arboard = { version = "3.7", default-features = false, features = ["image-data", "wayland-data-control"] }
+rfd = "0.18"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico", "tiff"] }
 windows-core = "0.62"
 
 [workspace.dependencies.windows]

@@ -405,7 +405,7 @@ pub struct TurnFileChange {
     pub path: PathBuf,
     pub added_lines: usize,
     pub removed_lines: usize,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub before_content: Option<String>,
 }
 
@@ -506,6 +506,7 @@ pub struct SessionFileChange {
     pub path: PathBuf,
     pub added_lines: usize,
     pub removed_lines: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_content: Option<String>,
     pub first_turn_msg_idx: usize,
 }

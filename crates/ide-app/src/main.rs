@@ -6,6 +6,8 @@ mod ide_state;
 mod image_preview;
 mod persistence;
 mod svg_icon;
+#[cfg(not(target_os = "windows"))]
+mod text_cosmic;
 mod text_input;
 
 use crate::canvas::{
@@ -26,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tao::dpi::{LogicalSize, PhysicalPosition};
+use tao::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use tao::event::{ElementState, Event, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget};
 use tao::keyboard::{Key, ModifiersState};
@@ -68,6 +70,26 @@ fn cursor_pos_in_window(
     fallback
 }
 
+#[cfg(target_os = "windows")]
+fn trim_process_working_set() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> *mut core::ffi::c_void;
+        fn SetProcessWorkingSetSize(
+            h_process: *mut core::ffi::c_void,
+            dw_minimum_working_set_size: usize,
+            dw_maximum_working_set_size: usize,
+        ) -> i32;
+    }
+    unsafe {
+        let proc_h = GetCurrentProcess();
+        let _ = SetProcessWorkingSetSize(proc_h, usize::MAX, usize::MAX);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn trim_process_working_set() {}
+
 #[derive(Debug, Clone, Copy)]
 enum IdeWakeupEvent {
     Wakeup(WindowId),
@@ -77,6 +99,14 @@ enum IdeWakeupEvent {
 enum WindowCommand {
     None,
     CloseWindow,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ManualResizeState {
+    dir: ResizeDirection,
+    start_cursor_screen: (i32, i32),
+    start_pos: (i32, i32),
+    start_size: (u32, u32),
 }
 
 struct IdeWindowHost {
@@ -89,6 +119,7 @@ struct IdeWindowHost {
     last_cursor_icon: CursorIcon,
     modifiers: ModifiersState,
     left_mouse_down: bool,
+    manual_resize: Option<ManualResizeState>,
     last_shift_press: Option<Instant>,
     last_titlebar_click: Option<(Instant, (i32, i32))>,
     last_input_click: Option<(Instant, (i32, i32), u8)>,
@@ -96,6 +127,9 @@ struct IdeWindowHost {
     pending_redraw: bool,
     is_focused: bool,
     is_minimized: bool,
+    unfocused_since: Option<Instant>,
+    idle_trimmed: bool,
+    minimized_trimmed: bool,
     last_wheel_time: Option<Instant>,
     last_wheel_dir: f32,
     wheel_velocity_boost: f32,
@@ -172,6 +206,7 @@ fn spawn_ide_window(
         last_cursor_icon: CursorIcon::Default,
         modifiers: ModifiersState::default(),
         left_mouse_down: false,
+        manual_resize: None,
         last_shift_press: None,
         last_titlebar_click: None,
         last_input_click: None,
@@ -179,6 +214,9 @@ fn spawn_ide_window(
         pending_redraw: true,
         is_focused: true,
         is_minimized: false,
+        unfocused_since: None,
+        idle_trimmed: false,
+        minimized_trimmed: false,
         last_wheel_time: None,
         last_wheel_dir: 0.0,
         wheel_velocity_boost: 1.0,
@@ -747,7 +785,9 @@ fn main() -> Result<()> {
                 init_log_h,
                 false,
             ) {
-                Ok(host) => {
+                Ok(mut host) => {
+                    host.is_focused = false;
+                    host.unfocused_since = Some(Instant::now());
                     session_order.push(host.app_state.workspace_root.clone());
                     let id = host.window.id();
                     windows.insert(id, host);
@@ -764,6 +804,7 @@ fn main() -> Result<()> {
                 }
             }
         }
+        trim_process_working_set();
     }
     let mut ui_test_frames: u32 = 0;
     let mut recent_reopen: Option<(WindowId, u32, Instant)> = None;
@@ -945,13 +986,19 @@ fn main() -> Result<()> {
                             remember_open_windows(storage_dir.as_deref(), &latest);
                         }
                     }
+                    let mut all_minimized = !windows.is_empty();
+                    let mut newly_trimmed_any = false;
                     for host in windows.values_mut() {
                         if host.is_minimized {
                             let _ = host.app_state.poll_background_updates();
-                            host.surface_canvas.shrink_for_minimized();
-                            host.app_state.trim_caches_when_minimized();
+                            if !host.minimized_trimmed {
+                                host.shrink_for_minimized_all();
+                                newly_trimmed_any = true;
+                            }
                             continue;
                         }
+                        all_minimized = false;
+                        host.minimized_trimmed = false;
                         let mut need_redraw = host.pending_redraw;
                         if host.app_state.poll_background_updates() {
                             sync_window_title(&host.window, &mut host.app_state);
@@ -975,8 +1022,27 @@ fn main() -> Result<()> {
                         }
                         if need_redraw {
                             host.pending_redraw = false;
+                            host.idle_trimmed = false;
                             host.window.request_redraw();
+                        } else if !host.is_focused && !host.idle_trimmed {
+                            if host
+                                .unfocused_since
+                                .is_some_and(|t| t.elapsed() >= Duration::from_secs(8))
+                            {
+                                host.surface_canvas.release_idle_framebuffer();
+                                host.app_state.trim_caches_when_background_idle();
+                                host.idle_trimmed = true;
+                                newly_trimmed_any = true;
+                            }
                         }
+                    }
+                    if newly_trimmed_any {
+                        if all_minimized {
+                            if let Some(first) = windows.values().next() {
+                                first.surface_canvas.trim_text_caches();
+                            }
+                        }
+                        trim_process_working_set();
                     }
                 }
             }
@@ -1004,6 +1070,8 @@ fn main() -> Result<()> {
                         .unwrap_or_default();
                     if let Some(host) = windows.remove(&window_id) {
                         host.app_state.save_all_persisted_state();
+                        drop(host);
+                        trim_process_working_set();
                     }
                     if windows.is_empty() {
                         let keep = session_windows_after_close(&snapshot, &[]);
@@ -1023,16 +1091,27 @@ fn main() -> Result<()> {
 }
 
 impl IdeWindowHost {
+    fn shrink_for_minimized_all(&mut self) {
+        self.surface_canvas.shrink_for_minimized();
+        let _ = self.surface.resize(NonZeroU32::MIN, NonZeroU32::MIN);
+        self.app_state.trim_caches_when_minimized();
+        self.minimized_trimmed = true;
+        self.idle_trimmed = true;
+    }
+
     fn render_frame(&mut self) {
         self.pending_redraw = false;
         let size = self.window.inner_size();
         if size.width == 0 || size.height == 0 || self.window.is_minimized() {
             self.is_minimized = true;
-            self.surface_canvas.shrink_for_minimized();
-            self.app_state.trim_caches_when_minimized();
+            if !self.minimized_trimmed {
+                self.shrink_for_minimized_all();
+            }
             return;
         }
         self.is_minimized = false;
+        self.minimized_trimmed = false;
+        self.idle_trimmed = false;
         let width = size.width.max(1);
         let height = size.height.max(1);
         self.app_state.system_dpi_scale = (self.window.scale_factor() as f32).clamp(0.75, 4.0);
@@ -1076,7 +1155,13 @@ impl IdeWindowHost {
             }
             WindowEvent::Focused(focused) => {
                 self.is_focused = focused;
-                if focused {
+                if !focused {
+                    self.left_mouse_down = false;
+                    self.manual_resize = None;
+                    self.unfocused_since = Some(Instant::now());
+                } else {
+                    self.unfocused_since = None;
+                    self.idle_trimmed = false;
                     self.pending_redraw = true;
                 }
             }
@@ -1086,9 +1171,11 @@ impl IdeWindowHost {
                     || self.window.is_minimized();
                 self.is_minimized = minimized;
                 if minimized {
-                    self.surface_canvas.shrink_for_minimized();
-                    self.app_state.trim_caches_when_minimized();
+                    if !self.minimized_trimmed {
+                        self.shrink_for_minimized_all();
+                    }
                 } else {
+                    self.minimized_trimmed = false;
                     self.app_state.window_maximized = self.window.is_maximized();
                     self.pending_redraw = true;
                 }
@@ -1144,6 +1231,57 @@ impl IdeWindowHost {
                 self.modifiers = new_mods;
             }
             WindowEvent::CursorMoved { position, .. } => {
+                if let Some(rs) = self.manual_resize {
+                    if let Ok(inner_pos) = self.window.inner_position() {
+                        let cur_screen_x = inner_pos.x + position.x.round() as i32;
+                        let cur_screen_y = inner_pos.y + position.y.round() as i32;
+                        let dx = cur_screen_x - rs.start_cursor_screen.0;
+                        let dy = cur_screen_y - rs.start_cursor_screen.1;
+                        let min_w = (640.0 * self.surface_canvas.scale_factor).round() as i32;
+                        let min_h = (420.0 * self.surface_canvas.scale_factor).round() as i32;
+                        let mut new_x = rs.start_pos.0;
+                        let mut new_y = rs.start_pos.1;
+                        let mut new_w = rs.start_size.0 as i32;
+                        let mut new_h = rs.start_size.1 as i32;
+                        match rs.dir {
+                            ResizeDirection::East
+                            | ResizeDirection::NorthEast
+                            | ResizeDirection::SouthEast => {
+                                new_w = (rs.start_size.0 as i32 + dx).max(min_w);
+                            }
+                            ResizeDirection::West
+                            | ResizeDirection::NorthWest
+                            | ResizeDirection::SouthWest => {
+                                let clamped_w = (rs.start_size.0 as i32 - dx).max(min_w);
+                                new_x = rs.start_pos.0 + (rs.start_size.0 as i32 - clamped_w);
+                                new_w = clamped_w;
+                            }
+                            _ => {}
+                        }
+                        match rs.dir {
+                            ResizeDirection::South
+                            | ResizeDirection::SouthEast
+                            | ResizeDirection::SouthWest => {
+                                new_h = (rs.start_size.1 as i32 + dy).max(min_h);
+                            }
+                            ResizeDirection::North
+                            | ResizeDirection::NorthEast
+                            | ResizeDirection::NorthWest => {
+                                let clamped_h = (rs.start_size.1 as i32 - dy).max(min_h);
+                                new_y = rs.start_pos.1 + (rs.start_size.1 as i32 - clamped_h);
+                                new_h = clamped_h;
+                            }
+                            _ => {}
+                        }
+                        if new_x != rs.start_pos.0 || new_y != rs.start_pos.1 {
+                            self.window
+                                .set_outer_position(PhysicalPosition::new(new_x, new_y));
+                        }
+                        self.window
+                            .set_inner_size(PhysicalSize::new(new_w as u32, new_h as u32));
+                        return WindowCommand::None;
+                    }
+                }
                 self.cursor_pos = self.surface_canvas.to_logical_pos(position.x, position.y);
                 let win_w = self.surface_canvas.width as i32;
                 let win_h = self.surface_canvas.height as i32;
@@ -1222,7 +1360,25 @@ impl IdeWindowHost {
                             win_h,
                         ) {
                             self.left_mouse_down = false;
-                            let _ = self.window.drag_resize_window(dir);
+                            if self.window.drag_resize_window(dir).is_err() {
+                                if let Ok(outer_pos) = self.window.outer_position() {
+                                    let inner_size = self.window.inner_size();
+                                    let inner_pos =
+                                        self.window.inner_position().unwrap_or(outer_pos);
+                                    let (phys_cx, phys_cy) = self
+                                        .surface_canvas
+                                        .to_physical_pos(self.cursor_pos.0, self.cursor_pos.1);
+                                    self.manual_resize = Some(ManualResizeState {
+                                        dir,
+                                        start_cursor_screen: (
+                                            inner_pos.x + phys_cx,
+                                            inner_pos.y + phys_cy,
+                                        ),
+                                        start_pos: (outer_pos.x, outer_pos.y),
+                                        start_size: (inner_size.width, inner_size.height),
+                                    });
+                                }
+                            }
                             return WindowCommand::None;
                         }
                     }
@@ -1341,6 +1497,9 @@ impl IdeWindowHost {
                 }
                 ElementState::Released => {
                     self.left_mouse_down = false;
+                    if self.manual_resize.take().is_some() {
+                        return WindowCommand::None;
+                    }
                     if let Some(cmd) = self
                         .app_state
                         .release_armed_window_control(self.cursor_pos.0, self.cursor_pos.1)
@@ -1406,7 +1565,9 @@ impl IdeWindowHost {
                     _ => (0.0, 0.0),
                 };
 
-                if self.modifiers.control_key() && !self.modifiers.alt_key() {
+                let zoom_mod = self.modifiers.control_key()
+                    || (cfg!(target_os = "macos") && self.modifiers.super_key());
+                if zoom_mod && !self.modifiers.alt_key() {
                     if raw_dy < -0.01 {
                         self.app_state.execute_ide_action(IdeAction::ZoomInUi);
                         self.surface_canvas
@@ -1484,7 +1645,10 @@ impl IdeWindowHost {
                     },
                 ..
             } => {
-                self.handle_keyboard_pressed(logical_key);
+                let cmd = self.handle_keyboard_pressed(logical_key);
+                if cmd == WindowCommand::CloseWindow {
+                    return WindowCommand::CloseWindow;
+                }
                 self.app_state.touch_caret_activity();
                 self.surface_canvas
                     .set_scale_factor(self.app_state.effective_scale());
@@ -1495,14 +1659,28 @@ impl IdeWindowHost {
         WindowCommand::None
     }
 
-    fn handle_keyboard_pressed(&mut self, logical_key: Key<'_>) {
-        let ctrl = self.modifiers.control_key();
+    fn handle_keyboard_pressed(&mut self, logical_key: Key<'_>) -> WindowCommand {
+        let raw_ctrl = self.modifiers.control_key();
+        let cmd = cfg!(target_os = "macos") && self.modifiers.super_key();
+        let ctrl = raw_ctrl || cmd;
         let alt = self.modifiers.alt_key();
         let shift = self.modifiers.shift_key();
         let app_state = &mut self.app_state;
         let surface_canvas = &mut self.surface_canvas;
 
         match &logical_key {
+                        #[cfg(target_os = "macos")]
+                        Key::Character(ch) if cmd && !alt && !shift && ch.eq_ignore_ascii_case("q") => {
+                            return WindowCommand::CloseWindow;
+                        }
+                        #[cfg(target_os = "macos")]
+                        Key::Character(ch) if cmd && !alt && !shift && ch.eq_ignore_ascii_case("w") => {
+                            app_state.execute_ide_action(IdeAction::CloseActiveTab);
+                        }
+                        #[cfg(target_os = "macos")]
+                        Key::Character(ch) if cmd && !alt && !shift && *ch == "," => {
+                            app_state.execute_ide_action(IdeAction::OpenSettingsModal);
+                        }
                         // 1. IDEA + Cursor 组合快捷键
                         Key::Character(ch) if ctrl && alt && ch.eq_ignore_ascii_case("s") => {
                             app_state.execute_ide_action(IdeAction::OpenSettingsModal);
@@ -1563,7 +1741,7 @@ impl IdeWindowHost {
                                 if app_state.focus == FocusTarget::TerminalInput {
                                     let _ = app_state.clear_active_input_selection();
                                 }
-                            } else if app_state.focus == FocusTarget::TerminalInput {
+                            } else if !cmd && app_state.focus == FocusTarget::TerminalInput {
                                 app_state.terminal.active_pty_mut().send_interrupt();
                             }
                         }
@@ -2141,5 +2319,6 @@ impl IdeWindowHost {
                             }
                             _ => {}
                         }
+        WindowCommand::None
     }
 }

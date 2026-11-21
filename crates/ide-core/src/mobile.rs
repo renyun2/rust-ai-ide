@@ -980,7 +980,7 @@ fn build_hidden_command(bin: &Path, args: &[&str]) -> Command {
         }
     };
     #[cfg(not(target_os = "windows"))]
-    let mut cmd = {
+    let cmd = {
         let mut c = Command::new(bin);
         c.args(args);
         c

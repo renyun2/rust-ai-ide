@@ -135,8 +135,10 @@ pub fn execute_curl_llm_streaming(
         }
         let trimmed = line.trim();
         if !trimmed.is_empty() {
-            raw_fallback.push_str(trimmed);
-            raw_fallback.push('\n');
+            if assembled.is_empty() && raw_fallback.len() < 256 * 1024 {
+                raw_fallback.push_str(trimmed);
+                raw_fallback.push('\n');
+            }
             if let Some(data) = trimmed.strip_prefix("data:") {
                 let data = data.trim();
                 if data != "[DONE]" {

@@ -5,27 +5,180 @@ use crate::cli_discovery::{
     resolve_cursor_model_id,
 };
 use crate::cli_runner::{
-    compute_file_diff_counts, execute_cli_once, paths_same_file, CliRunParams, TurnDiffTracker,
+    compute_file_diff_counts, execute_cli_once, is_snapshot_eligible_path, is_valid_text_snapshot,
+    paths_same_file, CliRunParams, TurnDiffTracker,
 };
+
+const MAX_CHECKPOINTS_PER_SESSION: usize = 12;
+const MAX_SESSION_SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_HISTORY_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024;
 
 fn build_turn_file_changes(
     modified_files: &[PathBuf],
-    backups: &HashMap<PathBuf, Option<String>>,
+    _backups: &HashMap<PathBuf, Option<String>>,
     stats: &HashMap<PathBuf, (usize, usize)>,
 ) -> Vec<TurnFileChange> {
+    // 文件回退/Diff 基线统一保存在 WorkspaceCheckpoint 与 SessionFileChange 中，
+    // 不在每条聊天消息内重复克隆全文，彻底消除 3× 冗余内存与磁盘膨胀。
     modified_files
         .iter()
         .map(|p| {
             let (added_lines, removed_lines) = stats.get(p).copied().unwrap_or((0, 0));
-            let before_content = backups.get(p).cloned().flatten();
             TurnFileChange {
                 path: p.clone(),
                 added_lines,
                 removed_lines,
-                before_content,
+                before_content: None,
             }
         })
         .collect()
+}
+
+fn sanitize_checkpoint_backups(backups: &mut HashMap<PathBuf, Option<String>>) -> usize {
+    let mut reclaimed = 0usize;
+    backups.retain(|path, content| {
+        if !is_snapshot_eligible_path(path) {
+            if let Some(s) = content {
+                reclaimed += s.len();
+            }
+            return false;
+        }
+        if let Some(s) = content {
+            if !is_valid_text_snapshot(s) {
+                reclaimed += s.len();
+                return false;
+            }
+        }
+        true
+    });
+    reclaimed
+}
+
+fn checkpoint_bytes(ckpt: &WorkspaceCheckpoint) -> usize {
+    ckpt.file_backups
+        .values()
+        .filter_map(|v| v.as_ref().map(|s| s.len()))
+        .sum()
+}
+
+fn enforce_checkpoints_budget(checkpoints: &mut Vec<WorkspaceCheckpoint>) -> usize {
+    let mut reclaimed = 0usize;
+    for ckpt in checkpoints.iter_mut() {
+        reclaimed += sanitize_checkpoint_backups(&mut ckpt.file_backups);
+    }
+    if checkpoints.len() > MAX_CHECKPOINTS_PER_SESSION {
+        let drop_n = checkpoints.len() - MAX_CHECKPOINTS_PER_SESSION;
+        for ckpt in checkpoints.drain(..drop_n) {
+            reclaimed += checkpoint_bytes(&ckpt);
+        }
+    }
+    let mut total_bytes: usize = checkpoints.iter().map(checkpoint_bytes).sum();
+    while total_bytes > MAX_SESSION_SNAPSHOT_BYTES && checkpoints.len() > 1 {
+        let dropped = checkpoints.remove(0);
+        let b = checkpoint_bytes(&dropped);
+        total_bytes = total_bytes.saturating_sub(b);
+        reclaimed += b;
+    }
+    if total_bytes > MAX_SESSION_SNAPSHOT_BYTES {
+        if let Some(last) = checkpoints.last_mut() {
+            let mut entries: Vec<(PathBuf, usize)> = last
+                .file_backups
+                .iter()
+                .map(|(p, v)| (p.clone(), v.as_ref().map(|s| s.len()).unwrap_or(0)))
+                .collect();
+            entries.sort_by(|a, b| b.1.cmp(&a.1));
+            for (p, sz) in entries {
+                if total_bytes <= MAX_SESSION_SNAPSHOT_BYTES {
+                    break;
+                }
+                if sz > 0 {
+                    last.file_backups.remove(&p);
+                    total_bytes = total_bytes.saturating_sub(sz);
+                    reclaimed += sz;
+                }
+            }
+        }
+    }
+    reclaimed
+}
+
+fn compact_persisted_history(hist: &mut PersistedAgentHistory) -> usize {
+    let mut reclaimed = 0usize;
+    for sess in &mut hist.sessions {
+        for msg in &mut sess.messages {
+            for fc in &mut msg.file_changes {
+                if let Some(prev) = fc.before_content.take() {
+                    reclaimed += prev.len();
+                }
+            }
+        }
+        reclaimed += enforce_checkpoints_budget(&mut sess.checkpoints);
+        for cf in &mut sess.changed_files {
+            if !is_snapshot_eligible_path(&cf.path) {
+                if let Some(prev) = cf.original_content.take() {
+                    reclaimed += prev.len();
+                }
+            } else if let Some(ref s) = cf.original_content {
+                if !is_valid_text_snapshot(s) {
+                    reclaimed += s.len();
+                    cf.original_content = None;
+                }
+            }
+        }
+        let mut cf_bytes: usize = sess
+            .changed_files
+            .iter()
+            .filter_map(|c| c.original_content.as_ref().map(|s| s.len()))
+            .sum();
+        if cf_bytes > MAX_SESSION_SNAPSHOT_BYTES {
+            for cf in &mut sess.changed_files {
+                if cf_bytes <= MAX_SESSION_SNAPSHOT_BYTES {
+                    break;
+                }
+                if let Some(prev) = cf.original_content.take() {
+                    cf_bytes = cf_bytes.saturating_sub(prev.len());
+                    reclaimed += prev.len();
+                }
+            }
+        }
+    }
+
+    // 全局工作区历史总快照预算控制：按非活跃旧会话优先裁剪 checkpoint 备份
+    let active_idx = hist
+        .active_session_idx
+        .min(hist.sessions.len().saturating_sub(1));
+    let mut total_snap_bytes: usize = hist
+        .sessions
+        .iter()
+        .map(|s| {
+            let ck: usize = s.checkpoints.iter().map(checkpoint_bytes).sum();
+            let cf: usize = s
+                .changed_files
+                .iter()
+                .filter_map(|c| c.original_content.as_ref().map(|t| t.len()))
+                .sum();
+            ck + cf
+        })
+        .sum();
+    if total_snap_bytes > MAX_HISTORY_SNAPSHOT_BYTES {
+        for (idx, sess) in hist.sessions.iter_mut().enumerate() {
+            if idx == active_idx || total_snap_bytes <= MAX_HISTORY_SNAPSHOT_BYTES {
+                continue;
+            }
+            for ckpt in sess.checkpoints.drain(..) {
+                let b = checkpoint_bytes(&ckpt);
+                total_snap_bytes = total_snap_bytes.saturating_sub(b);
+                reclaimed += b;
+            }
+            for cf in &mut sess.changed_files {
+                if let Some(prev) = cf.original_content.take() {
+                    total_snap_bytes = total_snap_bytes.saturating_sub(prev.len());
+                    reclaimed += prev.len();
+                }
+            }
+        }
+    }
+    reclaimed
 }
 use crate::http_fallback::{execute_agent_tool_loop, execute_curl_llm_streaming};
 use crate::tools::{
@@ -256,10 +409,17 @@ impl AgentHub {
     pub fn set_history_file_path(&mut self, path: Option<PathBuf>) {
         self.history_file_path = path.clone();
         if let Some(p) = path {
-            if let Ok(raw) = fs::read_to_string(&p) {
-                if let Ok(hist) = serde_json::from_str::<PersistedAgentHistory>(&raw) {
+            let file_len = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+            if let Ok(file) = fs::File::open(&p) {
+                let reader = std::io::BufReader::with_capacity(64 * 1024, file);
+                if let Ok(mut hist) = serde_json::from_reader::<_, PersistedAgentHistory>(reader) {
                     if !hist.sessions.is_empty() {
+                        let reclaimed = compact_persisted_history(&mut hist);
                         self.import_history(hist);
+                        // 若检测到历史文件存在二进制/冗余快照膨胀，启动加载后立即压缩回写，大幅缩减磁盘与下次启动峰值内存
+                        if reclaimed >= 64 * 1024 || file_len >= 4 * 1024 * 1024 {
+                            self.save_history();
+                        }
                     }
                 }
             }
@@ -295,8 +455,123 @@ impl AgentHub {
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        if let Ok(json) = serde_json::to_string_pretty(&self.export_history()) {
-            let _ = fs::write(path, json);
+        // 使用零克隆借用视图 + 紧凑流式写入，避免保存时把所有会话再 clone 一份并生成巨大格式化 String
+        #[derive(serde::Serialize)]
+        struct AgentSessionRef<'a> {
+            id: &'a str,
+            title: &'a str,
+            custom_title: bool,
+            provider: AgentProviderKind,
+            active_model: &'a str,
+            fast_mode: bool,
+            reasoning_effort: ReasoningEffort,
+            messages: &'a [AgentChatMessage],
+            checkpoints: &'a [WorkspaceCheckpoint],
+            attached_items: &'a [AgentAttachedItem],
+            pasted_snippets: &'a [PastedCodeSnippet],
+            draft_prompt: &'a str,
+            is_busy: bool,
+            created_order: usize,
+            last_user_sent_ms: u64,
+            queued_prompts: &'a [QueuedAgentPrompt],
+            cli_session_id: &'a Option<String>,
+            cli_session_mode: &'a Option<AgentWorkbenchMode>,
+            cli_session_provider: &'a Option<AgentProviderKind>,
+            pending_fork_session: bool,
+            changed_files: &'a [SessionFileChange],
+            turn_anchors: &'a [TurnSyncAnchor],
+        }
+        #[derive(serde::Serialize)]
+        struct PersistedAgentHistoryRef<'a> {
+            active_provider: AgentProviderKind,
+            sessions: Vec<AgentSessionRef<'a>>,
+            active_session_idx: usize,
+            next_session_seq: usize,
+        }
+
+        let active_idx = self
+            .active_session_idx
+            .min(self.sessions.len().saturating_sub(1));
+        let active_model = self.active_model();
+        let active_fast = self.active_fast_mode();
+        let active_effort = self.active_reasoning_effort();
+
+        let sessions_ref: Vec<AgentSessionRef<'_>> = self
+            .sessions
+            .iter()
+            .enumerate()
+            .map(|(idx, s)| {
+                let is_active = idx == active_idx;
+                AgentSessionRef {
+                    id: &s.id,
+                    title: &s.title,
+                    custom_title: s.custom_title,
+                    provider: if is_active {
+                        self.active_provider
+                    } else {
+                        s.provider
+                    },
+                    active_model: if is_active {
+                        active_model.as_str()
+                    } else {
+                        s.active_model.as_str()
+                    },
+                    fast_mode: if is_active { active_fast } else { s.fast_mode },
+                    reasoning_effort: if is_active {
+                        active_effort
+                    } else {
+                        s.reasoning_effort
+                    },
+                    messages: if is_active {
+                        &self.messages
+                    } else {
+                        &s.messages
+                    },
+                    checkpoints: if is_active {
+                        &self.checkpoints
+                    } else {
+                        &s.checkpoints
+                    },
+                    attached_items: &s.attached_items,
+                    pasted_snippets: &s.pasted_snippets,
+                    draft_prompt: &s.draft_prompt,
+                    is_busy: false,
+                    created_order: s.created_order,
+                    last_user_sent_ms: s.last_user_sent_ms,
+                    queued_prompts: &s.queued_prompts,
+                    cli_session_id: &s.cli_session_id,
+                    cli_session_mode: &s.cli_session_mode,
+                    cli_session_provider: &s.cli_session_provider,
+                    pending_fork_session: s.pending_fork_session,
+                    changed_files: &s.changed_files,
+                    turn_anchors: &s.turn_anchors,
+                }
+            })
+            .collect();
+
+        let payload = PersistedAgentHistoryRef {
+            active_provider: self.active_provider,
+            sessions: sessions_ref,
+            active_session_idx: active_idx,
+            next_session_seq: self.next_session_seq,
+        };
+
+        let tmp_path = path.with_extension("json.tmp");
+        if let Ok(file) = fs::File::create(&tmp_path) {
+            let mut writer = std::io::BufWriter::with_capacity(64 * 1024, file);
+            if serde_json::to_writer(&mut writer, &payload).is_ok()
+                && std::io::Write::flush(&mut writer).is_ok()
+            {
+                drop(writer);
+                if fs::rename(&tmp_path, path).is_ok() {
+                    return;
+                }
+            }
+            let _ = fs::remove_file(&tmp_path);
+        }
+        if let Ok(file) = fs::File::create(path) {
+            let mut writer = std::io::BufWriter::with_capacity(64 * 1024, file);
+            let _ = serde_json::to_writer(&mut writer, &payload);
         }
     }
 
@@ -324,20 +599,28 @@ impl AgentHub {
         self.sessions = hist.sessions;
         self.next_session_seq = hist.next_session_seq.max(self.sessions.len() + 1);
         self.active_session_idx = target_idx;
-        let s = &self.sessions[target_idx];
-        self.messages = s.messages.clone();
-        self.checkpoints = s.checkpoints.clone();
-        self.active_provider = if s.provider != AgentProviderKind::CustomLlmApi
+        // 与 sync_session_in 一致，使用 mem::take 转移所有权而非克隆，避免活跃会话双份常驻内存
+        let (msgs, cks, prov, model, fast, effort) = {
+            let s = &mut self.sessions[target_idx];
+            (
+                std::mem::take(&mut s.messages),
+                std::mem::take(&mut s.checkpoints),
+                s.provider,
+                s.active_model.clone(),
+                s.fast_mode,
+                s.reasoning_effort,
+            )
+        };
+        self.messages = msgs;
+        self.checkpoints = cks;
+        self.active_provider = if prov != AgentProviderKind::CustomLlmApi
             || hist.active_provider == AgentProviderKind::CustomLlmApi
         {
-            s.provider
+            prov
         } else {
             hist.active_provider
         };
         let prov = self.active_provider;
-        let model = s.active_model.clone();
-        let fast = s.fast_mode;
-        let effort = s.reasoning_effort;
         if let Some(reg) = self.providers.iter_mut().find(|p| p.kind == prov) {
             if !model.is_empty() {
                 reg.active_model = model.clone();
@@ -347,6 +630,63 @@ impl AgentHub {
             reg.reasoning_effort = effort;
         }
         self.update_registration_status(prov);
+    }
+
+    /// 按消息与会话快照查找某文件在该轮修改前的文本基线（先查显式 before_content，再查对应 Checkpoint，最后查会话级 changed_files）
+    pub fn find_turn_file_before_content(
+        &self,
+        msg_idx: Option<usize>,
+        path: &Path,
+    ) -> Option<String> {
+        if let Some(idx) = msg_idx {
+            if let Some(msg) = self.messages.get(idx) {
+                if let Some(content) = msg
+                    .file_changes
+                    .iter()
+                    .find(|fc| paths_same_file(&fc.path, path))
+                    .and_then(|fc| fc.before_content.clone())
+                {
+                    return Some(content);
+                }
+                if let Some(cid) = msg.checkpoint_id.as_deref() {
+                    if let Some(ckpt) = self.checkpoints.iter().find(|c| c.id == cid) {
+                        if let Some(content) = ckpt
+                            .file_backups
+                            .iter()
+                            .find(|(p, _)| paths_same_file(p, path))
+                            .and_then(|(_, v)| v.clone())
+                        {
+                            return Some(content);
+                        }
+                    }
+                }
+            }
+            // 通过最近的 turn_anchor 查找该轮产生的 Checkpoint
+            let anchor_ckpt_id = self
+                .active_session()
+                .turn_anchors
+                .iter()
+                .rev()
+                .find(|a| a.user_msg_idx <= idx && a.checkpoint_id.is_some())
+                .and_then(|a| a.checkpoint_id.as_deref());
+            if let Some(cid) = anchor_ckpt_id {
+                if let Some(ckpt) = self.checkpoints.iter().find(|c| c.id == cid) {
+                    if let Some(content) = ckpt
+                        .file_backups
+                        .iter()
+                        .find(|(p, _)| paths_same_file(p, path))
+                        .and_then(|(_, v)| v.clone())
+                    {
+                        return Some(content);
+                    }
+                }
+            }
+        }
+        self.active_session()
+            .changed_files
+            .iter()
+            .find(|sf| paths_same_file(&sf.path, path))
+            .and_then(|sf| sf.original_content.clone())
     }
 
     pub fn set_wakeup(&mut self, wakeup: Option<AgentWakeupCallback>) {
@@ -1145,8 +1485,10 @@ impl AgentHub {
             for (sid, ckpt) in ck_inbox.drain(..) {
                 if sid == active_id {
                     self.checkpoints.push(ckpt);
+                    enforce_checkpoints_budget(&mut self.checkpoints);
                 } else if let Some(sess) = self.sessions.iter_mut().find(|s| s.id == sid) {
                     sess.checkpoints.push(ckpt);
+                    enforce_checkpoints_budget(&mut sess.checkpoints);
                 }
                 changed = true;
                 history_dirty = true;
@@ -1178,7 +1520,8 @@ impl AgentHub {
         changed
     }
 
-    fn apply_cli_turn_sync_update(&mut self, sync: CliTurnSyncUpdate, active_id: &str) {
+    fn apply_cli_turn_sync_update(&mut self, mut sync: CliTurnSyncUpdate, active_id: &str) {
+        sanitize_checkpoint_backups(&mut sync.checkpoint_backups);
         let target_is_active = sync.session_id == active_id;
         let ckpt_id = if !sync.checkpoint_backups.is_empty() {
             let id = format!("ckpt-{}", &Uuid::new_v4().to_string()[..8]);
@@ -1189,8 +1532,10 @@ impl AgentHub {
             };
             if target_is_active {
                 self.checkpoints.push(ckpt);
+                enforce_checkpoints_budget(&mut self.checkpoints);
             } else if let Some(sess) = self.sessions.iter_mut().find(|s| s.id == sync.session_id) {
                 sess.checkpoints.push(ckpt);
+                enforce_checkpoints_budget(&mut sess.checkpoints);
             }
             Some(id)
         } else {
@@ -1495,13 +1840,16 @@ impl AgentHub {
         let id = format!("ckpt-{}", &Uuid::new_v4().to_string()[..8]);
         let mut backups = HashMap::new();
         for (p, content) in files {
-            backups.insert(p.to_path_buf(), Some((*content).to_string()));
+            if is_snapshot_eligible_path(p) && is_valid_text_snapshot(content) {
+                backups.insert(p.to_path_buf(), Some((*content).to_string()));
+            }
         }
         self.checkpoints.push(WorkspaceCheckpoint {
             id: id.clone(),
             label: label.into(),
             file_backups: backups,
         });
+        enforce_checkpoints_budget(&mut self.checkpoints);
         id
     }
 
@@ -2301,7 +2649,7 @@ impl AgentHub {
                         path: path.clone(),
                         added_lines: added,
                         removed_lines: removed,
-                        before_content: backup.clone(),
+                        before_content: None,
                     });
                 }
                 if !ckpt_backups.is_empty() {
@@ -2311,24 +2659,12 @@ impl AgentHub {
                         cli_session_id: None,
                         turn_mode: AgentWorkbenchMode::Agent,
                         provider_kind: provider,
-                        checkpoint_backups: ckpt_backups.clone(),
+                        checkpoint_backups: ckpt_backups,
                         file_diff_stats,
                     });
                 }
-                let ckpt_id = if !ckpt_backups.is_empty() {
-                    let id = format!("ckpt-{}", &Uuid::new_v4().to_string()[..8]);
-                    ck_inbox.lock().push((
-                        target_session_id.clone(),
-                        WorkspaceCheckpoint {
-                            id: id.clone(),
-                            label: format!("Agent edits ({} files)", ckpt_backups.len()),
-                            file_backups: ckpt_backups,
-                        },
-                    ));
-                    Some(id)
-                } else {
-                    None
-                };
+                let ckpt_id = None;
+                let _ = &ck_inbox;
 
                 let (content, patch) = match res {
                     Ok((text, steps)) => {
@@ -3509,5 +3845,144 @@ mod tests {
             ExecutionBackend::Cli(p) => assert_eq!(p.resume_session_id, None),
             _ => panic!("expected CLI backend"),
         }
+    }
+
+    #[test]
+    fn test_history_compaction_filters_binary_oversized_and_deduplicates_snapshots() {
+        let hist_path = std::env::temp_dir().join(format!(
+            "rust_ai_ide_compact_hist_{}.json",
+            Uuid::new_v4()
+        ));
+
+        let valid_src = PathBuf::from("D:/repo/src/lib.rs");
+        let binary_exe = PathBuf::from("D:/repo/target/release/app.exe");
+        let minified_js = PathBuf::from("D:/repo/web/sdk-all-min.js");
+        let oversized_txt = "x".repeat(600 * 1024);
+
+        let mut ckpts = Vec::new();
+        for i in 0..16usize {
+            let mut backups = HashMap::new();
+            backups.insert(valid_src.clone(), Some(format!("// version {i}\nfn main() {{}}\n")));
+            backups.insert(binary_exe.clone(), Some("\0MZ\u{FFFD}\u{FFFD}binary".to_string()));
+            backups.insert(minified_js.clone(), Some("var a=1;".repeat(20_000)));
+            backups.insert(PathBuf::from("D:/repo/src/huge.rs"), Some(oversized_txt.clone()));
+            ckpts.push(WorkspaceCheckpoint {
+                id: format!("ckpt-{i}"),
+                label: format!("turn {i}"),
+                file_backups: backups,
+            });
+        }
+
+        let bloated = PersistedAgentHistory {
+            active_provider: AgentProviderKind::CursorCli,
+            active_session_idx: 0,
+            next_session_seq: 2,
+            sessions: vec![AgentSession {
+                id: "sess-compact".to_string(),
+                title: "Bloat Test".to_string(),
+                custom_title: true,
+                provider: AgentProviderKind::CursorCli,
+                active_model: "auto".to_string(),
+                fast_mode: false,
+                reasoning_effort: ReasoningEffort::Medium,
+                messages: vec![
+                    AgentChatMessage {
+                        role: "user".to_string(),
+                        agent: AgentProviderKind::CursorCli,
+                        content: "请优化内存".to_string(),
+                        thought: None,
+                        checkpoint_id: None,
+                        patch: None,
+                        modified_files: Vec::new(),
+                        file_changes: Vec::new(),
+                        attachments: Vec::new(),
+                    },
+                    AgentChatMessage {
+                        role: "assistant".to_string(),
+                        agent: AgentProviderKind::CursorCli,
+                        content: "已完成优化".to_string(),
+                        thought: None,
+                        checkpoint_id: Some("ckpt-15".to_string()),
+                        patch: None,
+                        modified_files: vec![valid_src.clone()],
+                        file_changes: vec![TurnFileChange {
+                            path: valid_src.clone(),
+                            added_lines: 3,
+                            removed_lines: 1,
+                            before_content: Some("// duplicated huge copy".repeat(10_000)),
+                        }],
+                        attachments: Vec::new(),
+                    },
+                ],
+                checkpoints: ckpts,
+                attached_items: Vec::new(),
+                pasted_snippets: Vec::new(),
+                draft_prompt: String::new(),
+                is_busy: false,
+                created_order: 1,
+                last_user_sent_ms: 100,
+                queued_prompts: Vec::new(),
+                cli_session_id: None,
+                cli_session_mode: None,
+                cli_session_provider: None,
+                pending_fork_session: false,
+                changed_files: vec![
+                    SessionFileChange {
+                        path: valid_src.clone(),
+                        added_lines: 3,
+                        removed_lines: 1,
+                        original_content: Some("// valid original\n".to_string()),
+                        first_turn_msg_idx: 0,
+                    },
+                    SessionFileChange {
+                        path: binary_exe.clone(),
+                        added_lines: 100,
+                        removed_lines: 0,
+                        original_content: Some("MZ\0\0binary".to_string()),
+                        first_turn_msg_idx: 0,
+                    },
+                ],
+                turn_anchors: vec![TurnSyncAnchor {
+                    user_msg_idx: 0,
+                    pre_turn_cli_session_id: None,
+                    checkpoint_id: Some("ckpt-15".to_string()),
+                }],
+            }],
+        };
+
+        let raw_json = serde_json::to_string_pretty(&bloated).unwrap();
+        let before_size = raw_json.len();
+        fs::write(&hist_path, raw_json).unwrap();
+
+        let mut hub = AgentHub::new(Path::new("."));
+        hub.set_history_file_path(Some(hist_path.clone()));
+
+        // Active session messages/checkpoints moved (not duplicated inside self.sessions[0])
+        assert!(hub.sessions[0].messages.is_empty());
+        assert!(hub.sessions[0].checkpoints.is_empty());
+        assert_eq!(hub.messages.len(), 2);
+        assert!(hub.messages[1].file_changes[0].before_content.is_none());
+        // Checkpoints capped at MAX_CHECKPOINTS_PER_SESSION and sanitized of binary/oversized/minified
+        assert!(hub.checkpoints.len() <= MAX_CHECKPOINTS_PER_SESSION);
+        for ck in &hub.checkpoints {
+            assert!(!ck.file_backups.contains_key(&binary_exe));
+            assert!(!ck.file_backups.contains_key(&minified_js));
+            assert!(!ck.file_backups.contains_key(&PathBuf::from("D:/repo/src/huge.rs")));
+            assert!(ck.file_backups.contains_key(&valid_src));
+        }
+        // Diff baseline lookup still resolves cleanly through the linked checkpoint
+        let resolved_before = hub
+            .find_turn_file_before_content(Some(1), &valid_src)
+            .expect("checkpoint fallback should resolve before_content");
+        assert!(resolved_before.contains("// version 15"));
+
+        // Disk file was automatically compacted and shrunk dramatically
+        let after_size = fs::metadata(&hist_path).unwrap().len() as usize;
+        assert!(
+            after_size * 10 < before_size,
+            "expected >10x compaction: before={before_size}, after={after_size}"
+        );
+
+        let _ = fs::remove_file(&hist_path);
     }
 }

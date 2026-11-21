@@ -1,9 +1,12 @@
+#[cfg(target_os = "windows")]
 use std::ffi::c_void;
 use std::fs::{self, File};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+#[cfg(target_os = "windows")]
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static CLIP_IMG_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -95,6 +98,7 @@ pub fn load_image_for_preview(path: &Path) -> Option<DecodedPreviewImage> {
         None
     }
     .or_else(|| decode_with_windows_gdiplus(path))
+    .or_else(|| decode_with_image_crate(&bytes))
     .or_else(|| extract_windows_shell_thumbnail(path, 960, false));
 
     let (orig_w, orig_h, rgba) = decoded?;
@@ -155,22 +159,18 @@ pub fn load_media_preview_tab(
                     }));
                 }
             }
-            if file_size_bytes <= 64 * 1024 * 1024 {
-                if let Ok(bytes) = fs::read(path) {
-                    duration_secs = parse_mp4_mvhd_duration(&bytes);
-                }
-            }
+            duration_secs = read_mp4_mvhd_duration_bounded(path, file_size_bytes);
         }
         MediaKind::Audio => {
-            if file_size_bytes <= 64 * 1024 * 1024 {
+            if format_label == "M4A" {
+                duration_secs = read_mp4_mvhd_duration_bounded(path, file_size_bytes);
+            } else if file_size_bytes <= 16 * 1024 * 1024 {
                 if let Ok(bytes) = fs::read(path) {
                     if let Some((dur, sr, ch, peaks)) = parse_wav_info_and_peaks(&bytes) {
                         duration_secs = Some(dur);
                         sample_rate_hz = Some(sr);
                         channels = Some(ch);
                         waveform_peaks = peaks;
-                    } else if format_label == "M4A" {
-                        duration_secs = parse_mp4_mvhd_duration(&bytes);
                     }
                 }
             }
@@ -239,8 +239,18 @@ pub fn open_media_with_system_app(path: &Path) -> bool {
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn open_media_with_system_app(_path: &Path) -> bool {
-    false
+pub fn open_media_with_system_app(path: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(not(target_os = "macos"))]
+    let program = "xdg-open";
+    std::process::Command::new(program)
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .is_ok()
 }
 
 fn parse_wav_info_and_peaks(bytes: &[u8]) -> Option<(f64, u32, u16, Vec<f32>)> {
@@ -308,6 +318,29 @@ fn parse_wav_info_and_peaks(bytes: &[u8]) -> Option<(f64, u32, u16, Vec<f32>)> {
         }
     }
     Some((duration_secs, sample_rate, channels, peaks))
+}
+
+/// 仅读取 MP4/M4A 头部与尾部各最多 512 KB 查找 `mvhd`，避免把几十 MB 视频整文件读入内存。
+fn read_mp4_mvhd_duration_bounded(path: &Path, file_size: u64) -> Option<f64> {
+    use std::io::{Read, Seek, SeekFrom};
+    const WINDOW: usize = 512 * 1024;
+    let mut f = File::open(path).ok()?;
+    let head_len = (file_size as usize).min(WINDOW);
+    let mut buf = vec![0u8; head_len];
+    let n = f.read(&mut buf).ok()?;
+    if let Some(d) = parse_mp4_mvhd_duration(&buf[..n]) {
+        return Some(d);
+    }
+    if file_size > WINDOW as u64 {
+        let tail_start = file_size.saturating_sub(WINDOW as u64);
+        if f.seek(SeekFrom::Start(tail_start)).is_ok() {
+            let mut tail = vec![0u8; WINDOW];
+            if let Ok(tn) = f.read(&mut tail) {
+                return parse_mp4_mvhd_duration(&tail[..tn]);
+            }
+        }
+    }
+    None
 }
 
 fn parse_mp4_mvhd_duration(bytes: &[u8]) -> Option<f64> {
@@ -731,6 +764,19 @@ fn decode_with_windows_gdiplus(_path: &Path) -> Option<(u32, u32, Vec<u8>)> {
     None
 }
 
+#[cfg(not(target_os = "windows"))]
+fn decode_with_image_crate(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    let img = image::load_from_memory(bytes).ok()?;
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    Some((w, h, rgba.into_raw()))
+}
+
+#[cfg(target_os = "windows")]
+fn decode_with_image_crate(_bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    None
+}
+
 pub(crate) fn encode_rgba_to_temp_png(w: u32, h: u32, rgba: &[u8]) -> Option<PathBuf> {
     let dir = std::env::temp_dir().join("rust-ai-ide-attachments");
     fs::create_dir_all(&dir).ok()?;
@@ -857,7 +903,27 @@ pub fn read_windows_clipboard_payload() -> Option<ClipboardPastePayload> {
 
 #[cfg(not(target_os = "windows"))]
 pub fn read_windows_clipboard_payload() -> Option<ClipboardPastePayload> {
-    None
+    crate::ide_state::with_arboard_clipboard(|cb| {
+        if let Ok(files) = cb.get().file_list() {
+            if !files.is_empty() {
+                return Some(ClipboardPastePayload::Files(files));
+            }
+        }
+        if let Ok(img) = cb.get_image() {
+            if img.width > 0 && img.height > 0 {
+                if let Some(saved) =
+                    encode_rgba_to_temp_png(img.width as u32, img.height as u32, &img.bytes)
+                {
+                    return Some(ClipboardPastePayload::ImageFile(saved));
+                }
+            }
+        }
+        if let Ok(text) = cb.get_text() {
+            return Some(ClipboardPastePayload::Text(text.replace("\r\n", "\n")));
+        }
+        None
+    })
+    .flatten()
 }
 
 /// 识别粘贴到 AI Composer 中的长代码/多行代码片段，以便折叠展示而不撑爆输入框

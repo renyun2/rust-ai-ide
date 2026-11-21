@@ -291,6 +291,26 @@ fn git_command(root: &Path) -> Command {
     cmd
 }
 
+const MAX_DIFF_LINES_PER_FILE: usize = 1500;
+const MAX_TOTAL_DIFF_LINES: usize = 8000;
+const MAX_DIFF_LINE_BYTES: usize = 1024;
+const MAX_UNTRACKED_DIFF_FILE_BYTES: u64 = 256 * 1024;
+const MAX_COMMIT_DETAILS_CACHE: usize = 16;
+const MAX_FILE_HISTORY_CACHE: usize = 8;
+const MAX_FILE_BLAME_CACHE: usize = 8;
+
+fn clip_diff_line(s: &str) -> String {
+    if s.len() <= MAX_DIFF_LINE_BYTES {
+        s.to_string()
+    } else {
+        let mut end = MAX_DIFF_LINE_BYTES;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &s[..end])
+    }
+}
+
 fn parse_unified_diff_sections(
     diff_text: &str,
 ) -> (Vec<GitCommitFileChange>, HashMap<String, Vec<DiffLine>>) {
@@ -300,6 +320,8 @@ fn parse_unified_diff_sections(
     let mut current_path: Option<String> = None;
     let mut current_status = GitFileStatusKind::Modified;
     let mut current_lines: Vec<DiffLine> = Vec::new();
+    let mut current_truncated = false;
+    let mut total_stored_lines = 0usize;
     let mut additions = 0usize;
     let mut deletions = 0usize;
     let mut old_ln = 1usize;
@@ -311,9 +333,18 @@ fn parse_unified_diff_sections(
                          add: usize,
                          del: usize,
                          lines: &mut Vec<DiffLine>,
+                         truncated: &mut bool,
                          files_out: &mut Vec<GitCommitFileChange>,
                          diffs_out: &mut HashMap<String, Vec<DiffLine>>| {
         if let Some(path) = path_opt.take() {
+            if *truncated {
+                lines.push(DiffLine {
+                    kind: DiffLineKind::Context,
+                    old_lineno: None,
+                    new_lineno: None,
+                    content: "... (diff truncated to save memory)".to_string(),
+                });
+            }
             files_out.push(GitCommitFileChange {
                 path: path.clone(),
                 status,
@@ -321,6 +352,7 @@ fn parse_unified_diff_sections(
                 deletions: del,
             });
             diffs_out.insert(path, std::mem::take(lines));
+            *truncated = false;
         }
     };
 
@@ -332,6 +364,7 @@ fn parse_unified_diff_sections(
                 additions,
                 deletions,
                 &mut current_lines,
+                &mut current_truncated,
                 &mut files,
                 &mut file_diffs,
             );
@@ -379,12 +412,19 @@ fn parse_unified_diff_sections(
                     }
                 }
             }
-            current_lines.push(DiffLine {
-                kind: DiffLineKind::Context,
-                old_lineno: None,
-                new_lineno: None,
-                content: raw_line.to_string(),
-            });
+            if current_lines.len() < MAX_DIFF_LINES_PER_FILE
+                && total_stored_lines < MAX_TOTAL_DIFF_LINES
+            {
+                current_lines.push(DiffLine {
+                    kind: DiffLineKind::Context,
+                    old_lineno: None,
+                    new_lineno: None,
+                    content: clip_diff_line(raw_line),
+                });
+                total_stored_lines += 1;
+            } else {
+                current_truncated = true;
+            }
             continue;
         }
 
@@ -392,31 +432,48 @@ fn parse_unified_diff_sections(
             continue;
         }
 
+        let can_push = current_lines.len() < MAX_DIFF_LINES_PER_FILE
+            && total_stored_lines < MAX_TOTAL_DIFF_LINES;
         if let Some(added) = raw_line.strip_prefix('+') {
             additions += 1;
-            current_lines.push(DiffLine {
-                kind: DiffLineKind::Added,
-                old_lineno: None,
-                new_lineno: Some(new_ln),
-                content: added.to_string(),
-            });
+            if can_push {
+                current_lines.push(DiffLine {
+                    kind: DiffLineKind::Added,
+                    old_lineno: None,
+                    new_lineno: Some(new_ln),
+                    content: clip_diff_line(added),
+                });
+                total_stored_lines += 1;
+            } else {
+                current_truncated = true;
+            }
             new_ln += 1;
         } else if let Some(removed) = raw_line.strip_prefix('-') {
             deletions += 1;
-            current_lines.push(DiffLine {
-                kind: DiffLineKind::Removed,
-                old_lineno: Some(old_ln),
-                new_lineno: None,
-                content: removed.to_string(),
-            });
+            if can_push {
+                current_lines.push(DiffLine {
+                    kind: DiffLineKind::Removed,
+                    old_lineno: Some(old_ln),
+                    new_lineno: None,
+                    content: clip_diff_line(removed),
+                });
+                total_stored_lines += 1;
+            } else {
+                current_truncated = true;
+            }
             old_ln += 1;
         } else if let Some(ctx) = raw_line.strip_prefix(' ') {
-            current_lines.push(DiffLine {
-                kind: DiffLineKind::Context,
-                old_lineno: Some(old_ln),
-                new_lineno: Some(new_ln),
-                content: ctx.to_string(),
-            });
+            if can_push {
+                current_lines.push(DiffLine {
+                    kind: DiffLineKind::Context,
+                    old_lineno: Some(old_ln),
+                    new_lineno: Some(new_ln),
+                    content: clip_diff_line(ctx),
+                });
+                total_stored_lines += 1;
+            } else {
+                current_truncated = true;
+            }
             old_ln += 1;
             new_ln += 1;
         }
@@ -428,6 +485,7 @@ fn parse_unified_diff_sections(
         additions,
         deletions,
         &mut current_lines,
+        &mut current_truncated,
         &mut files,
         &mut file_diffs,
     );
@@ -775,6 +833,12 @@ fn collect_snapshot(root: &Path) -> GitSnapshot {
     let mut working_diffs = diff_res;
     for ch in &status_res {
         if ch.status == GitFileStatusKind::Untracked && !working_diffs.contains_key(&ch.path) {
+            let file_ok = std::fs::metadata(&ch.path)
+                .map(|m| m.is_file() && m.len() <= MAX_UNTRACKED_DIFF_FILE_BYTES)
+                .unwrap_or(false);
+            if !file_ok {
+                continue;
+            }
             if let Ok(content) = std::fs::read_to_string(&ch.path) {
                 let added_lines: Vec<DiffLine> = content
                     .lines()
@@ -784,7 +848,7 @@ fn collect_snapshot(root: &Path) -> GitSnapshot {
                         kind: DiffLineKind::Added,
                         old_lineno: None,
                         new_lineno: Some(idx + 1),
-                        content: line.to_string(),
+                        content: clip_diff_line(line),
                     })
                     .collect();
                 working_diffs.insert(ch.path.clone(), added_lines);
@@ -1990,8 +2054,38 @@ impl GitEngine {
         self.recent_commits = snapshot.recent_commits;
         self.has_loaded_snapshot = true;
         if let Some(detail) = snapshot.head_detail {
-            self.commit_details.insert(detail.hash.clone(), detail);
+            self.insert_commit_detail_bounded(detail);
         }
+    }
+
+    fn insert_commit_detail_bounded(&mut self, detail: GitCommitDetail) {
+        if self.commit_details.len() >= MAX_COMMIT_DETAILS_CACHE
+            && !self.commit_details.contains_key(&detail.hash)
+        {
+            let head_hash = self.recent_commits.first().map(|c| c.hash.as_str());
+            if let Some(evict) = self
+                .commit_details
+                .keys()
+                .find(|k| Some(k.as_str()) != head_hash)
+                .cloned()
+                .or_else(|| self.commit_details.keys().next().cloned())
+            {
+                self.commit_details.remove(&evict);
+            }
+        }
+        self.commit_details.insert(detail.hash.clone(), detail);
+    }
+
+    /// 释放后台/最小化窗口的非核心 Git 缓存，保留工作区变更状态与 HEAD 摘要
+    pub fn trim_caches(&mut self) {
+        let head_hash = self.recent_commits.first().map(|c| c.hash.clone());
+        self.commit_details
+            .retain(|k, _| head_hash.as_deref() == Some(k.as_str()));
+        self.commit_details.shrink_to_fit();
+        self.file_histories.clear();
+        self.file_histories.shrink_to_fit();
+        self.file_blames.clear();
+        self.file_blames.shrink_to_fit();
     }
 
     pub fn is_file_checked_for_commit(&self, path: &Path) -> bool {
@@ -2328,12 +2422,26 @@ impl GitEngine {
                     }
                 }
                 GitWorkerEvent::CommitDetailLoaded { detail } => {
-                    self.commit_details.insert(detail.hash.clone(), detail);
+                    self.insert_commit_detail_bounded(detail);
                 }
                 GitWorkerEvent::FileHistoryLoaded { path, entries } => {
+                    if self.file_histories.len() >= MAX_FILE_HISTORY_CACHE
+                        && !self.file_histories.contains_key(&path)
+                    {
+                        if let Some(drop_k) = self.file_histories.keys().next().cloned() {
+                            self.file_histories.remove(&drop_k);
+                        }
+                    }
                     self.file_histories.insert(path, entries);
                 }
                 GitWorkerEvent::FileBlameLoaded { path, lines } => {
+                    if self.file_blames.len() >= MAX_FILE_BLAME_CACHE
+                        && !self.file_blames.contains_key(&path)
+                    {
+                        if let Some(drop_k) = self.file_blames.keys().next().cloned() {
+                            self.file_blames.remove(&drop_k);
+                        }
+                    }
                     self.file_blames.insert(path, lines);
                 }
                 GitWorkerEvent::AiDiffReady {

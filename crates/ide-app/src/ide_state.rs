@@ -197,8 +197,14 @@ pub fn pick_folder_windows(initial_dir: Option<&Path>) -> Option<PathBuf> {
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn pick_folder_windows(_initial_dir: Option<&Path>) -> Option<PathBuf> {
-    None
+pub fn pick_folder_windows(initial_dir: Option<&Path>) -> Option<PathBuf> {
+    let mut dialog = rfd::FileDialog::new();
+    if let Some(dir) = initial_dir {
+        if dir.is_dir() {
+            dialog = dialog.set_directory(dir);
+        }
+    }
+    dialog.pick_folder()
 }
 
 /// 可拖拽调整大小的面板分割线标识
@@ -405,8 +411,23 @@ pub fn read_windows_clipboard_text() -> Option<String> {
 }
 
 #[cfg(not(target_os = "windows"))]
+pub(crate) fn with_arboard_clipboard<R>(
+    f: impl FnOnce(&mut arboard::Clipboard) -> R,
+) -> Option<R> {
+    use std::sync::{Mutex, OnceLock};
+    static CLIPBOARD: OnceLock<Mutex<Option<arboard::Clipboard>>> = OnceLock::new();
+    let mutex = CLIPBOARD.get_or_init(|| Mutex::new(arboard::Clipboard::new().ok()));
+    let mut guard = mutex.lock().ok()?;
+    if guard.is_none() {
+        *guard = arboard::Clipboard::new().ok();
+    }
+    let cb = guard.as_mut()?;
+    Some(f(cb))
+}
+
+#[cfg(not(target_os = "windows"))]
 pub fn read_windows_clipboard_text() -> Option<String> {
-    None
+    with_arboard_clipboard(|cb| cb.get_text().ok().map(|s| s.replace("\r\n", "\n"))).flatten()
 }
 
 #[cfg(target_os = "windows")]
@@ -453,8 +474,9 @@ pub fn write_windows_clipboard_text(text: &str) -> bool {
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn write_windows_clipboard_text(_text: &str) -> bool {
-    false
+pub fn write_windows_clipboard_text(text: &str) -> bool {
+    let normalized = text.replace("\r\n", "\n");
+    with_arboard_clipboard(|cb| cb.set_text(normalized).is_ok()).unwrap_or(false)
 }
 
 /// Settings 对话框页面，结构对齐 IntelliJ IDEA `Ctrl+Alt+S`。
@@ -857,7 +879,7 @@ pub enum HitAction {
     OpenImagePreview(PathBuf),
     CloseImagePreview,
     CopyAgentMessage(usize),
-    CopyAgentCodeBlock(String),
+    CopyAgentCodeBlock(Arc<str>),
     OpenFileAtLine(PathBuf, Option<usize>),
     OpenExternalUrl(String),
     FocusAgentChatStream,
@@ -1597,8 +1619,17 @@ fn open_http_url(url: &str) -> bool {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = url;
-        false
+        #[cfg(target_os = "macos")]
+        let program = "open";
+        #[cfg(not(target_os = "macos"))]
+        let program = "xdg-open";
+        std::process::Command::new(program)
+            .arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .is_ok()
     }
 }
 
@@ -1636,7 +1667,9 @@ impl IdeApplicationState {
         let (folder_pick_tx, folder_pick_rx) = mpsc::channel::<PathBuf>();
         let workspace_files_cache = Arc::new(RwLock::new(None));
         let search_seq = Arc::new(AtomicU64::new(0));
-        let is_indexing_workspace = Arc::new(AtomicBool::new(wakeup_enabled));
+        // 工作区文件搜索索引改为按需懒加载（首次触发 Search Everywhere / Find in Files 时再构建），
+        // 避免多窗口同时启动时为每个工作区预先扫描并常驻数万条路径字符串。
+        let is_indexing_workspace = Arc::new(AtomicBool::new(false));
         let (search_cmd_tx, search_event_rx) = spawn_search_worker(
             workspace_root.clone(),
             Arc::clone(&workspace_files_cache),
@@ -1644,9 +1677,6 @@ impl IdeApplicationState {
             Arc::clone(&is_indexing_workspace),
             wakeup.clone(),
         );
-        if wakeup_enabled {
-            let _ = search_cmd_tx.send(SearchWorkerCmd::ReindexWorkspace);
-        }
         let now = Instant::now();
 
         let open_buffers = pick_initial_buffers(&workspace_root, &project_tree);
@@ -2376,9 +2406,26 @@ impl IdeApplicationState {
         self.window_attention_until = Some(Instant::now() + Duration::from_millis(980));
     }
 
+    /// 后台非活跃窗口空置时释放可重建的瞬态渲染/语法/Git 缓存，显著降低多窗口常驻内存。
+    pub fn trim_caches_when_background_idle(&mut self) {
+        self.cached_highlight_lines.2.clear();
+        self.cached_highlight_lines.2.shrink_to_fit();
+        self.cached_structure = None;
+        self.cached_runnables = None;
+        self.cached_chat_rows = AgentChatCache::default();
+        self.agent_chat_line_rects.clear();
+        self.agent_chat_line_rects.shrink_to_fit();
+        self.git_engine.trim_caches();
+    }
+
     /// Trims heavy per-window transient caches when a window is minimized.
     pub fn trim_caches_when_minimized(&mut self) {
-        self.cached_highlight_lines.2.clear();
+        self.trim_caches_when_background_idle();
+        self.hit_regions.clear();
+        self.hit_regions.shrink_to_fit();
+        if let Ok(mut guard) = self.workspace_files_cache.try_write() {
+            *guard = None;
+        }
         let active_media: std::collections::HashSet<PathBuf> = self
             .media_tabs
             .iter()
@@ -2386,11 +2433,20 @@ impl IdeApplicationState {
             .collect();
         self.image_preview_cache
             .retain(|p, _| active_media.contains(p));
+        self.image_preview_cache.shrink_to_fit();
     }
 
     fn cache_decoded_image_preview(&mut self, path: PathBuf, img: Arc<DecodedPreviewImage>) {
         const MAX_IMAGE_PREVIEW_CACHE: usize = 24;
-        if self.image_preview_cache.len() >= MAX_IMAGE_PREVIEW_CACHE
+        const MAX_IMAGE_PREVIEW_BYTES: usize = 32 * 1024 * 1024;
+        let incoming_bytes = img.rgba.len();
+        let current_bytes: usize = self
+            .image_preview_cache
+            .values()
+            .map(|v| v.rgba.len())
+            .sum();
+        if (self.image_preview_cache.len() >= MAX_IMAGE_PREVIEW_CACHE
+            || current_bytes.saturating_add(incoming_bytes) > MAX_IMAGE_PREVIEW_BYTES)
             && !self.image_preview_cache.contains_key(&path)
         {
             let keep: std::collections::HashSet<PathBuf> = self
@@ -2399,16 +2455,25 @@ impl IdeApplicationState {
                 .map(|m| m.path.clone())
                 .collect();
             self.image_preview_cache.retain(|p, _| keep.contains(p));
-            if self.image_preview_cache.len() >= MAX_IMAGE_PREVIEW_CACHE {
-                if let Some(drop_key) = self
+            while self.image_preview_cache.len() >= MAX_IMAGE_PREVIEW_CACHE
+                || self
+                    .image_preview_cache
+                    .values()
+                    .map(|v| v.rgba.len())
+                    .sum::<usize>()
+                    .saturating_add(incoming_bytes)
+                    > MAX_IMAGE_PREVIEW_BYTES
+            {
+                let drop_key = self
                     .image_preview_cache
                     .keys()
                     .find(|k| !keep.contains(*k))
                     .cloned()
-                    .or_else(|| self.image_preview_cache.keys().next().cloned())
-                {
-                    self.image_preview_cache.remove(&drop_key);
-                }
+                    .or_else(|| self.image_preview_cache.keys().next().cloned());
+                let Some(k) = drop_key else {
+                    break;
+                };
+                self.image_preview_cache.remove(&k);
             }
         }
         self.image_preview_cache.insert(path, img);
@@ -2549,8 +2614,7 @@ impl IdeApplicationState {
             .search_cmd_tx
             .send(SearchWorkerCmd::SetWorkspaceRoot(clean.clone()));
         if self.wakeup_enabled {
-            self.is_indexing_workspace.store(true, Ordering::Release);
-            let _ = self.search_cmd_tx.send(SearchWorkerCmd::ReindexWorkspace);
+            self.is_indexing_workspace.store(false, Ordering::Release);
             self.startup_loading_until = Instant::now() + Duration::from_millis(550);
             self.startup_load_alpha = 0.85;
             self.git_load_alpha = 0.85;
@@ -2634,7 +2698,15 @@ impl IdeApplicationState {
     }
 
     pub fn refresh_workspace_file_index_async(&self) {
-        let _ = self.search_cmd_tx.send(SearchWorkerCmd::ReindexWorkspace);
+        // 仅在索引已建立时增量重建；尚未搜索过的工作区保持懒加载
+        let has_index = self
+            .workspace_files_cache
+            .try_read()
+            .map(|g| g.is_some())
+            .unwrap_or(false);
+        if has_index {
+            let _ = self.search_cmd_tx.send(SearchWorkerCmd::ReindexWorkspace);
+        }
     }
 
     pub fn trigger_search_everywhere(&mut self, max_results: usize) {
@@ -2996,22 +3068,9 @@ impl IdeApplicationState {
     }
 
     pub fn open_agent_file_diff_in_editor(&mut self, path: &Path, msg_idx: Option<usize>) {
-        let old_from_msg = msg_idx.and_then(|idx| {
-            self.agent_hub.messages.get(idx).and_then(|m| {
-                m.file_changes
-                    .iter()
-                    .find(|fc| fc.path == path)
-                    .and_then(|fc| fc.before_content.clone())
-            })
-        });
-        let old_from_sess = self
+        let old_text = self
             .agent_hub
-            .active_session_changed_files()
-            .iter()
-            .find(|sf| sf.path == path)
-            .and_then(|sf| sf.original_content.clone());
-        let old_text = old_from_msg
-            .or(old_from_sess)
+            .find_turn_file_before_content(msg_idx, path)
             .unwrap_or_else(|| self.read_git_head_text_for_path(path));
         let new_text = std::fs::read_to_string(path).unwrap_or_default();
         let subtitle = self
@@ -3674,7 +3733,7 @@ impl IdeApplicationState {
             }
         }
 
-        let candidate_files: Vec<PathBuf> = if let Ok(guard) = self.workspace_files_cache.try_read() {
+        let mut candidate_files: Vec<PathBuf> = if let Ok(guard) = self.workspace_files_cache.try_read() {
             guard
                 .as_ref()
                 .map(|list| list.iter().map(|f| f.full_path.clone()).collect())
@@ -3682,6 +3741,15 @@ impl IdeApplicationState {
         } else {
             Vec::new()
         };
+        if candidate_files.is_empty() {
+            candidate_files = self
+                .project_tree
+                .visible_entries
+                .iter()
+                .filter(|e| !e.is_dir)
+                .map(|e| e.path.clone())
+                .collect();
+        }
         for path in candidate_files.into_iter().take(180) {
             if path == active_path {
                 continue;
@@ -9290,6 +9358,30 @@ impl IdeApplicationState {
         {
             let arg = format!("/select,{}", path.display());
             let _ = std::process::Command::new("explorer.exe").arg(arg).spawn();
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("open")
+                .arg("-R")
+                .arg(path)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            let target = if path.is_dir() {
+                path
+            } else {
+                path.parent().unwrap_or(path)
+            };
+            let _ = std::process::Command::new("xdg-open")
+                .arg(target)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
         }
         self.status_notification = format!(
             "{}: {}",

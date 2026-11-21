@@ -41,13 +41,33 @@ pub struct WorkspaceFileEntry {
     pub full_path: PathBuf,
 }
 
+const MAX_INDEXED_WORKSPACE_FILES: usize = 50_000;
+
 fn build_workspace_walker(root: &Path) -> ignore::Walk {
     WalkBuilder::new(root)
         .hidden(false)
         .git_ignore(true)
         .filter_entry(|e| {
             let name = e.file_name().to_string_lossy();
-            !matches!(name.as_ref(), ".git" | "target" | "node_modules" | ".venv")
+            !matches!(
+                name.as_ref(),
+                ".git"
+                    | "target"
+                    | "node_modules"
+                    | ".venv"
+                    | "venv"
+                    | "__pycache__"
+                    | "dist"
+                    | "build"
+                    | "out"
+                    | ".next"
+                    | ".nuxt"
+                    | ".gradle"
+                    | ".dart_tool"
+                    | ".cache"
+                    | ".turbo"
+                    | "coverage"
+            )
         })
         .build()
 }
@@ -56,6 +76,9 @@ fn build_workspace_walker(root: &Path) -> ignore::Walk {
 pub fn index_workspace_files(root: &Path) -> Vec<WorkspaceFileEntry> {
     let mut files = Vec::new();
     for entry in build_workspace_walker(root).flatten() {
+        if files.len() >= MAX_INDEXED_WORKSPACE_FILES {
+            break;
+        }
         if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
             continue;
         }
@@ -76,6 +99,7 @@ pub fn index_workspace_files(root: &Path) -> Vec<WorkspaceFileEntry> {
             full_path: path.to_path_buf(),
         });
     }
+    files.shrink_to_fit();
     files
 }
 

@@ -24,7 +24,9 @@ use std::time::SystemTime;
 use std::os::windows::process::CommandExt;
 
 #[cfg(target_os = "windows")]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+// `creation_flags` replaces the default, so keep CREATE_UNICODE_ENVIRONMENT (0x400).
+// Without it, Windows reads the environment as ANSI and `git status` fails on CI.
+const CREATE_NO_WINDOW: u32 = 0x0800_0000 | 0x0000_0400;
 
 #[derive(Debug, Clone)]
 pub struct CliRunParams {

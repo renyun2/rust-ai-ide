@@ -20742,7 +20742,7 @@ mod tests {
             .any(|m| m.content == "alpha session question"));
         assert_eq!(restarted.agent_chat_input.as_str(), "alpha draft");
         assert_eq!(
-            restarted.active_buffer().path,
+            clean_workspace_path(restarted.active_buffer().path.clone()),
             clean_workspace_path(ws1_lib)
         );
         assert_eq!(restarted.active_buffer().cursor_line, 2);

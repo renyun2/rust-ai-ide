@@ -1809,9 +1809,50 @@ fn infer_language_from_command(command: &str, args: &[String]) -> LanguageId {
     }
 }
 
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    #[cfg(target_os = "windows")]
+    if let Some(s) = path.to_str() {
+        if let Some(stripped) = s.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{stripped}"));
+        }
+        if let Some(stripped) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(stripped);
+        }
+    }
+    path
+}
+
+fn normalize_for_prefix(path: &Path) -> PathBuf {
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        return strip_verbatim_prefix(canon);
+    }
+    let mut suffix = Vec::new();
+    let mut cur = path;
+    while let Some(name) = cur.file_name() {
+        suffix.push(name.to_os_string());
+        let Some(parent) = cur.parent() else {
+            break;
+        };
+        if let Ok(canon_parent) = std::fs::canonicalize(parent) {
+            let mut resolved = strip_verbatim_prefix(canon_parent);
+            for part in suffix.into_iter().rev() {
+                resolved.push(part);
+            }
+            return resolved;
+        }
+        cur = parent;
+    }
+    path.to_path_buf()
+}
+
 fn relative_display_path(file_path: &Path, workspace_root: &Path) -> String {
-    file_path
-        .strip_prefix(workspace_root)
+    if let Ok(rel) = file_path.strip_prefix(workspace_root) {
+        return rel.to_string_lossy().replace('\\', "/");
+    }
+    let norm_file = normalize_for_prefix(file_path);
+    let norm_root = normalize_for_prefix(workspace_root);
+    norm_file
+        .strip_prefix(&norm_root)
         .unwrap_or(file_path)
         .to_string_lossy()
         .replace('\\', "/")
@@ -2094,6 +2135,31 @@ mod tests {
             RunConfiguration::for_file(&root.join("test/widget_test.dart"), &root).unwrap();
         assert_eq!(dart_test.command, "flutter");
         assert_eq!(dart_test.args, vec!["test", "test/widget_test.dart"]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn relative_display_path_handles_uncanonical_and_canonical_mismatch() {
+        let unique = format!(
+            "ide-core-rel-norm-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let sub = root.join("nested");
+        std::fs::create_dir_all(&sub).unwrap();
+        let py_file = root.join("worker.py");
+        std::fs::write(&py_file, "print('ok')\n").unwrap();
+
+        let canon_root = normalize_for_prefix(&root);
+        let root_name = root.file_name().unwrap();
+        let uncanonical_file = root.join("..").join(root_name).join("worker.py");
+        let cfg = RunConfiguration::for_file(&uncanonical_file, &canon_root).unwrap();
+        assert_eq!(cfg.command, "python");
+        assert_eq!(cfg.args, vec!["worker.py"]);
 
         let _ = std::fs::remove_dir_all(&root);
     }

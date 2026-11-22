@@ -1155,7 +1155,7 @@ dependencies = [
 
 [[package]]
 name = "ide-agent-hub"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "ide-core",
@@ -1171,7 +1171,7 @@ dependencies = [
 
 [[package]]
 name = "ide-app"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -1201,7 +1201,7 @@ dependencies = [
 
 [[package]]
 name = "ide-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "parking_lot",
@@ -1213,7 +1213,7 @@ dependencies = [
 
 [[package]]
 name = "ide-dap"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "ide-core",
@@ -1223,7 +1223,7 @@ dependencies = [
 
 [[package]]
 name = "ide-git"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -1232,7 +1232,7 @@ dependencies = [
 
 [[package]]
 name = "ide-lsp"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "ide-core",
@@ -1245,7 +1245,7 @@ dependencies = [
 
 [[package]]
 name = "ide-search"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "grep-matcher",
@@ -1258,7 +1258,7 @@ dependencies = [
 
 [[package]]
 name = "ide-syntax"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ide-core",
  "regex",
@@ -1267,7 +1267,7 @@ dependencies = [
 
 [[package]]
 name = "ide-terminal"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "ide-core",
@@ -1278,7 +1278,7 @@ dependencies = [
 
 [[package]]
 name = "ide-vfs"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "ide-core",

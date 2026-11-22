@@ -259,6 +259,7 @@ impl FileIconKind {
             ide_core::LanguageId::TypeScript => Self::TypeScript,
             ide_core::LanguageId::JavaScript => Self::JavaScript,
             ide_core::LanguageId::Python => Self::Python,
+            ide_core::LanguageId::Java => Self::Java,
             ide_core::LanguageId::Json => Self::Json,
             ide_core::LanguageId::Toml => Self::Toml,
             ide_core::LanguageId::Markdown => Self::Markdown,
@@ -338,11 +339,15 @@ impl FileIconKind {
         if name == "package.json" {
             return Some(Self::Npm);
         }
-        if name == "pom.xml" || name == "mvnw" || name == "mvnw.cmd" {
+        if name == "pom.xml" || name == "mvnw" || name == "mvnw.cmd" || name == "maven-wrapper.properties" {
             return Some(Self::Maven);
         }
         if name == "build.gradle"
+            || name == "build.gradle.kts"
             || name == "settings.gradle"
+            || name == "settings.gradle.kts"
+            || name == "gradle.properties"
+            || name == "gradle-wrapper.properties"
             || name == "gradlew"
             || name == "gradlew.bat"
         {

@@ -269,6 +269,16 @@ impl RunConfiguration {
             }
             return None;
         }
+        if lower_name == "pom.xml" {
+            let mut detected = Vec::new();
+            detect_maven_configs(&parent_dir, workspace_root, None, &mut detected);
+            if let Some(mut first) = detected.into_iter().next() {
+                first.source = RunConfigSource::Custom;
+                first.target_file = Some(file_path.to_path_buf());
+                return Some(first);
+            }
+            return None;
+        }
         if lower_name == "cargo.toml" {
             let mut detected = Vec::new();
             let mut ignored = Vec::new();
@@ -382,15 +392,7 @@ impl RunConfiguration {
                     })
                 }
             }
-            "java" => Some(Self {
-                name: format!("Java: {file_name}"),
-                language: LanguageId::PlainText,
-                command: "java".to_string(),
-                args: vec![rel_display],
-                cwd: workspace_root.to_path_buf(),
-                source: RunConfigSource::Custom,
-                target_file: Some(file_path.to_path_buf()),
-            }),
+            "java" => Some(java_config_for_file(file_path, workspace_root)),
             "dart" => {
                 let is_flutter = crate::mobile::dir_has_flutter_pubspec(workspace_root);
                 let is_test = lower_name.ends_with("_test.dart");
@@ -933,7 +935,7 @@ fn detect_gradle_configs(
         let args: Vec<String> = task.split_whitespace().map(|s| s.to_string()).collect();
         configs.push(RunConfiguration {
             name: suffix_name(format!("Gradle: {task}"), sub_label),
-            language: LanguageId::PlainText,
+            language: LanguageId::Java,
             command: gradle_cmd.clone(),
             args,
             cwd: dir.to_path_buf(),
@@ -961,6 +963,26 @@ fn detect_gradle_executable(dir: &Path, workspace_root: &Path) -> String {
         }
     }
     "gradle".to_string()
+}
+
+fn detect_maven_executable(dir: &Path, workspace_root: &Path) -> String {
+    for base in [dir, workspace_root] {
+        if cfg!(windows) && base.join("mvnw.cmd").is_file() {
+            return if paths_equivalent(base, dir) {
+                ".\\mvnw.cmd".to_string()
+            } else {
+                base.join("mvnw.cmd").display().to_string()
+            };
+        }
+        if base.join("mvnw").is_file() {
+            return if paths_equivalent(base, dir) {
+                "./mvnw".to_string()
+            } else {
+                base.join("mvnw").display().to_string()
+            };
+        }
+    }
+    "mvn".to_string()
 }
 
 fn extract_gradle_custom_tasks(content: &str) -> Vec<String> {
@@ -1001,15 +1023,7 @@ fn detect_maven_configs(
         return;
     };
 
-    let mvn_cmd = if cfg!(windows) && dir.join("mvnw.cmd").is_file() {
-        ".\\mvnw.cmd".to_string()
-    } else if dir.join("mvnw").is_file() {
-        "./mvnw".to_string()
-    } else if cfg!(windows) && workspace_root.join("mvnw.cmd").is_file() {
-        workspace_root.join("mvnw.cmd").display().to_string()
-    } else {
-        "mvn".to_string()
-    };
+    let mvn_cmd = detect_maven_executable(dir, workspace_root);
 
     let mut goals: Vec<&str> = Vec::new();
     if content.contains("spring-boot-maven-plugin") {
@@ -1018,16 +1032,20 @@ fn detect_maven_configs(
     if content.contains("quarkus-maven-plugin") {
         goals.push("quarkus:dev");
     }
+    if content.contains("javafx-maven-plugin") {
+        goals.push("javafx:run");
+    }
     if content.contains("exec-maven-plugin") || content.contains("<mainClass>") {
         goals.push("exec:java");
     }
+    goals.push("compile");
     goals.push("test");
     goals.push("package");
 
     for goal in goals {
         configs.push(RunConfiguration {
             name: suffix_name(format!("Maven: {goal}"), sub_label),
-            language: LanguageId::PlainText,
+            language: LanguageId::Java,
             command: mvn_cmd.clone(),
             args: vec![goal.to_string()],
             cwd: dir.to_path_buf(),
@@ -1035,6 +1053,33 @@ fn detect_maven_configs(
             target_file: Some(pom_path.clone()),
         });
     }
+
+    // Multi-module Maven: scan nested <module> directories (e.g. services/api) that immediate subdir scan didn't cover
+    if sub_label.is_none() {
+        for module_rel in extract_maven_modules(&content).into_iter().take(12) {
+            let mod_dir = dir.join(&module_rel);
+            if mod_dir.is_dir() && mod_dir.join("pom.xml").is_file() && module_rel.contains('/') {
+                detect_maven_configs(&mod_dir, workspace_root, Some(&module_rel), configs);
+            }
+        }
+    }
+}
+
+fn extract_maven_modules(pom_content: &str) -> Vec<String> {
+    let mut modules = Vec::new();
+    let mut rest = pom_content;
+    while let Some(start) = rest.find("<module>") {
+        let after = &rest[start + 8..];
+        let Some(end) = after.find("</module>") else {
+            break;
+        };
+        let name = after[..end].trim().replace('\\', "/");
+        if !name.is_empty() && !modules.iter().any(|m| m == &name) {
+            modules.push(name);
+        }
+        rest = &after[end + 9..];
+    }
+    modules
 }
 
 fn detect_cargo_configs(
@@ -1561,6 +1606,138 @@ fn cargo_config_for_rust_file(file_path: &Path, workspace_root: &Path) -> RunCon
     }
 }
 
+fn extract_java_package(source: &str) -> Option<String> {
+    for line in source.lines().take(40) {
+        let trimmed = line.trim();
+        if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*') {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("package ") {
+            let pkg = rest.trim_end_matches(';').trim();
+            if !pkg.is_empty() && pkg.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_') {
+                return Some(pkg.to_string());
+            }
+        }
+        if trimmed.starts_with("public class ")
+            || trimmed.starts_with("class ")
+            || trimmed.starts_with("public interface ")
+            || trimmed.starts_with("public record ")
+            || trimmed.starts_with("public enum ")
+        {
+            break;
+        }
+    }
+    None
+}
+
+fn java_config_for_file(file_path: &Path, workspace_root: &Path) -> RunConfiguration {
+    let file_name = file_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("Main.java");
+    let stem = file_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Main");
+    let src = std::fs::read_to_string(file_path).unwrap_or_default();
+    let fqcn = match extract_java_package(&src) {
+        Some(pkg) => format!("{pkg}.{stem}"),
+        None => stem.to_string(),
+    };
+    let is_test = stem.ends_with("Test")
+        || stem.ends_with("Tests")
+        || stem.ends_with("IT")
+        || src.contains("@Test")
+        || src.contains("@ParameterizedTest")
+        || src.contains("@RepeatedTest")
+        || src.contains("org.junit")
+        || src.contains("org.testng");
+    let is_spring_boot = src.contains("@SpringBootApplication");
+
+    let mut cursor = file_path.parent();
+    while let Some(dir) = cursor {
+        let pom_path = dir.join("pom.xml");
+        if pom_path.is_file() {
+            let mvn_cmd = detect_maven_executable(dir, workspace_root);
+            let pom_raw = std::fs::read_to_string(&pom_path).unwrap_or_default();
+            let (name, args) = if is_test {
+                (
+                    format!("Maven Test: {stem}"),
+                    vec!["test".to_string(), format!("-Dtest={fqcn}")],
+                )
+            } else if is_spring_boot && pom_raw.contains("spring-boot-maven-plugin") {
+                (
+                    format!("Spring Boot: {stem}"),
+                    vec!["spring-boot:run".to_string()],
+                )
+            } else {
+                (
+                    format!("Maven: {stem}"),
+                    vec![
+                        "compile".to_string(),
+                        "exec:java".to_string(),
+                        format!("-Dexec.mainClass={fqcn}"),
+                    ],
+                )
+            };
+            return RunConfiguration {
+                name,
+                language: LanguageId::Java,
+                command: mvn_cmd,
+                args,
+                cwd: dir.to_path_buf(),
+                source: RunConfigSource::Custom,
+                target_file: Some(file_path.to_path_buf()),
+            };
+        }
+
+        let has_gradle = dir.join("build.gradle.kts").is_file() || dir.join("build.gradle").is_file();
+        if has_gradle {
+            let gradle_cmd = detect_gradle_executable(dir, workspace_root);
+            let (name, args) = if is_test {
+                (
+                    format!("Gradle Test: {stem}"),
+                    vec!["test".to_string(), "--tests".to_string(), fqcn],
+                )
+            } else if is_spring_boot {
+                (
+                    format!("Spring Boot: {stem}"),
+                    vec!["bootRun".to_string()],
+                )
+            } else {
+                (
+                    format!("Gradle: {stem}"),
+                    vec!["run".to_string()],
+                )
+            };
+            return RunConfiguration {
+                name,
+                language: LanguageId::Java,
+                command: gradle_cmd,
+                args,
+                cwd: dir.to_path_buf(),
+                source: RunConfigSource::Custom,
+                target_file: Some(file_path.to_path_buf()),
+            };
+        }
+
+        if paths_equivalent(dir, workspace_root) {
+            break;
+        }
+        cursor = dir.parent();
+    }
+
+    RunConfiguration {
+        name: format!("Java: {file_name}"),
+        language: LanguageId::Java,
+        command: "java".to_string(),
+        args: vec![relative_display_path(file_path, workspace_root)],
+        cwd: workspace_root.to_path_buf(),
+        source: RunConfigSource::Custom,
+        target_file: Some(file_path.to_path_buf()),
+    }
+}
+
 fn parse_toml_package_name(raw: &str) -> Option<String> {
     let mut section = String::new();
     for line in raw.lines() {
@@ -1804,6 +1981,9 @@ fn infer_language_from_command(command: &str, args: &[String]) -> LanguageId {
         }
         "python" | "python3" | "py" | "pytest" | "uv" | "poetry" | "uvicorn" | "flask" => {
             LanguageId::Python
+        }
+        "java" | "javac" | "javap" | "jshell" | "mvn" | "mvnw" | "gradle" | "gradlew" => {
+            LanguageId::Java
         }
         _ => LanguageId::PlainText,
     }
@@ -2160,6 +2340,113 @@ mod tests {
         let cfg = RunConfiguration::for_file(&uncanonical_file, &canon_root).unwrap();
         assert_eq!(cfg.command, "python");
         assert_eq!(cfg.args, vec!["worker.py"]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_java_maven_gradle_and_standalone_run_configs() {
+        let unique = format!(
+            "ide-core-java-rc-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let maven_dir = root.join("maven-svc");
+        let gradle_dir = root.join("gradle-svc");
+        let standalone_dir = root.join("scripts");
+        std::fs::create_dir_all(maven_dir.join("src/main/java/com/example")).unwrap();
+        std::fs::create_dir_all(maven_dir.join("src/test/java/com/example")).unwrap();
+        std::fs::create_dir_all(gradle_dir.join("src/test/java/com/demo")).unwrap();
+        std::fs::create_dir_all(&standalone_dir).unwrap();
+
+        std::fs::write(
+            maven_dir.join("pom.xml"),
+            "<project><build><plugins><plugin><artifactId>spring-boot-maven-plugin</artifactId></plugin></plugins></build></project>",
+        )
+        .unwrap();
+        std::fs::write(maven_dir.join("mvnw"), "#!/bin/sh\n").unwrap();
+        std::fs::write(maven_dir.join("mvnw.cmd"), "@echo off\r\n").unwrap();
+        let maven_app = maven_dir.join("src/main/java/com/example/DemoApplication.java");
+        std::fs::write(
+            &maven_app,
+            "package com.example;\n\n@SpringBootApplication\npublic class DemoApplication {\n    public static void main(String[] args) {}\n}\n",
+        )
+        .unwrap();
+        let maven_main = maven_dir.join("src/main/java/com/example/CliTool.java");
+        std::fs::write(
+            &maven_main,
+            "package com.example;\n\npublic class CliTool {\n    public static void main(String[] args) {}\n}\n",
+        )
+        .unwrap();
+        let maven_test = maven_dir.join("src/test/java/com/example/DemoTests.java");
+        std::fs::write(
+            &maven_test,
+            "package com.example;\nimport org.junit.jupiter.api.Test;\npublic class DemoTests {\n    @Test\n    void contextLoads() {}\n}\n",
+        )
+        .unwrap();
+
+        std::fs::write(
+            gradle_dir.join("build.gradle.kts"),
+            "plugins { java; application }\n",
+        )
+        .unwrap();
+        let gradle_test = gradle_dir.join("src/test/java/com/demo/CalcTest.java");
+        std::fs::write(
+            &gradle_test,
+            "package com.demo;\nimport org.junit.jupiter.api.Test;\nclass CalcTest {\n    @Test void adds() {}\n}\n",
+        )
+        .unwrap();
+
+        let standalone_java = standalone_dir.join("Hello.java");
+        std::fs::write(
+            &standalone_java,
+            "public class Hello {\n    public static void main(String[] args) { System.out.println(\"hi\"); }\n}\n",
+        )
+        .unwrap();
+
+        let detected = RunConfiguration::detect_for_workspace(&root);
+        assert!(detected
+            .iter()
+            .any(|c| c.language == LanguageId::Java && c.args == vec!["spring-boot:run"]));
+        assert!(detected
+            .iter()
+            .any(|c| c.language == LanguageId::Java && c.args == vec!["compile"]));
+        assert!(detected
+            .iter()
+            .any(|c| c.language == LanguageId::Java && c.args == vec!["run"]));
+
+        let pom_cfg = RunConfiguration::for_file(&maven_dir.join("pom.xml"), &root).unwrap();
+        assert_eq!(pom_cfg.language, LanguageId::Java);
+        assert_eq!(pom_cfg.source, RunConfigSource::Custom);
+
+        let boot_cfg = RunConfiguration::for_file(&maven_app, &root).unwrap();
+        assert_eq!(boot_cfg.language, LanguageId::Java);
+        assert!(boot_cfg.command.contains("mvnw"));
+        assert_eq!(boot_cfg.args, vec!["spring-boot:run"]);
+
+        let cli_cfg = RunConfiguration::for_file(&maven_main, &root).unwrap();
+        assert_eq!(
+            cli_cfg.args,
+            vec!["compile", "exec:java", "-Dexec.mainClass=com.example.CliTool"]
+        );
+
+        let mtest_cfg = RunConfiguration::for_file(&maven_test, &root).unwrap();
+        assert_eq!(mtest_cfg.args, vec!["test", "-Dtest=com.example.DemoTests"]);
+
+        let gtest_cfg = RunConfiguration::for_file(&gradle_test, &root).unwrap();
+        assert_eq!(gtest_cfg.language, LanguageId::Java);
+        assert_eq!(gtest_cfg.args, vec!["test", "--tests", "com.demo.CalcTest"]);
+
+        let single_cfg = RunConfiguration::for_file(&standalone_java, &root).unwrap();
+        assert_eq!(single_cfg.language, LanguageId::Java);
+        assert_eq!(single_cfg.command, "java");
+        assert_eq!(single_cfg.args, vec!["scripts/Hello.java"]);
+
+        let cli_parsed = RunConfiguration::from_terminal_command("./mvnw spring-boot:run", &root).unwrap();
+        assert_eq!(cli_parsed.language, LanguageId::Java);
 
         let _ = std::fs::remove_dir_all(&root);
     }

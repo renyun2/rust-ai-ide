@@ -399,10 +399,18 @@ async function ensureChromeRunning(port) {
       const chromeArgs = [
         `--remote-debugging-port=${port}`,
         `--user-data-dir=${USER_DATA_DIR}`,
+        '--enable-automation',
         '--no-first-run',
         '--no-default-browser-check',
         '--hide-crash-restore-bubble',
         '--disable-backgrounding-occluded-windows',
+        '--disable-background-timer-throttling',
+        '--disable-renderer-backgrounding',
+        '--disable-popup-blocking',
+        '--disable-hang-monitor',
+        '--allow-pre-commit-input',
+        '--disable-ipc-flooding-protection',
+        '--disable-prompt-on-repost',
       ];
       let chromeExited = false;
       const chromeProc = spawn(chromeExe, chromeArgs, {
@@ -861,5 +869,13 @@ mod tests {
         assert_eq!(fs::read_to_string(&mcp_path).unwrap(), original);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bridge_script_launches_chrome_with_automation_banner_and_cdp_flags() {
+        assert!(CHROME_DEVTOOLS_BRIDGE_SCRIPT.contains("'--enable-automation'"));
+        assert!(CHROME_DEVTOOLS_BRIDGE_SCRIPT.contains("`--remote-debugging-port=${port}`"));
+        assert!(CHROME_DEVTOOLS_BRIDGE_SCRIPT.contains("'--browserUrl'"));
+        assert!(CHROME_DEVTOOLS_BRIDGE_SCRIPT.contains("'--disable-background-timer-throttling'"));
     }
 }

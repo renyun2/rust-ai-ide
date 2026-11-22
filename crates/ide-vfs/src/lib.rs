@@ -1171,7 +1171,7 @@ impl ProjectTreeState {
     pub fn new(root: &Path) -> Self {
         let mut expanded_dirs = BTreeSet::new();
         expanded_dirs.insert(root.to_path_buf());
-        // 默认展开 crates 及其一级子目录
+        // 默认展开 crates 及其一级子目录，或 Java/Maven/Gradle 的 src/main/java 源码树
         let crates_dir = root.join("crates");
         if crates_dir.exists() {
             expanded_dirs.insert(crates_dir.clone());
@@ -1184,6 +1184,21 @@ impl ProjectTreeState {
                             expanded_dirs.insert(src_dir);
                         }
                     }
+                }
+            }
+        }
+        let src_dir = root.join("src");
+        if src_dir.is_dir()
+            && (root.join("pom.xml").is_file()
+                || root.join("build.gradle").is_file()
+                || root.join("build.gradle.kts").is_file()
+                || src_dir.join("main/java").is_dir())
+        {
+            expanded_dirs.insert(src_dir.clone());
+            for sub in ["main", "main/java", "test", "test/java"] {
+                let candidate = src_dir.join(sub);
+                if candidate.is_dir() {
+                    expanded_dirs.insert(candidate);
                 }
             }
         }
@@ -1246,13 +1261,14 @@ impl ProjectTreeState {
         }
         if !target.exists() {
             let lang = LanguageId::from_path(&target);
-            let template = match lang {
-                LanguageId::Rust => "// Created in Rust AI IDE\npub fn init() {\n    println!(\"Ready\");\n}\n",
-                LanguageId::TypeScript | LanguageId::JavaScript => "// Created in Rust AI IDE\nexport function init(): void {\n  console.log('Ready');\n}\n",
-                LanguageId::Python => "# Created in Rust AI IDE\ndef main() -> None:\n    print('Ready')\n\nif __name__ == '__main__':\n    main()\n",
-                _ => "",
+            let content = match lang {
+                LanguageId::Rust => "// Created in Rust AI IDE\npub fn init() {\n    println!(\"Ready\");\n}\n".to_string(),
+                LanguageId::TypeScript | LanguageId::JavaScript => "// Created in Rust AI IDE\nexport function init(): void {\n  console.log('Ready');\n}\n".to_string(),
+                LanguageId::Python => "# Created in Rust AI IDE\ndef main() -> None:\n    print('Ready')\n\nif __name__ == '__main__':\n    main()\n".to_string(),
+                LanguageId::Java => build_java_file_template(&target),
+                _ => String::new(),
             };
-            fs::write(&target, template)?;
+            fs::write(&target, content)?;
         }
         self.selected_path = Some(target.clone());
         self.rebuild();
@@ -1385,6 +1401,64 @@ pub fn scan_workspace_tree(root: &Path, _max_entries: usize) -> Vec<FileTreeEntr
     ProjectTreeState::new(root).visible_entries
 }
 
+fn build_java_file_template(target: &Path) -> String {
+    let raw_stem = target
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Main");
+    let class_name: String = raw_stem
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
+        .collect();
+    let class_name = if class_name.is_empty() {
+        "Main".to_string()
+    } else {
+        class_name
+    };
+
+    let norm = target.to_string_lossy().replace('\\', "/");
+    let pkg = ["src/main/java/", "src/test/java/", "src/"]
+        .iter()
+        .filter_map(|marker| norm.rfind(marker).map(|idx| idx + marker.len()))
+        .max()
+        .and_then(|start| {
+            let after = &norm[start..];
+            let dir_part = after.rsplit_once('/')?.0;
+            let segments: Vec<&str> = dir_part
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .collect();
+            if segments.is_empty() {
+                None
+            } else {
+                Some(segments.join("."))
+            }
+        });
+
+    let mut out = String::new();
+    if let Some(p) = pkg {
+        out.push_str(&format!("package {p};\n\n"));
+    }
+
+    let is_test = class_name.ends_with("Test")
+        || class_name.ends_with("Tests")
+        || norm.contains("/src/test/java/");
+    if is_test {
+        out.push_str("import org.junit.jupiter.api.Test;\n");
+        out.push_str("import static org.junit.jupiter.api.Assertions.*;\n\n");
+        out.push_str(&format!(
+            "class {class_name} {{\n    @Test\n    void shouldWork() {{\n        assertTrue(true);\n    }}\n}}\n"
+        ));
+    } else if matches!(class_name.as_str(), "Main" | "App" | "Application") {
+        out.push_str(&format!(
+            "public class {class_name} {{\n    public static void main(String[] args) {{\n        System.out.println(\"Ready\");\n    }}\n}}\n"
+        ));
+    } else {
+        out.push_str(&format!("public class {class_name} {{\n    \n}}\n"));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1452,6 +1526,43 @@ mod tests {
         let p2 = tree.rename_path(&p1, "new_name.rs").unwrap();
         assert!(!p1.exists());
         assert!(p2.exists());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_java_file_template_and_tree_expansion() {
+        let unique = format!(
+            "rust_ai_ide_vfs_java_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let tmp = std::env::temp_dir().join(unique);
+        fs::create_dir_all(tmp.join("src/main/java/com/example")).unwrap();
+        fs::create_dir_all(tmp.join("src/test/java/com/example")).unwrap();
+        fs::write(tmp.join("pom.xml"), "<project/>").unwrap();
+
+        let mut tree = ProjectTreeState::new(&tmp);
+        assert!(tree.expanded_dirs.contains(&tmp.join("src")));
+        assert!(tree.expanded_dirs.contains(&tmp.join("src/main/java")));
+
+        let app_file = tree
+            .create_new_file("src/main/java/com/example/App.java")
+            .unwrap();
+        let app_src = fs::read_to_string(&app_file).unwrap();
+        assert!(app_src.contains("package com.example;"));
+        assert!(app_src.contains("public class App"));
+        assert!(app_src.contains("public static void main"));
+
+        tree.selected_path = None;
+        let test_file = tree
+            .create_new_file("src/test/java/com/example/AppTest.java")
+            .unwrap();
+        let test_src = fs::read_to_string(&test_file).unwrap();
+        assert!(test_src.contains("package com.example;"));
+        assert!(test_src.contains("@Test"));
+
         let _ = fs::remove_dir_all(&tmp);
     }
 }

@@ -707,14 +707,14 @@ const SETTINGS_NAV: &[SettingsNavItem] = &[
         depth: 0,
         zh: "语言和框架",
         en: "Languages & Frameworks",
-        keywords: "language rust typescript javascript python framework 语言 框架",
+        keywords: "language rust typescript javascript python java maven gradle jdtls framework 语言 框架",
     },
     SettingsNavItem {
         page: Some(SettingsPage::MobileSdk),
         depth: 0,
         zh: "移动端 SDK",
         en: "Mobile SDKs",
-        keywords: "mobile sdk flutter android jdk adb install directory path 移动端 sdk 安装目录 flutter android",
+        keywords: "mobile sdk flutter android jdk java adb install directory path 移动端 sdk 安装目录 flutter android",
     },
     SettingsNavItem {
         page: Some(SettingsPage::Advanced),
@@ -1389,6 +1389,12 @@ fn pick_initial_buffers(workspace_root: &Path, project_tree: &ProjectTreeState) 
         workspace_root.join("src/main.rs"),
         workspace_root.join("src/lib.rs"),
         workspace_root.join("Cargo.toml"),
+        workspace_root.join("src/main/java/Main.java"),
+        workspace_root.join("src/main/java/App.java"),
+        workspace_root.join("Main.java"),
+        workspace_root.join("pom.xml"),
+        workspace_root.join("build.gradle.kts"),
+        workspace_root.join("build.gradle"),
         workspace_root.join("package.json"),
         workspace_root.join("main.py"),
         workspace_root.join("README.md"),
@@ -3814,6 +3820,7 @@ impl IdeApplicationState {
                     | ide_core::LanguageId::TypeScript
                     | ide_core::LanguageId::JavaScript
                     | ide_core::LanguageId::Python
+                    | ide_core::LanguageId::Java
             ) {
                 continue;
             }
@@ -4737,6 +4744,33 @@ impl IdeApplicationState {
                     base.name = format!("Pytest: {fn_name}");
                     base.args.push("-k".to_string());
                     base.args.push(fn_name);
+                }
+                base
+            }
+            Some(entry) if entry.command == "mvn" && entry.args.first().map(|s| s.as_str()) == Some("test") => {
+                let mut base = RunConfiguration::for_file(&buf.path, &self.workspace_root)
+                    .unwrap_or_else(|| RunConfiguration {
+                        name: entry.label.clone(),
+                        language: buf.language,
+                        command: "mvn".to_string(),
+                        args: vec!["test".to_string()],
+                        cwd: self.workspace_root.clone(),
+                        source: RunConfigSource::Custom,
+                        target_file: Some(buf.path.clone()),
+                    });
+                if let Some(method_name) = entry.args.get(1) {
+                    base.name = format!("Java Test: {method_name}()");
+                    if let Some(dtest_arg) = base.args.iter_mut().find(|a| a.starts_with("-Dtest=")) {
+                        if !dtest_arg.contains('#') {
+                            dtest_arg.push('#');
+                            dtest_arg.push_str(method_name);
+                        }
+                    } else if let Some(pos) = base.args.iter().position(|a| a == "--tests") {
+                        if let Some(target_cls) = base.args.get_mut(pos + 1) {
+                            target_cls.push('.');
+                            target_cls.push_str(method_name);
+                        }
+                    }
                 }
                 base
             }
@@ -18768,8 +18802,8 @@ impl IdeApplicationState {
         hy: i32,
     ) {
         let intro = self.tr(
-            "Rust、TypeScript、JavaScript 与 Python 使用同一套缩进。",
-            "Rust, TypeScript, JavaScript, and Python share one indent.",
+            "Rust、TypeScript、JavaScript、Python 与 Java 使用同一套缩进。",
+            "Rust, TypeScript, JavaScript, Python, and Java share one indent.",
         );
         self.settings_note(canvas, flow, x, w, intro);
         let title = self.tr("缩进", "Tabs and Indents");
@@ -18913,8 +18947,8 @@ impl IdeApplicationState {
             self.tr("Git 集成", "Git Integration"),
             self.tr("终端 (ConPTY)", "Terminal (ConPTY)"),
             self.tr(
-                "调试器 (codelldb / js-debug / debugpy)",
-                "Debugger (codelldb / js-debug / debugpy)",
+                "调试器 (codelldb / js-debug / debugpy / java-debug)",
+                "Debugger (codelldb / js-debug / debugpy / java-debug)",
             ),
             self.tr("中文语言包", "Chinese Language Pack"),
         ];
@@ -18983,8 +19017,8 @@ impl IdeApplicationState {
         hy: i32,
     ) {
         let intro = self.tr(
-            "Rust 使用 codelldb，TypeScript / JavaScript 使用 js-debug，Python 使用 debugpy。",
-            "Rust uses codelldb, TypeScript / JavaScript uses js-debug, Python uses debugpy.",
+            "Rust 使用 codelldb，TypeScript / JavaScript 使用 js-debug，Python 使用 debugpy，Java 使用 java-debug。",
+            "Rust uses codelldb, TypeScript / JavaScript uses js-debug, Python uses debugpy, Java uses java-debug.",
         );
         self.settings_note(canvas, flow, x, w, intro);
         let adapter_label = self.tr("调试器", "Debugger");
@@ -19070,6 +19104,7 @@ impl IdeApplicationState {
             ("TypeScript", "vtsls", "js-debug"),
             ("JavaScript", "vtsls", "js-debug"),
             ("Python", "pyright-langserver", "debugpy"),
+            ("Java", "jdtls", "java-debug"),
             (
                 "JSON / TOML / Markdown",
                 self.tr("内置语法", "Built-in syntax"),
@@ -22198,5 +22233,82 @@ mod tests {
                 line: 2
             }
         );
+    }
+
+    #[test]
+    fn java_maven_project_end_to_end_support() {
+        let unique = format!(
+            "rust-ai-ide-java-e2e-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let root = std::env::temp_dir().join(unique);
+        let main_dir = root.join("src/main/java/com/acme");
+        let test_dir = root.join("src/test/java/com/acme");
+        std::fs::create_dir_all(&main_dir).unwrap();
+        std::fs::create_dir_all(&test_dir).unwrap();
+        std::fs::write(
+            root.join("pom.xml"),
+            "<project><modelVersion>4.0.0</modelVersion><build><plugins><plugin><artifactId>spring-boot-maven-plugin</artifactId></plugin></plugins></build></project>",
+        )
+        .unwrap();
+        let app_java = main_dir.join("App.java");
+        std::fs::write(
+            &app_java,
+            "package com.acme;\n\npublic class App {\n    public static void main(String[] args) {\n        var msg = \"hello\";\n    }\n}\n",
+        )
+        .unwrap();
+        let test_java = test_dir.join("AppTest.java");
+        std::fs::write(
+            &test_java,
+            "package com.acme;\n\nimport org.junit.jupiter.api.Test;\n\nclass AppTest {\n    @Test\n    void shouldPass() {}\n}\n",
+        )
+        .unwrap();
+
+        let mut state = IdeApplicationState::new(root.clone());
+        assert!(state
+            .run_configs
+            .iter()
+            .any(|c| c.language == ide_core::LanguageId::Java && c.args == vec!["spring-boot:run"]));
+        assert!(state
+            .lsp_hub
+            .servers
+            .iter()
+            .any(|s| s.language == ide_core::LanguageId::Java && s.binary_name.contains("jdtls")));
+
+        // Open test file -> gutter runnable on @Test method runs Maven with Class#method
+        state.open_file(test_java.clone());
+        assert_eq!(state.active_buffer().language, ide_core::LanguageId::Java);
+        let mut canvas = SurfaceCanvas::new(1440, 900);
+        state.render(&mut canvas);
+        let runnables = state
+            .cached_runnables
+            .as_ref()
+            .map(|(_, _, entries)| entries.clone())
+            .unwrap_or_default();
+        let test_entry = runnables
+            .iter()
+            .find(|r| r.label == "Run 'shouldPass()'")
+            .expect("Java @Test gutter entry");
+        state.run_gutter_entry_in_terminal(test_entry.line);
+        assert!(state.run_configs.iter().any(|c| {
+            c.language == ide_core::LanguageId::Java
+                && c.args.iter().any(|a| a == "-Dtest=com.acme.AppTest#shouldPass")
+        }));
+
+        // DAP debug on Java file
+        state.open_file(app_java.clone());
+        state.active_buffer_mut().set_cursor(4, 8, false);
+        state.execute_ide_action(IdeAction::DebugActiveConfig);
+        assert_eq!(state.dap_engine.active_adapter, "java-debug");
+        assert!(state
+            .dap_engine
+            .variables
+            .iter()
+            .any(|v| v.name == "msg" && v.value == "\"hello\""));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

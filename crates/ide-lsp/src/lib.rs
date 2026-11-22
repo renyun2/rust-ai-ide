@@ -100,7 +100,7 @@ impl LspHub {
             line: 1,
             column: 1,
             severity: DiagnosticSeverityLevel::Information,
-            message: "rust-analyzer: Workspace indexed (Rust + TS/JS + Python multi-language engine ready)".to_string(),
+            message: "rust-analyzer: Workspace indexed (Rust + TS/JS + Python + Java multi-language engine ready)".to_string(),
             source: "rust-analyzer".to_string(),
             quick_fix_suggestion: Some("Ask Agent to optimize or add unit tests".to_string()),
         }];
@@ -584,6 +584,10 @@ fn probe_installed_lsp_servers() -> Vec<LspServerStatus> {
                 "pylsp",
             ][..],
         ),
+        (
+            LanguageId::Java,
+            &["jdtls.bat", "jdtls.cmd", "jdtls", "java-language-server"][..],
+        ),
     ];
 
     let mut servers = Vec::new();
@@ -675,7 +679,11 @@ pub fn analyze_source_diagnostics(
         // 3. 括号平衡与未完成宏检查（跳过注释与字符串字面量）
         if matches!(
             lang,
-            LanguageId::Rust | LanguageId::TypeScript | LanguageId::JavaScript | LanguageId::Python
+            LanguageId::Rust
+                | LanguageId::TypeScript
+                | LanguageId::JavaScript
+                | LanguageId::Python
+                | LanguageId::Java
         ) {
             if let Some(pos) = raw_line.find("todo!(").or_else(|| raw_line.find("unimplemented!(")) {
                 if !trimmed.starts_with("//") && !trimmed.starts_with('#') {
@@ -716,6 +724,21 @@ pub fn analyze_source_diagnostics(
                             continue;
                         }
                         if chars[i] == '"' {
+                            break;
+                        }
+                        i += 1;
+                    }
+                    i += 1;
+                    continue;
+                }
+                if c == '\'' && lang == LanguageId::Java {
+                    i += 1;
+                    while i < chars.len() {
+                        if chars[i] == '\\' {
+                            i += 2;
+                            continue;
+                        }
+                        if chars[i] == '\'' {
                             break;
                         }
                         i += 1;
@@ -887,7 +910,188 @@ fn run_workspace_compiler_and_lsp_diagnostics(workspace_root: &Path) -> Vec<IdeD
             }
         }
     }
+
+    if workspace_root.join("pom.xml").is_file() {
+        let mvn_bin = if cfg!(windows) && workspace_root.join("mvnw.cmd").is_file() {
+            Some(workspace_root.join("mvnw.cmd"))
+        } else if workspace_root.join("mvnw").is_file() {
+            Some(workspace_root.join("mvnw"))
+        } else {
+            ["mvn.cmd", "mvn"]
+                .into_iter()
+                .find_map(find_executable_in_path)
+        };
+        if let Some(bin) = mvn_bin {
+            if let Some(out) = run_build_check_output(&bin, &["test-compile", "-B"], workspace_root) {
+                for line in out.lines() {
+                    if let Some(diag) = parse_java_compiler_diagnostic_line(workspace_root, line) {
+                        results.push(diag);
+                    }
+                }
+            }
+        }
+    } else if workspace_root.join("build.gradle.kts").is_file()
+        || workspace_root.join("build.gradle").is_file()
+    {
+        let gradle_bin = if cfg!(windows) && workspace_root.join("gradlew.bat").is_file() {
+            Some(workspace_root.join("gradlew.bat"))
+        } else if workspace_root.join("gradlew").is_file() {
+            Some(workspace_root.join("gradlew"))
+        } else {
+            ["gradle.bat", "gradle"]
+                .into_iter()
+                .find_map(find_executable_in_path)
+        };
+        if let Some(bin) = gradle_bin {
+            if let Some(out) = run_build_check_output(
+                &bin,
+                &["compileJava", "compileTestJava", "--console=plain"],
+                workspace_root,
+            ) {
+                for line in out.lines() {
+                    if let Some(diag) = parse_java_compiler_diagnostic_line(workspace_root, line) {
+                        results.push(diag);
+                    }
+                }
+            }
+        }
+    }
     results
+}
+
+fn run_build_check_output(bin: &Path, args: &[&str], workspace_root: &Path) -> Option<String> {
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let ext = bin
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if ext == "bat" || ext == "cmd" {
+            let mut c = Command::new("cmd.exe");
+            c.arg("/C").arg(bin).args(args);
+            c
+        } else {
+            let mut c = Command::new(bin);
+            c.args(args);
+            c
+        }
+    };
+    #[cfg(not(target_os = "windows"))]
+    let mut cmd = {
+        let mut c = Command::new(bin);
+        c.args(args);
+        c
+    };
+    cmd.current_dir(workspace_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let output = cmd.output().ok()?;
+    let mut combined = String::from_utf8_lossy(&output.stdout).to_string();
+    combined.push('\n');
+    combined.push_str(&String::from_utf8_lossy(&output.stderr));
+    Some(combined)
+}
+
+/// 解析 Maven (`[ERROR] path:[line,col] message`) 与 `javac`/Gradle (`path:line: error: message`) 诊断输出
+pub fn parse_java_compiler_diagnostic_line(
+    workspace_root: &Path,
+    raw_line: &str,
+) -> Option<IdeDiagnostic> {
+    let trimmed = raw_line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // 1. Maven format: `[ERROR] /D:/proj/src/Main.java:[12,34] cannot find symbol`
+    if let Some((severity, rest)) = trimmed
+        .strip_prefix("[ERROR]")
+        .map(|r| (DiagnosticSeverityLevel::Error, r.trim()))
+        .or_else(|| {
+            trimmed
+                .strip_prefix("[WARNING]")
+                .map(|r| (DiagnosticSeverityLevel::Warning, r.trim()))
+        })
+    {
+        if let Some(bracket_idx) = rest.find(":[") {
+            let after_bracket = &rest[bracket_idx + 2..];
+            if let Some(close_idx) = after_bracket.find(']') {
+                let coords = &after_bracket[..close_idx];
+                let mut parts = coords.split(',');
+                let line = parts.next()?.trim().parse::<usize>().ok()?;
+                let column = parts
+                    .next()
+                    .and_then(|c| c.trim().parse::<usize>().ok())
+                    .unwrap_or(1);
+                let message = after_bracket[close_idx + 1..].trim();
+                if !message.is_empty() {
+                    let raw_path = strip_maven_leading_slash(rest[..bracket_idx].trim());
+                    let file_path = resolve_diag_path(workspace_root, raw_path);
+                    return Some(IdeDiagnostic {
+                        file_path,
+                        line,
+                        column,
+                        severity,
+                        message: message.to_string(),
+                        source: "maven / javac".to_string(),
+                        quick_fix_suggestion: None,
+                    });
+                }
+            }
+        }
+    }
+
+    // 2. javac / Gradle format: `D:\proj\src\Main.java:12: error: ';' expected`
+    for (marker, severity) in [
+        (": error: ", DiagnosticSeverityLevel::Error),
+        (": warning: ", DiagnosticSeverityLevel::Warning),
+        (": note: ", DiagnosticSeverityLevel::Information),
+    ] {
+        if let Some(marker_idx) = trimmed.find(marker) {
+            let left = &trimmed[..marker_idx];
+            let message = trimmed[marker_idx + marker.len()..].trim();
+            if let Some((raw_path, line_str)) = left.rsplit_once(':') {
+                if let Ok(line) = line_str.trim().parse::<usize>() {
+                    let file_path = resolve_diag_path(workspace_root, raw_path.trim());
+                    return Some(IdeDiagnostic {
+                        file_path,
+                        line,
+                        column: 1,
+                        severity,
+                        message: message.to_string(),
+                        source: "javac / jdtls".to_string(),
+                        quick_fix_suggestion: None,
+                    });
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn strip_maven_leading_slash(p: &str) -> &str {
+    let bytes = p.as_bytes();
+    if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' {
+        &p[1..]
+    } else {
+        p
+    }
+}
+
+fn resolve_diag_path(workspace_root: &Path, raw: &str) -> PathBuf {
+    let p = Path::new(raw);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        workspace_root.join(p)
+    }
 }
 
 /// 编码符合 LSP 标准协议头的 `Content-Length: ...\r\n\r\n{json}` 帧
@@ -1013,5 +1217,31 @@ mod tests {
         );
         assert!(!diags.is_empty());
         assert_eq!(diags[0].severity, DiagnosticSeverityLevel::Error);
+
+        let valid_java = "public class A { char q = '{'; String s = \"}\"; // }\n}\n";
+        assert!(analyze_source_diagnostics(
+            Path::new("src/A.java"),
+            LanguageId::Java,
+            valid_java
+        )
+        .is_empty());
+
+        let maven_diag = parse_java_compiler_diagnostic_line(
+            Path::new("D:/work/demo"),
+            "[ERROR] /D:/work/demo/src/main/java/App.java:[15,9] cannot find symbol",
+        )
+        .unwrap();
+        assert_eq!(maven_diag.line, 15);
+        assert_eq!(maven_diag.column, 9);
+        assert_eq!(maven_diag.severity, DiagnosticSeverityLevel::Error);
+        assert!(maven_diag.file_path.to_string_lossy().ends_with("App.java"));
+
+        let javac_diag = parse_java_compiler_diagnostic_line(
+            Path::new("D:/work/demo"),
+            r"D:\work\demo\src\Main.java:8: warning: [deprecation] oldMethod()",
+        )
+        .unwrap();
+        assert_eq!(javac_diag.line, 8);
+        assert_eq!(javac_diag.severity, DiagnosticSeverityLevel::Warning);
     }
 }

@@ -1,29 +1,32 @@
 <div align="center">
-  <img src="assets/ri_icon.png" alt="RI 标志" width="120" height="120" />
+  <img src="assets/ri_icon.png" alt="RI — 纯 Rust AI IDE 标志" width="120" height="120" />
 
   <h1>RI — 纯 Rust AI IDE</h1>
 
-  <p>面向 Rust、TypeScript、JavaScript、Python 与 Flutter 的原生桌面 IDE。<br/>复刻 IntelliJ IDEA New UI 布局与快捷键，在单一轻量原生进程中接入本机编码 Agent。</p>
+  <p><strong>100% 纯 Rust 打造的轻量级跨平台原生桌面 IDE 与多 Agent 协同编程工作台。</strong><br/>复刻 IntelliJ IDEA New UI（Islands）布局与键位，常驻内存约 59 MiB，约 522 FPS 渲染，原生接入本地编码 Agent —— 零 JVM、零 Electron、零 Chromium。</p>
 
   <p>
-    <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a>
+    <a href="https://github.com/renyun2/rust-ai-ide/releases/latest">下载发行版</a> ·
+    <a href="README.md">English</a> ·
+    <a href="README.zh-CN.md">简体中文</a>
   </p>
 
   <p>
+    <a href="https://github.com/renyun2/rust-ai-ide/releases/tag/v0.3.0"><img alt="Version 0.3.0" src="https://img.shields.io/badge/version-0.3.0-blue" /></a>
     <img alt="Rust 2021" src="https://img.shields.io/badge/Rust-2021-orange?logo=rust&logoColor=white" />
-    <img alt="Version 0.2.0" src="https://img.shields.io/badge/version-0.2.0-blue" />
     <img alt="Platforms Windows | Linux | macOS" src="https://img.shields.io/badge/platform-Windows_%7C_Linux_%7C_macOS-0078D4" />
-    <img alt="License" src="https://img.shields.io/badge/license-MIT_OR_Apache--2.0-green" />
+    <img alt="License MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT_OR_Apache--2.0-green" />
   </p>
 </div>
 
-RI 自行绘制界面，基于 `ropey` 编辑文本，并直接连接本机已安装的语言服务（LSP）、调试器（DAP）、Git、终端与编码 Agent CLI。**不捆绑 JVM、Chromium、Electron 或 Node.js 运行时。**
+**RI（Rust AI IDE）** 是一款面向 **Rust**、**Java（Maven / Gradle）**、**TypeScript / JavaScript**、**Python** 与 **Flutter / Android** 的开源纯 Rust 原生桌面 IDE。它自行绘制 2D 界面（`tao` + `tiny-skia` + `softbuffer`），基于增量式 `ropey` 缓冲编辑代码，并在**单个原生操作系统进程**中直连本机 LSP 语言服务、DAP 调试器、Git、ConPTY/PTY 终端以及本地编码 Agent（**Cursor CLI**、**Claude Code**、**OpenAI Codex**、**Google Antigravity ACP**）。
 
 ---
 
 ## 目录
 
-- [特性亮点](#特性亮点)
+- [v0.3.0 新特性](#v030-新特性)
+- [为什么选择 RI？（核心亮点）](#为什么选择-ri核心亮点)
 - [主流 IDE 横向对比](#主流-ide-横向对比)
 - [内存占用与性能实测](#内存占用与性能实测)
 - [安装包与交付形态](#安装包与交付形态)
@@ -32,6 +35,7 @@ RI 自行绘制界面，基于 `ropey` 编辑文本，并直接连接本机已�
 - [快捷键](#快捷键)
 - [环境要求](#环境要求)
 - [架构](#架构)
+- [常见问题（FAQ）](#常见问题faq)
 - [开发与构建](#开发与构建)
 - [发行版](#发行版)
 - [仓库结构](#仓库结构)
@@ -40,24 +44,36 @@ RI 自行绘制界面，基于 `ropey` 编辑文本，并直接连接本机已�
 
 ---
 
-## 特性亮点
+## v0.3.0 新特性
 
-- **单进程原生运行，常驻内存约 59 MiB。** 窗口、编辑器、工具窗与 Agent 面板全部跑在同一个 Rust 进程中；在 Windows 打开本工作区稳定后仅占 **59.18 MiB Working Set / 43.97 MiB Private Bytes**。
-- **3.28 MiB 绿色发行包。** Windows x86_64 剥离符号后的 `ide-app.exe`（含多分辨率嵌入式应用图标）仅 **8.24 MiB**，压缩包 `RI-v0.2.0-windows-x86_64.zip` 仅 **3.28 MiB** —— 安装体积比 JVM / Electron IDE 小两个数量级。
-- **跨平台支持（`v0.2.0`）。** 支持 Windows（DirectWrite + ConPTY + DWM）、Linux（X11/Wayland + `cosmic-text`）与 macOS（`arm64` / `x86_64` `.app` 应用包 + `Cmd` 快捷键）。
-- **IDEA New UI 与键位。** 内置 Islands Dark、Darcula Classic、Islands Light 三套主题，New UI 工具条、`Ctrl+Alt+U` 中英文实时切换与启动揭幕动画。
-- **本地 Agent 协同工作台。** 统一接入 Cursor（含模式会话隔离与持久化 Chrome DevTools MCP 桥接）、Google Antigravity（ACP）、Claude Code、OpenAI Codex，共用会话标签、排队区、Myers/Patience 行内 diff 与工作区检查点。
-- **一等语言与移动端。** 开箱连接 `PATH` 上的 Rust、TS/JS、Python LSP/DAP，并提供 Flutter / Android 设备选择器与 SDK 设置。
+- **Java 项目全套支持（Maven / Gradle / 单文件）：**
+  - 新增 `LanguageId::Java` 识别、IDEA Darcula 风格 Java 语法高亮（关键字、`@Override` / `@SpringBootApplication` / `@GetMapping` 注解、字符串与字符字面量）、**结构大纲（`Alt+7`）**、转到声明（`Ctrl+B`）以及 `main(String[] args)` 与 JUnit `@Test` 的 **Gutter 运行按钮（`▶`）**（支持单方法定向运行 `mvn test -Dtest=Class#method` 与 Gradle `--tests`）。
+  - 自动探测 **Maven**（`pom.xml`、`mvnw`/`mvnw.cmd`、Spring Boot `spring-boot:run`、Quarkus `quarkus:dev`、JavaFX `javafx:run`、`exec:java`、`compile`、`test`、`package`）、**Gradle**（`build.gradle` / `build.gradle.kts`、`gradlew`）与独立 `.java` 文件运行配置。
+  - **LSP 与编译器诊断解析**：自动发现 `jdtls` / `java-language-server`，内置 Maven（`[ERROR] ...:[line,col]`）与 `javac`/Gradle（`path:line: error:`）诊断解析器，接入「问题」面板与 AI 一键修复。
+  - **DAP 调试与项目模板**：集成 `java-debug` 调用栈与局部变量解析，新建 `.java` 文件自动推断 `package` 并生成 JUnit / `main` 模板，同时补齐 Maven / Gradle 专属文件图标。
+- **Chrome 受控模式持久化桥接（`browser_bridge`）：**
+  - 持久化 `chrome-devtools-mcp` stdio 代理启动独立调试 Chrome 时自动传入 `--enable-automation`（显示「Chrome 正受到自动测试软件的控制」横幅）及 `--disable-background-timer-throttling`、`--disable-renderer-backgrounding`、`--allow-pre-commit-input` 等防后台节流与防拦截参数，让 Cursor 等 Agent 在多轮对话中真正点击、输入并自动化操作浏览器，而不仅是打开网页。
+
+---
+
+## 为什么选择 RI？（核心亮点）
+
+- **单进程原生运行，常驻内存约 59 MiB。** 窗口、编辑器、工具窗、Git、终端与 Agent 面板全部跑在同一个 Rust 进程中；Windows 打开本工作区稳定后仅占 **59.18 MiB Working Set / 43.97 MiB Private Bytes**（`v0.2.0` 实测基线）。
+- **约 3.3 MiB 绿色包，零运行时膨胀。** 不捆绑 JVM、Electron、Chromium 或 Node.js 运行时 —— 磁盘体积比 IntelliJ IDEA 小 **约 500 倍**，比 Electron AI 编辑器小 **约 110–134 倍**。
+- **约 522 FPS 缓存帧渲染（单帧 1.92 ms）。** 自研 2D 画布配合有界 DirectWrite / `cosmic-text` 字形掩码缓存，滚动帧率较无缓存基线提升 **约 31 倍**。
+- **原汁原味 IntelliJ IDEA New UI 与键位。** 内置 Islands Dark、Darcula Classic、Islands Light 三套主题，`Ctrl+Alt+U` 中英文实时切换，输入法防闪烁，支持多窗口工作区恢复与启动揭幕动画。
+- **多 Agent 协同工作台（`Alt+8`）。** 统一驱动 **Cursor CLI**（Ask/Edit/Agent 模式会话隔离 + 持久化 Chrome DevTools MCP 桥接）、**Google Antigravity（ACP）**、**Claude Code**、**OpenAI Codex** 及 **OpenAI/Gemini 自定义端点**，共用 `Ctrl+K` Myers/Patience 行内 diff、排队等待区与 `Ctrl+Alt+Z` 工作区检查点回滚。
+- **全平台原生分发。** 提供 **Windows x86_64**（DirectWrite + ConPTY + DWM）、**Linux x86_64**（X11/Wayland + `cosmic-text`）与 **macOS**（Apple Silicon `arm64` / Intel `x86_64` `.app` 应用包 + `Cmd` 快捷键）。
 
 ---
 
 ## 主流 IDE 横向对比
 
-> **实测环境说明**：下表中 RI 与本机已安装 IDE 的磁盘占用均在同一台 Windows 开发机上实测获得（`AMD Ryzen 9 5950X 16 核 32 线程`、`64 GiB 内存`）；架构与运行时栈对照各 IDE 实际发行形态。
+> **实测环境说明**：下表中 RI（`v0.2.0` Release 基线）与本机已安装 IDE 的磁盘占用均在同一台 Windows 开发机上实测获得（`AMD Ryzen 9 5950X 16 核 32 线程`、`64 GiB 内存`）；架构与运行时栈对照各 IDE 实际发行形态。
 
 ### 安装体积、进程模型与技术栈对比
 
-| 对比维度 | RI `v0.2.0` | IntelliJ IDEA | Cursor | VS Code | Antigravity IDE |
+| 对比维度 | RI（`v0.2.0` 基线） | IntelliJ IDEA | Cursor | VS Code | Antigravity IDE |
 | --- | --- | --- | --- | --- | --- |
 | **Windows 交付形态** | 免安装便携 `.zip`（**3.28 MiB**）→ 单文件 `.exe`（**8.24 MiB**） | 安装程序 + JBR + JVM 插件包 | Electron 安装包 + ASAR + Node/Chromium | Electron 安装包 + ASAR + Node/Chromium | Electron 安装包 + ASAR + Node/Chromium |
 | **本机实测安装体积** | **8.24 MiB**（`ide-app.exe`） | **4,229.58 MiB**（约 4.13 GiB） | **1,104.72 MiB**（约 1.08 GiB） | **1,081.49 MiB**（约 1.06 GiB） | **921.28 MiB** |
@@ -68,9 +84,9 @@ RI 自行绘制界面，基于 `ropey` 编辑文本，并直接连接本机已�
 | **终端引擎** | `portable-pty`（ConPTY / PTY） | `pty4j`（JNI） | `node-pty`（原生 Node 扩展） | `node-pty`（原生 Node 扩展） | `node-pty`（原生 Node 扩展） |
 | **AI Agent 集成** | 原生 Rust Hub（Cursor / Antigravity ACP / Claude Code / Codex） | AI Assistant 插件 | 内置 Cursor 运行时 | Copilot 扩展 | 内置 Antigravity 运行时 |
 
-### RI `v0.2.0` Windows 实测冷启动与内存占用
+### Windows 实测冷启动与内存占用（Release 基线）
 
-以 Release 构建打开当前 Rust 仓库（`ide-app.exe --workspace D:\work\rust-ai-ide`）：
+以 Release 构建打开当前 Rust 仓库（`ide-app.exe --workspace D:\work\rust-ai-ide`，`v0.2.0` 实测）：
 
 | 实测指标 | 实测数据 | 说明 |
 | --- | ---: | --- |
@@ -86,17 +102,17 @@ RI 自行绘制界面，基于 `ropey` 编辑文本，并直接连接本机已�
 
 ### 编辑器滚动与帧渲染基准
 
-基于工作区单元测试 `fast_scrolling_and_glyph_mask_cache_achieve_high_fps`（在 `1560×940` 完整 IDE 表面上连续滚动代码并混合横向滚动，连续渲染 20 帧）：
+基于工作区单元测试 `fast_scrolling_and_glyph_mask_cache_achieve_high_fps`（在 `1560×940` 完整 IDE 表面上连续滚动代码并混合横向滚动，连续渲染 20 帧，`v0.2.0` 实测）：
 
 | 构建配置 | 20 帧总耗时 | 单帧平均耗时 | 等效帧率 | 相对无缓存基线 |
 | --- | ---: | ---: | ---: | ---: |
 | 无字形掩码缓存基线（每帧 DirectWrite） | ~1,191 ms | ~59.6 ms | ~17 FPS | 1.0× |
-| `v0.2.0` Debug（`opt-level = 2`） | **59.72 ms** | **2.99 ms** | **~335 FPS** | **~19.9×** |
-| `v0.2.0` Release（`opt-level = 3`, thin LTO） | **38.35 ms** | **1.92 ms** | **~522 FPS** | **~31.0×** |
+| Debug（`opt-level = 2`） | **59.72 ms** | **2.99 ms** | **~335 FPS** | **~19.9×** |
+| Release（`opt-level = 3`, thin LTO） | **38.35 ms** | **1.92 ms** | **~522 FPS** | **~31.0×** |
 
-### `v0.2.0` 有界内存与低拷贝设计
+### 有界内存与低拷贝设计
 
-为避免长时间编程与多轮 AI 对话导致内存缓慢膨胀，`v0.2.0` 对所有核心缓存和持久化链路均设置了明确上限：
+为避免长时间编程与多轮 AI 对话导致内存缓慢膨胀，RI 对所有核心缓存和持久化链路均设置了明确上限：
 
 - **字形与排版缓存**（`ide-app`）：DirectWrite 亚像素字形掩码缓存上限 **1,024 条 / 16 MiB**、布局缓存 **192 条**、文本测量缓存 **3,072 条**；`cosmic-text` 整形缓存上限 **1,024 条**；超过 **300 字节** 的长文本跳过缓存；持久 DIB 渲染目标上限为 `2400×256`。
 - **Agent 会话与工作区检查点**（`ide-agent-hub`）：单会话最多保留 **12 个** 检查点、单会话快照上限 **2 MiB**、历史持久化总快照上限 **8 MiB**、单文件快照上限 **512 KiB**（自动跳过二进制或超大/压缩文件）；聊天代码块改用 `Arc<str>` 共享，避免滚动与渲染时深拷贝。
@@ -109,12 +125,12 @@ RI 自行绘制界面，基于 `ropey` 编辑文本，并直接连接本机已�
 
 通过 [GitHub Releases](https://github.com/renyun2/rust-ai-ide/releases) 自动构建并发布三大桌面平台包，全部采用免安装绿色解压即用形态（附带 `.sha256` 校验文件）：
 
-| 目标平台 | 发行包文件名 | 包内结构 | 体积说明 |
+| 目标平台 | 发行包文件名 | 包内结构 | 说明 |
 | --- | --- | --- | --- |
-| **Windows x86_64** | `RI-<标签>-windows-x86_64.zip` | 单文件 `ide-app.exe`（内置多分辨率图标，无需安装向导） | 压缩包 **3.28 MiB** → 解压后 **8.24 MiB**（`v0.2.0`） |
-| **Linux x86_64** | `RI-<标签>-linux-x86_64.tar.gz` | `ide-app`、`rust-ai-ide.png`、`rust-ai-ide.desktop` | 剥离符号原生二进制 + 桌面入口 |
-| **macOS Apple Silicon（`arm64`）** | `RI-<标签>-macos-arm64.zip` | `Rust AI IDE.app`（含 `Info.plist` 与 `AppIcon.icns`） | 原生 `aarch64` 应用包 |
-| **macOS Intel（`x86_64`）** | `RI-<标签>-macos-x86_64.zip` | `Rust AI IDE.app`（含 `Info.plist` 与 `AppIcon.icns`） | 原生 `x86_64` 应用包 |
+| **Windows x86_64** | `RI-v0.3.0-windows-x86_64.zip` | 单文件 `ide-app.exe`（内置多分辨率图标，无需安装向导） | 原生单可执行文件 |
+| **Linux x86_64** | `RI-v0.3.0-linux-x86_64.tar.gz` | `ide-app`、`rust-ai-ide.png`、`rust-ai-ide.desktop` | 剥离符号原生二进制 + 桌面入口 |
+| **macOS Apple Silicon（`arm64`）** | `RI-v0.3.0-macos-arm64.zip` | `Rust AI IDE.app`（含 `Info.plist` 与 `AppIcon.icns`） | 原生 `aarch64` 应用包 |
+| **macOS Intel（`x86_64`）** | `RI-v0.3.0-macos-x86_64.zip` | `Rust AI IDE.app`（含 `Info.plist` 与 `AppIcon.icns`） | 原生 `x86_64` 应用包 |
 
 无需管理员权限、无注册表残留、无后台自动更新守护进程。
 
@@ -124,9 +140,9 @@ RI 自行绘制界面，基于 `ropey` 编辑文本，并直接连接本机已�
 
 ### 直接使用发行包
 
-- **Windows**：解压 `RI-v0.2.0-windows-x86_64.zip`，双击 `ide-app.exe` 启动，或执行 `.\ide-app.exe --workspace D:\path\to\project`。
-- **Linux**：解压 `RI-v0.2.0-linux-x86_64.tar.gz` 并运行 `./ide-app --workspace /path/to/project`（需系统具备 GTK3 及无衬线/等宽字体）。
-- **macOS**：解压 `RI-v0.2.0-macos-arm64.zip`（或 `x86_64`），将 `Rust AI IDE.app` 拖入 `/Applications`。
+- **Windows**：解压 `RI-v0.3.0-windows-x86_64.zip`，双击 `ide-app.exe` 启动，或执行 `.\ide-app.exe --workspace D:\path\to\project`。
+- **Linux**：解压 `RI-v0.3.0-linux-x86_64.tar.gz` 并运行 `./ide-app --workspace /path/to/project`（需系统具备 GTK3 及无衬线/等宽字体）。
+- **macOS**：解压 `RI-v0.3.0-macos-arm64.zip`（或 `x86_64`），将 `Rust AI IDE.app` 拖入 `/Applications`。
 
 ### 从源码编译运行
 
@@ -158,7 +174,7 @@ cargo run -p ide-app --release -- --export-icon assets/ri_icon.ico
 ### 工作台
 
 - **三套主题**：**JetBrains Dark (Islands)**、**Darcula Classic**、**IntelliJ Light (Islands)**；`` Ctrl+` `` 循环切换，`Ctrl+Alt+S`（macOS 为 `Cmd+,`）打开设置。
-- **IDEA 风格设置页**：外观、菜单与工具栏、系统设置、编辑器、字体、配色、代码风格、键位、插件、Git、调试、终端、语言、**移动端 SDK**、高级。
+- **IDEA 风格设置页**：外观、菜单与工具栏、系统设置、编辑器、字体、配色、代码风格、键位、插件、Git、调试、终端、语言和框架、**移动端 SDK**、高级。
 - **DPI 与实时缩放**：启动自动检测系统缩放（`100%`–`400%`），支持 `Ctrl+=`、`Ctrl+-`、`Ctrl+0` 实时缩放界面。
 - **原生窗口与启动动画**：无边框自绘标题栏、Windows 11 圆角、嵌入式任务栏图标、启动揭幕动画、多窗口工作区恢复与 Git 分支弹窗。
 - **输入法防闪烁与全输入框撤销重做**：仅在光标位置真实改变时更新 IME 候选框位置（彻底消除中文输入法闪烁），全部文本输入框均支持 `Ctrl+Z` / `Ctrl+Shift+Z` / `Ctrl+Y`。
@@ -167,16 +183,17 @@ cargo run -p ide-app --release -- --export-icon assets/ri_icon.ico
 
 - 基于 `ropey` 的文本缓冲：撤销/重做、复制/删除行、行注释、格式化、重命名（`Shift+F6`）、查找/替换、跳转行与意图操作（`Alt+Enter`）。
 - **Search Everywhere**（双击 `Shift`）、**转到文件**（`Ctrl+Shift+N`）、**在文件中查找**（`Ctrl+Shift+F`）、**查找命令**（`Ctrl+Shift+A`），基于 `ripgrep` 栈实现。
-- 基于 Tree-sitter 的语法高亮与**结构**大纲（`Alt+7`），覆盖 Rust、TypeScript、JavaScript、Python、JSON、TOML、Markdown。
+- 语法高亮、**结构**大纲（`Alt+7`）与可运行 gutter 标记（`▶`），覆盖 **Rust、Java、TypeScript、JavaScript、Python、JSON、TOML、Markdown**。
 
 ### 语言、运行、调试与移动端
 
-| 语言 | 语言服务 | 调试器 | 运行配置 |
+| 语言 | 语言服务 / 诊断 | 调试器 | 运行配置 |
 | --- | --- | --- | --- |
-| Rust | `rust-analyzer` | `codelldb` | Cargo check / test / run |
-| TypeScript / JavaScript | `vtsls` 或 `typescript-language-server` | `js-debug` | 按工程自动探测 |
-| Python | `pyright-langserver` 或 `ruff` | `debugpy` | Python 脚本 / 入口 |
-| Flutter / Android | — | 通过 ADB 选择设备 | `flutter run` / `test` / `build apk` / `pub get` / `doctor` |
+| **Rust** | `rust-analyzer` | `codelldb` | Cargo `check` / `test` / `run` |
+| **Java** | `jdtls` / `java-language-server` + Maven/`javac` 解析 | `java-debug` | Maven（`spring-boot:run`、`quarkus:dev`、`javafx:run`、`exec:java`、`compile`、`test`、`package`）、Gradle 任务、JUnit `@Test`、单文件 `.java` |
+| **TypeScript / JavaScript** | `vtsls` 或 `typescript-language-server` | `js-debug` | 按 `package.json` / 工程自动探测 |
+| **Python** | `pyright-langserver` 或 `ruff` | `debugpy` | Python 脚本 / 入口 |
+| **Flutter / Android** | — | 通过 ADB 选择设备 | `flutter run` / `test` / `build apk` / `pub get` / `doctor` |
 
 打开 Flutter 或 Android 工程后工具栏自动出现**设备**选择器，可在 `Ctrl+Alt+S` → **移动端 SDK** 中指定 Flutter SDK、Android SDK 与 JDK 路径（留空则自动探测）。
 
@@ -192,13 +209,13 @@ cargo run -p ide-app --release -- --export-icon assets/ri_icon.ico
 
 | 提供方 | 接入方式 |
 | --- | --- |
-| **Cursor** | 本地 CLI（Ask / Edit / Agent 模式会话隔离），`Ctrl+K` 行内编辑，以及持久化 `chrome-devtools-mcp` 桥接（`browser_bridge`，跨轮保持调试浏览器） |
+| **Cursor** | 本地 CLI（Ask / Edit / Agent 模式会话隔离），`Ctrl+K` 行内编辑，以及持久化受控模式 `chrome-devtools-mcp` 桥接（`browser_bridge`） |
 | **Google Antigravity** | ACP（基于 stdio 的 JSON-RPC 2.0，`agy`） |
 | **Claude Code** | `claude` 无头 Stream-JSON + 内嵌 PTY |
 | **OpenAI Codex** | `codex` exec + 内嵌 PTY |
 | **自定义端点** | 兼容 OpenAI HTTP 或 Gemini REST |
 
-支持 **Ask / Edit / Agent** 模式切换、推理深度选择、图片拖拽/粘贴、围栏代码块折叠、按发送时间排序的会话标签、排队等待区（撤销 / 退回编辑 / 关闭 / 立即发送）以及 `Ctrl+Alt+Z` 一键回滚工作区检查点。
+支持 **Ask / Edit / Agent** 模式切换、推理深度选择、图片拖拽/粘贴、围栏代码块折叠、按发送时间排序的会话标签、排队等待区（编辑 / 撤销 / 关闭 / 立即发送）以及 `Ctrl+Alt+Z` 一键回滚工作区检查点。
 
 ---
 
@@ -227,10 +244,10 @@ cargo run -p ide-app --release -- --export-icon assets/ri_icon.ico
 - **运行环境**：Windows 10/11、Linux（GTK3、D-Bus、X11/Wayland 与系统字体）、macOS 11+。
 - **源码编译**：Rust stable（2021 edition）。Linux 下需安装 `libgtk-3-dev`、`libdbus-1-dev`、`pkg-config`、`fonts-dejavu-core`。
 - **可选外部工具**（从 `PATH` 或设置中发现）：
-  - 语言服务：`rust-analyzer`、`vtsls` / `typescript-language-server`、`pyright-langserver` / `ruff`
-  - 调试器：`codelldb`、`js-debug`、`debugpy`
-  - Agent：`agy`、`claude`、`codex`、Cursor CLI
-  - 移动端：Flutter SDK、Android SDK（`platform-tools`）、JDK 17
+  - 语言服务：`rust-analyzer`、`jdtls` / `java-language-server`、`vtsls` / `typescript-language-server`、`pyright-langserver` / `ruff`
+  - 调试器：`codelldb`、`java-debug`、`js-debug`、`debugpy`
+  - 构建与工具链：Cargo/Rustup、JDK 17+ 与 Maven/Gradle、Node.js、Python、Flutter SDK、Android SDK（`platform-tools`）
+  - Agent：`agy`、`claude`、`codex`、Cursor CLI（浏览器桥接需本机 Node/`npx` 以拉起 `chrome-devtools-mcp`）
 
 ---
 
@@ -240,16 +257,29 @@ cargo run -p ide-app --release -- --export-icon assets/ri_icon.ico
 
 | Crate | 职责 |
 | --- | --- |
-| [`ide-core`](crates/ide-core) | 主题、键位、`LanguageId`、运行配置、Flutter/Android SDK 探测 |
-| [`ide-vfs`](crates/ide-vfs) | `ropey` 文本缓冲、撤销快照、工作区文件树 |
-| [`ide-syntax`](crates/ide-syntax) | Tree-sitter 语法高亮、结构符号、可运行 gutter 标记 |
+| [`ide-core`](crates/ide-core) | 主题、键位、`LanguageId`、Cargo/Maven/Gradle/Node/Flutter 运行配置、移动端 SDK 探测 |
+| [`ide-vfs`](crates/ide-vfs) | `ropey` 文本缓冲、撤销快照、工作区文件树与语言模板 |
+| [`ide-syntax`](crates/ide-syntax) | 语法高亮、结构符号、可运行 gutter 标记（Rust、Java、TS/JS、Python 等） |
 | [`ide-search`](crates/ide-search) | 基于 ripgrep 栈的 Search Everywhere 与在文件中查找 |
-| [`ide-lsp`](crates/ide-lsp) | LSP JSON-RPC 客户端与本机服务发现 |
-| [`ide-dap`](crates/ide-dap) | DAP 调试会话、断点、调用栈、供 Agent 使用的崩溃上下文 |
+| [`ide-lsp`](crates/ide-lsp) | LSP JSON-RPC 客户端、本机服务发现、Maven/`javac` 编译器诊断解析 |
+| [`ide-dap`](crates/ide-dap) | DAP 调试会话、断点、调用栈、局部变量与供 Agent 使用的崩溃上下文 |
 | [`ide-git`](crates/ide-git) | 状态、暂存、提交、分支、历史图、blame 与有界行级 diff |
 | [`ide-terminal`](crates/ide-terminal) | `portable-pty`（ConPTY / PTY）终端与 VT100 解析 |
 | [`ide-agent-hub`](crates/ide-agent-hub) | Agent 注册、会话、等待区、ACP、CLI 运行器、`browser_bridge`、行内 diff 与检查点 |
 | [`ide-app`](crates/ide-app) | `tao` 事件循环与 DirectWrite / `cosmic-text` + `tiny-skia` + `softbuffer` 渲染器 |
+
+---
+
+## 常见问题（FAQ）
+
+- **RI 会捆绑 JVM、Chromium 或 Electron 吗？**
+  不会。RI 使用纯 Rust 编译为单一原生二进制，界面与文本基于 `tao`、`tiny-skia`、`softbuffer`、`ropey` 及系统原生 API（Windows 下 DirectWrite/ConPTY，Linux/macOS 下 `cosmic-text`/PTY）。
+- **RI 可以作为轻量级 IntelliJ IDEA 替代品用于 Rust 或 Java 开发吗？**
+  可以。RI 复刻了 IntelliJ IDEA New UI（Islands Dark / Darcula / Islands Light）与完整 IDEA 键位，开箱支持 Cargo 工程与 Java Maven/Gradle/Spring Boot/JUnit 项目（`jdtls`、`java-debug`、gutter `▶` 运行），常驻内存仅约 59 MiB。
+- **支持哪些本地 AI 编码 Agent？**
+  支持 Cursor CLI（含 `Ctrl+K` 行内编辑与受控模式 `chrome-devtools-mcp` 浏览器自动化）、Google Antigravity（ACP）、Claude Code CLI、OpenAI Codex CLI 以及兼容 OpenAI/Gemini 的自定义端点。
+- **支持 macOS 和 Linux 吗？**
+  支持。每次 [GitHub Release](https://github.com/renyun2/rust-ai-ide/releases) 都会自动构建并附上 Windows（`x86_64`）、Linux（`x86_64`）与 macOS（Apple Silicon `arm64` 与 Intel `x86_64`）原生发行包。
 
 ---
 
@@ -282,12 +312,12 @@ cargo run -p ide-app -- --self-check
 ```text
 rust-ai-ide/
 ├── crates/
-│   ├── ide-core/           # 主题、键位、运行配置、移动端 SDK
-│   ├── ide-vfs/            # ropey 缓冲、文件树
-│   ├── ide-syntax/         # tree-sitter 高亮与结构
+│   ├── ide-core/           # 主题、键位、运行配置（Cargo/Maven/Gradle/Flutter）、移动端 SDK
+│   ├── ide-vfs/            # ropey 缓冲、文件树、Java/TS/Rust/Python 模板
+│   ├── ide-syntax/         # 语法高亮、结构与可运行 gutter 标记
 │   ├── ide-search/         # ripgrep 搜索
-│   ├── ide-lsp/            # LSP 客户端
-│   ├── ide-dap/            # DAP 客户端
+│   ├── ide-lsp/            # LSP 客户端与 Maven/javac 诊断
+│   ├── ide-dap/            # DAP 客户端（codelldb、java-debug、js-debug、debugpy）
 │   ├── ide-git/            # Git 状态、日志、diff、blame
 │   ├── ide-terminal/       # ConPTY / PTY 终端
 │   ├── ide-agent-hub/      # ACP、CLI 运行器、browser_bridge、检查点
@@ -303,7 +333,7 @@ rust-ai-ide/
 
 ## 现状
 
-版本 **0.2.0**。已支持 Windows、Linux 与 macOS 原生运行。界面布局、配色与快捷键对齐 IntelliJ IDEA New UI，所有实现均为独立纯 Rust 构建。
+版本 **0.3.0**。已支持 Windows、Linux 与 macOS 原生运行。界面布局、配色与快捷键对齐 IntelliJ IDEA New UI，所有实现均为独立纯 Rust 构建。
 
 ---
 

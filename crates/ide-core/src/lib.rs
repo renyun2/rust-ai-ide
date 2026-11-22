@@ -232,6 +232,7 @@ pub enum LanguageId {
     TypeScript,
     JavaScript,
     Python,
+    Java,
     Json,
     Toml,
     Markdown,
@@ -251,6 +252,7 @@ impl LanguageId {
             "ts" | "tsx" => Self::TypeScript,
             "js" | "jsx" | "mjs" | "cjs" => Self::JavaScript,
             "py" | "pyi" => Self::Python,
+            "java" => Self::Java,
             "json" | "jsonc" => Self::Json,
             "toml" => Self::Toml,
             "md" | "markdown" => Self::Markdown,
@@ -264,6 +266,7 @@ impl LanguageId {
             Self::TypeScript => "TypeScript",
             Self::JavaScript => "JavaScript",
             Self::Python => "Python",
+            Self::Java => "Java",
             Self::Json => "JSON",
             Self::Toml => "TOML",
             Self::Markdown => "Markdown",
@@ -277,6 +280,7 @@ impl LanguageId {
             Self::TypeScript => "typescript",
             Self::JavaScript => "javascript",
             Self::Python => "python",
+            Self::Java => "java",
             Self::Json => "json",
             Self::Toml => "toml",
             Self::Markdown => "markdown",
@@ -289,6 +293,7 @@ impl LanguageId {
             Self::Rust => Some("rust-analyzer"),
             Self::TypeScript | Self::JavaScript => Some("vtsls"),
             Self::Python => Some("pyright-langserver"),
+            Self::Java => Some("jdtls"),
             _ => None,
         }
     }
@@ -298,6 +303,7 @@ impl LanguageId {
             Self::Rust => Some("codelldb"),
             Self::TypeScript | Self::JavaScript => Some("js-debug"),
             Self::Python => Some("debugpy"),
+            Self::Java => Some("java-debug"),
             _ => None,
         }
     }
@@ -1048,6 +1054,12 @@ mod tests {
         assert_eq!(LanguageId::from_path(Path::new("src/main.rs")), LanguageId::Rust);
         assert_eq!(LanguageId::from_path(Path::new("web/app.tsx")), LanguageId::TypeScript);
         assert_eq!(LanguageId::from_path(Path::new("agent/run.py")), LanguageId::Python);
+        let java = LanguageId::from_path(Path::new("src/main/java/App.java"));
+        assert_eq!(java, LanguageId::Java);
+        assert_eq!(java.display_name(), "Java");
+        assert_eq!(java.lsp_language_id(), "java");
+        assert_eq!(java.default_lsp_binary(), Some("jdtls"));
+        assert_eq!(java.default_dap_adapter(), Some("java-debug"));
         let t = ThemeKind::IslandsDark.next();
         assert_eq!(t, ThemeKind::DarculaClassic);
     }

@@ -51,7 +51,8 @@ impl DapDebugEngine {
     pub fn new() -> Self {
         Self {
             state: DebugSessionState::Inactive,
-            active_adapter: "codelldb (Rust) / js-debug (TS) / debugpy (Python)".to_string(),
+            active_adapter: "codelldb (Rust) / js-debug (TS) / debugpy (Python) / java-debug (Java)"
+                .to_string(),
             breakpoints: Vec::new(),
             call_stack: Vec::new(),
             selected_frame: 0,
@@ -489,6 +490,28 @@ fn find_enclosing_function_name(
                     }
                 }
             }
+            LanguageId::Java => {
+                if let Some(before_paren) = trimmed.split('(').next() {
+                    let clean = before_paren.trim();
+                    if trimmed.contains('(')
+                        && !clean.starts_with("//")
+                        && !clean.starts_with('@')
+                        && !trimmed.contains('=')
+                    {
+                        if let Some(name) = clean.split_whitespace().last() {
+                            let valid = !name.is_empty()
+                                && name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+                                && !matches!(
+                                    name,
+                                    "if" | "for" | "while" | "switch" | "catch" | "synchronized" | "new" | "return"
+                                );
+                            if valid {
+                                return Some(format!("{name}()"));
+                            }
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -523,6 +546,20 @@ fn extract_local_variables_near_line(
                     None
                 }
             }
+            LanguageId::Java => {
+                if !trimmed.starts_with("//")
+                    && !trimmed.starts_with("/*")
+                    && !trimmed.starts_with('*')
+                    && !trimmed.starts_with("return ")
+                    && !trimmed.starts_with("if ")
+                    && !trimmed.starts_with("for ")
+                    && !trimmed.starts_with("while ")
+                {
+                    Some(trimmed)
+                } else {
+                    None
+                }
+            }
             _ => None,
         };
         let Some(rest) = binding else {
@@ -535,8 +572,17 @@ fn extract_local_variables_near_line(
             continue;
         }
         let lhs_clean = lhs.trim();
-        let (var_name, explicit_ty) = if let Some((n, ty)) = lhs_clean.split_once(':') {
-            (n.trim(), Some(ty.trim()))
+        let (var_name, explicit_ty) = if lang == LanguageId::Java {
+            let mut parts: Vec<&str> = lhs_clean.split_whitespace().collect();
+            let name = parts.pop().unwrap_or("");
+            let ty = if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join(" "))
+            };
+            (name, ty)
+        } else if let Some((n, ty)) = lhs_clean.split_once(':') {
+            (n.trim(), Some(ty.trim().to_string()))
         } else {
             (lhs_clean, None)
         };
@@ -548,9 +594,7 @@ fn extract_local_variables_near_line(
             continue;
         }
         let val = rhs.trim().trim_end_matches(';').trim().to_string();
-        let inferred_ty = explicit_ty
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| infer_expr_type(&val));
+        let inferred_ty = explicit_ty.unwrap_or_else(|| infer_expr_type(&val));
         if let Some(existing) = vars.iter_mut().find(|v: &&mut DebugVariable| v.name == var_name) {
             existing.value = val;
         } else {
@@ -637,5 +681,31 @@ mod tests {
         assert!(dap.variables.iter().any(|v| v.name == "count" && v.value == "42"));
         assert!(dap.variables.iter().any(|v| v.name == "label"));
         assert!(dap.evaluate_watch("count").contains("42"));
+    }
+
+    #[test]
+    fn test_java_dap_debug_session_frame_and_variables() {
+        let mut dap = DapDebugEngine::new();
+        let file = PathBuf::from("src/main/java/com/example/OrderService.java");
+        let src = "\
+public class OrderService {
+    public int calculateTotal(int base) {
+        final int tax = 8;
+        var label = \"paid\";
+        return base + tax;
+    }
+}
+";
+        dap.start_debug_session_with_source(LanguageId::Java, &file, 4, src);
+        assert_eq!(dap.active_adapter, "java-debug");
+        assert_eq!(dap.call_stack[0].name, "calculateTotal()");
+        assert!(dap
+            .variables
+            .iter()
+            .any(|v| v.name == "tax" && v.type_name == "final int" && v.value == "8"));
+        assert!(dap
+            .variables
+            .iter()
+            .any(|v| v.name == "label" && v.value == "\"paid\""));
     }
 }

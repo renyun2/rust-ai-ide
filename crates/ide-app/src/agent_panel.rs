@@ -338,6 +338,7 @@ fn language_from_fence_tag(tag: &str) -> LanguageId {
         "ts" | "tsx" | "typescript" => LanguageId::TypeScript,
         "js" | "jsx" | "mjs" | "cjs" | "javascript" => LanguageId::JavaScript,
         "py" | "python" => LanguageId::Python,
+        "java" => LanguageId::Java,
         "json" => LanguageId::Json,
         "toml" => LanguageId::Toml,
         "md" | "markdown" => LanguageId::Markdown,

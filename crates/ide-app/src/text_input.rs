@@ -5,6 +5,16 @@ pub struct WrappedLineSeg {
     pub start_char: usize,
     pub end_char: usize,
     pub text: String,
+    pub hard_break_end: bool,
+}
+
+#[derive(Debug, Clone)]
+struct WrappedLinesCache {
+    edit_seq: u64,
+    max_width: i32,
+    style: FontStyle,
+    scale_bits: u32,
+    segs: Vec<WrappedLineSeg>,
 }
 
 const INPUT_UNDO_LIMIT: usize = 128;
@@ -40,6 +50,8 @@ pub struct TextInputField {
     undo_stack: Vec<InputEditSnapshot>,
     redo_stack: Vec<InputEditSnapshot>,
     coalesce: InputCoalesceKind,
+    edit_seq: u64,
+    wrap_cache: Option<WrappedLinesCache>,
 }
 
 impl TextInputField {
@@ -66,6 +78,8 @@ impl TextInputField {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             coalesce: InputCoalesceKind::None,
+            edit_seq: 0,
+            wrap_cache: None,
         }
     }
 
@@ -87,6 +101,8 @@ impl TextInputField {
         self.selection_anchor = None;
         self.scroll_x = 0;
         self.scroll_y = 0;
+        self.edit_seq = self.edit_seq.wrapping_add(1);
+        self.wrap_cache = None;
         self.reset_edit_history();
     }
 
@@ -105,6 +121,8 @@ impl TextInputField {
         self.scroll_x = 0;
         self.scroll_y = 0;
         self.history_cursor = None;
+        self.edit_seq = self.edit_seq.wrapping_add(1);
+        self.wrap_cache = None;
     }
 
     pub fn take_and_push_history(&mut self) -> String {
@@ -121,6 +139,8 @@ impl TextInputField {
         self.scroll_x = 0;
         self.scroll_y = 0;
         self.history_cursor = None;
+        self.edit_seq = self.edit_seq.wrapping_add(1);
+        self.wrap_cache = None;
         taken
     }
 
@@ -233,6 +253,7 @@ impl TextInputField {
         self.cursor += norm.chars().count();
         self.selection_anchor = None;
         self.history_cursor = None;
+        self.edit_seq = self.edit_seq.wrapping_add(1);
     }
 
     pub fn backspace(&mut self) {
@@ -253,6 +274,7 @@ impl TextInputField {
         self.text.replace_range(start_b..end_b, "");
         self.cursor -= 1;
         self.history_cursor = None;
+        self.edit_seq = self.edit_seq.wrapping_add(1);
     }
 
     pub fn delete_forward(&mut self) {
@@ -272,6 +294,7 @@ impl TextInputField {
         let end_b = char_to_byte_idx(&self.text, self.cursor + 1);
         self.text.replace_range(start_b..end_b, "");
         self.history_cursor = None;
+        self.edit_seq = self.edit_seq.wrapping_add(1);
     }
 
     pub fn delete_word_backward(&mut self) {
@@ -288,6 +311,7 @@ impl TextInputField {
         self.text.replace_range(start_b..end_b, "");
         self.cursor = target;
         self.history_cursor = None;
+        self.edit_seq = self.edit_seq.wrapping_add(1);
     }
 
     pub fn delete_word_forward(&mut self) {
@@ -303,6 +327,7 @@ impl TextInputField {
         let end_b = char_to_byte_idx(&self.text, target);
         self.text.replace_range(start_b..end_b, "");
         self.history_cursor = None;
+        self.edit_seq = self.edit_seq.wrapping_add(1);
     }
 
     pub fn cut_selected(&mut self) -> Option<String> {
@@ -418,19 +443,22 @@ impl TextInputField {
         style: FontStyle,
     ) -> bool {
         self.end_coalesce();
-        let segs = self.compute_wrapped_lines(canvas, max_width, style);
-        if segs.is_empty() {
-            return false;
-        }
-        let (cur_line, cur_col_chars) = self.cursor_line_and_col(&segs);
-        let target_line = cur_line as isize + delta_lines;
-        if target_line < 0 || target_line >= segs.len() as isize {
-            return false;
-        }
-        let target_line = target_line as usize;
-        let seg = &segs[target_line];
-        let seg_len = seg.end_char.saturating_sub(seg.start_char);
-        let next_cursor = seg.start_char + cur_col_chars.min(seg_len);
+        let cur = self.cursor;
+        let (target_start_char, target_len) = {
+            let segs = self.ensure_wrapped_lines_cached(canvas, max_width, style);
+            if segs.is_empty() {
+                return false;
+            }
+            let (cur_line, cur_col_chars) = cursor_line_and_col_from_segs(cur, segs);
+            let target_line = cur_line as isize + delta_lines;
+            if target_line < 0 || target_line >= segs.len() as isize {
+                return false;
+            }
+            let seg = &segs[target_line as usize];
+            let seg_len = seg.end_char.saturating_sub(seg.start_char);
+            (seg.start_char, cur_col_chars.min(seg_len))
+        };
+        let next_cursor = target_start_char + target_len;
 
         if extend && self.selection_anchor.is_none() {
             self.selection_anchor = Some(self.cursor);
@@ -501,6 +529,33 @@ impl TextInputField {
         self.cursor = e;
     }
 
+    fn ensure_wrapped_lines_cached(
+        &mut self,
+        canvas: &SurfaceCanvas,
+        max_width: i32,
+        style: FontStyle,
+    ) -> &[WrappedLineSeg] {
+        let max_w = max_width.max(40);
+        let scale_bits = canvas.scale_factor.to_bits();
+        let hit = self.wrap_cache.as_ref().is_some_and(|c| {
+            c.edit_seq == self.edit_seq
+                && c.max_width == max_w
+                && c.style == style
+                && c.scale_bits == scale_bits
+        });
+        if !hit {
+            let segs = self.compute_wrapped_lines(canvas, max_w, style);
+            self.wrap_cache = Some(WrappedLinesCache {
+                edit_seq: self.edit_seq,
+                max_width: max_w,
+                style,
+                scale_bits,
+                segs,
+            });
+        }
+        &self.wrap_cache.as_ref().unwrap().segs
+    }
+
     pub fn compute_wrapped_lines(
         &self,
         canvas: &SurfaceCanvas,
@@ -508,67 +563,72 @@ impl TextInputField {
         style: FontStyle,
     ) -> Vec<WrappedLineSeg> {
         let max_w = max_width.max(40);
-        let chars: Vec<char> = self.text.chars().collect();
         let mut out = Vec::new();
-        let mut line_start = 0usize;
-        let mut idx = 0usize;
+        let raw_lines: Vec<&str> = self.text.split('\n').collect();
+        let total_lines = raw_lines.len();
+        let mut line_start_char = 0usize;
 
-        while idx <= chars.len() {
-            if idx == chars.len() || chars[idx] == '\n' {
-                let raw_segment: String = chars[line_start..idx].iter().collect();
-                if raw_segment.is_empty() {
+        for (line_idx, raw_segment) in raw_lines.into_iter().enumerate() {
+            let seg_chars_total = raw_segment.chars().count();
+            let line_end_char = line_start_char + seg_chars_total;
+            let has_trailing_nl = line_idx + 1 < total_lines;
+
+            if raw_segment.is_empty() {
+                out.push(WrappedLineSeg {
+                    start_char: line_start_char,
+                    end_char: line_start_char,
+                    text: String::new(),
+                    hard_break_end: has_trailing_nl,
+                });
+            } else {
+                let (full_w, _) = canvas.measure_text(raw_segment, style);
+                if full_w <= max_w {
                     out.push(WrappedLineSeg {
-                        start_char: line_start,
-                        end_char: line_start,
-                        text: String::new(),
+                        start_char: line_start_char,
+                        end_char: line_end_char,
+                        text: raw_segment.to_string(),
+                        hard_break_end: has_trailing_nl,
                     });
                 } else {
-                    let (full_w, _) = canvas.measure_text(&raw_segment, style);
-                    if full_w <= max_w {
-                        out.push(WrappedLineSeg {
-                            start_char: line_start,
-                            end_char: idx,
-                            text: raw_segment,
-                        });
-                    } else {
-                        let mut seg_start = line_start;
-                        while seg_start < idx {
-                            let rem_str: String = chars[seg_start..idx].iter().collect();
-                            let (rw, _) = canvas.measure_text(&rem_str, style);
-                            if rw <= max_w {
-                                out.push(WrappedLineSeg {
-                                    start_char: seg_start,
-                                    end_char: idx,
-                                    text: rem_str,
-                                });
-                                break;
-                            }
-                            let mut take_n = canvas
-                                .measure_caret_col_in_line(&rem_str, max_w, style)
-                                .max(1);
-                            let rem_len = idx - seg_start;
-                            if take_n >= rem_len {
-                                take_n = rem_len.saturating_sub(1).max(1);
-                            }
-                            let mut cand: String =
-                                chars[seg_start..seg_start + take_n].iter().collect();
-                            if take_n > 1 && canvas.measure_text(&cand, style).0 > max_w {
-                                take_n -= 1;
-                                cand = chars[seg_start..seg_start + take_n].iter().collect();
-                            }
-                            let split_at = seg_start + take_n;
+                    let mut rem = raw_segment;
+                    let mut seg_start = line_start_char;
+                    while !rem.is_empty() {
+                        let (rw, _) = canvas.measure_text(rem, style);
+                        if rw <= max_w {
                             out.push(WrappedLineSeg {
                                 start_char: seg_start,
-                                end_char: split_at,
-                                text: cand,
+                                end_char: line_end_char,
+                                text: rem.to_string(),
+                                hard_break_end: has_trailing_nl,
                             });
-                            seg_start = split_at;
+                            break;
                         }
+                        let mut take_n = canvas
+                            .measure_caret_col_in_line(rem, max_w, style)
+                            .max(1);
+                        let rem_len = line_end_char - seg_start;
+                        if take_n >= rem_len {
+                            take_n = rem_len.saturating_sub(1).max(1);
+                        }
+                        let mut byte_cut = char_to_byte_idx(rem, take_n);
+                        if take_n > 1 && canvas.measure_text(&rem[..byte_cut], style).0 > max_w {
+                            take_n -= 1;
+                            byte_cut = char_to_byte_idx(rem, take_n);
+                        }
+                        let (cand, rest) = rem.split_at(byte_cut);
+                        let split_at = seg_start + take_n;
+                        out.push(WrappedLineSeg {
+                            start_char: seg_start,
+                            end_char: split_at,
+                            text: cand.to_string(),
+                            hard_break_end: false,
+                        });
+                        seg_start = split_at;
+                        rem = rest;
                     }
                 }
-                line_start = idx + 1;
             }
-            idx += 1;
+            line_start_char = line_end_char + 1;
         }
 
         if out.is_empty() {
@@ -576,28 +636,15 @@ impl TextInputField {
                 start_char: 0,
                 end_char: 0,
                 text: String::new(),
+                hard_break_end: false,
             });
         }
         out
     }
 
+    #[cfg(test)]
     pub fn cursor_line_and_col(&self, segs: &[WrappedLineSeg]) -> (usize, usize) {
-        let cur = self.cursor.min(self.char_len());
-        let chars: Vec<char> = self.text.chars().collect();
-        for (i, seg) in segs.iter().enumerate() {
-            let is_last = i + 1 == segs.len();
-            // 若当前位置正好在硬换行前的行尾（且不是被自动折行拆开的前一段），归属该行末尾
-            let ends_with_newline = seg.end_char < chars.len() && chars[seg.end_char] == '\n';
-            let inclusive_end = is_last || ends_with_newline;
-            if cur >= seg.start_char
-                && (cur < seg.end_char || (inclusive_end && cur <= seg.end_char))
-            {
-                return (i, cur - seg.start_char);
-            }
-        }
-        let last = segs.len().saturating_sub(1);
-        let len = segs[last].end_char.saturating_sub(segs[last].start_char);
-        (last, len)
+        cursor_line_and_col_from_segs(self.cursor.min(self.char_len()), segs)
     }
 
     pub fn hit_test_singleline(
@@ -820,62 +867,73 @@ impl TextInputField {
             return (text_rect.x, text_rect.y + line_h);
         }
 
-        let segs = self.compute_wrapped_lines(canvas, text_rect.w, style);
-        let (cur_line, cur_col) = self.cursor_line_and_col(&segs);
-
-        if cur_line < self.scroll_y {
-            self.scroll_y = cur_line;
-        } else if cur_line >= self.scroll_y + max_lines {
-            self.scroll_y = cur_line + 1 - max_lines;
-        }
-        let max_scroll = segs.len().saturating_sub(max_lines);
-        if self.scroll_y > max_scroll {
-            self.scroll_y = max_scroll;
-        }
-
+        let cursor = self.cursor.min(self.char_len());
+        let scroll_y = self.scroll_y;
         let sel = self.selected_range();
+        let total_segs;
+        let (cur_line, cur_col);
+        let next_scroll_y;
         let mut ime = (text_rect.x, text_rect.y + line_h);
         let mut y = text_rect.y;
 
-        for (vis_idx, seg) in segs.iter().enumerate().skip(self.scroll_y).take(max_lines) {
-            if let Some((sel_s, sel_e)) = sel {
-                let ov_s = sel_s.max(seg.start_char).min(seg.end_char);
-                let ov_e = sel_e.max(seg.start_char).min(seg.end_char);
-                if ov_e > ov_s
-                    || (sel_s <= seg.start_char && sel_e > seg.end_char && seg.text.is_empty())
-                {
-                    let before: String = seg.text.chars().take(ov_s - seg.start_char).collect();
-                    let upto: String = seg.text.chars().take(ov_e - seg.start_char).collect();
-                    let (sx, _) = canvas.measure_text(&before, style);
-                    let (ex, _) = canvas.measure_text(&upto, style);
-                    let hl_w = if seg.text.is_empty() {
-                        8
-                    } else {
-                        (ex - sx).max(4)
-                    };
-                    canvas.fill_rounded_rect(
-                        Rect::new(text_rect.x + sx, y, hl_w, line_h - 1),
-                        2,
-                        selection_bg,
-                    );
-                }
-            }
+        {
+            let segs = self.ensure_wrapped_lines_cached(canvas, text_rect.w, style);
+            total_segs = segs.len();
+            (cur_line, cur_col) = cursor_line_and_col_from_segs(cursor, segs);
 
-            if !seg.text.is_empty() {
-                canvas.draw_text_styled(text_rect.x, y, &seg.text, text_color, text_rect.w, style);
+            let mut sy = scroll_y;
+            if cur_line < sy {
+                sy = cur_line;
+            } else if cur_line >= sy + max_lines {
+                sy = cur_line + 1 - max_lines;
             }
+            let max_scroll = total_segs.saturating_sub(max_lines);
+            if sy > max_scroll {
+                sy = max_scroll;
+            }
+            next_scroll_y = sy;
 
-            if vis_idx == cur_line {
-                let prefix: String = seg.text.chars().take(cur_col).collect();
-                let (px, _) = canvas.measure_text(&prefix, style);
-                let caret_x = (text_rect.x + px).min(text_rect.x + text_rect.w - 2);
-                if focused && caret_visible {
-                    canvas.fill_rect(Rect::new(caret_x, y + 1, 2, 15), caret_color);
+            for (vis_idx, seg) in segs.iter().enumerate().skip(sy).take(max_lines) {
+                if let Some((sel_s, sel_e)) = sel {
+                    let ov_s = sel_s.max(seg.start_char).min(seg.end_char);
+                    let ov_e = sel_e.max(seg.start_char).min(seg.end_char);
+                    if ov_e > ov_s
+                        || (sel_s <= seg.start_char && sel_e > seg.end_char && seg.text.is_empty())
+                    {
+                        let b0 = char_to_byte_idx(&seg.text, ov_s - seg.start_char);
+                        let b1 = char_to_byte_idx(&seg.text, ov_e - seg.start_char);
+                        let (sx, _) = canvas.measure_text(&seg.text[..b0], style);
+                        let (ex, _) = canvas.measure_text(&seg.text[..b1], style);
+                        let hl_w = if seg.text.is_empty() {
+                            8
+                        } else {
+                            (ex - sx).max(4)
+                        };
+                        canvas.fill_rounded_rect(
+                            Rect::new(text_rect.x + sx, y, hl_w, line_h - 1),
+                            2,
+                            selection_bg,
+                        );
+                    }
                 }
-                ime = (caret_x, y + line_h);
+
+                if !seg.text.is_empty() {
+                    canvas.draw_text_styled(text_rect.x, y, &seg.text, text_color, text_rect.w, style);
+                }
+
+                if vis_idx == cur_line {
+                    let prefix_b = char_to_byte_idx(&seg.text, cur_col);
+                    let (px, _) = canvas.measure_text(&seg.text[..prefix_b], style);
+                    let caret_x = (text_rect.x + px).min(text_rect.x + text_rect.w - 2);
+                    if focused && caret_visible {
+                        canvas.fill_rect(Rect::new(caret_x, y + 1, 2, 15), caret_color);
+                    }
+                    ime = (caret_x, y + line_h);
+                }
+                y += line_h;
             }
-            y += line_h;
         }
+        self.scroll_y = next_scroll_y;
         ime
     }
 
@@ -902,6 +960,7 @@ impl TextInputField {
         self.scroll_y = snap.scroll_y;
         self.history_cursor = snap.history_cursor;
         self.coalesce = InputCoalesceKind::None;
+        self.edit_seq = self.edit_seq.wrapping_add(1);
     }
 
     fn reset_edit_history(&mut self) {
@@ -944,6 +1003,7 @@ impl TextInputField {
         self.selection_anchor = None;
         self.scroll_x = 0;
         self.scroll_y = 0;
+        self.edit_seq = self.edit_seq.wrapping_add(1);
     }
 
     fn delete_selection_internal(&mut self) -> bool {
@@ -956,6 +1016,7 @@ impl TextInputField {
         self.cursor = s;
         self.selection_anchor = None;
         self.history_cursor = None;
+        self.edit_seq = self.edit_seq.wrapping_add(1);
         true
     }
 
@@ -1039,6 +1100,19 @@ fn normalize_input(s: &str, multiline: bool) -> String {
     } else {
         clean.replace('\n', " ")
     }
+}
+
+fn cursor_line_and_col_from_segs(cur: usize, segs: &[WrappedLineSeg]) -> (usize, usize) {
+    for (i, seg) in segs.iter().enumerate() {
+        let is_last = i + 1 == segs.len();
+        let inclusive_end = is_last || seg.hard_break_end;
+        if cur >= seg.start_char && (cur < seg.end_char || (inclusive_end && cur <= seg.end_char)) {
+            return (i, cur - seg.start_char);
+        }
+    }
+    let last = segs.len().saturating_sub(1);
+    let len = segs[last].end_char.saturating_sub(segs[last].start_char);
+    (last, len)
 }
 
 fn char_to_byte_idx(s: &str, char_idx: usize) -> usize {

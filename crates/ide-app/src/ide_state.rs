@@ -11,8 +11,10 @@ use crate::persistence::{
 };
 use crate::text_input::TextInputField;
 use ide_agent_hub::{
-    parse_path_and_line_token, AgentAttachedItem, AgentHub, AgentProviderKind, AgentWorkbenchMode,
-    AiApiFormat, IdeCodeContext, PastedCodeSnippet,
+    cli_install_spec, detect_node_and_npm, install_agent_cli_blocking, parse_path_and_line_token,
+    AgentAttachedItem, AgentHub, AgentProviderKind, AgentWorkbenchMode, AiApiFormat,
+    CliInstallError, IdeCodeContext, NodeEnvironmentStatus, PastedCodeSnippet,
+    NODEJS_DOWNLOAD_URL,
 };
 use ide_core::{
     detect_mobile_project, probe_mobile_environment, IdeAction, IdeaTheme, MainMenuCategory,
@@ -20,7 +22,10 @@ use ide_core::{
     RunConfigSource, RunConfiguration, ThemeKind, ToolWindowId, UiLanguage,
 };
 use ide_dap::{DapDebugEngine, DebugSessionState};
-use ide_git::{DiffLineKind, GitEngine};
+use ide_git::{
+    clone_repository_blocking, derive_repo_name_from_url, install_git_blocking, DiffLineKind,
+    GitEngine, GIT_DOWNLOAD_URL,
+};
 use ide_lsp::{DiagnosticSeverityLevel, LspHub};
 use ide_search::{
     find_in_files, find_in_files_indexed, index_workspace_files, search_everywhere,
@@ -41,6 +46,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 static FOLDER_PICKER_OPEN: AtomicBool = AtomicBool::new(false);
+pub const MAX_RECENT_WORKSPACES: usize = 50;
 
 #[inline]
 pub(crate) fn blend_rgb(bg: u32, fg: u32, t: f32) -> u32 {
@@ -62,6 +68,7 @@ pub(crate) fn blend_rgb(bg: u32, fg: u32, t: f32) -> u32 {
 pub enum FolderPickMode {
     AskUser,
     NewWindow,
+    CloneTarget,
     /// 0 = Flutter SDK, 1 = Android SDK, 2 = JDK.
     MobileSdk(u8),
 }
@@ -301,11 +308,12 @@ pub enum TextInputNavAction {
 pub struct ActiveEditorDiff {
     pub path: PathBuf,
     pub subtitle: String,
-    pub diff_lines: Vec<ide_git::DiffLine>,
+    pub diff_lines: Arc<Vec<ide_git::DiffLine>>,
     pub added_lines: usize,
     pub removed_lines: usize,
     pub scroll: usize,
     pub scroll_x: i32,
+    pub cached_max_line_px: Option<(i32, i32)>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -902,9 +910,19 @@ pub enum HitAction {
     FocusAgentChatInput,
     SubmitAgentChatPrompt,
     CancelAgentRequest,
-    // 本地 CLI 与模型总览弹窗
+    // 本地 CLI 与模型总览弹窗 / 安装
     OpenAiConfigModal,
     SaveAiConfigModal,
+    InstallAgentCli(AgentProviderKind),
+    OpenNodeJsDownloadPage,
+    RecheckNodeAndRetryInstall,
+    // Git 下载安装与远程仓库克隆打开
+    InstallGit,
+    OpenGitDownloadPage,
+    OpenCloneGitRepoModal,
+    FocusCloneModalField(u8),
+    BrowseCloneTargetDir,
+    SubmitGitClone { new_window: bool },
     // 终端与运行调试
     FocusTerminalInput,
     NewTerminalTab,
@@ -946,6 +964,9 @@ pub enum HitAction {
     ApplySettings,
     OpenFolderDialog,
     OpenFolderInNewWindowDialog,
+    OpenRecentProjectsModal,
+    FocusRecentProjectsSearch,
+    RemoveRecentWorkspace(PathBuf),
     PromptOpenWorkspace(PathBuf),
     OpenWorkspaceInNewWindow(PathBuf),
     ConfirmOpenPendingInThisWindow,
@@ -987,7 +1008,10 @@ pub enum FocusTarget {
     EditorReplaceInput,
     SettingsModal,
     AiConfigModal(usize),
+    CloneGitRepoModal,
+    NodeMissingModal,
     OpenProjectChoiceModal,
+    RecentProjectsModal,
     EditMessageRewindModal,
     ImagePreviewModal,
 }
@@ -1042,6 +1066,8 @@ pub struct IdeApplicationState {
     pub modal_scroll: usize,
     pub settings_page: SettingsPage,
     pub mobile_sdk: MobileSdkLocations,
+    loaded_mobile_sdk: MobileSdkLocations,
+    mobile_sdk_edited_locally: bool,
     pub settings_nav_scroll: usize,
     pub settings_nav_max_scroll: usize,
     pub settings_content_max_scroll: usize,
@@ -1126,7 +1152,6 @@ pub struct IdeApplicationState {
     pub agent_sessions_popup_open: bool,
     pub agent_changed_files_expanded: bool,
     pub agent_mode: AgentWorkbenchMode,
-    pub agent_busy_started_at: Option<Instant>,
     pub agent_provider_pill_rect: Rect,
     pub agent_model_pill_rect: Rect,
     pub agent_mode_pill_rect: Rect,
@@ -1158,12 +1183,32 @@ pub struct IdeApplicationState {
     pub mobile_env: MobileEnvironmentReport,
     pub selected_mobile_device_id: Option<String>,
     pub mobile_missing_prompted: bool,
-    mobile_probe_rx: Option<mpsc::Receiver<MobileEnvironmentReport>>,
+    mobile_probe_seq: u64,
+    mobile_probe_rx: Option<mpsc::Receiver<(u64, MobileEnvironmentReport)>>,
     pub lsp_hub: LspHub,
     pub dap_engine: DapDebugEngine,
     pub git_engine: GitEngine,
+    pub ai_commit_generating: bool,
+    pub git_install_in_progress: bool,
+    git_install_tx: mpsc::Sender<Result<PathBuf, String>>,
+    git_install_rx: mpsc::Receiver<Result<PathBuf, String>>,
+    pub git_clone_in_progress: bool,
+    pub git_clone_error: Option<String>,
+    git_clone_tx: mpsc::Sender<(Result<PathBuf, String>, bool)>,
+    git_clone_rx: mpsc::Receiver<(Result<PathBuf, String>, bool)>,
+    pub clone_repo_url_input: TextInputField,
+    pub clone_target_dir_input: TextInputField,
+    pub clone_base_dir: PathBuf,
+    pub clone_target_manually_edited: bool,
+    pub clone_modal_field_focus: u8,
+    pub clone_modal_field_rects: [Rect; 2],
     pub terminal: TerminalSession,
     pub agent_hub: AgentHub,
+    pub node_env: NodeEnvironmentStatus,
+    pub cli_install_in_progress: Option<AgentProviderKind>,
+    cli_install_tx: mpsc::Sender<(AgentProviderKind, Result<String, CliInstallError>)>,
+    cli_install_rx: mpsc::Receiver<(AgentProviderKind, Result<String, CliInstallError>)>,
+    pub pending_install_cli_after_node: Option<AgentProviderKind>,
     // 焦点与原生输入框 / IME / 光标交互状态
     pub focus: FocusTarget,
     pub ime_spot: (i32, i32),
@@ -1176,6 +1221,7 @@ pub struct IdeApplicationState {
     pub git_log_search_input: TextInputField,
     pub modal_text_input: TextInputField,
     pub search_query_input: TextInputField,
+    pub recent_projects_query_input: TextInputField,
     pub ai_cfg_format: AiApiFormat,
     pub ai_cfg_url: TextInputField,
     pub ai_cfg_key: TextInputField,
@@ -1205,6 +1251,11 @@ pub struct IdeApplicationState {
     pub git_log_search_rect: Rect,
     pub search_modal_text_start_x: i32,
     pub search_modal_input_rect: Rect,
+    pub recent_projects_text_start_x: i32,
+    pub recent_projects_input_rect: Rect,
+    pub recent_projects_list_rect: Rect,
+    pub recent_projects_max_visible: usize,
+    pub recent_projects_selected_idx: usize,
     pub prompt_modal_input_rect: Rect,
     pub ai_cfg_field_rects: [Rect; 3],
     pub search_results: Vec<SearchEverywhereItem>,
@@ -1239,6 +1290,7 @@ pub struct IdeApplicationState {
     cached_structure: Option<(PathBuf, usize, Vec<StructureSymbol>)>,
     cached_highlight_lines: (PathBuf, usize, HashMap<usize, Vec<HighlightSpan>>),
     cached_max_editor_line_w: (PathBuf, usize, i32, i32),
+    pending_diagnostics_refresh: bool,
     pub(crate) cached_chat_rows: AgentChatCache,
     pub hit_regions: Vec<(Rect, HitAction)>,
     pub status_notification: String,
@@ -1650,6 +1702,23 @@ impl IdeApplicationState {
         workspace_root: PathBuf,
         wakeup: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Self {
+        Self::new_with_wakeup_inner(workspace_root, wakeup, true)
+    }
+
+    /// Creates state for a GUI window whose `restore_from_persistence_dir` will immediately supply
+    /// persisted `mobile_sdk` paths and trigger the initial mobile SDK probe.
+    pub fn new_with_wakeup_deferred_mobile_probe(
+        workspace_root: PathBuf,
+        wakeup: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> Self {
+        Self::new_with_wakeup_inner(workspace_root, wakeup, false)
+    }
+
+    fn new_with_wakeup_inner(
+        workspace_root: PathBuf,
+        wakeup: Option<Arc<dyn Fn() + Send + Sync>>,
+        probe_mobile_on_init: bool,
+    ) -> Self {
         let workspace_root = clean_workspace_path(workspace_root);
         let wakeup_enabled = wakeup.is_some();
         let ui_lang = UiLanguage::default();
@@ -1673,6 +1742,15 @@ impl IdeApplicationState {
         let api_cfg = agent_hub.api_config.clone();
 
         let (folder_pick_tx, folder_pick_rx) = mpsc::channel::<PathBuf>();
+        let (git_install_tx, git_install_rx) = mpsc::channel::<Result<PathBuf, String>>();
+        let (git_clone_tx, git_clone_rx) = mpsc::channel::<(Result<PathBuf, String>, bool)>();
+        let (cli_install_tx, cli_install_rx) =
+            mpsc::channel::<(AgentProviderKind, Result<String, CliInstallError>)>();
+        let default_clone_base = workspace_root
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| workspace_root.clone());
         let workspace_files_cache = Arc::new(RwLock::new(None));
         let search_seq = Arc::new(AtomicU64::new(0));
         // 工作区文件搜索索引改为按需懒加载（首次触发 Search Everywhere / Find in Files 时再构建），
@@ -1739,6 +1817,8 @@ impl IdeApplicationState {
             settings_search_text_x: 0,
             settings_query_input: TextInputField::single_line(),
             mobile_sdk: MobileSdkLocations::default(),
+            loaded_mobile_sdk: MobileSdkLocations::default(),
+            mobile_sdk_edited_locally: false,
             settings_sdk_focus: None,
             mobile_sdk_flutter: TextInputField::single_line(),
             mobile_sdk_android: TextInputField::single_line(),
@@ -1811,7 +1891,6 @@ impl IdeApplicationState {
             agent_sessions_popup_open: false,
             agent_changed_files_expanded: false,
             agent_mode: agent_hub.normalize_mode_for_active(AgentWorkbenchMode::Agent),
-            agent_busy_started_at: None,
             agent_provider_pill_rect: Rect::new(0, 0, 0, 0),
             agent_model_pill_rect: Rect::new(0, 0, 0, 0),
             agent_mode_pill_rect: Rect::new(0, 0, 0, 0),
@@ -1845,12 +1924,35 @@ impl IdeApplicationState {
             },
             selected_mobile_device_id: None,
             mobile_missing_prompted: false,
+            mobile_probe_seq: 0,
             mobile_probe_rx: None,
             lsp_hub,
             dap_engine,
             git_engine,
+            ai_commit_generating: false,
+            git_install_in_progress: false,
+            git_install_tx,
+            git_install_rx,
+            git_clone_in_progress: false,
+            git_clone_error: None,
+            git_clone_tx,
+            git_clone_rx,
+            clone_repo_url_input: TextInputField::single_line(),
+            clone_target_dir_input: TextInputField::new(
+                false,
+                &default_clone_base.display().to_string(),
+            ),
+            clone_base_dir: default_clone_base,
+            clone_target_manually_edited: false,
+            clone_modal_field_focus: 0,
+            clone_modal_field_rects: [Rect::new(0, 0, 0, 0); 2],
             terminal,
             agent_hub,
+            node_env: detect_node_and_npm(),
+            cli_install_in_progress: None,
+            cli_install_tx,
+            cli_install_rx,
+            pending_install_cli_after_node: None,
             focus: FocusTarget::Editor,
             ime_spot: (420, 200),
             caret_visible: true,
@@ -1865,6 +1967,7 @@ impl IdeApplicationState {
             git_log_search_input: TextInputField::single_line(),
             modal_text_input: TextInputField::single_line(),
             search_query_input: TextInputField::single_line(),
+            recent_projects_query_input: TextInputField::single_line(),
             ai_cfg_format: api_cfg.format,
             ai_cfg_url: TextInputField::new(false, &api_cfg.base_url),
             ai_cfg_key: TextInputField::new(false, &api_cfg.api_key),
@@ -1894,6 +1997,11 @@ impl IdeApplicationState {
             git_log_search_rect: Rect::new(0, 0, 0, 0),
             search_modal_text_start_x: 0,
             search_modal_input_rect: Rect::new(0, 0, 0, 0),
+            recent_projects_text_start_x: 0,
+            recent_projects_input_rect: Rect::new(0, 0, 0, 0),
+            recent_projects_list_rect: Rect::new(0, 0, 0, 0),
+            recent_projects_max_visible: 10,
+            recent_projects_selected_idx: 0,
             prompt_modal_input_rect: Rect::new(0, 0, 0, 0),
             ai_cfg_field_rects: [Rect::new(0, 0, 0, 0); 3],
             search_results: Vec::new(),
@@ -1930,6 +2038,7 @@ impl IdeApplicationState {
             cached_structure: None,
             cached_highlight_lines: (PathBuf::new(), usize::MAX, HashMap::new()),
             cached_max_editor_line_w: (PathBuf::new(), usize::MAX, 0, 0),
+            pending_diagnostics_refresh: false,
             cached_chat_rows: AgentChatCache::default(),
             hit_regions: Vec::new(),
             status_notification:
@@ -1939,7 +2048,7 @@ impl IdeApplicationState {
 
         let first_path = state.active_buffer().path.clone();
         state.dap_engine.toggle_breakpoint(&first_path, 17);
-        if wakeup_enabled && mobile_kind.is_mobile() {
+        if probe_mobile_on_init && wakeup_enabled && mobile_kind.is_mobile() {
             state.refresh_mobile_environment_async();
         }
         state
@@ -2004,11 +2113,15 @@ impl IdeApplicationState {
             let mut merged_recent = vec![self.workspace_root.clone()];
             for p in gs.recent_workspaces {
                 let cp = clean_workspace_path(p);
-                if cp.is_dir() && !merged_recent.contains(&cp) {
+                if cp.is_dir()
+                    && !merged_recent
+                        .iter()
+                        .any(|existing| workspace_paths_equal(existing, &cp))
+                {
                     merged_recent.push(cp);
                 }
             }
-            merged_recent.truncate(10);
+            merged_recent.truncate(MAX_RECENT_WORKSPACES);
             self.recent_workspaces = merged_recent;
 
             for pref in &gs.provider_prefs {
@@ -2033,10 +2146,17 @@ impl IdeApplicationState {
                 let _ = self.agent_hub.update_api_config(cfg);
             }
             self.mobile_sdk = gs.mobile_sdk;
+            self.loaded_mobile_sdk = self.mobile_sdk.clone();
+            self.mobile_sdk_edited_locally = false;
             self.sync_mobile_sdk_inputs();
             self.agent_hub.active_provider = gs.active_provider;
             self.agent_mode = self.agent_hub.normalize_mode_for_active(gs.agent_mode);
         }
+
+        self.mobile_missing_prompted = false;
+        self.mobile_probe_seq = self.mobile_probe_seq.wrapping_add(1);
+        self.mobile_probe_rx = None;
+        self.mobile_env.probing = false;
 
         let hist_path = persistence::agent_history_path(&dir, &self.workspace_root);
         self.agent_hub.set_history_file_path(Some(hist_path));
@@ -2049,6 +2169,9 @@ impl IdeApplicationState {
 
         self.restore_workspace_state(&dir);
         self.save_global_settings();
+        if self.wakeup_enabled && self.mobile_env.project_kind.is_mobile() {
+            self.refresh_mobile_environment_async();
+        }
     }
 
     pub fn save_global_settings(&self) {
@@ -2071,18 +2194,32 @@ impl IdeApplicationState {
         } else {
             (1560, 940)
         };
-        let mut recent = Vec::with_capacity(self.recent_workspaces.len().min(10));
+        let mut recent: Vec<PathBuf> =
+            Vec::with_capacity(self.recent_workspaces.len().min(MAX_RECENT_WORKSPACES));
         for p in &self.recent_workspaces {
             let cp = clean_workspace_path(p.clone());
-            if !recent.contains(&cp) {
+            if !recent
+                .iter()
+                .any(|existing| workspace_paths_equal(existing, &cp))
+            {
                 recent.push(cp);
             }
         }
-        recent.truncate(10);
+        recent.truncate(MAX_RECENT_WORKSPACES);
         let settings_path = persistence::global_settings_path(dir);
-        let preserved_open_windows = persistence::load_json::<PersistedGlobalSettings>(&settings_path)
-            .map(|gs| gs.open_windows)
+        let existing_gs = persistence::load_json::<PersistedGlobalSettings>(&settings_path);
+        let preserved_open_windows = existing_gs
+            .as_ref()
+            .map(|gs| gs.open_windows.clone())
             .unwrap_or_default();
+        let persisted_mobile_sdk =
+            if self.mobile_sdk_edited_locally || self.mobile_sdk != self.loaded_mobile_sdk {
+                self.mobile_sdk.clone()
+            } else {
+                existing_gs
+                    .map(|gs| gs.mobile_sdk)
+                    .unwrap_or_else(|| self.mobile_sdk.clone())
+            };
         let gs = PersistedGlobalSettings {
             ui_lang: self.ui_lang,
             ui_scale: self.ui_scale,
@@ -2109,7 +2246,7 @@ impl IdeApplicationState {
             active_provider: self.agent_hub.active_provider,
             provider_prefs,
             ai_api_config: Some(self.agent_hub.api_config.clone()),
-            mobile_sdk: self.mobile_sdk.clone(),
+            mobile_sdk: persisted_mobile_sdk,
         };
         persistence::save_json(&settings_path, &gs);
     }
@@ -2348,6 +2485,113 @@ impl IdeApplicationState {
             });
     }
 
+    fn push_recent_workspace(&mut self, clean: PathBuf) {
+        self.recent_workspaces
+            .retain(|p| !workspace_paths_equal(p, &clean));
+        self.recent_workspaces.insert(0, clean);
+        self.recent_workspaces.truncate(MAX_RECENT_WORKSPACES);
+    }
+
+    pub fn open_recent_projects_modal(&mut self) {
+        self.project_popup_open = false;
+        self.close_top_menu();
+        self.context_menu = None;
+        self.recent_projects_query_input.clear();
+        self.modal_scroll = 0;
+        self.recent_projects_selected_idx = 0;
+        self.focus = FocusTarget::RecentProjectsModal;
+        self.touch_caret_activity();
+    }
+
+    pub fn filtered_recent_workspaces(&self) -> Vec<PathBuf> {
+        let query = self
+            .recent_projects_query_input
+            .as_str()
+            .trim()
+            .to_lowercase();
+        let tokens: Vec<&str> = query.split_whitespace().collect();
+        self.recent_workspaces
+            .iter()
+            .filter(|path| {
+                if tokens.is_empty() {
+                    return true;
+                }
+                let full_lower = path.display().to_string().to_lowercase();
+                let name_lower = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                tokens
+                    .iter()
+                    .all(|tok| name_lower.contains(tok) || full_lower.contains(tok))
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub fn remove_recent_workspace(&mut self, path: &Path) {
+        let clean = clean_workspace_path(path.to_path_buf());
+        if workspace_paths_equal(&clean, &self.workspace_root) {
+            return;
+        }
+        self.recent_workspaces
+            .retain(|p| !workspace_paths_equal(p, &clean));
+        let total = self.filtered_recent_workspaces().len();
+        if total == 0 {
+            self.recent_projects_selected_idx = 0;
+            self.modal_scroll = 0;
+        } else {
+            self.recent_projects_selected_idx =
+                self.recent_projects_selected_idx.min(total - 1);
+            let vis = self.recent_projects_max_visible.max(1);
+            let max_s = total.saturating_sub(vis);
+            if self.modal_scroll > max_s {
+                self.modal_scroll = max_s;
+            }
+        }
+        self.save_global_settings();
+    }
+
+    pub fn move_recent_projects_selection(&mut self, delta: isize) {
+        let total = self.filtered_recent_workspaces().len();
+        if total == 0 {
+            self.recent_projects_selected_idx = 0;
+            self.modal_scroll = 0;
+            return;
+        }
+        let cur = self.recent_projects_selected_idx.min(total - 1) as isize;
+        let next = (cur + delta).clamp(0, (total - 1) as isize) as usize;
+        self.recent_projects_selected_idx = next;
+        let vis = self.recent_projects_max_visible.max(1);
+        if next < self.modal_scroll {
+            self.modal_scroll = next;
+        } else if next >= self.modal_scroll + vis {
+            self.modal_scroll = next + 1 - vis;
+        }
+    }
+
+    pub fn confirm_selected_recent_project(&mut self) {
+        let filtered = self.filtered_recent_workspaces();
+        if filtered.is_empty() {
+            return;
+        }
+        let idx = self.recent_projects_selected_idx.min(filtered.len() - 1);
+        let target = filtered[idx].clone();
+        if workspace_paths_equal(&target, &self.workspace_root) {
+            self.focus = FocusTarget::Editor;
+            self.status_notification = self
+                .tr(
+                    "该项目已在当前窗口打开",
+                    "Project is already open in this window",
+                )
+                .to_string();
+        } else {
+            self.pending_open_workspace = Some(target);
+            self.focus = FocusTarget::OpenProjectChoiceModal;
+        }
+    }
+
     pub fn open_workspace_in_new_window(&mut self, path: PathBuf) {
         let clean = clean_workspace_path(path);
         if !clean.is_dir() {
@@ -2358,13 +2602,14 @@ impl IdeApplicationState {
             );
             return;
         }
-        self.recent_workspaces.retain(|p| p != &clean);
-        self.recent_workspaces.insert(0, clean.clone());
-        self.recent_workspaces.truncate(10);
+        self.push_recent_workspace(clean.clone());
         self.save_global_settings();
         self.project_popup_open = false;
         self.pending_open_workspace = None;
-        if self.focus == FocusTarget::OpenProjectChoiceModal {
+        if matches!(
+            self.focus,
+            FocusTarget::OpenProjectChoiceModal | FocusTarget::RecentProjectsModal
+        ) {
             self.focus = FocusTarget::Editor;
         }
 
@@ -2392,13 +2637,14 @@ impl IdeApplicationState {
             );
             return;
         }
-        self.recent_workspaces.retain(|p| p != &clean);
-        self.recent_workspaces.insert(0, clean.clone());
-        self.recent_workspaces.truncate(10);
+        self.push_recent_workspace(clean.clone());
         self.save_global_settings();
         self.project_popup_open = false;
         self.pending_open_workspace = None;
-        if self.focus == FocusTarget::OpenProjectChoiceModal {
+        if matches!(
+            self.focus,
+            FocusTarget::OpenProjectChoiceModal | FocusTarget::RecentProjectsModal
+        ) {
             self.focus = FocusTarget::Editor;
         }
         self.pending_switch_workspaces.push(clean.clone());
@@ -2539,6 +2785,10 @@ impl IdeApplicationState {
             || self.startup_anim_alpha > 0.01
             || startup_busy
             || git_busy
+            || self.ai_commit_generating
+            || self.git_install_in_progress
+            || self.git_clone_in_progress
+            || self.cli_install_in_progress.is_some()
             || search_busy
             || agent_busy
             || attention
@@ -2630,11 +2880,12 @@ impl IdeApplicationState {
             );
             return;
         }
+        if self.focus == FocusTarget::SettingsModal {
+            self.commit_mobile_sdk_locations_from_inputs();
+        }
         self.save_all_persisted_state();
 
-        self.recent_workspaces.retain(|p| p != &clean);
-        self.recent_workspaces.insert(0, clean.clone());
-        self.recent_workspaces.truncate(10);
+        self.push_recent_workspace(clean.clone());
         self.save_global_settings();
 
         self.workspace_root = clean.clone();
@@ -2687,6 +2938,7 @@ impl IdeApplicationState {
         self.tree_scroll = 0;
         self.git_changes_scroll = 0;
         self.git_amend_commit = false;
+        self.ai_commit_generating = false;
         self.git_log_scroll = 0;
         self.git_diff_scroll = 0;
         self.git_files_scroll = 0;
@@ -2720,6 +2972,7 @@ impl IdeApplicationState {
         self.mobile_popup_rect = Rect::new(0, 0, 0, 0);
         self.selected_mobile_device_id = None;
         self.mobile_missing_prompted = false;
+        self.mobile_probe_seq = self.mobile_probe_seq.wrapping_add(1);
         self.mobile_probe_rx = None;
         let mobile_kind = detect_mobile_project(&clean);
         self.mobile_env = MobileEnvironmentReport {
@@ -2838,6 +3091,16 @@ impl IdeApplicationState {
             None => true,
         };
         if needs_rebuild {
+            if self.wakeup_enabled
+                && self.active_buffer().line_count() > 800
+                && self.last_input_activity.elapsed() < Duration::from_millis(180)
+                && self
+                    .cached_runnables
+                    .as_ref()
+                    .is_some_and(|(p, _, _)| p == path)
+            {
+                return;
+            }
             let text = self.active_buffer().text();
             let entries = detect_runnable_gutter_entries(&text, lang);
             self.cached_runnables = Some((path.clone(), rev, entries));
@@ -2883,14 +3146,7 @@ impl IdeApplicationState {
         let mut line_estimates: Vec<(usize, i32)> = {
             let buf = self.active_buffer();
             (0..buf.line_count())
-                .map(|idx| {
-                    let s = buf.line_text(idx);
-                    let est: i32 = s
-                        .chars()
-                        .map(|c| if c.is_ascii() { char_w } else { char_w * 2 })
-                        .sum();
-                    (idx, est)
-                })
+                .map(|idx| (idx, buf.line_display_width_est(idx, char_w)))
                 .collect()
         };
         let max_est = line_estimates
@@ -3083,11 +3339,12 @@ impl IdeApplicationState {
         self.active_editor_diff = Some(ActiveEditorDiff {
             path: path.clone(),
             subtitle,
-            diff_lines,
+            diff_lines: Arc::new(diff_lines),
             added_lines,
             removed_lines,
             scroll: 0,
             scroll_x: 0,
+            cached_max_line_px: None,
         });
         self.focus = FocusTarget::Editor;
         self.touch_caret_activity();
@@ -3216,6 +3473,7 @@ impl IdeApplicationState {
         self.context_menu = None;
         match action {
             IdeAction::OpenFolder => self.request_open_folder_dialog(),
+            IdeAction::OpenFromGitRepo => self.open_clone_git_repo_modal(),
             IdeAction::SwitchUiLanguage => {
                 let next = self.ui_lang.toggle();
                 self.set_ui_language(next);
@@ -3721,6 +3979,7 @@ impl IdeApplicationState {
     }
 
     pub fn refresh_active_buffer_diagnostics(&mut self) {
+        self.pending_diagnostics_refresh = false;
         if self.open_buffers.is_empty() {
             return;
         }
@@ -3729,6 +3988,14 @@ impl IdeApplicationState {
             (buf.path.clone(), buf.language, buf.text())
         };
         self.lsp_hub.refresh_buffer_diagnostics(&path, lang, &text);
+    }
+
+    fn schedule_or_refresh_active_buffer_diagnostics(&mut self) {
+        if self.wakeup_enabled && self.active_buffer().line_count() > 800 {
+            self.pending_diagnostics_refresh = true;
+        } else {
+            self.refresh_active_buffer_diagnostics();
+        }
     }
 
     /// IDEA `Ctrl+B`: 转到当前光标下符号的声明/定义；若已位于定义处则查找全工作区引用 (Usages)
@@ -4335,11 +4602,6 @@ impl IdeApplicationState {
             ctx.as_ref(),
         );
         self.reload_paths_after_revert(&restored_paths);
-        self.agent_busy_started_at = if self.agent_hub.is_active_session_busy() {
-            Some(Instant::now())
-        } else {
-            None
-        };
         self.right_agent_open = true;
         self.right_panel_tab = RightPanelTab::Chat;
         self.focus = FocusTarget::AgentChatInput;
@@ -4434,6 +4696,15 @@ impl IdeApplicationState {
         self.mobile_sdk_jdk.set_text(&self.mobile_sdk.jdk_home);
     }
 
+    fn normalize_mobile_sdk_input(raw: &str) -> String {
+        let trimmed = raw.trim();
+        if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
+            trimmed[1..trimmed.len() - 1].trim().to_string()
+        } else {
+            trimmed.to_string()
+        }
+    }
+
     fn apply_picked_mobile_sdk_dir(&mut self, slot: u8, path: PathBuf) {
         let text = clean_workspace_path(path).display().to_string();
         match slot {
@@ -4450,6 +4721,7 @@ impl IdeApplicationState {
                 self.mobile_sdk_jdk.set_text(&text);
             }
         }
+        self.mobile_sdk_edited_locally = true;
         self.save_global_settings();
         self.mobile_missing_prompted = false;
         self.refresh_mobile_environment_async();
@@ -4459,24 +4731,32 @@ impl IdeApplicationState {
 
     pub fn commit_mobile_sdk_locations_from_inputs(&mut self) -> bool {
         let next = MobileSdkLocations {
-            flutter_sdk: self.mobile_sdk_flutter.as_str().trim().to_string(),
-            android_sdk: self.mobile_sdk_android.as_str().trim().to_string(),
-            jdk_home: self.mobile_sdk_jdk.as_str().trim().to_string(),
+            flutter_sdk: Self::normalize_mobile_sdk_input(self.mobile_sdk_flutter.as_str()),
+            android_sdk: Self::normalize_mobile_sdk_input(self.mobile_sdk_android.as_str()),
+            jdk_home: Self::normalize_mobile_sdk_input(self.mobile_sdk_jdk.as_str()),
         };
         if next == self.mobile_sdk {
             return false;
         }
         self.mobile_sdk = next;
+        self.sync_mobile_sdk_inputs();
+        self.mobile_sdk_edited_locally = true;
         self.save_global_settings();
         self.mobile_missing_prompted = false;
         self.refresh_mobile_environment_async();
         true
     }
 
+    pub fn close_settings_modal(&mut self) {
+        self.commit_mobile_sdk_locations_from_inputs();
+        self.settings_sdk_focus = None;
+        self.focus = FocusTarget::Editor;
+        self.touch_caret_activity();
+    }
+
     pub fn refresh_mobile_environment_async(&mut self) {
-        if self.mobile_env.probing {
-            return;
-        }
+        self.mobile_probe_seq = self.mobile_probe_seq.wrapping_add(1);
+        let seq = self.mobile_probe_seq;
         self.mobile_env.probing = true;
         let root = self.workspace_root.clone();
         let kind = self.mobile_env.project_kind;
@@ -4486,7 +4766,7 @@ impl IdeApplicationState {
         self.mobile_probe_rx = Some(rx);
         thread::spawn(move || {
             let report = probe_mobile_environment(&root, kind, &locations);
-            let _ = tx.send(report);
+            let _ = tx.send((seq, report));
             if let Some(w) = wakeup {
                 w();
             }
@@ -4907,11 +5187,6 @@ impl IdeApplicationState {
         self.agent_hub
             .submit_workbench_prompt(&prompt, self.agent_mode, ctx.as_ref());
         self.reveal_active_session_tab();
-        self.agent_busy_started_at = if self.agent_hub.is_active_session_busy() {
-            Some(Instant::now())
-        } else {
-            None
-        };
         self.right_agent_open = true;
         self.right_panel_tab = RightPanelTab::Chat;
         self.agent_scroll = usize::MAX;
@@ -4938,7 +5213,6 @@ impl IdeApplicationState {
         self.agent_sessions_popup_open = false;
         self.agent_mode_popup_open = false;
         self.agent_changed_files_expanded = false;
-        self.agent_busy_started_at = None;
         self.right_agent_open = true;
         self.right_panel_tab = RightPanelTab::Chat;
         self.agent_scroll = 0;
@@ -4973,11 +5247,6 @@ impl IdeApplicationState {
             self.agent_sessions_popup_open = false;
             self.agent_mode_popup_open = false;
             self.agent_changed_files_expanded = false;
-            self.agent_busy_started_at = if self.agent_hub.is_active_session_busy() {
-                Some(Instant::now())
-            } else {
-                None
-            };
             self.agent_scroll = usize::MAX;
             self.reveal_active_session_tab();
             self.agent_chat_signature_salt = self.agent_chat_signature_salt.wrapping_add(1);
@@ -5000,11 +5269,6 @@ impl IdeApplicationState {
             self.expanded_message_thoughts.clear();
             self.expanded_message_file_changes.clear();
             self.expanded_composer_snippet_id = None;
-            self.agent_busy_started_at = if self.agent_hub.is_active_session_busy() {
-                Some(Instant::now())
-            } else {
-                None
-            };
             self.agent_scroll = usize::MAX;
             self.reveal_active_session_tab();
             self.agent_chat_signature_salt = self.agent_chat_signature_salt.wrapping_add(1);
@@ -5035,7 +5299,6 @@ impl IdeApplicationState {
         };
         if self.agent_hub.is_active_session_busy() {
             self.agent_hub.cancel_active_request();
-            self.agent_busy_started_at = None;
         }
         let ctx = if self.attach_active_context {
             self.build_active_ide_code_context()
@@ -5045,11 +5308,6 @@ impl IdeApplicationState {
         self.agent_hub
             .submit_workbench_prompt(&item.text, item.mode, ctx.as_ref());
         self.reveal_active_session_tab();
-        self.agent_busy_started_at = if self.agent_hub.is_active_session_busy() {
-            Some(Instant::now())
-        } else {
-            None
-        };
         self.agent_mode = item.mode;
         self.right_agent_open = true;
         self.right_panel_tab = RightPanelTab::Chat;
@@ -5081,11 +5339,6 @@ impl IdeApplicationState {
         self.agent_hub
             .submit_workbench_prompt(&item.text, self.agent_mode, ctx.as_ref());
         self.reveal_active_session_tab();
-        self.agent_busy_started_at = if self.agent_hub.is_active_session_busy() {
-            Some(Instant::now())
-        } else {
-            None
-        };
         self.agent_scroll = usize::MAX;
         self.agent_chat_signature_salt = self.agent_chat_signature_salt.wrapping_add(1);
         self.status_notification = self
@@ -5279,10 +5532,202 @@ impl IdeApplicationState {
     }
 
     pub fn open_ai_config_modal(&mut self) {
+        self.node_env = detect_node_and_npm();
         self.agent_hub.refresh_local_cli_agents();
         self.ai_cfg_model.set_text(&self.agent_hub.active_model());
         self.focus = FocusTarget::AiConfigModal(0);
         self.touch_caret_activity();
+    }
+
+    pub fn start_install_git(&mut self) {
+        if self.git_install_in_progress {
+            self.status_notification = self
+                .tr("Git 正在后台下载安装中...", "Git installation is already in progress...")
+                .to_string();
+            return;
+        }
+        self.git_install_in_progress = true;
+        self.status_notification = self
+            .tr(
+                "正在下载并安装 Git，请稍候...",
+                "Downloading and installing Git...",
+            )
+            .to_string();
+        let tx = self.git_install_tx.clone();
+        let wakeup = self.wakeup.clone();
+        let _ = thread::Builder::new()
+            .name("ide-git-installer".to_string())
+            .spawn(move || {
+                let res = install_git_blocking();
+                let _ = tx.send(res);
+                if let Some(cb) = wakeup {
+                    cb();
+                }
+            });
+    }
+
+    pub fn open_clone_git_repo_modal(&mut self) {
+        self.close_top_menu();
+        self.project_popup_open = false;
+        self.more_menu_popup_open = false;
+        self.git_clone_error = None;
+        self.clone_target_manually_edited = false;
+        let base = self
+            .workspace_root
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.workspace_root.clone());
+        self.clone_base_dir = base.clone();
+        if let Some(repo) = derive_repo_name_from_url(self.clone_repo_url_input.as_str()) {
+            self.clone_target_dir_input
+                .set_text(&base.join(repo).display().to_string());
+        } else {
+            self.clone_target_dir_input
+                .set_text(&base.display().to_string());
+        }
+        self.clone_modal_field_focus = 0;
+        self.clone_repo_url_input.select_all();
+        self.focus = FocusTarget::CloneGitRepoModal;
+        self.git_engine.request_refresh();
+        self.touch_caret_activity();
+    }
+
+    pub fn submit_git_clone(&mut self, new_window: bool) {
+        if self.git_clone_in_progress {
+            return;
+        }
+        if !self.git_engine.git_installed {
+            self.git_clone_error = Some(
+                self.tr(
+                    "本机尚未安装 Git，请先点击下方「下载并安装 Git」",
+                    "Git is not installed. Click 'Download & Install Git' below first.",
+                )
+                .to_string(),
+            );
+            return;
+        }
+        let url = self.clone_repo_url_input.as_str().trim().to_string();
+        if url.is_empty() {
+            self.git_clone_error = Some(
+                self.tr("请输入 Git 远程仓库地址", "Please enter a Git repository URL")
+                    .to_string(),
+            );
+            self.clone_modal_field_focus = 0;
+            return;
+        }
+        let raw_dir = self.clone_target_dir_input.as_str().trim().to_string();
+        let target_dir = if raw_dir.is_empty() {
+            let repo = derive_repo_name_from_url(&url).unwrap_or_else(|| "repo".to_string());
+            self.clone_base_dir.join(repo)
+        } else {
+            let p = PathBuf::from(&raw_dir);
+            if p == self.clone_base_dir {
+                if let Some(repo) = derive_repo_name_from_url(&url) {
+                    p.join(repo)
+                } else {
+                    p
+                }
+            } else {
+                p
+            }
+        };
+
+        self.git_clone_in_progress = true;
+        self.git_clone_error = None;
+        self.status_notification = format!(
+            "{}: {url}",
+            self.tr("正在克隆 Git 仓库", "Cloning Git repository")
+        );
+        let tx = self.git_clone_tx.clone();
+        let wakeup = self.wakeup.clone();
+        let _ = thread::Builder::new()
+            .name("ide-git-clone".to_string())
+            .spawn(move || {
+                let res = clone_repository_blocking(&url, &target_dir);
+                let _ = tx.send((res, new_window));
+                if let Some(cb) = wakeup {
+                    cb();
+                }
+            });
+    }
+
+    pub fn start_install_agent_cli(&mut self, kind: AgentProviderKind) {
+        if self.cli_install_in_progress.is_some() {
+            self.status_notification = self
+                .tr(
+                    "已有智能体 CLI 正在安装中，请稍候...",
+                    "Another Agent CLI installation is already in progress...",
+                )
+                .to_string();
+            return;
+        }
+        let spec = cli_install_spec(kind);
+        if kind == AgentProviderKind::GoogleAntigravityAcp {
+            if open_http_url(spec.official_url) {
+                self.status_notification = format!(
+                    "🌐 {}: {}",
+                    self.tr("已打开 Antigravity CLI 官网下载页", "Opened Antigravity official page"),
+                    spec.official_url
+                );
+            }
+            return;
+        }
+        if spec.requires_node {
+            self.node_env = detect_node_and_npm();
+            if !self.node_env.is_ready() {
+                self.pending_install_cli_after_node = Some(kind);
+                self.focus = FocusTarget::NodeMissingModal;
+                self.status_notification = self
+                    .tr(
+                        "安装该 CLI 需要 Node.js 环境，请前往官网下载安装",
+                        "Node.js is required to install this CLI. Please download from nodejs.org.",
+                    )
+                    .to_string();
+                return;
+            }
+        }
+
+        self.cli_install_in_progress = Some(kind);
+        self.status_notification = format!(
+            "{}: {} ({})",
+            self.tr("正在安装智能体 CLI", "Installing Agent CLI"),
+            kind.display_name(),
+            spec.install_command_display
+        );
+        let tx = self.cli_install_tx.clone();
+        let wakeup = self.wakeup.clone();
+        let _ = thread::Builder::new()
+            .name("ide-cli-installer".to_string())
+            .spawn(move || {
+                let res = install_agent_cli_blocking(kind);
+                let _ = tx.send((kind, res));
+                if let Some(cb) = wakeup {
+                    cb();
+                }
+            });
+    }
+
+    pub fn recheck_node_and_retry_install(&mut self) {
+        self.node_env = detect_node_and_npm();
+        if self.node_env.is_ready() {
+            let pending = self.pending_install_cli_after_node.take();
+            self.focus = FocusTarget::AiConfigModal(0);
+            if let Some(kind) = pending {
+                self.start_install_agent_cli(kind);
+            } else {
+                self.status_notification = self
+                    .tr("已检测到 Node.js 环境", "Node.js environment detected")
+                    .to_string();
+            }
+        } else {
+            self.status_notification = self
+                .tr(
+                    "仍未检测到 Node.js，请确认已完成安装并重启或点击重试",
+                    "Node.js still not found. Complete installation and retry.",
+                )
+                .to_string();
+        }
     }
 
     pub fn save_ai_config_modal(&mut self) {
@@ -5536,6 +5981,9 @@ impl IdeApplicationState {
                     | FocusTarget::RenamePathModal
                     | FocusTarget::SettingsModal
                     | FocusTarget::AiConfigModal(_)
+                    | FocusTarget::CloneGitRepoModal
+                    | FocusTarget::NodeMissingModal
+                    | FocusTarget::RecentProjectsModal
             )
             || self.active_overlay_rects.iter().any(|r| r.contains(x, y))
         {
@@ -5624,13 +6072,21 @@ impl IdeApplicationState {
                 | FocusTarget::RenamePathModal
                 | FocusTarget::SettingsModal
                 | FocusTarget::AiConfigModal(_)
+                | FocusTarget::CloneGitRepoModal
+                | FocusTarget::NodeMissingModal
                 | FocusTarget::OpenProjectChoiceModal
+                | FocusTarget::RecentProjectsModal
                 | FocusTarget::EditMessageRewindModal
         );
         if modal_open {
             match self.focus {
                 FocusTarget::SearchEverywhereModal | FocusTarget::FindInFilesModal => {
                     if self.search_modal_input_rect.contains(x, y) {
+                        return IdeCursorKind::Text;
+                    }
+                }
+                FocusTarget::RecentProjectsModal => {
+                    if self.recent_projects_input_rect.contains(x, y) {
                         return IdeCursorKind::Text;
                     }
                 }
@@ -5648,6 +6104,11 @@ impl IdeApplicationState {
                 }
                 FocusTarget::AiConfigModal(_) => {
                     if self.ai_cfg_field_rects.iter().any(|r| r.contains(x, y)) {
+                        return IdeCursorKind::Text;
+                    }
+                }
+                FocusTarget::CloneGitRepoModal => {
+                    if self.clone_modal_field_rects.iter().any(|r| r.contains(x, y)) {
                         return IdeCursorKind::Text;
                     }
                 }
@@ -5903,7 +6364,6 @@ impl IdeApplicationState {
             }
         }
         if self.agent_hub.poll_async_messages() {
-            self.agent_scroll = usize::MAX;
             changed = true;
         }
         let queued_before = self.agent_hub.active_session().queued_prompts.len();
@@ -5915,17 +6375,18 @@ impl IdeApplicationState {
             .mobile_probe_rx
             .as_ref()
             .and_then(|rx| rx.try_recv().ok());
-        if let Some(report) = mobile_report {
-            self.mobile_probe_rx = None;
-            self.apply_mobile_environment_report(report);
-            changed = true;
-        }
-        if self.agent_hub.is_active_session_busy() {
-            if self.agent_busy_started_at.is_none() {
-                self.agent_busy_started_at = Some(Instant::now());
+        if let Some((seq, report)) = mobile_report {
+            if seq == self.mobile_probe_seq {
+                self.mobile_probe_rx = None;
+                self.apply_mobile_environment_report(report);
+                changed = true;
             }
-        } else {
-            self.agent_busy_started_at = None;
+        }
+        if self.pending_diagnostics_refresh
+            && self.last_input_activity.elapsed() >= Duration::from_millis(180)
+        {
+            self.refresh_active_buffer_diagnostics();
+            changed = true;
         }
         if self.agent_hub.poll_inline_edit_result() {
             if let Some(s) = &self.agent_hub.inline_edit {
@@ -5955,6 +6416,7 @@ impl IdeApplicationState {
             changed = true;
         }
         if let Some(res) = self.agent_hub.poll_commit_message() {
+            self.ai_commit_generating = false;
             match res {
                 Ok(msg) => {
                     self.git_commit_input.set_text(&msg);
@@ -5981,9 +6443,115 @@ impl IdeApplicationState {
                     self.pending_open_workspace = Some(clean);
                     self.focus = FocusTarget::OpenProjectChoiceModal;
                 }
+                FolderPickMode::CloneTarget => {
+                    self.folder_pick_mode = FolderPickMode::AskUser;
+                    let clean = clean_workspace_path(picked);
+                    self.clone_base_dir = clean.clone();
+                    self.clone_target_manually_edited = false;
+                    let dest = if let Some(repo) =
+                        derive_repo_name_from_url(self.clone_repo_url_input.as_str())
+                    {
+                        clean.join(repo)
+                    } else {
+                        clean
+                    };
+                    self.clone_target_dir_input
+                        .set_text(&dest.display().to_string());
+                    self.focus = FocusTarget::CloneGitRepoModal;
+                    self.clone_modal_field_focus = 1;
+                    self.touch_caret_activity();
+                }
                 FolderPickMode::MobileSdk(slot) => {
                     self.folder_pick_mode = FolderPickMode::AskUser;
                     self.apply_picked_mobile_sdk_dir(slot, picked);
+                }
+            }
+            changed = true;
+        }
+        while let Ok(res) = self.git_install_rx.try_recv() {
+            self.git_install_in_progress = false;
+            match res {
+                Ok(bin) => {
+                    self.git_engine.request_refresh();
+                    self.git_clone_error = None;
+                    self.status_notification = format!(
+                        "✓ {}: {}",
+                        self.tr("Git 安装完成", "Git installed"),
+                        bin.display()
+                    );
+                }
+                Err(err) => {
+                    self.status_notification = format!(
+                        "⚠ {}: {err}",
+                        self.tr("Git 安装失败", "Git install failed")
+                    );
+                }
+            }
+            changed = true;
+        }
+        while let Ok((res, new_window)) = self.git_clone_rx.try_recv() {
+            self.git_clone_in_progress = false;
+            match res {
+                Ok(dest) => {
+                    self.git_clone_error = None;
+                    if self.focus == FocusTarget::CloneGitRepoModal {
+                        self.focus = FocusTarget::Editor;
+                    }
+                    if new_window {
+                        self.open_workspace_in_new_window(dest);
+                    } else {
+                        self.request_switch_workspace(dest);
+                    }
+                }
+                Err(err) => {
+                    self.git_clone_error = Some(err.clone());
+                    self.status_notification = format!(
+                        "⚠ {}: {err}",
+                        self.tr("克隆 Git 仓库失败", "Git clone failed")
+                    );
+                }
+            }
+            changed = true;
+        }
+        while let Ok((kind, res)) = self.cli_install_rx.try_recv() {
+            self.cli_install_in_progress = None;
+            self.node_env = detect_node_and_npm();
+            match res {
+                Ok(msg) => {
+                    self.agent_hub.refresh_local_cli_agents();
+                    if self
+                        .agent_hub
+                        .providers
+                        .iter()
+                        .any(|p| p.kind == kind && p.available)
+                    {
+                        self.agent_hub.active_provider = kind;
+                        self.agent_mode = self.agent_hub.normalize_mode_for_active(self.agent_mode);
+                    }
+                    self.ai_cfg_model.set_text(&self.agent_hub.active_model());
+                    self.save_global_settings();
+                    self.status_notification = format!("✓ {msg}");
+                }
+                Err(CliInstallError::MissingNodeJs) => {
+                    self.pending_install_cli_after_node = Some(kind);
+                    self.focus = FocusTarget::NodeMissingModal;
+                    self.status_notification = self
+                        .tr(
+                            "安装该 CLI 需要 Node.js 环境，请前往官网下载",
+                            "Node.js is required to install this CLI",
+                        )
+                        .to_string();
+                }
+                Err(CliInstallError::OpenDownloadPage(url)) => {
+                    let _ = open_http_url(url);
+                    self.status_notification = format!("🌐 {url}");
+                }
+                Err(CliInstallError::CommandFailed(err)) => {
+                    self.status_notification = format!(
+                        "⚠ {} {}: {err}",
+                        kind.short_name(),
+                        self.tr("安装失败", "install failed")
+                    );
                 }
             }
             changed = true;
@@ -6041,6 +6609,7 @@ impl IdeApplicationState {
             FocusTarget::SearchEverywhereModal | FocusTarget::FindInFilesModal => {
                 Some(&self.search_query_input)
             }
+            FocusTarget::RecentProjectsModal => Some(&self.recent_projects_query_input),
             FocusTarget::NewFileModal
             | FocusTarget::NewFolderModal
             | FocusTarget::NewRunConfigModal
@@ -6061,6 +6630,13 @@ impl IdeApplicationState {
             FocusTarget::AiConfigModal(0) => Some(&self.ai_cfg_url),
             FocusTarget::AiConfigModal(1) => Some(&self.ai_cfg_key),
             FocusTarget::AiConfigModal(2) => Some(&self.ai_cfg_model),
+            FocusTarget::CloneGitRepoModal => {
+                if self.clone_modal_field_focus == 0 {
+                    Some(&self.clone_repo_url_input)
+                } else {
+                    Some(&self.clone_target_dir_input)
+                }
+            }
             _ => None,
         }
     }
@@ -6076,6 +6652,7 @@ impl IdeApplicationState {
             FocusTarget::SearchEverywhereModal | FocusTarget::FindInFilesModal => {
                 Some(&mut self.search_query_input)
             }
+            FocusTarget::RecentProjectsModal => Some(&mut self.recent_projects_query_input),
             FocusTarget::NewFileModal
             | FocusTarget::NewFolderModal
             | FocusTarget::NewRunConfigModal
@@ -6096,6 +6673,13 @@ impl IdeApplicationState {
             FocusTarget::AiConfigModal(0) => Some(&mut self.ai_cfg_url),
             FocusTarget::AiConfigModal(1) => Some(&mut self.ai_cfg_key),
             FocusTarget::AiConfigModal(2) => Some(&mut self.ai_cfg_model),
+            FocusTarget::CloneGitRepoModal => {
+                if self.clone_modal_field_focus == 0 {
+                    Some(&mut self.clone_repo_url_input)
+                } else {
+                    Some(&mut self.clone_target_dir_input)
+                }
+            }
             _ => None,
         }
     }
@@ -6110,6 +6694,10 @@ impl IdeApplicationState {
                 self.modal_scroll = 0;
                 self.trigger_find_in_files(30);
             }
+            FocusTarget::RecentProjectsModal => {
+                self.modal_scroll = 0;
+                self.recent_projects_selected_idx = 0;
+            }
             FocusTarget::GitCommitInput => {
                 self.git_engine.commit_message_draft = self.git_commit_input.as_str().to_string();
             }
@@ -6119,6 +6707,24 @@ impl IdeApplicationState {
             FocusTarget::EditorFindInput => {
                 self.editor_find_match_idx = 0;
                 self.jump_to_current_find_match(false);
+            }
+            FocusTarget::CloneGitRepoModal => {
+                self.git_clone_error = None;
+                if self.clone_modal_field_focus == 0 {
+                    if !self.clone_target_manually_edited {
+                        let next_dir = if let Some(repo) =
+                            derive_repo_name_from_url(self.clone_repo_url_input.as_str())
+                        {
+                            self.clone_base_dir.join(repo)
+                        } else {
+                            self.clone_base_dir.clone()
+                        };
+                        self.clone_target_dir_input
+                            .set_text(&next_dir.display().to_string());
+                    }
+                } else {
+                    self.clone_target_manually_edited = true;
+                }
             }
             FocusTarget::SettingsModal => {
                 if self.settings_sdk_focus.is_some() {
@@ -6191,7 +6797,7 @@ impl IdeApplicationState {
                 return;
             }
             self.active_buffer_mut().insert_str_at_cursor(text);
-            self.refresh_active_buffer_diagnostics();
+            self.schedule_or_refresh_active_buffer_diagnostics();
             self.ensure_editor_cursor_visible();
             self.touch_caret_activity();
         }
@@ -6211,7 +6817,7 @@ impl IdeApplicationState {
         }
         if self.focus == FocusTarget::Editor {
             self.active_buffer_mut().backspace_at_cursor();
-            self.refresh_active_buffer_diagnostics();
+            self.schedule_or_refresh_active_buffer_diagnostics();
             self.ensure_editor_cursor_visible();
             self.touch_caret_activity();
         }
@@ -6520,6 +7126,17 @@ impl IdeApplicationState {
                 self.touch_caret_activity();
                 return true;
             }
+            FocusTarget::RecentProjectsModal => {
+                let idx = self.recent_projects_query_input.hit_test_singleline(
+                    canvas,
+                    x,
+                    self.recent_projects_text_start_x,
+                    FontStyle::UiRegular,
+                );
+                self.recent_projects_query_input.set_cursor_at(idx, true);
+                self.touch_caret_activity();
+                return true;
+            }
             FocusTarget::NewFileModal
             | FocusTarget::NewFolderModal
             | FocusTarget::NewRunConfigModal
@@ -6558,6 +7175,20 @@ impl IdeApplicationState {
                     FontStyle::CodeMono,
                     masked,
                 );
+                field.set_cursor_at(idx, true);
+                self.touch_caret_activity();
+                return true;
+            }
+            FocusTarget::CloneGitRepoModal => {
+                let fi = usize::from(self.clone_modal_field_focus.min(1));
+                let rect = self.clone_modal_field_rects[fi];
+                let start_x = rect.x + 8;
+                let field = if fi == 0 {
+                    &mut self.clone_repo_url_input
+                } else {
+                    &mut self.clone_target_dir_input
+                };
+                let idx = field.hit_test_singleline(canvas, x, start_x, FontStyle::CodeMono);
                 field.set_cursor_at(idx, true);
                 self.touch_caret_activity();
                 return true;
@@ -6692,6 +7323,24 @@ impl IdeApplicationState {
                 self.touch_caret_activity();
                 true
             }
+            FocusTarget::CloneGitRepoModal => {
+                let fi = usize::from(self.clone_modal_field_focus.min(1));
+                let rect = self.clone_modal_field_rects[fi];
+                if rect.contains(x, y) {
+                    let start_x = rect.x + 8;
+                    let field = if fi == 0 {
+                        &mut self.clone_repo_url_input
+                    } else {
+                        &mut self.clone_target_dir_input
+                    };
+                    let idx = field.hit_test_singleline(canvas, x, start_x, FontStyle::CodeMono);
+                    field.select_word_at(idx);
+                    self.touch_caret_activity();
+                    true
+                } else {
+                    false
+                }
+            }
             FocusTarget::SettingsModal
                 if self
                     .settings_sdk_focus
@@ -6717,6 +7366,17 @@ impl IdeApplicationState {
                     FontStyle::UiRegular,
                 );
                 self.settings_query_input.select_word_at(idx);
+                self.touch_caret_activity();
+                true
+            }
+            FocusTarget::RecentProjectsModal if self.recent_projects_input_rect.contains(x, y) => {
+                let idx = self.recent_projects_query_input.hit_test_singleline(
+                    canvas,
+                    x,
+                    self.recent_projects_text_start_x,
+                    FontStyle::UiRegular,
+                );
+                self.recent_projects_query_input.select_word_at(idx);
                 self.touch_caret_activity();
                 true
             }
@@ -6782,7 +7442,9 @@ impl IdeApplicationState {
             | FocusTarget::GoToLineModal
             | FocusTarget::AddDebugWatchModal
             | FocusTarget::AiConfigModal(_)
-            | FocusTarget::SettingsModal => self.select_all_at_focus(),
+            | FocusTarget::CloneGitRepoModal
+            | FocusTarget::SettingsModal
+            | FocusTarget::RecentProjectsModal => self.select_all_at_focus(),
             _ => false,
         }
     }
@@ -6793,72 +7455,179 @@ impl IdeApplicationState {
         self.handle_mouse_wheel_2d(x, y, lines_delta, 0);
     }
 
-    /// 二维平滑滚轮滚动：支持垂直加速滚动与代码编辑器水平滚动 (`Shift+滚轮` 或触控板横向滑动)
+    /// 返回当前鼠标坐标 `(x, y)` 所在可滚动视图的「一屏可见行数/条目数」（用于系统「每次滚动一屏 / WHEEL_PAGESCROLL」设置）。
+    pub fn wheel_page_lines_at(&self, x: i32, y: i32) -> usize {
+        if self.run_config_popup_open && self.run_config_popup_rect.contains(x, y) {
+            return 9;
+        }
+        match self.focus {
+            FocusTarget::SettingsModal => {
+                if self.settings_nav_rect.h > 0 && self.settings_nav_rect.contains(x, y) {
+                    return (self.settings_nav_rect.h / 28).max(1) as usize;
+                }
+                let view_h = (self.settings_content_rect.h - 56).max(40);
+                return (view_h / 28).max(1) as usize;
+            }
+            FocusTarget::SearchEverywhereModal | FocusTarget::FindInFilesModal => {
+                return 11;
+            }
+            FocusTarget::RecentProjectsModal => {
+                return self.recent_projects_max_visible.max(1);
+            }
+            _ => {}
+        }
+        if self.left_tool.is_some() && self.left_pane_rect.contains(x, y) {
+            return self.left_scroll_info.visible.max(6);
+        }
+        if self.right_agent_open && self.right_pane_rect.contains(x, y) {
+            if self.right_panel_tab == RightPanelTab::Chat
+                && !self.cached_chat_rows.rows.is_empty()
+                && self.agent_chat_area_rect.h > 4
+            {
+                return ((self.agent_chat_area_rect.h - 4) / 23).max(8) as usize;
+            }
+            return self.right_scroll_info.visible.max(8);
+        }
+        if self.bottom_tool.is_some() && self.bottom_pane_rect.contains(x, y) {
+            return match self.bottom_tool {
+                Some(ToolWindowId::GitLog) => {
+                    if self.git_log_diff_rect.contains(x, y) {
+                        self.git_log_diff_scroll_info.visible.max(6)
+                    } else if self.git_log_files_rect.contains(x, y) {
+                        ((self.git_log_files_rect.h - 4) / 20).max(3) as usize
+                    } else if self.git_log_branches_rect.contains(x, y) {
+                        ((self.git_log_branches_rect.h - 8) / 21).max(3) as usize
+                    } else {
+                        self.git_log_commits_scroll_info.visible.max(6)
+                    }
+                }
+                Some(ToolWindowId::Problems) => self.problems_scroll_info.visible.max(3),
+                _ => self.terminal_scroll_info.visible.max(6),
+            };
+        }
+        if self.active_editor_diff.is_some() && self.editor_scroll_info.visible > 0 {
+            return self.editor_scroll_info.visible;
+        }
+        self.editor_visible_lines.max(12)
+    }
+
+    /// 二维滚轮滚动：支持所有可滚动面板/弹窗，按行/条目跟随系统滚轮行数设置。
     pub fn handle_mouse_wheel_2d(&mut self, x: i32, y: i32, lines_delta: i32, horiz_px_delta: i32) {
         if lines_delta == 0 && horiz_px_delta == 0 {
             return;
         }
+        let apply_delta = |cur: usize, delta: i32, max_s: usize| -> usize {
+            if delta < 0 {
+                cur.saturating_sub((-delta) as usize)
+            } else {
+                (cur + delta as usize).min(max_s)
+            }
+        };
+
         if self.run_config_popup_open && self.run_config_popup_rect.contains(x, y) {
             let max_scroll = self.run_configs.len().saturating_sub(9);
-            if lines_delta < 0 {
-                self.run_config_popup_scroll = self
-                    .run_config_popup_scroll
-                    .saturating_sub((-lines_delta) as usize);
-            } else if lines_delta > 0 {
-                self.run_config_popup_scroll =
-                    (self.run_config_popup_scroll + lines_delta as usize).min(max_scroll);
-            }
+            self.run_config_popup_scroll =
+                apply_delta(self.run_config_popup_scroll, lines_delta, max_scroll);
             return;
         }
         match self.focus {
             FocusTarget::SettingsModal => {
                 if self.settings_nav_rect.h > 0 && self.settings_nav_rect.contains(x, y) {
-                    if lines_delta < 0 {
-                        self.settings_nav_scroll = self
-                            .settings_nav_scroll
-                            .saturating_sub((-lines_delta) as usize);
-                    } else if lines_delta > 0 {
-                        self.settings_nav_scroll = (self.settings_nav_scroll
-                            + lines_delta as usize)
-                            .min(self.settings_nav_max_scroll);
-                    }
-                } else if lines_delta < 0 {
-                    self.modal_scroll = self.modal_scroll.saturating_sub((-lines_delta) as usize);
-                } else if lines_delta > 0 {
-                    self.modal_scroll = (self.modal_scroll + lines_delta as usize)
-                        .min(self.settings_content_max_scroll);
+                    self.settings_nav_scroll = apply_delta(
+                        self.settings_nav_scroll,
+                        lines_delta,
+                        self.settings_nav_max_scroll,
+                    );
+                } else {
+                    self.modal_scroll = apply_delta(
+                        self.modal_scroll,
+                        lines_delta,
+                        self.settings_content_max_scroll,
+                    );
                 }
                 return;
             }
-            FocusTarget::SearchEverywhereModal | FocusTarget::FindInFilesModal => {
-                if lines_delta < 0 {
-                    self.modal_scroll = self.modal_scroll.saturating_sub((-lines_delta) as usize);
-                } else if lines_delta > 0 {
-                    self.modal_scroll = (self.modal_scroll + lines_delta as usize).min(40);
-                }
+            FocusTarget::SearchEverywhereModal => {
+                let max_s = self.search_results.len().saturating_sub(11);
+                self.modal_scroll = apply_delta(self.modal_scroll, lines_delta, max_s);
+                return;
+            }
+            FocusTarget::FindInFilesModal => {
+                let max_s = self.content_search_hits.len().saturating_sub(11);
+                self.modal_scroll = apply_delta(self.modal_scroll, lines_delta, max_s);
+                return;
+            }
+            FocusTarget::RecentProjectsModal => {
+                let total = self.filtered_recent_workspaces().len();
+                let vis = self.recent_projects_max_visible.max(1);
+                let max_s = total.saturating_sub(vis);
+                self.modal_scroll = apply_delta(self.modal_scroll, lines_delta, max_s);
+                return;
+            }
+            FocusTarget::ImagePreviewModal
+            | FocusTarget::AiConfigModal(_)
+            | FocusTarget::CloneGitRepoModal
+            | FocusTarget::NodeMissingModal
+            | FocusTarget::OpenProjectChoiceModal
+            | FocusTarget::EditMessageRewindModal
+            | FocusTarget::NewFileModal
+            | FocusTarget::NewFolderModal
+            | FocusTarget::NewRunConfigModal
+            | FocusTarget::NewGitBranchModal
+            | FocusTarget::NewGitTagModal
+            | FocusTarget::NewGitStashModal
+            | FocusTarget::GitAddRemoteModal
+            | FocusTarget::GitMergeModal
+            | FocusTarget::GitRebaseModal
+            | FocusTarget::GitUnstashModal
+            | FocusTarget::GitResetModal
+            | FocusTarget::GitRollbackModal
+            | FocusTarget::GitRemotesModal
+            | FocusTarget::RenamePathModal
+            | FocusTarget::RenameSymbolModal
+            | FocusTarget::GoToLineModal
+            | FocusTarget::AddDebugWatchModal => {
                 return;
             }
             _ => {}
         }
 
+        if self.active_overlay_rects.iter().any(|r| r.contains(x, y)) {
+            return;
+        }
+
         if self.left_tool.is_some() && self.left_pane_rect.contains(x, y) {
             if self.left_tool == Some(ToolWindowId::Commit) {
-                let max_s = (self.git_engine.changed_files.len() + 4).saturating_sub(4);
-                if lines_delta < 0 {
-                    self.git_changes_scroll = self
-                        .git_changes_scroll
-                        .saturating_sub((-lines_delta) as usize);
-                } else if lines_delta > 0 {
-                    self.git_changes_scroll =
-                        (self.git_changes_scroll + lines_delta as usize).min(max_s);
-                }
+                let max_s = if self.left_scroll_info.total > 0 {
+                    self.left_scroll_info
+                        .total
+                        .saturating_sub(self.left_scroll_info.visible.max(1))
+                } else {
+                    (self.git_engine.changed_files.len() + 2).saturating_sub(4)
+                };
+                self.git_changes_scroll =
+                    apply_delta(self.git_changes_scroll, lines_delta, max_s);
+            } else if self.left_tool == Some(ToolWindowId::Structure) {
+                let max_t = if self.left_scroll_info.total > 0 {
+                    self.left_scroll_info
+                        .total
+                        .saturating_sub(self.left_scroll_info.visible.max(1))
+                } else {
+                    self.cached_structure
+                        .as_ref()
+                        .map(|(_, _, s)| s.len().saturating_sub(6))
+                        .unwrap_or(0)
+                };
+                self.tree_scroll = apply_delta(self.tree_scroll, lines_delta, max_t);
             } else {
-                let max_t = self.project_tree.visible_entries.len().saturating_sub(6);
-                if lines_delta < 0 {
-                    self.tree_scroll = self.tree_scroll.saturating_sub((-lines_delta) as usize);
-                } else if lines_delta > 0 {
-                    self.tree_scroll = (self.tree_scroll + lines_delta as usize).min(max_t);
-                }
+                let max_t = if self.left_scroll_info.total > 0 {
+                    self.left_scroll_info
+                        .total
+                        .saturating_sub(self.left_scroll_info.visible.max(1))
+                } else {
+                    self.project_tree.visible_entries.len().saturating_sub(6)
+                };
+                self.tree_scroll = apply_delta(self.tree_scroll, lines_delta, max_t);
             }
         } else if self.agent_session_tab_strip.w > 0
             && self.agent_session_tab_strip.contains(x, y)
@@ -6874,29 +7643,61 @@ impl IdeApplicationState {
                 self.agent_session_tab_wheel_px = 0;
                 lines_delta
             };
-            if tab_delta < 0 {
-                self.agent_session_tab_scroll = self
-                    .agent_session_tab_scroll
-                    .saturating_sub((-tab_delta) as usize);
-            } else if tab_delta > 0 {
-                self.agent_session_tab_scroll = (self.agent_session_tab_scroll
-                    + tab_delta as usize)
-                    .min(self.agent_session_tab_max_scroll);
-            }
+            self.agent_session_tab_scroll = apply_delta(
+                self.agent_session_tab_scroll,
+                tab_delta,
+                self.agent_session_tab_max_scroll,
+            );
             self.agent_session_tab_reveal = None;
             return;
         } else if self.right_agent_open && self.right_pane_rect.contains(x, y) {
-            let max_r = self
-                .right_scroll_info
-                .total
-                .saturating_sub(self.right_scroll_info.visible.max(1));
-            if self.agent_scroll == usize::MAX {
-                self.agent_scroll = max_r;
-            }
-            if lines_delta < 0 {
-                self.agent_scroll = self.agent_scroll.saturating_sub((-lines_delta) as usize);
-            } else if lines_delta > 0 {
-                self.agent_scroll = (self.agent_scroll + lines_delta as usize).min(max_r);
+            if self.right_panel_tab == RightPanelTab::Chat
+                && !self.cached_chat_rows.row_tops.is_empty()
+                && self.agent_chat_area_rect.h > 4
+            {
+                let max_s = self
+                    .cached_chat_rows
+                    .max_scroll_row_for_height((self.agent_chat_area_rect.h - 4).max(1));
+                let cur = if self.agent_scroll == usize::MAX || self.agent_scroll > max_s {
+                    max_s
+                } else {
+                    self.agent_scroll
+                };
+                if lines_delta < 0 {
+                    let cur_px = self.cached_chat_rows.row_tops[cur];
+                    let target_px = cur_px + lines_delta.saturating_mul(23);
+                    if target_px <= 0 {
+                        self.agent_scroll = 0;
+                    } else {
+                        let next = self
+                            .cached_chat_rows
+                            .row_tops
+                            .partition_point(|&top| top < target_px);
+                        self.agent_scroll = next.min(cur.saturating_sub(1));
+                    }
+                } else if lines_delta > 0 {
+                    if cur >= max_s {
+                        self.agent_scroll = max_s;
+                    } else {
+                        let cur_px = self.cached_chat_rows.row_tops[cur];
+                        let max_px = self.cached_chat_rows.row_tops[max_s];
+                        let target_px = (cur_px + lines_delta.saturating_mul(23)).min(max_px);
+                        let next = self
+                            .cached_chat_rows
+                            .row_tops
+                            .partition_point(|&top| top < target_px);
+                        self.agent_scroll = next.max(cur + 1).min(max_s);
+                    }
+                }
+            } else {
+                let max_r = self
+                    .right_scroll_info
+                    .total
+                    .saturating_sub(self.right_scroll_info.visible.max(1));
+                if self.agent_scroll == usize::MAX {
+                    self.agent_scroll = max_r;
+                }
+                self.agent_scroll = apply_delta(self.agent_scroll, lines_delta, max_r);
             }
         } else if self.bottom_tool.is_some() && self.bottom_pane_rect.contains(x, y) {
             if self.bottom_tool == Some(ToolWindowId::GitLog) {
@@ -6905,71 +7706,51 @@ impl IdeApplicationState {
                         .git_log_diff_scroll_info
                         .total
                         .saturating_sub(self.git_log_diff_scroll_info.visible.max(1));
-                    if lines_delta < 0 {
-                        self.git_diff_scroll =
-                            self.git_diff_scroll.saturating_sub((-lines_delta) as usize);
-                    } else if lines_delta > 0 {
-                        self.git_diff_scroll =
-                            (self.git_diff_scroll + lines_delta as usize).min(max_d);
-                    }
+                    self.git_diff_scroll = apply_delta(self.git_diff_scroll, lines_delta, max_d);
                 } else if self.git_log_files_rect.contains(x, y) {
-                    if lines_delta < 0 {
-                        self.git_files_scroll = self
-                            .git_files_scroll
-                            .saturating_sub((-lines_delta) as usize);
-                    } else if lines_delta > 0 {
-                        self.git_files_scroll =
-                            (self.git_files_scroll + lines_delta as usize).min(120);
-                    }
+                    let max_f = self
+                        .selected_git_commit_hash
+                        .as_ref()
+                        .and_then(|h| self.git_engine.commit_details.get(h))
+                        .map(|d| d.files.len().saturating_sub(1))
+                        .unwrap_or(120);
+                    self.git_files_scroll = apply_delta(self.git_files_scroll, lines_delta, max_f);
                 } else if self.git_log_branches_rect.contains(x, y) {
-                    if lines_delta < 0 {
-                        self.git_branches_scroll = self
-                            .git_branches_scroll
-                            .saturating_sub((-lines_delta) as usize);
-                    } else if lines_delta > 0 {
-                        self.git_branches_scroll =
-                            (self.git_branches_scroll + lines_delta as usize).min(60);
-                    }
+                    let max_b = (self.git_engine.local_branches.len()
+                        + self.git_engine.remote_branches.len()
+                        + self.git_engine.tags.len()
+                        + 4)
+                    .saturating_sub(3);
+                    self.git_branches_scroll =
+                        apply_delta(self.git_branches_scroll, lines_delta, max_b);
                 } else {
                     let max_c = self
                         .git_log_commits_scroll_info
                         .total
                         .saturating_sub(self.git_log_commits_scroll_info.visible.max(1));
-                    if lines_delta < 0 {
-                        self.git_log_scroll =
-                            self.git_log_scroll.saturating_sub((-lines_delta) as usize);
-                    } else if lines_delta > 0 {
-                        self.git_log_scroll =
-                            (self.git_log_scroll + lines_delta as usize).min(max_c);
-                    }
+                    self.git_log_scroll = apply_delta(self.git_log_scroll, lines_delta, max_c);
                 }
             } else if self.bottom_tool == Some(ToolWindowId::Problems) {
-                let max_p = self.lsp_hub.diagnostics.len().saturating_sub(3);
-                if lines_delta < 0 {
-                    self.problems_scroll =
-                        self.problems_scroll.saturating_sub((-lines_delta) as usize);
-                } else if lines_delta > 0 {
-                    self.problems_scroll =
-                        (self.problems_scroll + lines_delta as usize).min(max_p);
-                }
+                let max_p = if self.problems_scroll_info.total > 0 {
+                    self.problems_scroll_info
+                        .total
+                        .saturating_sub(self.problems_scroll_info.visible.max(1))
+                } else {
+                    self.lsp_hub.diagnostics.len().saturating_sub(3)
+                };
+                self.problems_scroll = apply_delta(self.problems_scroll, lines_delta, max_p);
+            } else if self.bottom_tool == Some(ToolWindowId::Debug) {
+                return;
             } else {
                 let pty = self.terminal.active_pty_mut();
                 let total = pty.snapshot().lines.len();
                 let max_up = total.saturating_sub(4);
                 // scroll_offset 表示从底部向上回看多少行
-                if lines_delta < 0 {
-                    pty.scroll_offset = (pty.scroll_offset + (-lines_delta) as usize).min(max_up);
-                } else if lines_delta > 0 {
-                    pty.scroll_offset = pty.scroll_offset.saturating_sub(lines_delta as usize);
-                }
+                pty.scroll_offset = apply_delta(pty.scroll_offset, -lines_delta, max_up);
             }
         } else if let Some(ref mut ed_diff) = self.active_editor_diff {
             let max_line = ed_diff.diff_lines.len().saturating_sub(5);
-            if lines_delta < 0 {
-                ed_diff.scroll = ed_diff.scroll.saturating_sub((-lines_delta) as usize);
-            } else if lines_delta > 0 {
-                ed_diff.scroll = (ed_diff.scroll + lines_delta as usize).min(max_line);
-            }
+            ed_diff.scroll = apply_delta(ed_diff.scroll, lines_delta, max_line);
             if horiz_px_delta != 0 {
                 let limit_hx = if self.editor_horiz_scroll_info.visible > 0 {
                     self.editor_horiz_scroll_info
@@ -6981,13 +7762,14 @@ impl IdeApplicationState {
                 };
                 ed_diff.scroll_x = (ed_diff.scroll_x + horiz_px_delta).clamp(0, limit_hx);
             }
+        } else if self
+            .active_media_tab
+            .is_some_and(|i| i < self.media_tabs.len())
+        {
+            return;
         } else {
             let max_line = self.active_buffer().line_count().saturating_sub(5);
-            if lines_delta < 0 {
-                self.scroll_line = self.scroll_line.saturating_sub((-lines_delta) as usize);
-            } else if lines_delta > 0 {
-                self.scroll_line = (self.scroll_line + lines_delta as usize).min(max_line);
-            }
+            self.scroll_line = apply_delta(self.scroll_line, lines_delta, max_line);
             if horiz_px_delta != 0 {
                 let limit_hx = if self.editor_horiz_scroll_info.visible > 0 {
                     self.editor_horiz_scroll_info
@@ -7097,7 +7879,32 @@ impl IdeApplicationState {
                 }
             }
             DragScrollbar::RightPanel => {
-                self.agent_scroll = ratio_for(self.right_scroll_info);
+                if self.right_panel_tab == RightPanelTab::Chat
+                    && !self.cached_chat_rows.row_tops.is_empty()
+                    && self.agent_chat_area_rect.h > 4
+                {
+                    let info = self.right_scroll_info;
+                    let max_s = self
+                        .cached_chat_rows
+                        .max_scroll_row_for_height((self.agent_chat_area_rect.h - 4).max(1));
+                    let max_px = self
+                        .cached_chat_rows
+                        .row_tops
+                        .get(max_s)
+                        .copied()
+                        .unwrap_or(0)
+                        .max(0) as f32;
+                    let rel = ((y - info.track.y) as f32 / (info.track.h.max(1) as f32))
+                        .clamp(0.0, 1.0);
+                    let target_px = (rel * max_px).round() as i32;
+                    self.agent_scroll = self
+                        .cached_chat_rows
+                        .row_tops
+                        .partition_point(|&top| top < target_px)
+                        .min(max_s);
+                } else {
+                    self.agent_scroll = ratio_for(self.right_scroll_info);
+                }
             }
             DragScrollbar::BottomTerminal => {
                 let info = self.terminal_scroll_info;
@@ -7183,15 +7990,27 @@ impl IdeApplicationState {
         match drag {
             DragSplitter::LeftPanel => {
                 let (min, max) = self.span_limits_for_drag(DockEdge::Left, win_w, win_h);
-                self.left_panel_width = (x - stripe_w).clamp(min, max);
+                let next = (x - stripe_w).clamp(min, max);
+                if next == self.left_panel_width {
+                    return false;
+                }
+                self.left_panel_width = next;
             }
             DragSplitter::RightPanel => {
                 let (min, max) = self.span_limits_for_drag(DockEdge::Right, win_w, win_h);
-                self.right_panel_width = (win_w - stripe_w - x).clamp(min, max);
+                let next = (win_w - stripe_w - x).clamp(min, max);
+                if next == self.right_panel_width {
+                    return false;
+                }
+                self.right_panel_width = next;
             }
             DragSplitter::BottomPanel => {
                 let (min, max) = self.span_limits_for_drag(DockEdge::Bottom, win_w, win_h);
-                self.bottom_panel_height = (win_h - status_h - y).clamp(min, max);
+                let next = (win_h - status_h - y).clamp(min, max);
+                if next == self.bottom_panel_height {
+                    return false;
+                }
+                self.bottom_panel_height = next;
             }
         }
         true
@@ -7894,9 +8713,25 @@ impl IdeApplicationState {
                 }
             }
             HitAction::GenerateAiCommitMessage => {
-                self.git_engine.request_ai_commit_diff();
-                self.status_notification =
-                    "正在后台分析 Git Diff 并生成 Commit 信息...".to_string();
+                if self.ai_commit_generating {
+                    return;
+                }
+                if self.git_engine.request_ai_commit_diff() {
+                    self.ai_commit_generating = true;
+                    self.status_notification = self
+                        .tr(
+                            "正在后台分析 Git Diff 并生成 Commit 信息...",
+                            "Analyzing Git diff and generating commit message...",
+                        )
+                        .to_string();
+                } else {
+                    self.status_notification = self
+                        .tr(
+                            "Git 后台服务未就绪，请稍后重试",
+                            "Git background worker is unavailable",
+                        )
+                        .to_string();
+                }
             }
             HitAction::RollbackGitFile(path) => {
                 self.git_engine.request_rollback_file(&path);
@@ -8236,6 +9071,7 @@ impl IdeApplicationState {
                 self.save_global_settings();
             }
             HitAction::RefreshLocalCliAgents => {
+                self.node_env = detect_node_and_npm();
                 self.agent_hub.refresh_local_cli_agents();
                 self.agent_mode = self.agent_hub.normalize_mode_for_active(self.agent_mode);
                 self.ai_cfg_model.set_text(&self.agent_hub.active_model());
@@ -8586,7 +9422,6 @@ impl IdeApplicationState {
             }
             HitAction::CancelAgentRequest => {
                 self.agent_hub.cancel_active_request();
-                self.agent_busy_started_at = None;
                 self.agent_scroll = usize::MAX;
                 self.status_notification = "已停止当前 AI 生成".to_string();
             }
@@ -8595,6 +9430,58 @@ impl IdeApplicationState {
             }
             HitAction::SaveAiConfigModal => {
                 self.save_ai_config_modal();
+            }
+            HitAction::InstallAgentCli(kind) => {
+                self.start_install_agent_cli(kind);
+            }
+            HitAction::OpenNodeJsDownloadPage => {
+                if open_http_url(NODEJS_DOWNLOAD_URL) {
+                    self.status_notification = format!(
+                        "🌐 {}: {}",
+                        self.tr("已打开 Node.js 官网下载页", "Opened Node.js download page"),
+                        NODEJS_DOWNLOAD_URL
+                    );
+                }
+            }
+            HitAction::RecheckNodeAndRetryInstall => {
+                self.recheck_node_and_retry_install();
+            }
+            HitAction::InstallGit => {
+                self.start_install_git();
+            }
+            HitAction::OpenGitDownloadPage => {
+                if open_http_url(GIT_DOWNLOAD_URL) {
+                    self.status_notification = format!(
+                        "🌐 {}: {}",
+                        self.tr("已打开 Git 官方下载页", "Opened Git download page"),
+                        GIT_DOWNLOAD_URL
+                    );
+                }
+            }
+            HitAction::OpenCloneGitRepoModal => {
+                self.open_clone_git_repo_modal();
+            }
+            HitAction::FocusCloneModalField(slot) => {
+                let slot = slot.min(1);
+                self.focus = FocusTarget::CloneGitRepoModal;
+                self.clone_modal_field_focus = slot;
+                let rect = self.clone_modal_field_rects[slot as usize];
+                let start_x = rect.x + 8;
+                let field = if slot == 0 {
+                    &mut self.clone_repo_url_input
+                } else {
+                    &mut self.clone_target_dir_input
+                };
+                let idx = field.hit_test_singleline(canvas, x, start_x, FontStyle::CodeMono);
+                field.set_cursor_at(idx, shift);
+                self.mouse_drag_target = Some(FocusTarget::CloneGitRepoModal);
+                self.touch_caret_activity();
+            }
+            HitAction::BrowseCloneTargetDir => {
+                self.request_open_folder_dialog_with_mode(FolderPickMode::CloneTarget);
+            }
+            HitAction::SubmitGitClone { new_window } => {
+                self.submit_git_clone(new_window);
             }
             HitAction::FocusTerminalInput => {
                 self.focus = FocusTarget::TerminalInput;
@@ -8755,6 +9642,7 @@ impl IdeApplicationState {
                 self.set_ui_scale((pct as f32 / 100.0).clamp(0.85, 2.0));
             }
             HitAction::SelectSettingsPage(page) => {
+                self.commit_mobile_sdk_locations_from_inputs();
                 self.settings_sdk_focus = None;
                 if self.settings_page != page {
                     self.settings_page = page;
@@ -8763,6 +9651,7 @@ impl IdeApplicationState {
                 }
             }
             HitAction::FocusSettingsSearch => {
+                self.commit_mobile_sdk_locations_from_inputs();
                 self.settings_sdk_focus = None;
                 let idx = self.settings_query_input.hit_test_singleline(
                     canvas,
@@ -8792,6 +9681,23 @@ impl IdeApplicationState {
             }
             HitAction::OpenFolderInNewWindowDialog => {
                 self.request_open_folder_dialog_with_mode(FolderPickMode::NewWindow);
+            }
+            HitAction::OpenRecentProjectsModal => {
+                self.open_recent_projects_modal();
+            }
+            HitAction::FocusRecentProjectsSearch => {
+                let idx = self.recent_projects_query_input.hit_test_singleline(
+                    canvas,
+                    x,
+                    self.recent_projects_text_start_x,
+                    FontStyle::UiRegular,
+                );
+                self.recent_projects_query_input.set_cursor_at(idx, shift);
+                self.mouse_drag_target = Some(FocusTarget::RecentProjectsModal);
+                self.touch_caret_activity();
+            }
+            HitAction::RemoveRecentWorkspace(path) => {
+                self.remove_recent_workspace(&path);
             }
             HitAction::PromptOpenWorkspace(path) => {
                 self.project_popup_open = false;
@@ -8837,12 +9743,13 @@ impl IdeApplicationState {
             }
             HitAction::CloseModalOrPopup => {
                 if self.focus == FocusTarget::SettingsModal {
-                    self.commit_mobile_sdk_locations_from_inputs();
+                    self.close_settings_modal();
+                } else {
+                    self.focus = FocusTarget::Editor;
                 }
                 self.pending_open_workspace = None;
                 self.active_image_preview = None;
                 self.prev_focus_before_image_preview = None;
-                self.focus = FocusTarget::Editor;
                 self.close_top_menu();
                 self.git_branch_popup_open = false;
                 self.agent_provider_popup_open = false;
@@ -9259,6 +10166,13 @@ impl IdeApplicationState {
             (0..3)
                 .find(|&fi| self.ai_cfg_field_rects[fi].contains(x, y))
                 .map(FocusTarget::AiConfigModal)
+        } else if self.focus == FocusTarget::CloneGitRepoModal {
+            if let Some(fi) = (0..2u8).find(|&i| self.clone_modal_field_rects[i as usize].contains(x, y)) {
+                self.clone_modal_field_focus = fi;
+                Some(FocusTarget::CloneGitRepoModal)
+            } else {
+                None
+            }
         } else if matches!(
             self.focus,
             FocusTarget::NewFileModal
@@ -9289,6 +10203,10 @@ impl IdeApplicationState {
                 self.settings_sdk_focus = None;
             }
             Some(FocusTarget::SettingsModal)
+        } else if self.focus == FocusTarget::RecentProjectsModal
+            && self.recent_projects_input_rect.contains(x, y)
+        {
+            Some(FocusTarget::RecentProjectsModal)
         } else {
             None
         };
@@ -9826,6 +10744,7 @@ impl IdeApplicationState {
         let w = canvas.width as i32;
         let h = canvas.height as i32;
         self.last_win_size = (w, h);
+        canvas.fast_image_resample = self.active_splitter_drag.is_some();
         let t = self.theme;
 
         // 1. Islands 外围深色底板
@@ -10083,6 +11002,12 @@ impl IdeApplicationState {
             | FocusTarget::GitRemotesModal => {
                 self.render_git_operation_modal(canvas, w, h);
             }
+            FocusTarget::CloneGitRepoModal => {
+                self.render_clone_git_repo_modal(canvas, w, h);
+            }
+            FocusTarget::NodeMissingModal => {
+                self.render_node_missing_modal(canvas, w, h);
+            }
             FocusTarget::SettingsModal => {
                 self.render_settings_modal(canvas, w, h);
             }
@@ -10091,6 +11016,9 @@ impl IdeApplicationState {
             }
             FocusTarget::OpenProjectChoiceModal => {
                 self.render_open_project_choice_modal(canvas, w, h);
+            }
+            FocusTarget::RecentProjectsModal => {
+                self.render_recent_projects_modal(canvas, w, h);
             }
             FocusTarget::EditMessageRewindModal => {
                 self.render_edit_message_rewind_modal(canvas, w, h);
@@ -10110,6 +11038,7 @@ impl IdeApplicationState {
         }
         self.render_startup_animation_overlay(canvas, w, h);
         self.render_window_attention_flash(canvas, w, h);
+        canvas.fast_image_resample = false;
     }
 
     fn render_startup_animation_overlay(&self, canvas: &mut SurfaceCanvas, w: i32, h: i32) {
@@ -10778,27 +11707,7 @@ impl IdeApplicationState {
             },
         ));
 
-        // 3. 主题切换图标
-        let theme_btn = Rect::new(rect.x + 5, rect.y + 84, 32, 30);
-        let theme_hov = theme_btn.contains(hx, hy);
-        if theme_hov {
-            canvas.fill_rounded_rect(theme_btn, 6, t.panel_bg);
-        }
-        canvas.draw_theme_icon(
-            theme_btn.x + 8,
-            theme_btn.y + 7,
-            if theme_hov {
-                t.text_primary
-            } else {
-                t.text_muted
-            },
-        );
-        self.hit_regions.push((
-            theme_btn,
-            HitAction::ExecuteIdeAction(IdeAction::SwitchTheme),
-        ));
-
-        // 4. 设置与快捷键图标
+        // 3. 设置与快捷键图标（已移除右侧主题切换按钮，仅保留系统设置中的主题切换）
         let set_btn = Rect::new(rect.x + 5, rect.y + rect.h - 40, 32, 30);
         let set_hov = set_btn.contains(hx, hy);
         if set_hov {
@@ -11126,6 +12035,10 @@ impl IdeApplicationState {
                 );
                 let mut y = rect.y + 37;
 
+                if self.git_engine.has_loaded_snapshot && !self.git_engine.git_installed {
+                    let card = Rect::new(rect.x + 8, y, (rect.w - 16).max(80), 156);
+                    self.render_git_missing_card(canvas, card);
+                } else {
                 // 1. 当前分支胶囊与 Ahead/Behind 指示器 + 快捷 Fetch / Pull / Push 按钮
                 let branch_name = self.git_engine.current_branch.clone();
                 let (ahead, behind) = self.git_engine.ahead_behind;
@@ -11648,18 +12561,63 @@ impl IdeApplicationState {
 
                 let ai_msg_w = 82;
                 let ai_msg_btn = Rect::new(rect.x + rect.w - ai_msg_w - 8, opt_y + 1, ai_msg_w, 22);
-                canvas.stroke_rounded_rect(ai_msg_btn, 4, t.accent_blue, t.window_bg);
-                canvas.draw_ai_sparkle_icon(ai_msg_btn.x + 5, ai_msg_btn.y + 3, t.accent_blue);
+                let ai_busy = self.ai_commit_generating;
+                let ai_hov = !ai_busy && ai_msg_btn.contains(hx, hy);
+                canvas.stroke_rounded_rect(
+                    ai_msg_btn,
+                    4,
+                    if ai_busy {
+                        t.border_color
+                    } else {
+                        t.accent_blue
+                    },
+                    if ai_busy {
+                        t.panel_header_bg
+                    } else if ai_hov {
+                        t.popup_hover_bg
+                    } else {
+                        t.window_bg
+                    },
+                );
+                if ai_busy {
+                    canvas.draw_subtle_spinner(
+                        ai_msg_btn.x + 12,
+                        ai_msg_btn.y + 11,
+                        4.8,
+                        self.spinner_phase(),
+                        t.accent_blue,
+                        t.border_color,
+                        0.95,
+                    );
+                } else {
+                    canvas.draw_ai_sparkle_icon(
+                        ai_msg_btn.x + 5,
+                        ai_msg_btn.y + 3,
+                        if ai_hov { 0xFFFFFF } else { t.accent_blue },
+                    );
+                }
                 canvas.draw_text_styled(
                     ai_msg_btn.x + 22,
                     ai_msg_btn.y + 2,
-                    self.tr("AI 生成", "AI Msg"),
-                    t.accent_blue,
+                    if ai_busy {
+                        self.tr("生成中...", "Working")
+                    } else {
+                        self.tr("AI 生成", "AI Msg")
+                    },
+                    if ai_busy {
+                        t.text_muted
+                    } else if ai_hov {
+                        0xFFFFFF
+                    } else {
+                        t.accent_blue
+                    },
                     ai_msg_w - 26,
                     FontStyle::UiSmall,
                 );
-                self.hit_regions
-                    .push((ai_msg_btn, HitAction::GenerateAiCommitMessage));
+                if !ai_busy {
+                    self.hit_regions
+                        .push((ai_msg_btn, HitAction::GenerateAiCommitMessage));
+                }
 
                 // 4. Commit Message 输入框 + 双按钮：[提交 Commit (N)]  [提交并推送…]
                 let msg_box = Rect::new(rect.x + 8, commit_box_y + 26, rect.w - 16, 46);
@@ -11769,6 +12727,7 @@ impl IdeApplicationState {
                 );
                 self.hit_regions
                     .push((cp_btn, HitAction::CommitAndPushGitChanges));
+                }
             }
             ToolWindowId::Structure => {
                 canvas.fill_rect(
@@ -13056,25 +14015,9 @@ impl IdeApplicationState {
             (body.h - 28).max(32),
         );
         // 透明通道棋盘格底纹，方便识别透明 PNG/SVG 边界
-        let tile = 16;
         let c1 = t.window_bg;
         let c2 = blend_rgb(t.window_bg, t.text_primary, 0.045);
-        for row in 0..((inner.h / tile) + 1) {
-            let ty = inner.y + row * tile;
-            let th = tile.min(inner.y + inner.h - ty);
-            if th <= 0 {
-                break;
-            }
-            for col in 0..((inner.w / tile) + 1) {
-                let tx = inner.x + col * tile;
-                let tw = tile.min(inner.x + inner.w - tx);
-                if tw <= 0 {
-                    break;
-                }
-                let col_rgb = if (row + col) % 2 == 0 { c1 } else { c2 };
-                canvas.fill_rect(Rect::new(tx, ty, tw, th), col_rgb);
-            }
-        }
+        canvas.fill_checkerboard_rect(inner, 16, c1, c2);
 
         if let Some(ref im) = tab.preview_image {
             let scale = (tab.zoom_pct as f32 / 100.0).clamp(0.25, 3.0);
@@ -13429,12 +14372,44 @@ impl IdeApplicationState {
         self.editor_code_start_x = code_start_x;
         let right_limit = rect.x + rect.w - 14;
         let horiz_avail_w = (right_limit - code_start_x).max(24);
-        let max_line_px = diff_snap
-            .diff_lines
-            .iter()
-            .map(|dl| canvas.measure_text(&dl.content, FontStyle::CodeMono).0)
-            .max()
-            .unwrap_or(0);
+        let max_line_px = if let Some((_, cached_px)) = diff_snap
+            .cached_max_line_px
+            .filter(|(cw, _)| *cw == char_w)
+        {
+            cached_px
+        } else {
+            let mut candidates: Vec<(usize, i32)> = diff_snap
+                .diff_lines
+                .iter()
+                .enumerate()
+                .map(|(idx, dl)| {
+                    let est: i32 = dl
+                        .content
+                        .chars()
+                        .map(|c| if c.is_ascii() { char_w } else { char_w * 2 })
+                        .sum();
+                    (idx, est)
+                })
+                .collect();
+            let max_est = candidates.iter().map(|(_, e)| *e).max().unwrap_or(0);
+            let thresh = (max_est - char_w * 16).max(0);
+            candidates.retain(|(_, e)| *e >= thresh);
+            candidates.sort_by(|a, b| b.1.cmp(&a.1));
+            let px = candidates
+                .into_iter()
+                .take(12)
+                .map(|(idx, _)| {
+                    canvas
+                        .measure_text(&diff_snap.diff_lines[idx].content, FontStyle::CodeMono)
+                        .0
+                })
+                .max()
+                .unwrap_or(0);
+            if let Some(ref mut ed_diff) = self.active_editor_diff {
+                ed_diff.cached_max_line_px = Some((char_w, px));
+            }
+            px
+        };
         let content_total_w = max_line_px + 48;
         let has_horiz_overflow = content_total_w > horiz_avail_w;
         let max_scroll_x = (content_total_w - horiz_avail_w).max(0);
@@ -13694,22 +14669,8 @@ impl IdeApplicationState {
             tx += 26;
 
             canvas.draw_chevron_down(tx + 2, rect.y + 13, t.text_muted);
-            tx += 18;
 
             let clr_btn = Rect::new(rect.x + rect.w - 300, rect.y + 5, 22, 22);
-            if clr_btn.x - tx > 130 {
-                canvas.draw_text_styled(
-                    tx + 6,
-                    rect.y + 8,
-                    self.tr(
-                        "Ctrl+C 复制 · Ctrl+V 粘贴 · 点击链接或文件路径打开",
-                        "Ctrl+C Copy · Ctrl+V Paste · Click a link or file path to open",
-                    ),
-                    t.text_muted,
-                    clr_btn.x - tx - 14,
-                    FontStyle::UiSmall,
-                );
-            }
 
             // 清空终端输出图标
             let clr_hov = clr_btn.contains(hx, hy);
@@ -14459,6 +15420,17 @@ impl IdeApplicationState {
                 self.git_log_diff_rect = Rect::new(0, 0, 0, 0);
                 self.git_log_commits_scroll_info = ScrollTrackInfo::default();
                 self.git_log_diff_scroll_info = ScrollTrackInfo::default();
+
+                if self.git_engine.has_loaded_snapshot && !self.git_engine.git_installed {
+                    let card = Rect::new(
+                        content_rect.x + 12,
+                        content_rect.y + 10,
+                        (content_rect.w - 24).min(520).max(200),
+                        148.min(content_rect.h - 20).max(110),
+                    );
+                    self.render_git_missing_card(canvas, card);
+                    return;
+                }
 
                 // 顶部 IDEA Git Log 工具栏：[搜索框] [分支过滤状态] [Fetch/Pull/Push/Refresh] [Checkout/New Branch/Cherry-Pick/Revert/Copy Hash]
                 let tb_rect = Rect::new(
@@ -15566,7 +16538,9 @@ impl IdeApplicationState {
             24 + (remotes.len() as i32) * 26
         };
         let (ahead, behind) = self.git_engine.ahead_behind;
-        let popup_h = (branches.len() as i32) * 28 + remote_h + 236;
+        let git_missing = self.git_engine.has_loaded_snapshot && !self.git_engine.git_installed;
+        let missing_h = if git_missing { 34 } else { 0 };
+        let popup_h = (branches.len() as i32) * 28 + remote_h + 236 + missing_h;
         let popup_x = if self.git_pane_popup_anchor_x() > 0 {
             self.git_pane_popup_anchor_x()
         } else {
@@ -15597,6 +16571,36 @@ impl IdeApplicationState {
         );
 
         let mut y = popup_rect.y + 34;
+        if git_missing {
+            let inst_row = Rect::new(popup_rect.x + 8, y, popup_w - 16, 28);
+            let ihov = inst_row.contains(hx, hy);
+            canvas.stroke_rounded_rect(
+                inst_row,
+                5,
+                t.warning_yellow,
+                if ihov {
+                    t.accent_blue
+                } else {
+                    blend_rgb(t.popup_bg, t.warning_yellow, 0.16)
+                },
+            );
+            let msg = if self.git_install_in_progress {
+                self.tr("⏳ 正在下载并安装 Git...", "⏳ Downloading & installing Git...")
+            } else {
+                self.tr(
+                    "⚠ 本机未安装 Git · 点击直接下载安装",
+                    "⚠ Git not installed · Click to Download & Install",
+                )
+            };
+            canvas.draw_text_centered(
+                inst_row,
+                msg,
+                if ihov { 0xFFFFFF } else { t.warning_yellow },
+                FontStyle::UiSmall,
+            );
+            self.hit_regions.push((inst_row, HitAction::InstallGit));
+            y += 34;
+        }
         let actions = [
             (
                 self.tr("+ 新建分支...", "+ New Branch..."),
@@ -15803,21 +16807,23 @@ impl IdeApplicationState {
     fn render_project_popup(&mut self, canvas: &mut SurfaceCanvas) {
         let t = self.theme;
         let (hx, hy) = self.hover_pos;
-        let recent: Vec<PathBuf> = self
+        let all_recent: Vec<PathBuf> = self
             .recent_workspaces
             .iter()
-            .filter(|p| *p != &self.workspace_root)
-            .take(4)
+            .filter(|p| !workspace_paths_equal(p, &self.workspace_root))
             .cloned()
             .collect();
+        let max_recent_shown = ((canvas.height as i32 - 360) / 28).clamp(4, 8) as usize;
+        let recent: Vec<PathBuf> = all_recent.iter().take(max_recent_shown).cloned().collect();
+        let has_more_recent = !all_recent.is_empty();
 
-        let popup_w = 388;
+        let popup_w = 404;
         let recent_h = if recent.is_empty() {
             0
         } else {
-            28 + (recent.len() as i32) * 28
+            28 + (recent.len() as i32) * 28 + if has_more_recent { 30 } else { 0 }
         };
-        let popup_h = 56 + 5 * 28 + recent_h + 28 + (ThemeKind::all().len() as i32) * 28 + 10;
+        let popup_h = 56 + 6 * 28 + recent_h + 10;
         let popup_x = 68;
         let popup_y = 40;
         let popup_rect = Rect::new(popup_x, popup_y, popup_w, popup_h);
@@ -15858,6 +16864,11 @@ impl IdeApplicationState {
                 self.tr("打开文件夹...", "Open Folder..."),
                 "Ctrl+O",
                 HitAction::OpenFolderDialog,
+            ),
+            (
+                self.tr("从 Git 仓库打开...", "Open from Git Repository..."),
+                "",
+                HitAction::OpenCloneGitRepoModal,
             ),
             (
                 self.tr("在新窗口中打开文件夹...", "Open Folder in New Window..."),
@@ -15925,7 +16936,7 @@ impl IdeApplicationState {
                 FontStyle::UiSmall,
             );
             y += 20;
-            for path in recent {
+            for path in &recent {
                 let new_win_w = 66;
                 let row = Rect::new(popup_x + 6, y, popup_w - new_win_w - 18, 26);
                 let hovered = row.contains(hx, hy);
@@ -15943,7 +16954,7 @@ impl IdeApplicationState {
                     y + 6,
                     if hovered { 0xFFFFFF } else { t.accent_blue },
                 );
-                canvas.draw_text_styled(
+                canvas.draw_text_ellipsis(
                     row.x + 26,
                     y + 4,
                     &label,
@@ -15977,50 +16988,52 @@ impl IdeApplicationState {
                     FontStyle::UiSmall,
                 );
                 self.hit_regions
-                    .push((nw_btn, HitAction::OpenWorkspaceInNewWindow(path)));
+                    .push((nw_btn, HitAction::OpenWorkspaceInNewWindow(path.clone())));
                 y += 28;
             }
-        }
 
-        canvas.fill_rect(
-            Rect::new(popup_x + 10, y + 2, popup_w - 20, 1),
-            t.border_color,
-        );
-        y += 8;
-        canvas.draw_text_styled(
-            popup_x + 12,
-            y,
-            self.tr("外观主题", "Appearance Theme"),
-            t.text_muted,
-            popup_w - 24,
-            FontStyle::UiSmall,
-        );
-        y += 20;
-
-        for &kind in ThemeKind::all() {
-            let row = Rect::new(popup_x + 6, y, popup_w - 12, 27);
-            let active = self.theme.kind == kind;
-            let hovered = row.contains(hx, hy);
-            if active || hovered {
-                canvas.fill_rounded_rect(row, 5, t.popup_hover_bg);
+            if has_more_recent {
+                y += 2;
+                let more_row = Rect::new(popup_x + 6, y, popup_w - 12, 26);
+                let more_hov = more_row.contains(hx, hy);
+                if more_hov {
+                    canvas.fill_rounded_rect(more_row, 5, t.popup_hover_bg);
+                }
+                let total_saved = self.recent_workspaces.len();
+                let remaining = all_recent.len().saturating_sub(recent.len());
+                let more_label = match self.ui_lang {
+                    UiLanguage::ZhCn if remaining > 0 => format!(
+                        "更多最近项目... (还有 {remaining} 个，共 {total_saved} 个)"
+                    ),
+                    UiLanguage::ZhCn => {
+                        format!("更多最近项目... (共 {total_saved} 个)")
+                    }
+                    UiLanguage::EnUs if remaining > 0 => format!(
+                        "More Recent Projects... (+{remaining}, {total_saved} total)"
+                    ),
+                    UiLanguage::EnUs => {
+                        format!("More Recent Projects... ({total_saved} total)")
+                    }
+                };
+                canvas.draw_text_ellipsis(
+                    more_row.x + 10,
+                    y + 4,
+                    &more_label,
+                    if more_hov { 0xFFFFFF } else { t.accent_blue },
+                    more_row.w - 30,
+                    FontStyle::UiRegular,
+                );
+                canvas.draw_text_styled(
+                    more_row.x + more_row.w - 18,
+                    y + 3,
+                    "›",
+                    if more_hov { 0xFFFFFF } else { t.text_muted },
+                    14,
+                    FontStyle::UiBold,
+                );
+                self.hit_regions
+                    .push((more_row, HitAction::OpenRecentProjectsModal));
             }
-            if active {
-                canvas.draw_check_icon(row.x + 8, y + 7, 0xFFFFFF);
-            }
-            canvas.draw_text_styled(
-                row.x + 26,
-                y + 4,
-                kind.display_name(),
-                if active || hovered {
-                    0xFFFFFF
-                } else {
-                    t.text_primary
-                },
-                popup_w - 38,
-                FontStyle::UiRegular,
-            );
-            self.hit_regions.push((row, HitAction::SelectTheme(kind)));
-            y += 28;
         }
     }
 
@@ -16751,6 +17764,11 @@ impl IdeApplicationState {
                 false,
             ),
             (
+                self.tr("从 Git 仓库打开...", "Open from Git Repository..."),
+                HitAction::OpenCloneGitRepoModal,
+                false,
+            ),
+            (
                 if self.hamburger_menu_expanded {
                     self.tr("隐藏主菜单栏", "Hide Main Menu Bar")
                 } else {
@@ -16782,11 +17800,6 @@ impl IdeApplicationState {
             (
                 self.tr("缩小界面与字体 (Ctrl+-)", "Zoom Out UI & Fonts (Ctrl+-)"),
                 HitAction::ExecuteIdeAction(IdeAction::ZoomOutUi),
-                false,
-            ),
-            (
-                self.tr("快速切换主题 (Ctrl+`)", "Quick Switch Theme (Ctrl+`)"),
-                HitAction::ExecuteIdeAction(IdeAction::SwitchTheme),
                 false,
             ),
             (
@@ -17262,6 +18275,780 @@ impl IdeApplicationState {
         );
         self.hit_regions
             .push((new_btn, HitAction::ConfirmOpenPendingInNewWindow));
+    }
+
+    fn render_recent_projects_modal(&mut self, canvas: &mut SurfaceCanvas, w: i32, h: i32) {
+        let t = self.theme;
+        let (hx, hy) = self.hover_pos;
+        let mw = 680.min((w - 36).max(360));
+        let mh = (h - 56).clamp(320, 560).min((h - 20).max(260));
+        let mx = (w - mw) / 2;
+        let my = ((h - mh) / 3).max(12);
+        let modal = Rect::new(mx, my, mw, mh);
+
+        let backdrop = Rect::new(0, 0, w, h);
+        canvas.fill_rect_alpha(backdrop, 0x000000, 88);
+        self.active_overlay_rects.push(backdrop);
+        self.active_overlay_rects.push(modal);
+        self.hit_regions
+            .push((backdrop, HitAction::CloseModalOrPopup));
+        self.hit_regions
+            .push((modal, HitAction::FocusRecentProjectsSearch));
+
+        canvas.fill_rounded_shadow(modal, 10);
+        canvas.stroke_rounded_rect(modal, 10, t.accent_blue, t.popup_bg);
+
+        let header = Rect::new(mx + 2, my + 2, mw - 4, 36);
+        canvas.fill_rounded_rect(header, 8, t.panel_header_bg);
+        canvas.draw_folder_outline_icon(mx + 14, my + 12, t.accent_blue);
+        let total_saved = self.recent_workspaces.len();
+        let hdr_title = match self.ui_lang {
+            UiLanguage::ZhCn => {
+                format!("最近打开的项目  ({total_saved} / {MAX_RECENT_WORKSPACES})")
+            }
+            UiLanguage::EnUs => {
+                format!("Recent Projects  ({total_saved} / {MAX_RECENT_WORKSPACES})")
+            }
+        };
+        canvas.draw_text_styled(
+            mx + 36,
+            my + 10,
+            &hdr_title,
+            t.text_primary,
+            mw - 86,
+            FontStyle::UiBold,
+        );
+
+        let close_btn = Rect::new(mx + mw - 36, my + 7, 24, 24);
+        let close_hot = close_btn.contains(hx, hy);
+        if close_hot {
+            canvas.fill_rounded_rect(close_btn, 5, t.popup_hover_bg);
+        }
+        canvas.draw_window_close_icon(
+            close_btn.x + 12,
+            close_btn.y + 12,
+            if close_hot { 0xFFFFFF } else { t.text_secondary },
+        );
+        self.hit_regions
+            .push((close_btn, HitAction::CloseModalOrPopup));
+
+        let input_box = Rect::new(mx + 14, my + 46, mw - 28, 30);
+        self.recent_projects_input_rect = input_box;
+        canvas.stroke_rounded_rect(input_box, 6, t.accent_blue, t.editor_bg);
+        canvas.draw_search_icon(input_box.x + 10, input_box.y + 7, t.text_muted);
+        self.recent_projects_text_start_x = input_box.x + 30;
+        let field_box = Rect::new(
+            self.recent_projects_text_start_x,
+            input_box.y,
+            (input_box.w - 38).max(60),
+            input_box.h,
+        );
+        let placeholder = self.tr(
+            "搜索项目名称或路径...",
+            "Filter recent projects by name or path...",
+        );
+        let ime = self.recent_projects_query_input.render_singleline(
+            canvas,
+            field_box,
+            0,
+            input_box.y + 6,
+            placeholder,
+            true,
+            self.caret_visible,
+            t.text_primary,
+            t.text_muted,
+            t.editor_selection_bg,
+            t.accent_blue,
+            FontStyle::UiRegular,
+        );
+        self.ime_spot = ime;
+        self.hit_regions
+            .push((input_box, HitAction::FocusRecentProjectsSearch));
+
+        let list_top = my + 84;
+        let footer_h = 44;
+        let list_h = (mh - 84 - footer_h).max(40);
+        let list_rect = Rect::new(mx + 12, list_top, mw - 24, list_h);
+        self.recent_projects_list_rect = list_rect;
+
+        let row_step = 40;
+        let max_rows = (list_h / row_step).max(1) as usize;
+        self.recent_projects_max_visible = max_rows;
+
+        let filtered = self.filtered_recent_workspaces();
+        let total = filtered.len();
+        let max_scroll = total.saturating_sub(max_rows);
+        if self.modal_scroll > max_scroll {
+            self.modal_scroll = max_scroll;
+        }
+        if total > 0 && self.recent_projects_selected_idx >= total {
+            self.recent_projects_selected_idx = total - 1;
+        } else if total == 0 {
+            self.recent_projects_selected_idx = 0;
+        }
+
+        let has_scrollbar = total > max_rows;
+        let row_w = if has_scrollbar {
+            list_rect.w - 10
+        } else {
+            list_rect.w
+        };
+
+        if filtered.is_empty() {
+            let empty_msg = if self.recent_workspaces.is_empty() {
+                self.tr("暂无最近打开的项目", "No recent projects")
+            } else {
+                self.tr("没有匹配的最近项目", "No matching recent projects")
+            };
+            canvas.draw_text_styled(
+                list_rect.x + 8,
+                list_top + 14,
+                empty_msg,
+                t.text_muted,
+                list_rect.w - 16,
+                FontStyle::UiRegular,
+            );
+        } else {
+            let mut y = list_top;
+            for (idx, path) in filtered
+                .iter()
+                .enumerate()
+                .skip(self.modal_scroll)
+                .take(max_rows)
+            {
+                let is_current = workspace_paths_equal(path, &self.workspace_root);
+                let row = Rect::new(list_rect.x, y, row_w, 36);
+                let hovered = row.contains(hx, hy);
+                let selected = idx == self.recent_projects_selected_idx;
+                if hovered || selected {
+                    canvas.fill_rounded_rect(
+                        row,
+                        6,
+                        if hovered {
+                            t.popup_hover_bg
+                        } else {
+                            t.editor_current_line_bg
+                        },
+                    );
+                }
+
+                canvas.draw_folder_icon(
+                    row.x + 10,
+                    y + 11,
+                    if hovered { 0xFFFFFF } else { t.accent_blue },
+                );
+
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| path.display().to_string());
+
+                let right_reserve = if is_current { 74 } else { 104 };
+                let (name_w, _) = canvas.measure_text(&name, FontStyle::UiBold);
+                let max_name_w = (row.w - 36 - right_reserve).max(60);
+                canvas.draw_text_ellipsis(
+                    row.x + 30,
+                    y + 3,
+                    &name,
+                    if hovered { 0xFFFFFF } else { t.text_primary },
+                    max_name_w,
+                    FontStyle::UiBold,
+                );
+
+                if is_current {
+                    let tag_x = row.x + 30 + name_w.min(max_name_w) + 8;
+                    let tag_w = 48;
+                    if tag_x + tag_w <= row.x + row.w - 8 {
+                        let tag_rect = Rect::new(tag_x, y + 3, tag_w, 16);
+                        canvas.stroke_rounded_rect(
+                            tag_rect,
+                            4,
+                            t.accent_blue,
+                            blend_rgb(t.popup_bg, t.accent_blue, 0.18),
+                        );
+                        canvas.draw_text_centered(
+                            tag_rect,
+                            self.tr("当前", "Current"),
+                            t.accent_blue,
+                            FontStyle::UiSmall,
+                        );
+                    }
+                }
+
+                let path_str = path.display().to_string();
+                canvas.draw_text_ellipsis(
+                    row.x + 30,
+                    y + 19,
+                    &path_str,
+                    if hovered { 0xE2E8F0 } else { t.text_muted },
+                    (row.w - 36 - right_reserve).max(60),
+                    FontStyle::UiSmall,
+                );
+
+                if !is_current {
+                    let del_w = 24;
+                    let nw_w = 66;
+                    let del_btn = Rect::new(row.x + row.w - del_w - 4, y + 6, del_w, 24);
+                    let nw_btn = Rect::new(del_btn.x - nw_w - 6, y + 7, nw_w, 22);
+                    let click_row = Rect::new(row.x, row.y, nw_btn.x - row.x - 4, row.h);
+                    self.hit_regions
+                        .push((click_row, HitAction::PromptOpenWorkspace(path.clone())));
+
+                    let nw_hov = nw_btn.contains(hx, hy);
+                    canvas.stroke_rounded_rect(
+                        nw_btn,
+                        4,
+                        if nw_hov {
+                            t.accent_blue
+                        } else {
+                            t.border_color
+                        },
+                        if nw_hov {
+                            t.popup_hover_bg
+                        } else {
+                            t.window_bg
+                        },
+                    );
+                    canvas.draw_text_centered(
+                        nw_btn,
+                        self.tr("↗ 新窗口", "↗ New Win"),
+                        if nw_hov { 0xFFFFFF } else { t.accent_blue },
+                        FontStyle::UiSmall,
+                    );
+                    self.hit_regions
+                        .push((nw_btn, HitAction::OpenWorkspaceInNewWindow(path.clone())));
+
+                    let del_hov = del_btn.contains(hx, hy);
+                    if del_hov {
+                        canvas.fill_rounded_rect(
+                            del_btn,
+                            4,
+                            blend_rgb(t.popup_bg, t.breakpoint_red, 0.22),
+                        );
+                    }
+                    canvas.draw_text_centered(
+                        del_btn,
+                        "×",
+                        if del_hov {
+                            t.breakpoint_red
+                        } else {
+                            t.text_muted
+                        },
+                        FontStyle::UiBold,
+                    );
+                    self.hit_regions
+                        .push((del_btn, HitAction::RemoveRecentWorkspace(path.clone())));
+                }
+
+                y += row_step;
+            }
+        }
+
+        if has_scrollbar {
+            canvas.draw_vertical_scrollbar(
+                Rect::new(list_rect.x + list_rect.w - 6, list_top + 2, 5, (list_h - 6).max(16)),
+                self.modal_scroll,
+                max_rows,
+                total,
+                t.border_color,
+            );
+        }
+
+        let footer_y = my + mh - footer_h;
+        canvas.fill_rect(Rect::new(mx + 1, footer_y, mw - 2, 1), t.border_color);
+        let footer_note = match self.ui_lang {
+            UiLanguage::ZhCn => {
+                format!("显示 {total} / {total_saved} 个项目（上限 {MAX_RECENT_WORKSPACES}） · ↑↓/滚轮浏览 · 点击或回车打开")
+            }
+            UiLanguage::EnUs => {
+                format!("Showing {total} / {total_saved} projects (max {MAX_RECENT_WORKSPACES}) · Scroll or press Enter to open")
+            }
+        };
+        canvas.draw_text_ellipsis(
+            mx + 16,
+            footer_y + 13,
+            &footer_note,
+            t.text_muted,
+            mw - 128,
+            FontStyle::UiSmall,
+        );
+
+        let done_btn = Rect::new(mx + mw - 104, footer_y + 8, 88, 28);
+        let done_hov = done_btn.contains(hx, hy);
+        canvas.stroke_rounded_rect(
+            done_btn,
+            6,
+            if done_hov {
+                t.accent_blue
+            } else {
+                t.border_color
+            },
+            if done_hov {
+                t.panel_header_bg
+            } else {
+                t.window_bg
+            },
+        );
+        canvas.draw_text_centered(
+            done_btn,
+            self.tr("关闭 (Esc)", "Close (Esc)"),
+            if done_hov {
+                t.text_primary
+            } else {
+                t.text_secondary
+            },
+            FontStyle::UiSmall,
+        );
+        self.hit_regions
+            .push((done_btn, HitAction::CloseModalOrPopup));
+    }
+
+    fn render_git_missing_card(&mut self, canvas: &mut SurfaceCanvas, rect: Rect) {
+        let t = self.theme;
+        let (hx, hy) = self.hover_pos;
+        canvas.stroke_rounded_rect(
+            rect,
+            8,
+            t.warning_yellow,
+            blend_rgb(t.panel_bg, t.warning_yellow, 0.08),
+        );
+        canvas.draw_text_styled(
+            rect.x + 12,
+            rect.y + 10,
+            self.tr("⚠ 本机未检测到 Git", "⚠ Git Not Installed"),
+            t.warning_yellow,
+            rect.w - 24,
+            FontStyle::UiBold,
+        );
+        canvas.draw_text_styled(
+            rect.x + 12,
+            rect.y + 32,
+            self.tr(
+                "需安装 Git 后方可使用版本控制、分支管理与远程仓库克隆。",
+                "Git is required for version control, branches, and cloning repositories.",
+            ),
+            t.text_secondary,
+            rect.w - 24,
+            FontStyle::UiSmall,
+        );
+
+        let btn_y = (rect.y + rect.h - 40).max(rect.y + 58);
+        let inst_w = (rect.w - 24).min(176);
+        let inst_btn = Rect::new(rect.x + 12, btn_y, inst_w, 28);
+        let inst_hot = inst_btn.contains(hx, hy);
+        canvas.fill_rounded_rect(
+            inst_btn,
+            6,
+            if self.git_install_in_progress {
+                blend_rgb(t.accent_blue, t.panel_bg, 0.35)
+            } else if inst_hot {
+                blend_rgb(t.accent_blue, 0xFFFFFF, 0.12)
+            } else {
+                t.accent_blue
+            },
+        );
+        let inst_lbl = if self.git_install_in_progress {
+            self.tr("⏳ 正在下载安装...", "⏳ Installing Git...")
+        } else {
+            self.tr("⬇ 下载并安装 Git", "⬇ Download & Install Git")
+        };
+        canvas.draw_text_centered(inst_btn, inst_lbl, 0xFFFFFF, FontStyle::UiSmall);
+        self.hit_regions.push((inst_btn, HitAction::InstallGit));
+
+        let mut next_x = inst_btn.x + inst_btn.w + 8;
+        if next_x + 74 <= rect.x + rect.w - 10 {
+            let web_btn = Rect::new(next_x, btn_y, 74, 28);
+            let web_hot = web_btn.contains(hx, hy);
+            canvas.stroke_rounded_rect(
+                web_btn,
+                6,
+                if web_hot { t.accent_blue } else { t.border_color },
+                if web_hot { t.popup_hover_bg } else { t.window_bg },
+            );
+            canvas.draw_text_centered(
+                web_btn,
+                self.tr("官网下载", "Website"),
+                if web_hot { 0xFFFFFF } else { t.text_secondary },
+                FontStyle::UiSmall,
+            );
+            self.hit_regions
+                .push((web_btn, HitAction::OpenGitDownloadPage));
+            next_x += 82;
+        }
+        if next_x + 70 <= rect.x + rect.w - 10 {
+            let ref_btn = Rect::new(next_x, btn_y, 70, 28);
+            let ref_hot = ref_btn.contains(hx, hy);
+            canvas.stroke_rounded_rect(
+                ref_btn,
+                6,
+                if ref_hot { t.accent_blue } else { t.border_color },
+                if ref_hot { t.popup_hover_bg } else { t.window_bg },
+            );
+            canvas.draw_text_centered(
+                ref_btn,
+                self.tr("↻ 检测", "↻ Check"),
+                if ref_hot { 0xFFFFFF } else { t.text_secondary },
+                FontStyle::UiSmall,
+            );
+            self.hit_regions
+                .push((ref_btn, HitAction::RefreshGitStatus));
+        }
+    }
+
+    fn render_clone_git_repo_modal(&mut self, canvas: &mut SurfaceCanvas, w: i32, h: i32) {
+        let t = self.theme;
+        let (hx, hy) = self.hover_pos;
+        let git_missing = self.git_engine.has_loaded_snapshot && !self.git_engine.git_installed;
+        let has_err = self.git_clone_error.is_some();
+        let mw = 560.min((w - 36).max(340));
+        let mh = 250 + if git_missing { 44 } else { 0 } + if has_err { 28 } else { 0 };
+        let mx = (w - mw) / 2;
+        let my = (h - mh) / 3;
+        let modal = Rect::new(mx, my, mw, mh);
+
+        canvas.fill_rect_alpha(Rect::new(0, 0, w, h), 0x000000, 88);
+        self.active_overlay_rects.push(Rect::new(0, 0, w, h));
+        self.active_overlay_rects.push(modal);
+
+        canvas.fill_rounded_shadow(modal, 10);
+        canvas.stroke_rounded_rect(modal, 10, t.accent_blue, t.popup_bg);
+
+        let header = Rect::new(mx + 2, my + 2, mw - 4, 36);
+        canvas.fill_rounded_rect(header, 8, t.panel_header_bg);
+        canvas.draw_git_branch_icon(mx + 14, my + 12, t.accent_blue);
+        canvas.draw_text_styled(
+            mx + 34,
+            my + 10,
+            self.tr(
+                "从 Git 仓库打开  (Clone from Remote Repository)",
+                "Open from Git Repository  (Clone from URL)",
+            ),
+            t.text_primary,
+            mw - 60,
+            FontStyle::UiBold,
+        );
+
+        let mut y = my + 48;
+        if git_missing {
+            let warn = Rect::new(mx + 16, y, mw - 32, 34);
+            canvas.stroke_rounded_rect(
+                warn,
+                6,
+                t.warning_yellow,
+                blend_rgb(t.popup_bg, t.warning_yellow, 0.14),
+            );
+            canvas.draw_text_styled(
+                warn.x + 10,
+                warn.y + 8,
+                self.tr(
+                    "⚠ 本机未安装 Git，请先下载安装 Git 后再克隆",
+                    "⚠ Git is not installed on this machine",
+                ),
+                t.warning_yellow,
+                warn.w - 154,
+                FontStyle::UiSmall,
+            );
+            let inst_b = Rect::new(warn.x + warn.w - 138, warn.y + 4, 130, 26);
+            canvas.fill_rounded_rect(inst_b, 5, t.accent_blue);
+            canvas.draw_text_centered(
+                inst_b,
+                if self.git_install_in_progress {
+                    self.tr("⏳ 安装中...", "⏳ Installing...")
+                } else {
+                    self.tr("下载并安装 Git", "Install Git")
+                },
+                0xFFFFFF,
+                FontStyle::UiSmall,
+            );
+            self.hit_regions.push((inst_b, HitAction::InstallGit));
+            y += 44;
+        }
+
+        canvas.draw_text_styled(
+            mx + 16,
+            y,
+            self.tr("远程 Git 仓库地址 (URL):", "Repository URL:"),
+            t.text_secondary,
+            mw - 32,
+            FontStyle::UiSmall,
+        );
+        y += 20;
+
+        let url_rect = Rect::new(mx + 16, y, mw - 32, 32);
+        self.clone_modal_field_rects[0] = url_rect;
+        let url_focused = self.clone_modal_field_focus == 0;
+        canvas.stroke_rounded_rect(
+            url_rect,
+            6,
+            if url_focused { t.accent_blue } else { t.border_color },
+            t.editor_bg,
+        );
+        let url_ph = self.tr(
+            "https://github.com/user/repo.git 或 git@github.com:user/repo.git",
+            "https://github.com/user/repo.git or git@github.com:user/repo.git",
+        );
+        let ime0 = self.clone_repo_url_input.render_singleline(
+            canvas,
+            Rect::new(url_rect.x + 6, url_rect.y, url_rect.w - 12, url_rect.h),
+            2,
+            url_rect.y + 7,
+            url_ph,
+            url_focused,
+            self.caret_visible,
+            t.text_primary,
+            t.text_muted,
+            t.editor_selection_bg,
+            t.accent_blue,
+            FontStyle::CodeMono,
+        );
+        if url_focused {
+            self.ime_spot = ime0;
+        }
+        self.hit_regions
+            .push((url_rect, HitAction::FocusCloneModalField(0)));
+        y += 42;
+
+        canvas.draw_text_styled(
+            mx + 16,
+            y,
+            self.tr("本地保存目录 (Directory):", "Directory:"),
+            t.text_secondary,
+            mw - 32,
+            FontStyle::UiSmall,
+        );
+        y += 20;
+
+        let browse_w = 80;
+        let dir_rect = Rect::new(mx + 16, y, (mw - 32 - browse_w - 8).max(120), 32);
+        self.clone_modal_field_rects[1] = dir_rect;
+        let dir_focused = self.clone_modal_field_focus == 1;
+        canvas.stroke_rounded_rect(
+            dir_rect,
+            6,
+            if dir_focused { t.accent_blue } else { t.border_color },
+            t.editor_bg,
+        );
+        let dir_ph = self.tr("选择或输入本地保存路径...", "Local target directory...");
+        let ime1 = self.clone_target_dir_input.render_singleline(
+            canvas,
+            Rect::new(dir_rect.x + 6, dir_rect.y, dir_rect.w - 12, dir_rect.h),
+            2,
+            dir_rect.y + 7,
+            dir_ph,
+            dir_focused,
+            self.caret_visible,
+            t.text_primary,
+            t.text_muted,
+            t.editor_selection_bg,
+            t.accent_blue,
+            FontStyle::CodeMono,
+        );
+        if dir_focused {
+            self.ime_spot = ime1;
+        }
+        self.hit_regions
+            .push((dir_rect, HitAction::FocusCloneModalField(1)));
+
+        let browse_btn = Rect::new(dir_rect.x + dir_rect.w + 8, y, browse_w, 32);
+        let browse_hot = browse_btn.contains(hx, hy);
+        canvas.stroke_rounded_rect(
+            browse_btn,
+            6,
+            if browse_hot { t.accent_blue } else { t.border_color },
+            if browse_hot { t.popup_hover_bg } else { t.window_bg },
+        );
+        canvas.draw_text_centered(
+            browse_btn,
+            self.tr("浏览…", "Browse…"),
+            if browse_hot { 0xFFFFFF } else { t.text_primary },
+            FontStyle::UiRegular,
+        );
+        self.hit_regions
+            .push((browse_btn, HitAction::BrowseCloneTargetDir));
+        y += 40;
+
+        if let Some(err) = self.git_clone_error.clone() {
+            canvas.draw_text_ellipsis(
+                mx + 16,
+                y,
+                &format!("⚠ {err}"),
+                t.breakpoint_red,
+                mw - 32,
+                FontStyle::UiSmall,
+            );
+        }
+
+        let btn_y = my + mh - 42;
+        let cancel_btn = Rect::new(mx + mw - 104, btn_y, 88, 28);
+        let cancel_hov = cancel_btn.contains(hx, hy);
+        canvas.stroke_rounded_rect(
+            cancel_btn,
+            6,
+            t.border_color,
+            if cancel_hov { t.panel_header_bg } else { t.window_bg },
+        );
+        canvas.draw_text_centered(
+            cancel_btn,
+            self.tr("取消 (Esc)", "Cancel"),
+            t.text_secondary,
+            FontStyle::UiSmall,
+        );
+        self.hit_regions
+            .push((cancel_btn, HitAction::CloseModalOrPopup));
+
+        let nw_btn = Rect::new(cancel_btn.x - 134, btn_y, 126, 28);
+        let nw_hov = nw_btn.contains(hx, hy);
+        canvas.stroke_rounded_rect(
+            nw_btn,
+            6,
+            if nw_hov { t.accent_blue } else { t.border_color },
+            if nw_hov { t.popup_hover_bg } else { t.editor_bg },
+        );
+        canvas.draw_text_centered(
+            nw_btn,
+            self.tr("新窗口克隆打开", "Clone in New Win"),
+            if nw_hov { 0xFFFFFF } else { t.text_primary },
+            FontStyle::UiSmall,
+        );
+        self.hit_regions.push((
+            nw_btn,
+            HitAction::SubmitGitClone { new_window: true },
+        ));
+
+        let ok_btn = Rect::new(nw_btn.x - 150, btn_y, 142, 28);
+        canvas.fill_rounded_rect(ok_btn, 6, t.accent_blue);
+        canvas.draw_text_centered(
+            ok_btn,
+            if self.git_clone_in_progress {
+                self.tr("⏳ 正在克隆...", "⏳ Cloning...")
+            } else {
+                self.tr("克隆并打开 (Enter)", "Clone & Open")
+            },
+            0xFFFFFF,
+            FontStyle::UiBold,
+        );
+        self.hit_regions.push((
+            ok_btn,
+            HitAction::SubmitGitClone { new_window: false },
+        ));
+    }
+
+    fn render_node_missing_modal(&mut self, canvas: &mut SurfaceCanvas, w: i32, h: i32) {
+        let t = self.theme;
+        let (hx, hy) = self.hover_pos;
+        let mw = 520.min((w - 36).max(340));
+        let mh = 186;
+        let mx = (w - mw) / 2;
+        let my = (h - mh) / 3;
+        let modal = Rect::new(mx, my, mw, mh);
+
+        canvas.fill_rect_alpha(Rect::new(0, 0, w, h), 0x000000, 88);
+        self.active_overlay_rects.push(Rect::new(0, 0, w, h));
+        self.active_overlay_rects.push(modal);
+
+        canvas.fill_rounded_shadow(modal, 10);
+        canvas.stroke_rounded_rect(modal, 10, t.warning_yellow, t.popup_bg);
+
+        let header = Rect::new(mx + 2, my + 2, mw - 4, 36);
+        canvas.fill_rounded_rect(header, 8, t.panel_header_bg);
+        canvas.draw_text_styled(
+            mx + 16,
+            my + 10,
+            self.tr(
+                "⚠ 需要 Node.js 运行环境 (Node.js Required)",
+                "⚠ Node.js Environment Required",
+            ),
+            t.warning_yellow,
+            mw - 32,
+            FontStyle::UiBold,
+        );
+
+        let cli_name = self
+            .pending_install_cli_after_node
+            .map(|k| k.display_name())
+            .unwrap_or("AI Agent CLI");
+        let body1 = match self.ui_lang {
+            UiLanguage::ZhCn => {
+                format!("安装 `{cli_name}` 需要 Node.js 与 npm 运行环境。")
+            }
+            UiLanguage::EnUs => {
+                format!("Installing `{cli_name}` requires Node.js and npm.")
+            }
+        };
+        canvas.draw_text_styled(
+            mx + 18,
+            my + 52,
+            &body1,
+            t.text_primary,
+            mw - 36,
+            FontStyle::UiRegular,
+        );
+        canvas.draw_text_styled(
+            mx + 18,
+            my + 76,
+            self.tr(
+                "当前系统未检测到 Node.js，请先前往 Node.js 官网下载安装，完成后点击「重新检测」。",
+                "Node.js was not found on this machine. Download from nodejs.org and click Recheck.",
+            ),
+            t.text_secondary,
+            mw - 36,
+            FontStyle::UiSmall,
+        );
+        canvas.draw_text_styled(
+            mx + 18,
+            my + 102,
+            &format!("{}: {NODEJS_DOWNLOAD_URL}", self.tr("官网地址", "Official URL")),
+            t.accent_blue,
+            mw - 36,
+            FontStyle::CodeMono,
+        );
+
+        let btn_y = my + mh - 42;
+        let cancel_btn = Rect::new(mx + mw - 102, btn_y, 86, 28);
+        let cancel_hov = cancel_btn.contains(hx, hy);
+        canvas.stroke_rounded_rect(
+            cancel_btn,
+            6,
+            t.border_color,
+            if cancel_hov { t.panel_header_bg } else { t.window_bg },
+        );
+        canvas.draw_text_centered(
+            cancel_btn,
+            self.tr("取消 (Esc)", "Cancel"),
+            t.text_secondary,
+            FontStyle::UiSmall,
+        );
+        self.hit_regions
+            .push((cancel_btn, HitAction::CloseModalOrPopup));
+
+        let recheck_btn = Rect::new(cancel_btn.x - 134, btn_y, 126, 28);
+        let rc_hov = recheck_btn.contains(hx, hy);
+        canvas.stroke_rounded_rect(
+            recheck_btn,
+            6,
+            if rc_hov { t.accent_blue } else { t.border_color },
+            if rc_hov { t.popup_hover_bg } else { t.editor_bg },
+        );
+        canvas.draw_text_centered(
+            recheck_btn,
+            self.tr("↻ 重新检测并安装", "↻ Recheck & Install"),
+            if rc_hov { 0xFFFFFF } else { t.text_primary },
+            FontStyle::UiSmall,
+        );
+        self.hit_regions
+            .push((recheck_btn, HitAction::RecheckNodeAndRetryInstall));
+
+        let dl_btn = Rect::new(recheck_btn.x - 168, btn_y, 160, 28);
+        canvas.fill_rounded_rect(dl_btn, 6, t.accent_blue);
+        canvas.draw_text_centered(
+            dl_btn,
+            self.tr("前往 Node.js 官网下载", "Download Node.js"),
+            0xFFFFFF,
+            FontStyle::UiBold,
+        );
+        self.hit_regions
+            .push((dl_btn, HitAction::OpenNodeJsDownloadPage));
     }
 
     fn render_edit_message_rewind_modal(&mut self, canvas: &mut SurfaceCanvas, w: i32, h: i32) {
@@ -18587,13 +20374,14 @@ impl IdeApplicationState {
         let recent_title = self.tr("最近的项目", "Recent Projects");
         self.settings_section(canvas, flow, x, w, recent_title);
         let current = self.workspace_root.clone();
-        let recent: Vec<_> = self.recent_workspaces.iter().take(6).cloned().collect();
-        let mut any = false;
-        for path in recent {
-            if path == current {
-                continue;
-            }
-            any = true;
+        let all_other_recent: Vec<_> = self
+            .recent_workspaces
+            .iter()
+            .filter(|p| !workspace_paths_equal(p, &current))
+            .cloned()
+            .collect();
+        let recent_limit = 8usize;
+        for path in all_other_recent.iter().take(recent_limit).cloned() {
             if let Some(y) = flow.place(26, 2) {
                 let row = Rect::new(x, y, w, 26);
                 let hot = row.contains(hx, hy);
@@ -18613,9 +20401,28 @@ impl IdeApplicationState {
                     .push((row, HitAction::PromptOpenWorkspace(path)));
             }
         }
-        if !any {
+        if all_other_recent.is_empty() {
             let empty = self.tr("没有其他最近的项目", "No other recent projects");
             self.settings_note(canvas, flow, x, w, empty);
+        } else if let Some(y) = flow.place(30, 4) {
+            let total_saved = self.recent_workspaces.len();
+            let more_lbl = match self.ui_lang {
+                UiLanguage::ZhCn => {
+                    format!("查看全部最近项目 (共 {total_saved} / {MAX_RECENT_WORKSPACES})...")
+                }
+                UiLanguage::EnUs => {
+                    format!("View All Recent Projects ({total_saved} / {MAX_RECENT_WORKSPACES})...")
+                }
+            };
+            self.draw_settings_button(
+                canvas,
+                Rect::new(x, y, 250.min(w), 28),
+                &more_lbl,
+                false,
+                hx,
+                hy,
+                HitAction::OpenRecentProjectsModal,
+            );
         }
         let lang_title = self.tr("语言和区域", "Language and Region");
         self.settings_section(canvas, flow, x, w, lang_title);
@@ -18971,6 +20778,44 @@ impl IdeApplicationState {
             "Git tool window and shortcuts follow IntelliJ IDEA.",
         );
         self.settings_note(canvas, flow, x, w, intro);
+        let git_status_label = self.tr("Git 状态", "Git status");
+        let git_status_val = if self.git_engine.git_installed {
+            self.git_engine
+                .git_version
+                .clone()
+                .unwrap_or_else(|| self.tr("已安装", "Installed").to_string())
+        } else {
+            self.tr("未检测到 Git", "Git not installed").to_string()
+        };
+        self.settings_kv(canvas, flow, x, w, git_status_label, &git_status_val);
+        if !self.git_engine.git_installed {
+            if let Some(y) = flow.place(32, 8) {
+                let inst_lbl = if self.git_install_in_progress {
+                    self.tr("正在下载安装 Git…", "Installing Git…")
+                } else {
+                    self.tr("下载并安装 Git", "Download & Install Git")
+                };
+                self.draw_settings_button(
+                    canvas,
+                    Rect::new(x, y, 168, 28),
+                    inst_lbl,
+                    true,
+                    hx,
+                    hy,
+                    HitAction::InstallGit,
+                );
+                let web_lbl = self.tr("Git 官网下载", "Git Website");
+                self.draw_settings_button(
+                    canvas,
+                    Rect::new(x + 178, y, 128, 28),
+                    web_lbl,
+                    false,
+                    hx,
+                    hy,
+                    HitAction::OpenGitDownloadPage,
+                );
+            }
+        }
         let branch = if self.git_engine.current_branch.is_empty() {
             self.tr("（无）", "(none)").to_string()
         } else {
@@ -22310,5 +24155,718 @@ mod tests {
             .any(|v| v.name == "msg" && v.value == "\"hello\""));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn theme_switch_only_in_settings_and_file_clone_git_repo_and_install_prompts() {
+        let mut state = IdeApplicationState::new(PathBuf::from("."));
+        let mut canvas = SurfaceCanvas::new(1440, 900);
+
+        // 1. Right stripe must NOT contain SwitchTheme button
+        state.render(&mut canvas);
+        assert!(!state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::ExecuteIdeAction(IdeAction::SwitchTheme))));
+
+        // 2. Project dropdown must NOT contain SelectTheme, and MUST contain OpenCloneGitRepoModal
+        state.project_popup_open = true;
+        state.render(&mut canvas);
+        assert!(!state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::SelectTheme(_))));
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::OpenCloneGitRepoModal)));
+        state.project_popup_open = false;
+
+        // 3. More menu must NOT contain SwitchTheme, and MUST contain OpenCloneGitRepoModal
+        state.more_menu_popup_open = true;
+        state.render(&mut canvas);
+        assert!(!state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::ExecuteIdeAction(IdeAction::SwitchTheme))));
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::OpenCloneGitRepoModal)));
+        state.more_menu_popup_open = false;
+
+        // 4. File main menu must expose OpenFromGitRepo
+        state.active_menu_category = Some(MainMenuCategory::File);
+        state.render(&mut canvas);
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::ExecuteIdeAction(IdeAction::OpenFromGitRepo))));
+        state.active_menu_category = None;
+
+        // 5. Settings Appearance still exposes SelectTheme
+        state.execute_ide_action(IdeAction::OpenSettingsModal);
+        state.render(&mut canvas);
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::SelectTheme(_))));
+        state.focus = FocusTarget::Editor;
+
+        // 6. Missing Git exposes InstallGit in Commit & GitLog & Settings -> Git
+        state.git_engine.has_loaded_snapshot = true;
+        state.git_engine.git_installed = false;
+        state.left_tool = Some(ToolWindowId::Commit);
+        state.bottom_tool = Some(ToolWindowId::GitLog);
+        state.render(&mut canvas);
+        let install_git_hits = state
+            .hit_regions
+            .iter()
+            .filter(|(_, a)| matches!(a, HitAction::InstallGit))
+            .count();
+        assert!(install_git_hits >= 2);
+
+        // 7. Clone Git Repo Modal auto-derives repo directory from URL
+        state.execute_ide_action(IdeAction::OpenFromGitRepo);
+        assert_eq!(state.focus, FocusTarget::CloneGitRepoModal);
+        state.clone_modal_field_focus = 0;
+        state
+            .clone_repo_url_input
+            .set_text("https://github.com/rust-lang/cargo.git");
+        state.on_active_input_mutated();
+        assert!(state
+            .clone_target_dir_input
+            .as_str()
+            .ends_with("cargo"));
+        state.render(&mut canvas);
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::SubmitGitClone { new_window: false })));
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::InstallGit)));
+
+        // 8. Node missing modal exposes OpenNodeJsDownloadPage & RecheckNodeAndRetryInstall
+        state.pending_install_cli_after_node = Some(AgentProviderKind::ClaudeCodeCli);
+        state.focus = FocusTarget::NodeMissingModal;
+        state.render(&mut canvas);
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::OpenNodeJsDownloadPage)));
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::RecheckNodeAndRetryInstall)));
+
+        // 9. Missing CLI in AI Config Modal exposes InstallAgentCli
+        state.focus = FocusTarget::AiConfigModal(0);
+        if let Some(p) = state
+            .agent_hub
+            .providers
+            .iter_mut()
+            .find(|p| p.kind == AgentProviderKind::ClaudeCodeCli)
+        {
+            p.available = false;
+        }
+        state.render(&mut canvas);
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::InstallAgentCli(AgentProviderKind::ClaudeCodeCli))));
+    }
+
+    #[test]
+    fn ai_commit_message_progress_locks_button_until_finished() {
+        let tmp = std::env::temp_dir().join("rust_ai_ide_ai_commit_btn_test");
+        let _ = std::fs::create_dir_all(&tmp);
+        let mut state = IdeApplicationState::new(tmp);
+        let mut canvas = SurfaceCanvas::new(1400, 900);
+        state.left_tool = Some(ToolWindowId::Commit);
+        state.git_engine.has_loaded_snapshot = true;
+        state.git_engine.git_installed = true;
+        state.agent_hub.active_provider = AgentProviderKind::ClaudeCodeCli;
+        state.agent_hub.providers.clear();
+        state.agent_hub.api_config.api_key.clear();
+
+        assert!(!state.ai_commit_generating);
+        state.render(&mut canvas);
+        let ai_btn_rect = state
+            .hit_regions
+            .iter()
+            .find(|(_, a)| matches!(a, HitAction::GenerateAiCommitMessage))
+            .map(|(r, _)| *r)
+            .expect("AI commit button should be clickable initially");
+
+        // Clicking once starts generation, shows spinner, and locks further clicks.
+        state.handle_mouse_click_with_mods(
+            ai_btn_rect.x + ai_btn_rect.w / 2,
+            ai_btn_rect.y + ai_btn_rect.h / 2,
+            false,
+            &canvas,
+        );
+        assert!(state.ai_commit_generating);
+        assert!(state.has_active_animations());
+
+        state.render(&mut canvas);
+        assert!(!state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::GenerateAiCommitMessage)));
+
+        // Clicking the same button area while generating must not re-trigger.
+        state.handle_mouse_click_with_mods(
+            ai_btn_rect.x + ai_btn_rect.w / 2,
+            ai_btn_rect.y + ai_btn_rect.h / 2,
+            false,
+            &canvas,
+        );
+        assert!(state.ai_commit_generating);
+
+        // Once the background generation completes (Ok or Err), progress stops and button re-enables.
+        for _ in 0..80 {
+            state.poll_background_updates();
+            if !state.ai_commit_generating {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(!state.ai_commit_generating);
+
+        state.render(&mut canvas);
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::GenerateAiCommitMessage)));
+    }
+
+    #[test]
+    fn right_splitter_drag_reuses_parsed_cache_and_snaps_on_release() {
+        let root = PathBuf::from(".");
+        let mut state = IdeApplicationState::new(root);
+        let mut canvas = SurfaceCanvas::new(1560, 940);
+        state.right_agent_open = true;
+        state.agent_hub.messages.push(ide_agent_hub::AgentChatMessage {
+            role: "user".to_string(),
+            agent: AgentProviderKind::ClaudeCodeCli,
+            content: "Please check `crates/ide-app/src/main.rs` and wrap a long explanation across lines when panel resizes.".to_string(),
+            thought: None,
+            patch: None,
+            modified_files: Vec::new(),
+            file_changes: Vec::new(),
+            attachments: Vec::new(),
+            checkpoint_id: None,
+        });
+        state.agent_hub.messages.push(ide_agent_hub::AgentChatMessage {
+            role: "assistant".to_string(),
+            agent: AgentProviderKind::ClaudeCodeCli,
+            content: "Inspecting `crates/ide-app/src/ide_state.rs` now.\n\n```rust\nfn demo() -> usize { 42 }\n```".to_string(),
+            thought: None,
+            patch: None,
+            modified_files: Vec::new(),
+            file_changes: Vec::new(),
+            attachments: Vec::new(),
+            checkpoint_id: None,
+        });
+
+        state.render(&mut canvas);
+        let expected_msg_count = state.agent_hub.messages.len();
+        assert_eq!(state.cached_chat_rows.parsed_msgs.len(), expected_msg_count);
+        let initial_sig = state.cached_chat_rows.parsed_content_sig;
+
+        // Begin dragging the right splitter between AI assistant and center editor.
+        let split_x = 1560 - 42 - state.right_panel_width;
+        assert!(state.try_begin_splitter_drag(split_x, 200, 1560, 940));
+        // Moving vertically without changing X should report unchanged (false).
+        assert!(!state.update_splitter_drag(split_x, 260, 1560, 940));
+
+        // Dragging 1px left changes width, quantizes wrap_w to 12px steps, and keeps parsed_msgs intact.
+        assert!(state.update_splitter_drag(split_x - 3, 260, 1560, 940));
+        state.render(&mut canvas);
+        assert_eq!(state.cached_chat_rows.parsed_msgs.len(), expected_msg_count);
+        assert_eq!(state.cached_chat_rows.parsed_content_sig, initial_sig);
+        assert_eq!(state.cached_chat_rows.wrap_w % 12, 0);
+
+        // Releasing snaps wrap_w back to exact pixel width.
+        state.end_splitter_drag();
+        state.render(&mut canvas);
+        let expected_exact_wrap_w = (state.agent_chat_area_rect.w - 28).max(80);
+        assert_eq!(state.cached_chat_rows.wrap_w, expected_exact_wrap_w);
+
+        // Diff preview caches max_line_px after first render.
+        state.open_editor_diff_from_texts(
+            PathBuf::from("demo.rs"),
+            "Test".to_string(),
+            "let a = 1;\n",
+            "let a = 2;\nlet longer_line = 123456;\n",
+        );
+        state.render(&mut canvas);
+        assert!(state
+            .active_editor_diff
+            .as_ref()
+            .and_then(|d| d.cached_max_line_px)
+            .is_some());
+    }
+
+    #[test]
+    fn agent_busy_timer_persists_across_session_switches() {
+        let mut state = IdeApplicationState::new(PathBuf::from("."));
+        let prog = ide_agent_hub::StreamingAgentProgress {
+            phase: "Working...".to_string(),
+            thought_text: String::new(),
+            reply_text: String::new(),
+            execution_steps: Vec::new(),
+        };
+        state.agent_hub.set_active_streaming_progress(Some(prog));
+        let started = state
+            .agent_hub
+            .active_session_busy_started_at()
+            .expect("active busy session should record start instant");
+
+        // Create a second idle session and switch away.
+        state.create_new_agent_session();
+        assert!(state.agent_hub.active_session_busy_started_at().is_none());
+
+        // Switch back to session 0: elapsed start instant must remain identical.
+        state.switch_agent_session(0);
+        assert_eq!(
+            state.agent_hub.active_session_busy_started_at(),
+            Some(started)
+        );
+
+        // Clearing busy state clears the timer.
+        state.agent_hub.set_active_streaming_progress(None);
+        assert!(state.agent_hub.active_session_busy_started_at().is_none());
+    }
+
+    #[test]
+    fn all_scrollable_views_honor_exact_wheel_lines_and_page_sizes() {
+        let mut state = IdeApplicationState::new(PathBuf::from("."));
+        let mut canvas = SurfaceCanvas::new(1560, 940);
+
+        // 1. Code editor: exact line steps + page size.
+        let mut many_lines = String::new();
+        for i in 0..200 {
+            many_lines.push_str(&format!("let line_{i} = {i};\n"));
+        }
+        state.open_buffers = vec![TextBuffer::from_text(PathBuf::from("big.rs"), &many_lines)];
+        state.active_tab = 0;
+        state.render(&mut canvas);
+
+        let ed_x = state.editor_code_rect.x + 40;
+        let ed_y = state.editor_code_rect.y + 40;
+        assert_eq!(state.wheel_page_lines_at(ed_x, ed_y), state.editor_visible_lines);
+        state.handle_mouse_wheel_2d(ed_x, ed_y, 5, 0);
+        assert_eq!(state.scroll_line, 5);
+        state.handle_mouse_wheel_2d(ed_x, ed_y, -2, 0);
+        assert_eq!(state.scroll_line, 3);
+
+        // 2. Left Structure tool window uses structure symbol bounds, not project tree.
+        state.left_tool = Some(ToolWindowId::Structure);
+        state.tree_scroll = 0;
+        state.cached_structure = Some((
+            PathBuf::from("big.rs"),
+            0,
+            (0..60)
+                .map(|i| ide_syntax::StructureSymbol {
+                    name: format!("fn_{i}"),
+                    kind: ide_syntax::SymbolKind::Function,
+                    line: i,
+                })
+                .collect(),
+        ));
+        state.render(&mut canvas);
+        let lx = state.left_pane_rect.x + 20;
+        let ly = state.left_pane_rect.y + 60;
+        state.handle_mouse_wheel_2d(lx, ly, 4, 0);
+        assert_eq!(state.tree_scroll, 4);
+
+        // 3. Bottom Debug panel must not scroll the hidden Terminal PTY.
+        state.bottom_tool = Some(ToolWindowId::Debug);
+        state.render(&mut canvas);
+        let bx = state.bottom_pane_rect.x + 40;
+        let by = state.bottom_pane_rect.y + 60;
+        state.terminal.active_pty_mut().scroll_offset = 0;
+        state.handle_mouse_wheel_2d(bx, by, -3, 0);
+        assert_eq!(state.terminal.active_pty_mut().scroll_offset, 0);
+
+        // 4. SearchEverywhereModal clamps to actual result count (> 40 and < 11).
+        state.focus = FocusTarget::SearchEverywhereModal;
+        state.modal_scroll = 0;
+        state.search_results = (0..65)
+            .map(|i| SearchEverywhereItem::File {
+                name: format!("f_{i}.rs"),
+                relative_path: format!("src/f_{i}.rs"),
+                full_path: PathBuf::from(format!("src/f_{i}.rs")),
+            })
+            .collect();
+        state.handle_mouse_wheel_2d(100, 100, 50, 0);
+        assert_eq!(state.modal_scroll, 50);
+        state.handle_mouse_wheel_2d(100, 100, 20, 0);
+        assert_eq!(state.modal_scroll, 54);
+        state.modal_scroll = 0;
+        state.search_results.truncate(5);
+        state.handle_mouse_wheel_2d(100, 100, 3, 0);
+        assert_eq!(state.modal_scroll, 0);
+    }
+
+    #[test]
+    fn recent_workspaces_cap_is_50_and_persists_all_entries() {
+        let unique = format!(
+            "rust-ai-ide-recent50-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let base_tmp = std::env::temp_dir().join(&unique);
+        let persist_dir = base_tmp.join("persist");
+        std::fs::create_dir_all(&persist_dir).expect("create persist dir");
+
+        let mut dirs = Vec::new();
+        for i in 0..55 {
+            let d = base_tmp.join(format!("proj_{i:02}"));
+            std::fs::create_dir_all(&d).expect("create proj dir");
+            dirs.push(clean_workspace_path(d));
+        }
+
+        let mut state = IdeApplicationState::new(dirs[0].clone());
+        state.persistence_dir = Some(persist_dir.clone());
+        for d in &dirs {
+            state.push_recent_workspace(d.clone());
+        }
+
+        assert_eq!(state.recent_workspaces.len(), MAX_RECENT_WORKSPACES);
+        assert_eq!(state.recent_workspaces[0], dirs[54]);
+        assert!(!state.recent_workspaces.contains(&dirs[0]));
+        assert!(state.recent_workspaces.contains(&dirs[5]));
+
+        state.save_global_settings();
+
+        let mut restored = IdeApplicationState::new(dirs[54].clone());
+        restored.restore_from_persistence_dir(persist_dir);
+        assert_eq!(restored.recent_workspaces.len(), MAX_RECENT_WORKSPACES);
+        assert_eq!(restored.recent_workspaces[0], dirs[54]);
+        assert!(restored.recent_workspaces.contains(&dirs[5]));
+
+        let _ = std::fs::remove_dir_all(&base_tmp);
+    }
+
+    #[test]
+    fn project_popup_shows_more_recent_and_more_modal_browses_up_to_50() {
+        let mut state = IdeApplicationState::new(PathBuf::from("."));
+        let mut canvas = SurfaceCanvas::new(1560, 940);
+
+        state.recent_workspaces.clear();
+        state.recent_workspaces.push(state.workspace_root.clone());
+        for i in 0..50 {
+            state
+                .recent_workspaces
+                .push(PathBuf::from(format!("ws_project_{i:02}")));
+        }
+        state.recent_workspaces.truncate(MAX_RECENT_WORKSPACES);
+        assert_eq!(state.recent_workspaces.len(), 50);
+
+        // 1. Project switcher popup shows more than 4 projects (8) plus "More Recent Projects..."
+        state.project_popup_open = true;
+        state.render(&mut canvas);
+        let popup_recent_count = state
+            .hit_regions
+            .iter()
+            .filter(|(_, a)| matches!(a, HitAction::PromptOpenWorkspace(_)))
+            .count();
+        assert_eq!(popup_recent_count, 8);
+        assert!(state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::OpenRecentProjectsModal)));
+
+        // 2. Opening RecentProjectsModal exposes all 50 items with scrolling, filtering & keyboard nav
+        state.open_recent_projects_modal();
+        assert!(!state.project_popup_open);
+        assert_eq!(state.focus, FocusTarget::RecentProjectsModal);
+        state.render(&mut canvas);
+        assert_eq!(state.filtered_recent_workspaces().len(), 50);
+
+        let vis = state.recent_projects_max_visible;
+        assert!(vis >= 8 && vis < 50);
+
+        state.handle_mouse_wheel_2d(500, 300, 100, 0);
+        assert_eq!(state.modal_scroll, 50 - vis);
+
+        state.modal_scroll = 0;
+        state.recent_projects_selected_idx = 0;
+        state.move_recent_projects_selection((vis + 2) as isize);
+        assert_eq!(state.recent_projects_selected_idx, vis + 2);
+        assert_eq!(state.modal_scroll, 3);
+
+        state.recent_projects_query_input.set_text("ws_project_42");
+        state.on_active_input_mutated();
+        let filtered = state.filtered_recent_workspaces();
+        assert_eq!(filtered, vec![PathBuf::from("ws_project_42")]);
+
+        // Removing a non-current recent project shrinks the list and saves cleanly
+        state.recent_projects_query_input.clear();
+        state.remove_recent_workspace(Path::new("ws_project_42"));
+        assert_eq!(state.recent_workspaces.len(), 49);
+        assert!(!state
+            .recent_workspaces
+            .iter()
+            .any(|p| p == Path::new("ws_project_42")));
+    }
+
+    #[test]
+    fn agent_chat_scroll_up_after_turn_ends_is_monotonic_and_preserved() {
+        let mut state = IdeApplicationState::new(PathBuf::from("."));
+        let mut canvas = SurfaceCanvas::new(1560, 940);
+        state.right_agent_open = true;
+        state.right_panel_tab = RightPanelTab::Chat;
+
+        // Populate a realistic finished conversation with mixed prose, inline code, and code blocks.
+        for turn in 0..8 {
+            state.agent_hub.messages.push(ide_agent_hub::AgentChatMessage {
+                role: "user".to_string(),
+                agent: AgentProviderKind::ClaudeCodeCli,
+                content: format!("Question #{turn}: inspect `crates/ide-app/src/agent_panel.rs`"),
+                thought: None,
+                patch: None,
+                modified_files: Vec::new(),
+                file_changes: Vec::new(),
+                attachments: Vec::new(),
+                checkpoint_id: None,
+            });
+            state.agent_hub.messages.push(ide_agent_hub::AgentChatMessage {
+                role: "assistant".to_string(),
+                agent: AgentProviderKind::ClaudeCodeCli,
+                content: format!(
+                    "Answer #{turn} with `inline_code` and **bold** text.\n\n```rust\nfn step_{turn}() -> usize {{\n    let val = {turn} + 1;\n    val * 2\n}}\n```\n\nFinished checking turn {turn}."
+                ),
+                thought: None,
+                patch: None,
+                modified_files: Vec::new(),
+                file_changes: Vec::new(),
+                attachments: Vec::new(),
+                checkpoint_id: None,
+            });
+        }
+
+        // Initial render pins to bottom and precomputes highlighted spans on CodeBlockLine.
+        state.agent_scroll = usize::MAX;
+        state.render(&mut canvas);
+        let max_s = state
+            .cached_chat_rows
+            .max_scroll_row_for_height((state.agent_chat_area_rect.h - 4).max(1));
+        assert!(max_s > 10);
+        assert_eq!(state.agent_scroll, max_s);
+        assert!(state.cached_chat_rows.rows.iter().any(|r| matches!(
+            r,
+            crate::agent_panel::CachedChatRow::CodeBlockLine { spans, .. } if !spans.is_empty()
+        )));
+
+        // Scroll up step-by-step from the bottom; scroll row & pixel top must decrease monotonically.
+        let ax = state.agent_chat_area_rect.x + state.agent_chat_area_rect.w / 2;
+        let ay = state.agent_chat_area_rect.y + state.agent_chat_area_rect.h / 2;
+        let mut prev_scroll = state.agent_scroll;
+        let mut prev_px = state.cached_chat_rows.row_tops[prev_scroll];
+        for _ in 0..5 {
+            state.handle_mouse_wheel_2d(ax, ay, -3, 0);
+            state.render(&mut canvas);
+            assert!(
+                state.agent_scroll < prev_scroll,
+                "expected upward wheel to decrease agent_scroll ({} -> {})",
+                prev_scroll,
+                state.agent_scroll
+            );
+            let cur_px = state.cached_chat_rows.row_tops[state.agent_scroll];
+            assert!(
+                cur_px < prev_px,
+                "expected upward wheel to decrease pixel offset ({} -> {})",
+                prev_px,
+                cur_px
+            );
+            prev_scroll = state.agent_scroll;
+            prev_px = cur_px;
+        }
+
+        // Background busy->idle transition or async polling must NOT snap scrolled-up view to bottom.
+        let prog = ide_agent_hub::StreamingAgentProgress {
+            phase: "Finishing...".to_string(),
+            thought_text: String::new(),
+            reply_text: String::new(),
+            execution_steps: Vec::new(),
+        };
+        state.agent_hub.set_active_streaming_progress(Some(prog));
+        let _ = state.poll_background_updates();
+        state.agent_hub.set_active_streaming_progress(None);
+        let _ = state.poll_background_updates();
+        assert_eq!(state.agent_scroll, prev_scroll);
+        state.render(&mut canvas);
+        assert_eq!(state.agent_scroll, prev_scroll);
+    }
+
+    #[test]
+    fn mobile_sdk_directories_persist_across_restart_and_suppress_reprompt() {
+        let unique = format!(
+            "rust_ai_ide_mobile_sdk_persist_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let base_tmp = std::env::temp_dir().join(&unique);
+        let persist_dir = base_tmp.join("appdata");
+        let proj = base_tmp.join("flutter_proj");
+        let flutter_root = base_tmp.join("sdks").join("flutter");
+        let android_root = base_tmp.join("sdks").join("android");
+        let jdk_root = base_tmp.join("sdks").join("jdk");
+
+        std::fs::create_dir_all(proj.join("lib")).unwrap();
+        std::fs::create_dir_all(proj.join("android/app/src/main")).unwrap();
+        std::fs::write(
+            proj.join("pubspec.yaml"),
+            "name: persist_app\ndependencies:\n  flutter:\n    sdk: flutter\n",
+        )
+        .unwrap();
+        std::fs::write(
+            proj.join("android/app/src/main/AndroidManifest.xml"),
+            "<manifest/>\n",
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(flutter_root.join("bin")).unwrap();
+        std::fs::write(
+            flutter_root.join("bin").join("flutter.bat"),
+            "@echo off\r\necho Flutter 3.24.0\r\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(android_root.join("platform-tools")).unwrap();
+        std::fs::create_dir_all(android_root.join("platforms/android-34")).unwrap();
+        std::fs::create_dir_all(android_root.join("build-tools/34.0.0")).unwrap();
+        std::fs::write(android_root.join("platform-tools").join("adb.exe"), b"").unwrap();
+        std::fs::create_dir_all(jdk_root.join("bin")).unwrap();
+        std::fs::write(jdk_root.join("bin").join("java.exe"), b"").unwrap();
+
+        // Session 1: user configures SDK directories in Settings (including quoted path) and closes via Esc/OK
+        let mut session1 = IdeApplicationState::new(proj.clone());
+        session1.restore_from_persistence_dir(persist_dir.clone());
+        session1.execute_ide_action(IdeAction::OpenSettingsModal);
+        session1.settings_page = SettingsPage::MobileSdk;
+        session1
+            .mobile_sdk_flutter
+            .set_text(&format!("\"{}\"", flutter_root.display()));
+        session1
+            .mobile_sdk_android
+            .set_text(&android_root.display().to_string());
+        session1
+            .mobile_sdk_jdk
+            .set_text(&jdk_root.display().to_string());
+        session1.close_settings_modal();
+        assert_eq!(
+            session1.mobile_sdk.flutter_sdk,
+            flutter_root.display().to_string()
+        );
+        assert_eq!(
+            session1.mobile_sdk.android_sdk,
+            android_root.display().to_string()
+        );
+        assert_eq!(session1.mobile_sdk.jdk_home, jdk_root.display().to_string());
+        session1.save_all_persisted_state();
+
+        let saved_gs: PersistedGlobalSettings =
+            persistence::load_json(&persistence::global_settings_path(&persist_dir))
+                .expect("global settings saved");
+        assert_eq!(saved_gs.mobile_sdk, session1.mobile_sdk);
+
+        // Session 2a: even if `new_with_wakeup` starts an initial probe before `restore_from_persistence_dir`,
+        // restoring persistence supersedes the stale probe and re-probes with persisted SDK locations.
+        let wakeup: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let mut session2 = IdeApplicationState::new_with_wakeup(proj.clone(), Some(wakeup.clone()));
+        session2.restore_from_persistence_dir(persist_dir.clone());
+        assert_eq!(session2.mobile_sdk, saved_gs.mobile_sdk);
+        assert_eq!(
+            session2.mobile_sdk_flutter.as_str(),
+            flutter_root.display().to_string()
+        );
+        assert_eq!(
+            session2.mobile_sdk_android.as_str(),
+            android_root.display().to_string()
+        );
+        assert_eq!(
+            session2.mobile_sdk_jdk.as_str(),
+            jdk_root.display().to_string()
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while session2.mobile_env.probing && Instant::now() < deadline {
+            let _ = session2.poll_background_updates();
+            thread::sleep(Duration::from_millis(20));
+        }
+        let _ = session2.poll_background_updates();
+        assert!(!session2.mobile_env.probing);
+        assert!(!session2.mobile_popup_open);
+        assert!(session2.mobile_env.missing_required_tools().is_empty());
+        for id in ["flutter", "android_sdk", "jdk"] {
+            assert!(
+                session2
+                    .mobile_env
+                    .sdk_tools
+                    .iter()
+                    .any(|t| t.id == id && t.installed),
+                "expected {id} to be installed after restart"
+            );
+        }
+
+        // Session 2b: deferred probe path (used by GUI startup) restores and probes cleanly as well
+        let mut session2_gui =
+            IdeApplicationState::new_with_wakeup_deferred_mobile_probe(proj.clone(), Some(wakeup));
+        session2_gui.restore_from_persistence_dir(persist_dir.clone());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while session2_gui.mobile_env.probing && Instant::now() < deadline {
+            let _ = session2_gui.poll_background_updates();
+            thread::sleep(Duration::from_millis(20));
+        }
+        let _ = session2_gui.poll_background_updates();
+        assert!(!session2_gui.mobile_popup_open);
+        assert!(session2_gui.mobile_env.missing_required_tools().is_empty());
+
+        let _ = std::fs::remove_dir_all(&base_tmp);
+    }
+
+    #[test]
+    fn mobile_sdk_unmodified_window_does_not_overwrite_persisted_sdks() {
+        let unique = format!(
+            "rust_ai_ide_mobile_sdk_multiwin_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let base_tmp = std::env::temp_dir().join(&unique);
+        let persist_dir = base_tmp.join("appdata");
+        let ws1 = base_tmp.join("ws1");
+        let ws2 = base_tmp.join("ws2");
+        std::fs::create_dir_all(&ws1).unwrap();
+        std::fs::create_dir_all(&ws2).unwrap();
+
+        let mut win1 = IdeApplicationState::new(ws1);
+        win1.restore_from_persistence_dir(persist_dir.clone());
+        let mut win2 = IdeApplicationState::new(ws2);
+        win2.restore_from_persistence_dir(persist_dir.clone());
+
+        win1.mobile_sdk_flutter.set_text(r"D:\custom\flutter");
+        assert!(win1.commit_mobile_sdk_locations_from_inputs());
+
+        // Window 2 never modified mobile SDK settings; closing/saving Window 2 preserves disk's mobile_sdk.
+        win2.save_all_persisted_state();
+
+        let saved_gs: PersistedGlobalSettings =
+            persistence::load_json(&persistence::global_settings_path(&persist_dir))
+                .expect("global settings saved");
+        assert_eq!(saved_gs.mobile_sdk.flutter_sdk, r"D:\custom\flutter");
+
+        let _ = std::fs::remove_dir_all(&base_tmp);
     }
 }

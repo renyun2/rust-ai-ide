@@ -103,6 +103,8 @@ pub struct SurfaceCanvas {
     pub phys_width: usize,
     pub phys_height: usize,
     pub scale_factor: f32,
+    /// When true (e.g. during active splitter drag), large image previews use fast nearest-neighbor sampling.
+    pub fast_image_resample: bool,
     pixmap: Pixmap,
     #[cfg(test)]
     present_buf: Vec<u32>,
@@ -751,6 +753,7 @@ impl SurfaceCanvas {
             phys_width: pw,
             phys_height: ph,
             scale_factor: scale,
+            fast_image_resample: false,
             pixmap,
             #[cfg(test)]
             present_buf,
@@ -867,9 +870,8 @@ impl SurfaceCanvas {
 
     /// 单遍零中间缓冲直写 `softbuffer` 表面切片（省去中间 `present_buf` 拷贝，大幅降低高分屏帧耗时）
     pub fn copy_to_softbuffer(&self, dst_buf: &mut [u32]) {
-        let rgba = self.pixmap.data();
-        for (dst, src) in dst_buf.iter_mut().zip(rgba.chunks_exact(4)) {
-            *dst = ((src[0] as u32) << 16) | ((src[1] as u32) << 8) | (src[2] as u32);
+        for (dst, p) in dst_buf.iter_mut().zip(self.pixmap.pixels().iter()) {
+            *dst = ((p.red() as u32) << 16) | ((p.green() as u32) << 8) | (p.blue() as u32);
         }
     }
 
@@ -928,6 +930,53 @@ impl SurfaceCanvas {
 
     pub fn fill_rect(&mut self, rect: Rect, color: u32) {
         self.fill_rect_alpha(rect, color, 255);
+    }
+
+    /// Fill a checkerboard pattern in a single physical-pixel pass (avoids thousands of `fill_rect` calls).
+    pub fn fill_checkerboard_rect(&mut self, rect: Rect, tile: i32, color1: u32, color2: u32) {
+        if rect.w <= 0 || rect.h <= 0 {
+            return;
+        }
+        let s = self.scale_factor;
+        let x0 = ((rect.x as f32 * s).round() as i32).max(0);
+        let y0 = ((rect.y as f32 * s).round() as i32).max(0);
+        let x1 = (((rect.x + rect.w) as f32 * s).round() as i32).min(self.phys_width as i32);
+        let y1 = (((rect.y + rect.h) as f32 * s).round() as i32).min(self.phys_height as i32);
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        let tile_phys = ((tile.max(1) as f32 * s).round() as i32).max(1);
+        let Some(p1) = PremultipliedColorU8::from_rgba(
+            ((color1 >> 16) & 0xFF) as u8,
+            ((color1 >> 8) & 0xFF) as u8,
+            (color1 & 0xFF) as u8,
+            255,
+        ) else {
+            return;
+        };
+        let Some(p2) = PremultipliedColorU8::from_rgba(
+            ((color2 >> 16) & 0xFF) as u8,
+            ((color2 >> 8) & 0xFF) as u8,
+            (color2 & 0xFF) as u8,
+            255,
+        ) else {
+            return;
+        };
+        let pw_usize = self.phys_width;
+        let px = self.pixmap.pixels_mut();
+        for py in y0..y1 {
+            let row_tile = (py - y0) / tile_phys;
+            let row_base = (py as usize) * pw_usize;
+            let mut tx = x0;
+            let mut col_tile = 0;
+            while tx < x1 {
+                let next_tx = (tx + tile_phys).min(x1);
+                let c = if (row_tile + col_tile) & 1 == 0 { p1 } else { p2 };
+                px[row_base + (tx as usize)..row_base + (next_tx as usize)].fill(c);
+                tx = next_tx;
+                col_tile += 1;
+            }
+        }
     }
 
     pub fn fill_rect_alpha(&mut self, rect: Rect, color: u32, alpha: u8) {
@@ -1752,6 +1801,7 @@ impl SurfaceCanvas {
     }
 
     /// 绘制主题切换半月/太阳图标
+    #[allow(dead_code)]
     pub fn draw_theme_icon(&mut self, x: i32, y: i32, color: u32) {
         self.stroke_circle(x + 8, y + 8, 5.2, 1.5, color);
         self.fill_circle(x + 9, y + 7, 3, color);
@@ -2544,80 +2594,139 @@ impl SurfaceCanvas {
         let ph_phys = (py1 - py0).max(1) as f32;
         let r_phys =
             ((radius.saturating_sub(1) as f32) * s).clamp(0.0, (pw_phys * 0.5).min(ph_phys * 0.5));
+        let r_ceil = if r_phys > 0.5 {
+            r_phys.ceil() as i32 + 1
+        } else {
+            0
+        };
         let pw_usize = self.phys_width;
         let out_px = self.pixmap.pixels_mut();
         let iw = img_w as usize;
         let ih = img_h as usize;
+        let use_nearest = self.fast_image_resample && ((cx1 - cx0) * (cy1 - cy0) > 48_000);
 
+        // Precompute horizontal sample coordinates & fixed-point weights once per scanline width.
+        let vis_w = (cx1 - cx0) as usize;
+        let mut sx0_lut = Vec::with_capacity(vis_w);
+        let mut sx1_lut = Vec::with_capacity(vis_w);
+        let mut wx_lut = Vec::with_capacity(vis_w);
+        let iw_f = iw as f32;
+        let iw_max = (iw - 1) as f32;
+        for px_x in cx0..cx1 {
+            let u = ((px_x - px0) as f32 + 0.5) / pw_phys;
+            let sx_f = (u * iw_f - 0.5).clamp(0.0, iw_max);
+            let sx0 = sx_f.floor() as usize;
+            let sx1 = (sx0 + 1).min(iw - 1);
+            let fx_q = ((sx_f - sx0 as f32) * 256.0).round() as u32;
+            sx0_lut.push(sx0 * 4);
+            sx1_lut.push(sx1 * 4);
+            wx_lut.push(fx_q.min(256));
+        }
+
+        let ih_f = ih as f32;
+        let ih_max = (ih - 1) as f32;
         for py in cy0..cy1 {
             let v = ((py - py0) as f32 + 0.5) / ph_phys;
-            let sy_f = (v * ih as f32 - 0.5).clamp(0.0, (ih - 1) as f32);
+            let sy_f = (v * ih_f - 0.5).clamp(0.0, ih_max);
             let sy0 = sy_f.floor() as usize;
             let sy1 = (sy0 + 1).min(ih - 1);
-            let fy = sy_f - sy0 as f32;
+            let fy_q = (((sy_f - sy0 as f32) * 256.0).round() as u32).min(256);
+            let wy0 = 256 - fy_q;
+            let wy1 = fy_q;
+            let row0_off = sy0 * iw * 4;
+            let row1_off = sy1 * iw * 4;
+            let nearest_row_off = if fy_q >= 128 { row1_off } else { row0_off };
             let row_base = (py as usize) * pw_usize;
+            let in_corner_y = r_ceil > 0 && (py < py0 + r_ceil || py >= py1 - r_ceil);
+            let dy_edge = if in_corner_y {
+                ((py - py0) as f32 + 0.5 - r_phys).min((py1 - py) as f32 - 0.5 - r_phys)
+            } else {
+                0.0
+            };
 
-            for px_x in cx0..cx1 {
-                // 圆角裁切掩码
-                let mut corner_cov = 1.0f32;
-                if r_phys > 0.5 {
+            for (xi, px_x) in (cx0..cx1).enumerate() {
+                let mut corner_cov_q = 256u32;
+                if in_corner_y && (px_x < px0 + r_ceil || px_x >= px1 - r_ceil) {
                     let dx_edge = ((px_x - px0) as f32 + 0.5 - r_phys)
                         .min((px1 - px_x) as f32 - 0.5 - r_phys);
-                    let dy_edge =
-                        ((py - py0) as f32 + 0.5 - r_phys).min((py1 - py) as f32 - 0.5 - r_phys);
                     if dx_edge < 0.0 && dy_edge < 0.0 {
                         let dist = dx_edge.hypot(dy_edge) - r_phys;
-                        corner_cov = (0.5 - dist).clamp(0.0, 1.0);
-                        if corner_cov <= 0.0 {
+                        let cov = (0.5 - dist).clamp(0.0, 1.0);
+                        if cov <= 0.0 {
                             continue;
                         }
+                        corner_cov_q = (cov * 256.0).round() as u32;
                     }
                 }
 
-                let u = ((px_x - px0) as f32 + 0.5) / pw_phys;
-                let sx_f = (u * iw as f32 - 0.5).clamp(0.0, (iw - 1) as f32);
-                let sx0 = sx_f.floor() as usize;
-                let sx1 = (sx0 + 1).min(iw - 1);
-                let fx = sx_f - sx0 as f32;
-
-                let i00 = (sy0 * iw + sx0) * 4;
-                let i10 = (sy0 * iw + sx1) * 4;
-                let i01 = (sy1 * iw + sx0) * 4;
-                let i11 = (sy1 * iw + sx1) * 4;
-                let w00 = (1.0 - fx) * (1.0 - fy);
-                let w10 = fx * (1.0 - fy);
-                let w01 = (1.0 - fx) * fy;
-                let w11 = fx * fy;
-
-                let sr = rgba[i00] as f32 * w00
-                    + rgba[i10] as f32 * w10
-                    + rgba[i01] as f32 * w01
-                    + rgba[i11] as f32 * w11;
-                let sg = rgba[i00 + 1] as f32 * w00
-                    + rgba[i10 + 1] as f32 * w10
-                    + rgba[i01 + 1] as f32 * w01
-                    + rgba[i11 + 1] as f32 * w11;
-                let sb = rgba[i00 + 2] as f32 * w00
-                    + rgba[i10 + 2] as f32 * w10
-                    + rgba[i01 + 2] as f32 * w01
-                    + rgba[i11 + 2] as f32 * w11;
-                let sa = (rgba[i00 + 3] as f32 * w00
-                    + rgba[i10 + 3] as f32 * w10
-                    + rgba[i01 + 3] as f32 * w01
-                    + rgba[i11 + 3] as f32 * w11)
-                    * corner_cov
-                    / 255.0;
+                let (sr, sg, sb, sa) = if use_nearest {
+                    let sx_off = if wx_lut[xi] >= 128 {
+                        sx1_lut[xi]
+                    } else {
+                        sx0_lut[xi]
+                    };
+                    let idx = nearest_row_off + sx_off;
+                    (
+                        rgba[idx] as u32,
+                        rgba[idx + 1] as u32,
+                        rgba[idx + 2] as u32,
+                        rgba[idx + 3] as u32,
+                    )
+                } else {
+                    let wx1 = wx_lut[xi];
+                    let wx0 = 256 - wx1;
+                    let w00 = wx0 * wy0;
+                    let w10 = wx1 * wy0;
+                    let w01 = wx0 * wy1;
+                    let w11 = wx1 * wy1;
+                    let i00 = row0_off + sx0_lut[xi];
+                    let i10 = row0_off + sx1_lut[xi];
+                    let i01 = row1_off + sx0_lut[xi];
+                    let i11 = row1_off + sx1_lut[xi];
+                    (
+                        (rgba[i00] as u32 * w00
+                            + rgba[i10] as u32 * w10
+                            + rgba[i01] as u32 * w01
+                            + rgba[i11] as u32 * w11
+                            + 32768)
+                            >> 16,
+                        (rgba[i00 + 1] as u32 * w00
+                            + rgba[i10 + 1] as u32 * w10
+                            + rgba[i01 + 1] as u32 * w01
+                            + rgba[i11 + 1] as u32 * w11
+                            + 32768)
+                            >> 16,
+                        (rgba[i00 + 2] as u32 * w00
+                            + rgba[i10 + 2] as u32 * w10
+                            + rgba[i01 + 2] as u32 * w01
+                            + rgba[i11 + 2] as u32 * w11
+                            + 32768)
+                            >> 16,
+                        (rgba[i00 + 3] as u32 * w00
+                            + rgba[i10 + 3] as u32 * w10
+                            + rgba[i01 + 3] as u32 * w01
+                            + rgba[i11 + 3] as u32 * w11
+                            + 32768)
+                            >> 16,
+                    )
+                };
 
                 let dst = &mut out_px[row_base + (px_x as usize)];
-                let a = sa.clamp(0.0, 1.0);
-                let inv = 1.0 - a;
-                let nr = (dst.red() as f32 * inv + sr * a).round().clamp(0.0, 255.0) as u8;
-                let ng = (dst.green() as f32 * inv + sg * a)
-                    .round()
-                    .clamp(0.0, 255.0) as u8;
-                let nb = (dst.blue() as f32 * inv + sb * a).round().clamp(0.0, 255.0) as u8;
-                if let Some(p) = PremultipliedColorU8::from_rgba(nr, ng, nb, 255) {
-                    *dst = p;
+                if sa == 255 && corner_cov_q == 256 {
+                    if let Some(p) = PremultipliedColorU8::from_rgba(sr as u8, sg as u8, sb as u8, 255) {
+                        *dst = p;
+                    }
+                } else {
+                    let a = ((sa * corner_cov_q + 128) >> 8).min(255);
+                    if a > 0 {
+                        let inv = 255 - a;
+                        let nr = ((dst.red() as u32 * inv + sr * a + 127) / 255) as u8;
+                        let ng = ((dst.green() as u32 * inv + sg * a + 127) / 255) as u8;
+                        let nb = ((dst.blue() as u32 * inv + sb * a + 127) / 255) as u8;
+                        if let Some(p) = PremultipliedColorU8::from_rgba(nr, ng, nb, 255) {
+                            *dst = p;
+                        }
+                    }
                 }
             }
         }
@@ -2989,11 +3098,11 @@ use windows::Win32::Graphics::Gdi::{
     GetCurrentObject, GetObjectW, DIBSECTION, OBJ_BITMAP,
 };
 
-const MEASURE_CACHE_CAP: usize = 3072;
-const LAYOUT_CACHE_CAP: usize = 192;
-const MASK_CACHE_CAP: usize = 1024;
-const MASK_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
-const MAX_CACHED_TEXT_BYTES: usize = 300;
+const MEASURE_CACHE_CAP: usize = 16384;
+const LAYOUT_CACHE_CAP: usize = 4096;
+const MASK_CACHE_CAP: usize = 12288;
+const MASK_CACHE_MAX_BYTES: usize = 24 * 1024 * 1024;
+const MAX_CACHED_TEXT_BYTES: usize = 512;
 const MAX_PERSISTENT_BITMAP_W: i32 = 2400;
 const MAX_PERSISTENT_BITMAP_H: i32 = 256;
 
@@ -3030,13 +3139,80 @@ struct CachedGlyphMask {
     has_color_glyphs: bool,
 }
 
+/// 两代热/冷分代缓存：活跃文本从 `prev` 提升至 `curr` 永不被误逐，
+/// 临时输入前缀在下一代自然淘汰，彻底消除整表 `clear()` 导致的突发掉帧。
+struct GenerationalTextCache<V> {
+    curr: HashMap<FontStyle, HashMap<String, V>>,
+    prev: HashMap<FontStyle, HashMap<String, V>>,
+    curr_len: usize,
+    half_cap: usize,
+    curr_bytes: usize,
+    half_max_bytes: usize,
+}
+
+impl<V: Clone> GenerationalTextCache<V> {
+    fn new(cap: usize, max_bytes: usize) -> Self {
+        Self {
+            curr: HashMap::new(),
+            prev: HashMap::new(),
+            curr_len: 0,
+            half_cap: (cap / 2).max(64),
+            curr_bytes: 0,
+            half_max_bytes: if max_bytes == 0 {
+                0
+            } else {
+                (max_bytes / 2).max(1024 * 1024)
+            },
+        }
+    }
+
+    fn get(&mut self, style: FontStyle, text: &str) -> Option<V> {
+        if let Some(val) = self.curr.get(&style).and_then(|m| m.get(text)) {
+            return Some(val.clone());
+        }
+        let promoted = self.prev.get_mut(&style).and_then(|m| m.remove(text))?;
+        self.curr
+            .entry(style)
+            .or_default()
+            .insert(text.to_string(), promoted.clone());
+        self.curr_len += 1;
+        Some(promoted)
+    }
+
+    fn insert(&mut self, style: FontStyle, text: String, val: V, item_bytes: usize) {
+        if self.curr_len >= self.half_cap
+            || (self.half_max_bytes > 0
+                && self.curr_bytes.saturating_add(item_bytes) > self.half_max_bytes)
+        {
+            self.prev = std::mem::take(&mut self.curr);
+            self.curr_len = 0;
+            self.curr_bytes = 0;
+        }
+        let bucket = self.curr.entry(style).or_default();
+        if bucket.insert(text, val).is_none() {
+            self.curr_len += 1;
+            self.curr_bytes = self.curr_bytes.saturating_add(item_bytes);
+        }
+    }
+
+    fn total_len(&self) -> usize {
+        self.curr_len + self.prev.values().map(|m| m.len()).sum::<usize>()
+    }
+
+    fn clear(&mut self) {
+        self.curr.clear();
+        self.prev.clear();
+        self.curr_len = 0;
+        self.curr_bytes = 0;
+    }
+}
+
 struct DWriteState {
     scale_factor: f32,
     formats: HashMap<FontStyle, IDWriteTextFormat>,
-    measure_cache: HashMap<FontStyle, HashMap<String, (i32, i32)>>,
-    layout_cache: HashMap<FontStyle, HashMap<String, (IDWriteTextLayout, i32, i32, i32, i32)>>,
-    mask_cache: HashMap<FontStyle, HashMap<String, Rc<CachedGlyphMask>>>,
-    mask_cache_bytes: usize,
+    measure_cache: GenerationalTextCache<(i32, i32)>,
+    layout_cache: GenerationalTextCache<(IDWriteTextLayout, i32, i32, i32, i32)>,
+    mask_cache: GenerationalTextCache<Rc<CachedGlyphMask>>,
     bitmap_target: Option<IDWriteBitmapRenderTarget>,
     bitmap_w: i32,
     bitmap_h: i32,
@@ -3069,10 +3245,9 @@ impl DWriteTextEngine {
                 state: RefCell::new(DWriteState {
                     scale_factor: scale_factor.clamp(0.75, 4.0),
                     formats: HashMap::new(),
-                    measure_cache: HashMap::new(),
-                    layout_cache: HashMap::new(),
-                    mask_cache: HashMap::new(),
-                    mask_cache_bytes: 0,
+                    measure_cache: GenerationalTextCache::new(MEASURE_CACHE_CAP, 0),
+                    layout_cache: GenerationalTextCache::new(LAYOUT_CACHE_CAP, 0),
+                    mask_cache: GenerationalTextCache::new(MASK_CACHE_CAP, MASK_CACHE_MAX_BYTES),
                     bitmap_target: None,
                     bitmap_w: 0,
                     bitmap_h: 0,
@@ -3172,8 +3347,7 @@ impl DWriteTextEngine {
         let mut st = self.state.borrow_mut();
         st.layout_cache.clear();
         st.mask_cache.clear();
-        st.mask_cache_bytes = 0;
-        if st.measure_cache.values().map(|m| m.len()).sum::<usize>() > 1024 {
+        if st.measure_cache.total_len() > 1024 {
             st.measure_cache.clear();
         }
         st.bitmap_target = None;
@@ -3189,12 +3363,10 @@ impl DWriteTextEngine {
         style: FontStyle,
     ) -> Option<(IDWriteTextLayout, i32, i32, i32, i32)> {
         let scale = {
-            let st = self.state.borrow();
+            let mut st = self.state.borrow_mut();
             if text.len() <= MAX_CACHED_TEXT_BYTES {
-                if let Some(by_text) = st.layout_cache.get(&style) {
-                    if let Some((layout, log_mw, log_th, phys_mw, phys_th)) = by_text.get(text) {
-                        return Some((layout.clone(), *log_mw, *log_th, *phys_mw, *phys_th));
-                    }
+                if let Some(hit) = st.layout_cache.get(style, text) {
+                    return Some(hit);
                 }
             }
             st.scale_factor
@@ -3211,13 +3383,11 @@ impl DWriteTextEngine {
 
         if text.len() <= MAX_CACHED_TEXT_BYTES {
             let mut st = self.state.borrow_mut();
-            let total_cached: usize = st.layout_cache.values().map(|m| m.len()).sum();
-            if total_cached >= LAYOUT_CACHE_CAP {
-                st.layout_cache.clear();
-            }
-            st.layout_cache.entry(style).or_default().insert(
+            st.layout_cache.insert(
+                style,
                 text.to_string(),
                 (layout.clone(), log_mw, log_th, phys_mw, phys_th),
+                0,
             );
         }
         Some((layout, log_mw, log_th, phys_mw, phys_th))
@@ -3280,11 +3450,9 @@ impl DWriteTextEngine {
             return (0, 18);
         }
         {
-            let st = self.state.borrow();
-            if let Some(by_text) = st.measure_cache.get(&style) {
-                if let Some(&cached) = by_text.get(text) {
-                    return cached;
-                }
+            let mut st = self.state.borrow_mut();
+            if let Some(cached) = st.measure_cache.get(style, text) {
+                return cached;
             }
         }
         let Some((_, log_mw, log_th, _, _)) = self.get_or_create_layout(text, style) else {
@@ -3292,14 +3460,7 @@ impl DWriteTextEngine {
         };
         let res = (log_mw, log_th);
         let mut st = self.state.borrow_mut();
-        let total_cached: usize = st.measure_cache.values().map(|m| m.len()).sum();
-        if total_cached >= MEASURE_CACHE_CAP {
-            st.measure_cache.clear();
-        }
-        st.measure_cache
-            .entry(style)
-            .or_default()
-            .insert(text.to_string(), res);
+        st.measure_cache.insert(style, text.to_string(), res, 0);
         res
     }
 
@@ -3345,12 +3506,10 @@ impl DWriteTextEngine {
         text: &str,
         style: FontStyle,
     ) -> Option<Rc<CachedGlyphMask>> {
-        {
-            let st = self.state.borrow();
-            if let Some(by_text) = st.mask_cache.get(&style) {
-                if let Some(cached) = by_text.get(text) {
-                    return Some(Rc::clone(cached));
-                }
+        if text.len() <= MAX_CACHED_TEXT_BYTES {
+            let mut st = self.state.borrow_mut();
+            if let Some(cached) = st.mask_cache.get(style, text) {
+                return Some(cached);
             }
         }
 
@@ -3368,11 +3527,11 @@ impl DWriteTextEngine {
                 subpixel_mask: Vec::new(),
                 has_color_glyphs: false,
             });
-            let mut st = self.state.borrow_mut();
-            st.mask_cache
-                .entry(style)
-                .or_default()
-                .insert(text.to_string(), Rc::clone(&empty_mask));
+            if text.len() <= MAX_CACHED_TEXT_BYTES {
+                let mut st = self.state.borrow_mut();
+                st.mask_cache
+                    .insert(style, text.to_string(), Rc::clone(&empty_mask), text.len());
+            }
             return Some(empty_mask);
         }
 
@@ -3415,21 +3574,22 @@ impl DWriteTextEngine {
             for row in 0..ch {
                 let src_row =
                     unsafe { std::slice::from_raw_parts(bits.add(row * stride_usize), cw) };
-                for (col, &px) in src_row.iter().enumerate() {
-                    if (px & 0x00FFFFFF) != 0 {
-                        if row < min_y {
-                            min_y = row;
-                        }
-                        if row + 1 > max_y {
-                            max_y = row + 1;
-                        }
-                        if col < min_x {
-                            min_x = col;
-                        }
-                        if col + 1 > max_x {
-                            max_x = col + 1;
-                        }
-                    }
+                let Some(first) = src_row.iter().position(|&px| (px & 0x00FFFFFF) != 0) else {
+                    continue;
+                };
+                let last = src_row
+                    .iter()
+                    .rposition(|&px| (px & 0x00FFFFFF) != 0)
+                    .unwrap_or(first);
+                if row < min_y {
+                    min_y = row;
+                }
+                max_y = row + 1;
+                if first < min_x {
+                    min_x = first;
+                }
+                if last + 1 > max_x {
+                    max_x = last + 1;
                 }
             }
         }
@@ -3473,18 +3633,8 @@ impl DWriteTextEngine {
             && mask_bytes <= 256 * 1024
         {
             let mut st = self.state.borrow_mut();
-            let total_cached: usize = st.mask_cache.values().map(|m| m.len()).sum();
-            if total_cached >= MASK_CACHE_CAP
-                || st.mask_cache_bytes.saturating_add(mask_bytes) > MASK_CACHE_MAX_BYTES
-            {
-                st.mask_cache.clear();
-                st.mask_cache_bytes = 0;
-            }
             st.mask_cache
-                .entry(style)
-                .or_default()
-                .insert(text.to_string(), Rc::clone(&mask_rc));
-            st.mask_cache_bytes = st.mask_cache_bytes.saturating_add(mask_bytes);
+                .insert(style, text.to_string(), Rc::clone(&mask_rc), mask_bytes);
         }
         Some(mask_rc)
     }

@@ -7,9 +7,9 @@ use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 use tiny_skia::{Pixmap, PremultipliedColorU8};
 
-const MEASURE_CACHE_CAP: usize = 3072;
-const SHAPED_CACHE_CAP: usize = 1024;
-const MAX_CACHED_TEXT_BYTES: usize = 300;
+const MEASURE_CACHE_CAP: usize = 12288;
+const SHAPED_CACHE_CAP: usize = 4096;
+const MAX_CACHED_TEXT_BYTES: usize = 512;
 
 struct SharedFontContext {
     font_system: FontSystem,
@@ -122,10 +122,62 @@ struct ShapedLine {
     glyphs: Vec<CachedGlyph>,
 }
 
+struct GenerationalCosmicCache<V> {
+    curr: HashMap<FontStyle, HashMap<String, V>>,
+    prev: HashMap<FontStyle, HashMap<String, V>>,
+    curr_len: usize,
+    half_cap: usize,
+}
+
+impl<V: Clone> GenerationalCosmicCache<V> {
+    fn new(cap: usize) -> Self {
+        Self {
+            curr: HashMap::new(),
+            prev: HashMap::new(),
+            curr_len: 0,
+            half_cap: (cap / 2).max(64),
+        }
+    }
+
+    fn get(&mut self, style: FontStyle, text: &str) -> Option<V> {
+        if let Some(val) = self.curr.get(&style).and_then(|m| m.get(text)) {
+            return Some(val.clone());
+        }
+        let promoted = self.prev.get_mut(&style).and_then(|m| m.remove(text))?;
+        self.curr
+            .entry(style)
+            .or_default()
+            .insert(text.to_string(), promoted.clone());
+        self.curr_len += 1;
+        Some(promoted)
+    }
+
+    fn insert(&mut self, style: FontStyle, text: String, val: V) {
+        if self.curr_len >= self.half_cap {
+            self.prev = std::mem::take(&mut self.curr);
+            self.curr_len = 0;
+        }
+        let bucket = self.curr.entry(style).or_default();
+        if bucket.insert(text, val).is_none() {
+            self.curr_len += 1;
+        }
+    }
+
+    fn total_len(&self) -> usize {
+        self.curr_len + self.prev.values().map(|m| m.len()).sum::<usize>()
+    }
+
+    fn clear(&mut self) {
+        self.curr.clear();
+        self.prev.clear();
+        self.curr_len = 0;
+    }
+}
+
 struct CosmicState {
     scale_factor: f32,
-    measure_cache: HashMap<FontStyle, HashMap<String, (i32, i32)>>,
-    shaped_cache: HashMap<FontStyle, HashMap<String, Rc<ShapedLine>>>,
+    measure_cache: GenerationalCosmicCache<(i32, i32)>,
+    shaped_cache: GenerationalCosmicCache<Rc<ShapedLine>>,
 }
 
 pub struct CosmicTextEngine {
@@ -139,8 +191,8 @@ impl CosmicTextEngine {
             fonts: shared_font_context(),
             state: RefCell::new(CosmicState {
                 scale_factor: scale_factor.clamp(0.75, 4.0),
-                measure_cache: HashMap::new(),
-                shaped_cache: HashMap::new(),
+                measure_cache: GenerationalCosmicCache::new(MEASURE_CACHE_CAP),
+                shaped_cache: GenerationalCosmicCache::new(SHAPED_CACHE_CAP),
             }),
         }
     }
@@ -148,7 +200,7 @@ impl CosmicTextEngine {
     pub fn trim_caches(&self) {
         let mut st = self.state.borrow_mut();
         st.shaped_cache.clear();
-        if st.measure_cache.values().map(|m| m.len()).sum::<usize>() > 1024 {
+        if st.measure_cache.total_len() > 1024 {
             st.measure_cache.clear();
         }
     }
@@ -172,10 +224,10 @@ impl CosmicTextEngine {
 
     fn get_or_shape_line(&self, text: &str, style: FontStyle) -> Rc<ShapedLine> {
         let scale = {
-            let st = self.state.borrow();
-            if let Some(by_text) = st.shaped_cache.get(&style) {
-                if let Some(cached) = by_text.get(text) {
-                    return Rc::clone(cached);
+            let mut st = self.state.borrow_mut();
+            if text.len() <= MAX_CACHED_TEXT_BYTES {
+                if let Some(cached) = st.shaped_cache.get(style, text) {
+                    return cached;
                 }
             }
             st.scale_factor
@@ -252,14 +304,7 @@ impl CosmicTextEngine {
 
         if text.len() <= MAX_CACHED_TEXT_BYTES {
             let mut st = self.state.borrow_mut();
-            let total_cached: usize = st.shaped_cache.values().map(|m| m.len()).sum();
-            if total_cached >= SHAPED_CACHE_CAP {
-                st.shaped_cache.clear();
-            }
-            st.shaped_cache
-                .entry(style)
-                .or_default()
-                .insert(text.to_string(), Rc::clone(&shaped));
+            st.shaped_cache.insert(style, text.to_string(), Rc::clone(&shaped));
         }
         shaped
     }
@@ -269,24 +314,17 @@ impl CosmicTextEngine {
             return (0, 18);
         }
         {
-            let st = self.state.borrow();
-            if let Some(by_text) = st.measure_cache.get(&style) {
-                if let Some(&cached) = by_text.get(text) {
-                    return cached;
-                }
+            let mut st = self.state.borrow_mut();
+            if let Some(cached) = st.measure_cache.get(style, text) {
+                return cached;
             }
         }
         let shaped = self.get_or_shape_line(text, style);
         let res = (shaped.log_mw, shaped.log_th);
-        let mut st = self.state.borrow_mut();
-        let total_cached: usize = st.measure_cache.values().map(|m| m.len()).sum();
-        if total_cached >= MEASURE_CACHE_CAP {
-            st.measure_cache.clear();
+        if text.len() <= MAX_CACHED_TEXT_BYTES {
+            let mut st = self.state.borrow_mut();
+            st.measure_cache.insert(style, text.to_string(), res);
         }
-        st.measure_cache
-            .entry(style)
-            .or_default()
-            .insert(text.to_string(), res);
         res
     }
 

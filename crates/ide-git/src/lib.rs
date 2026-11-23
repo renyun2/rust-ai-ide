@@ -143,6 +143,9 @@ pub struct GitBlameLine {
 
 #[derive(Debug, Clone)]
 struct GitSnapshot {
+    git_installed: bool,
+    git_binary_path: Option<PathBuf>,
+    git_version: Option<String>,
     current_branch: String,
     local_branches: Vec<String>,
     remote_branches: Vec<String>,
@@ -254,6 +257,9 @@ pub struct GitPollOutcome {
 
 pub struct GitEngine {
     pub root: PathBuf,
+    pub git_installed: bool,
+    pub git_binary_path: Option<PathBuf>,
+    pub git_version: Option<String>,
     pub current_branch: String,
     pub local_branches: Vec<String>,
     pub remote_branches: Vec<String>,
@@ -280,8 +286,331 @@ pub struct GitEngine {
     is_busy: Arc<AtomicBool>,
 }
 
+pub const GIT_DOWNLOAD_URL: &str = "https://git-scm.com/downloads";
+
+/// Detects the local `git` executable from PATH or standard OS installation directories.
+pub fn detect_git_executable() -> Option<PathBuf> {
+    let exe_names: &[&str] = if cfg!(target_os = "windows") {
+        &["git.exe", "git.cmd", "git"]
+    } else {
+        &["git"]
+    };
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            for name in exe_names {
+                let cand = dir.join(name);
+                if cand.is_file() {
+                    return Some(cand);
+                }
+            }
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let mut candidates = Vec::new();
+        for env_key in ["ProgramFiles", "ProgramFiles(x86)"] {
+            if let Some(base) = std::env::var_os(env_key) {
+                let p = PathBuf::from(base);
+                candidates.push(p.join("Git").join("cmd").join("git.exe"));
+                candidates.push(p.join("Git").join("bin").join("git.exe"));
+            }
+        }
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            let p = PathBuf::from(local);
+            candidates.push(p.join("Programs").join("Git").join("cmd").join("git.exe"));
+            candidates.push(p.join("Programs").join("Git").join("bin").join("git.exe"));
+        }
+        for cand in candidates {
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        for p in [
+            "/usr/bin/git",
+            "/usr/local/bin/git",
+            "/opt/homebrew/bin/git",
+        ] {
+            let cand = PathBuf::from(p);
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+/// Returns the trimmed `git --version` string when `bin` executes cleanly.
+pub fn git_version_string(bin: &Path) -> Option<String> {
+    let mut cmd = Command::new(bin);
+    cmd.arg("--version");
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+/// Derives a local folder name from a remote Git URL (HTTPS or SSH).
+pub fn derive_repo_name_from_url(url: &str) -> Option<String> {
+    let trimmed = url.trim().trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() {
+        return None;
+    }
+    let segment = trimmed
+        .rsplit(['/', ':', '\\'])
+        .next()
+        .map(str::trim)
+        .unwrap_or("");
+    let name = segment.strip_suffix(".git").unwrap_or(segment).trim();
+    if name.is_empty() || name == "." || name == ".." {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// Downloads and installs Git silently (or via platform package manager) when missing locally.
+pub fn install_git_blocking() -> Result<PathBuf, String> {
+    if let Some(existing) = detect_git_executable() {
+        return Ok(existing);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // 1. Download latest official Git for Windows installer directly from GitHub Releases
+        let arch_suffix = if cfg!(target_arch = "aarch64") {
+            "arm64.exe"
+        } else {
+            "64-bit.exe"
+        };
+        let mut api_cmd = Command::new("curl.exe");
+        api_cmd.args([
+            "-fsSL",
+            "-H",
+            "User-Agent: Rust-AI-IDE",
+            "https://api.github.com/repos/git-for-windows/git/releases/latest",
+        ]);
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            api_cmd.creation_flags(0x0800_0000);
+        }
+        if let Ok(api_out) = api_cmd.output() {
+            if api_out.status.success() {
+                let json_txt = String::from_utf8_lossy(&api_out.stdout);
+                if let Some(dl_url) = extract_git_installer_download_url(&json_txt, arch_suffix) {
+                    let installer_path = std::env::temp_dir().join("rust-ai-ide-git-setup.exe");
+                    let mut dl_cmd = Command::new("curl.exe");
+                    dl_cmd
+                        .args(["-fL", "--retry", "2", "-o"])
+                        .arg(&installer_path)
+                        .arg(&dl_url);
+                    {
+                        use std::os::windows::process::CommandExt;
+                        dl_cmd.creation_flags(0x0800_0000);
+                    }
+                    if dl_cmd.output().is_ok_and(|o| o.status.success()) && installer_path.is_file()
+                    {
+                        let run_res = Command::new(&installer_path)
+                            .args(["/VERYSILENT", "/NORESTART", "/NOCANCEL", "/SP-"])
+                            .output();
+                        let ok = match run_res {
+                            Ok(o) if o.status.success() => true,
+                            _ => {
+                                // Elevation may be required for Program Files install
+                                let ps_script = format!(
+                                    "Start-Process -FilePath '{}' -ArgumentList '/VERYSILENT','/NORESTART','/NOCANCEL','/SP-' -Verb RunAs -Wait",
+                                    installer_path.display().to_string().replace('\'', "''")
+                                );
+                                Command::new("powershell.exe")
+                                    .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps_script])
+                                    .output()
+                                    .is_ok_and(|o| o.status.success())
+                            }
+                        };
+                        let _ = std::fs::remove_file(&installer_path);
+                        if ok {
+                            if let Some(bin) = detect_git_executable() {
+                                return Ok(bin);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Fallback to winget
+        let mut wg = Command::new("winget");
+        wg.args([
+            "install",
+            "--id",
+            "Git.Git",
+            "-e",
+            "--source",
+            "winget",
+            "--accept-package-agreements",
+            "--accept-source-agreements",
+        ]);
+        {
+            use std::os::windows::process::CommandExt;
+            wg.creation_flags(0x0800_0000);
+        }
+        match wg.output() {
+            Ok(out) if out.status.success() => {
+                if let Some(bin) = detect_git_executable() {
+                    return Ok(bin);
+                }
+                return Err("Git 安装命令已执行，但未检测到 git.exe，请重启 IDE 或手动安装".to_string());
+            }
+            Ok(out) => {
+                let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                return Err(if !err.is_empty() { err } else if !stdout.is_empty() { stdout } else { "Git 自动安装失败，请从官网下载安装".to_string() });
+            }
+            Err(e) => {
+                return Err(format!("无法启动 Git 安装程序: {e}"));
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if Command::new("brew").arg("--version").output().is_ok_and(|o| o.status.success()) {
+            let out = Command::new("brew")
+                .args(["install", "git"])
+                .output()
+                .map_err(|e| format!("brew install git 失败: {e}"))?;
+            if out.status.success() {
+                if let Some(bin) = detect_git_executable() {
+                    return Ok(bin);
+                }
+            }
+            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            return Err(if err.is_empty() { "brew install git 失败".to_string() } else { err });
+        }
+        let _ = Command::new("xcode-select").arg("--install").spawn();
+        return Err("已触发 macOS Xcode Command Line Tools 安装，请在系统弹窗中确认并在完成后刷新".to_string());
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        for (mgr, args) in [
+            ("apt-get", vec!["install", "-y", "git"]),
+            ("dnf", vec!["install", "-y", "git"]),
+            ("pacman", vec!["-S", "--noconfirm", "git"]),
+        ] {
+            if Command::new("which").arg(mgr).output().is_ok_and(|o| o.status.success()) {
+                let out = Command::new("pkexec")
+                    .arg(mgr)
+                    .args(&args)
+                    .output()
+                    .map_err(|e| format!("安装 Git 失败: {e}"))?;
+                if out.status.success() {
+                    if let Some(bin) = detect_git_executable() {
+                        return Ok(bin);
+                    }
+                }
+                let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                return Err(if err.is_empty() { format!("{mgr} 安装 Git 失败") } else { err });
+            }
+        }
+        Err("未找到受支持的包管理器，请访问 git-scm.com 安装 Git".to_string())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn extract_git_installer_download_url(json_txt: &str, arch_suffix: &str) -> Option<String> {
+    for line in json_txt.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("\"browser_download_url\"") {
+            if let Some(colon) = rest.find(':') {
+                let url = rest[colon + 1..]
+                    .trim()
+                    .trim_end_matches(',')
+                    .trim()
+                    .trim_matches('"');
+                if url.contains("/Git-") && url.ends_with(arch_suffix) {
+                    return Some(url.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Clones a remote Git repository into `target_dir` and returns the destination path on success.
+pub fn clone_repository_blocking(url: &str, target_dir: &Path) -> Result<PathBuf, String> {
+    let clean_url = url.trim();
+    if clean_url.is_empty() {
+        return Err("请输入 Git 远程仓库地址".to_string());
+    }
+    if target_dir.as_os_str().is_empty() {
+        return Err("请选择本地克隆目录".to_string());
+    }
+    let Some(git_bin) = detect_git_executable() else {
+        return Err("本机尚未安装 Git，请先点击下载安装 Git".to_string());
+    };
+    if target_dir.exists() {
+        let has_entries = std::fs::read_dir(target_dir)
+            .ok()
+            .and_then(|mut rd| rd.next())
+            .is_some();
+        if has_entries {
+            return Err(format!(
+                "目标目录已存在且非空: {}",
+                target_dir.display()
+            ));
+        }
+    } else if let Some(parent) = target_dir.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("无法创建父目录 {}: {e}", parent.display()))?;
+        }
+    }
+
+    let mut cmd = Command::new(git_bin);
+    cmd.args(["clone", clean_url]).arg(target_dir);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let out = cmd
+        .output()
+        .map_err(|e| format!("无法执行 git clone: {e}"))?;
+    if out.status.success() {
+        Ok(target_dir.to_path_buf())
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        Err(if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            "git clone 失败".to_string()
+        })
+    }
+}
+
 fn git_command(root: &Path) -> Command {
-    let mut cmd = Command::new("git");
+    let mut cmd = match detect_git_executable() {
+        Some(bin) => Command::new(bin),
+        None => Command::new("git"),
+    };
     cmd.current_dir(root);
     #[cfg(target_os = "windows")]
     {
@@ -635,6 +964,29 @@ fn assign_commit_graph_lanes(commits: &mut [GitLogEntry]) {
 }
 
 fn collect_snapshot(root: &Path) -> GitSnapshot {
+    let git_binary_path = detect_git_executable();
+    let Some(ref git_bin) = git_binary_path else {
+        return GitSnapshot {
+            git_installed: false,
+            git_binary_path: None,
+            git_version: None,
+            current_branch: "main".to_string(),
+            local_branches: vec!["main".to_string()],
+            remote_branches: Vec::new(),
+            tags: Vec::new(),
+            ahead_behind: (0, 0),
+            stashes: Vec::new(),
+            remotes: Vec::new(),
+            in_rebase: false,
+            in_merge: false,
+            changed_files: Vec::new(),
+            working_diffs: HashMap::new(),
+            recent_commits: Vec::new(),
+            head_detail: None,
+        };
+    };
+    let git_version = git_version_string(git_bin);
+
     let (branch_res, status_res, log_res, diff_res) = thread::scope(|s| {
         let h_branch = s.spawn(|| {
             let mut current_branch = String::new();
@@ -859,6 +1211,9 @@ fn collect_snapshot(root: &Path) -> GitSnapshot {
     let (stashes, remotes, in_rebase, in_merge) = collect_meta_extras(root);
 
     GitSnapshot {
+        git_installed: true,
+        git_binary_path,
+        git_version,
         current_branch: branch_res.0,
         local_branches: branch_res.1,
         remote_branches: branch_res.2,
@@ -1933,6 +2288,9 @@ fn spawn_git_worker(
                             });
                             (
                                 h_snap.join().unwrap_or_else(|_| GitSnapshot {
+                                    git_installed: detect_git_executable().is_some(),
+                                    git_binary_path: detect_git_executable(),
+                                    git_version: None,
                                     current_branch: "main".to_string(),
                                     local_branches: vec!["main".to_string()],
                                     remote_branches: Vec::new(),
@@ -1988,6 +2346,9 @@ impl GitEngine {
             spawn_git_worker(root_buf.clone(), wakeup);
         let engine = Self {
             root: root_buf,
+            git_installed: detect_git_executable().is_some(),
+            git_binary_path: detect_git_executable(),
+            git_version: None,
             current_branch: "main".to_string(),
             local_branches: vec!["main".to_string()],
             remote_branches: Vec::new(),
@@ -2020,6 +2381,9 @@ impl GitEngine {
     }
 
     fn apply_snapshot(&mut self, snapshot: GitSnapshot) {
+        self.git_installed = snapshot.git_installed;
+        self.git_binary_path = snapshot.git_binary_path;
+        self.git_version = snapshot.git_version;
         self.current_branch = snapshot.current_branch;
         self.local_branches = snapshot.local_branches;
         self.remote_branches = snapshot.remote_branches;
@@ -2394,8 +2758,8 @@ impl GitEngine {
         }
     }
 
-    pub fn request_ai_commit_diff(&self) {
-        let _ = self.cmd_tx.send(GitWorkerCmd::AiCommitDiff);
+    pub fn request_ai_commit_diff(&self) -> bool {
+        self.cmd_tx.send(GitWorkerCmd::AiCommitDiff).is_ok()
     }
 
     pub fn poll_updates(&mut self) -> GitPollOutcome {
@@ -2845,5 +3209,22 @@ mod tests {
         assert!(!engine.file_histories[&f_path].is_empty());
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_derive_repo_name_from_url() {
+        assert_eq!(
+            derive_repo_name_from_url("https://github.com/rust-lang/rust.git").as_deref(),
+            Some("rust")
+        );
+        assert_eq!(
+            derive_repo_name_from_url("https://github.com/owner/my-repo/").as_deref(),
+            Some("my-repo")
+        );
+        assert_eq!(
+            derive_repo_name_from_url("git@github.com:org/awesome-ide.git").as_deref(),
+            Some("awesome-ide")
+        );
+        assert_eq!(derive_repo_name_from_url("   "), None);
     }
 }

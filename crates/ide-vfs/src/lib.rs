@@ -104,6 +104,21 @@ impl TextBuffer {
         self.rope.to_string()
     }
 
+    /// Estimates a single line's pixel width without allocating a `String`.
+    pub fn line_display_width_est(&self, line: usize, char_w: i32) -> i32 {
+        if line >= self.line_count() {
+            return 0;
+        }
+        let mut est = 0i32;
+        for c in self.rope.line(line).chars() {
+            if c == '\n' || c == '\r' {
+                break;
+            }
+            est += if c.is_ascii() { char_w } else { char_w * 2 };
+        }
+        est
+    }
+
     pub fn clamp_pos(&self, line: usize, col: usize) -> (usize, usize) {
         let max_line = self.line_count().saturating_sub(1);
         let l = line.min(max_line);

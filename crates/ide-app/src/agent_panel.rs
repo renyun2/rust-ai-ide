@@ -4,8 +4,8 @@ use crate::ide_state::{
     RightPanelTab, ScrollTrackInfo,
 };
 use ide_agent_hub::{
-    detect_workspace_file_references, AgentAttachedItem, AgentWorkbenchMode, QueuedAgentPrompt,
-    StreamingAgentProgress,
+    detect_workspace_file_references, AgentAttachedItem, AgentProviderKind, AgentWorkbenchMode,
+    QueuedAgentPrompt, StreamingAgentProgress,
 };
 use ide_core::{LanguageId, ThemeKind, UiLanguage};
 use ide_git::DiffLineKind;
@@ -172,7 +172,7 @@ pub(crate) enum CachedChatRow {
     },
     CodeBlockLine {
         text: String,
-        lang: LanguageId,
+        spans: Arc<Vec<ide_syntax::HighlightSpan>>,
         user_bubble_w: Option<i32>,
     },
     TurnFilesToggle {
@@ -252,6 +252,34 @@ impl CachedChatRow {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct ParsedProseLine {
+    pub clean: String,
+    pub line_bold: bool,
+    pub spans: Vec<ChatTextSpan>,
+    pub pill_reserve: i32,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum ParsedBodyBlock {
+    ParaSpacer,
+    ProseLine(ParsedProseLine),
+    CodeBlock {
+        lang_tag: String,
+        lang_id: LanguageId,
+        full_code: Arc<str>,
+        lines: Vec<String>,
+        line_count: usize,
+        preview: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ParsedChatMessage {
+    pub blocks: Vec<ParsedBodyBlock>,
+    pub has_code_fence: bool,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct AgentChatCache {
     pub session_id: String,
     pub msg_count: usize,
@@ -262,6 +290,11 @@ pub(crate) struct AgentChatCache {
     pub rows: Vec<CachedChatRow>,
     pub row_tops: Vec<i32>,
     pub total_height: i32,
+    pub parsed_session_id: String,
+    pub parsed_msg_count: usize,
+    pub parsed_content_sig: u64,
+    pub parsed_workspace_root: PathBuf,
+    pub parsed_msgs: Vec<ParsedChatMessage>,
 }
 
 impl Default for AgentChatCache {
@@ -276,6 +309,11 @@ impl Default for AgentChatCache {
             rows: Vec::new(),
             row_tops: Vec::new(),
             total_height: 0,
+            parsed_session_id: String::new(),
+            parsed_msg_count: usize::MAX,
+            parsed_content_sig: 0,
+            parsed_workspace_root: PathBuf::new(),
+            parsed_msgs: Vec::new(),
         }
     }
 }
@@ -293,7 +331,7 @@ impl AgentChatCache {
     }
 
     /// 计算将底部最后一行对齐至 `viewport_h` 所需的最大起始行索引
-    fn max_scroll_row_for_height(&self, viewport_h: i32) -> usize {
+    pub(crate) fn max_scroll_row_for_height(&self, viewport_h: i32) -> usize {
         if self.rows.is_empty() {
             return 0;
         }
@@ -322,7 +360,7 @@ impl AgentChatCache {
         let mut cnt = 0usize;
         for r in &self.rows[start_row..] {
             let rh = r.row_height();
-            if acc > 0 && acc + rh > viewport_h + 4 {
+            if acc > 0 && acc + rh > viewport_h {
                 break;
             }
             acc += rh;
@@ -494,16 +532,16 @@ fn wrap_chat_line_segments(
     out
 }
 
-fn project_and_merge_spans(
-    root: &std::path::Path,
-    seg_text: &str,
+fn project_spans_slice(
     seg_start_char: usize,
     seg_end_char: usize,
-    raw_spans: &[ChatTextSpan],
+    full_spans: &[ChatTextSpan],
 ) -> Vec<ChatTextSpan> {
-    let seg_len = seg_end_char.saturating_sub(seg_start_char);
+    if full_spans.is_empty() || seg_end_char <= seg_start_char {
+        return Vec::new();
+    }
     let mut spans = Vec::new();
-    for sp in raw_spans {
+    for sp in full_spans {
         let ov_s = sp.start_char.max(seg_start_char);
         let ov_e = sp.end_char.min(seg_end_char);
         if ov_e > ov_s {
@@ -514,6 +552,18 @@ fn project_and_merge_spans(
             });
         }
     }
+    spans
+}
+
+fn project_and_merge_spans(
+    root: &std::path::Path,
+    seg_text: &str,
+    seg_start_char: usize,
+    seg_end_char: usize,
+    raw_spans: &[ChatTextSpan],
+) -> Vec<ChatTextSpan> {
+    let seg_len = seg_end_char.saturating_sub(seg_start_char);
+    let mut spans = project_spans_slice(seg_start_char, seg_end_char, raw_spans);
 
     let refs = detect_workspace_file_references(root, seg_text);
     for (tok, path, line_opt) in refs {
@@ -643,142 +693,72 @@ fn hit_test_chat_spans_col(
     len
 }
 
-/// 将包含 Markdown 代码块与行内格式的聊天消息拆分为美观排版的行
-fn append_message_body_rows(
-    root: &std::path::Path,
-    canvas: &SurfaceCanvas,
-    msg_idx: usize,
-    content: &str,
-    wrap_w: i32,
-    is_user: bool,
-    bubble_w: i32,
-    collapse_overrides: &std::collections::HashMap<(usize, usize), bool>,
-    out: &mut Vec<CachedChatRow>,
-) {
+/// Width-independent pre-parsing of a chat message body (markdown inline spans, file refs, code fences).
+/// Cached across `wrap_w` changes so splitter dragging never re-runs filesystem file-ref resolution.
+fn parse_message_body(root: &std::path::Path, content: &str) -> ParsedChatMessage {
+    let mut blocks = Vec::new();
     let mut in_fence = false;
     let mut fence_lang = String::new();
     let mut code_lines: Vec<String> = Vec::new();
-    let mut prose_buf: Vec<&str> = Vec::new();
-    let mut blk_idx = 0usize;
+    let mut has_code_fence = false;
 
-    let flush_prose = |prose: &mut Vec<&str>, out: &mut Vec<CachedChatRow>| {
-        if prose.is_empty() {
+    let push_prose = |raw_line: &str, blocks: &mut Vec<ParsedBodyBlock>| {
+        if raw_line.trim().is_empty() {
+            blocks.push(ParsedBodyBlock::ParaSpacer);
             return;
         }
-        for raw_line in prose.drain(..) {
-            if raw_line.trim().is_empty() {
-                if !out.is_empty() {
-                    out.push(CachedChatRow::ParaSpacer { is_user, bubble_w });
-                }
-                continue;
-            }
-            let (clean_line, line_bold, raw_spans) = parse_markdown_inline_line(raw_line);
-            let pill_reserve = chat_inline_pill_reserve(&raw_spans);
-            let base_style = if line_bold {
-                FontStyle::ChatBodyBold
-            } else {
-                FontStyle::ChatBody
-            };
-            let eff_wrap_w = (wrap_w - pill_reserve).max(60);
-            for (seg_s, seg_e, seg_txt) in
-                wrap_chat_line_segments(canvas, &clean_line, eff_wrap_w, base_style)
-            {
-                let spans = project_and_merge_spans(root, &seg_txt, seg_s, seg_e, &raw_spans);
-                if is_user {
-                    out.push(CachedChatRow::UserLine {
-                        text: seg_txt,
-                        spans,
-                        default_bold: line_bold,
-                        bubble_w,
-                    });
-                } else {
-                    out.push(CachedChatRow::AgentLine {
-                        text: seg_txt,
-                        spans,
-                        default_bold: line_bold,
-                    });
-                }
-            }
-        }
+        let (clean, line_bold, raw_spans) = parse_markdown_inline_line(raw_line);
+        let char_len = clean.chars().count();
+        let spans = project_and_merge_spans(root, &clean, 0, char_len, &raw_spans);
+        let pill_reserve = chat_inline_pill_reserve(&spans);
+        blocks.push(ParsedBodyBlock::ProseLine(ParsedProseLine {
+            clean,
+            line_bold,
+            spans,
+            pill_reserve,
+        }));
     };
 
-    let user_bubble_w = if is_user { Some(bubble_w) } else { None };
-    let code_wrap_w = if is_user {
-        (bubble_w - 42).max(40)
-    } else {
-        (wrap_w - 20).max(40)
-    };
-    let push_code_block = |tag: String,
-                           lines: Vec<String>,
-                           cur_blk_idx: usize,
-                           out: &mut Vec<CachedChatRow>| {
-        let full_code = lines.join("\n");
+    let push_code = |tag: String, lines: Vec<String>, blocks: &mut Vec<ParsedBodyBlock>| {
+        let full_code: Arc<str> = Arc::from(lines.join("\n"));
         let line_count = lines.len().max(1);
-        let default_collapsed = is_user || line_count >= 28;
-        let collapsed = collapse_overrides
-            .get(&(msg_idx, cur_blk_idx))
-            .copied()
-            .unwrap_or(default_collapsed);
-        let lang_label = if tag.is_empty() {
+        let preview = lines
+            .iter()
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty())
+            .unwrap_or("...")
+            .to_string();
+        let lang_id = language_from_fence_tag(&tag);
+        let lang_tag = if tag.is_empty() {
             "code".to_string()
         } else {
-            tag.clone()
+            tag
         };
-        out.push(CachedChatRow::CodeBlockHeader {
-            msg_idx,
-            blk_idx: cur_blk_idx,
-            lang: lang_label,
-            code: Arc::from(full_code),
+        blocks.push(ParsedBodyBlock::CodeBlock {
+            lang_tag,
+            lang_id,
+            full_code,
+            lines,
             line_count,
-            collapsed,
-            user_bubble_w,
+            preview,
         });
-        if collapsed {
-            let preview = lines
-                .iter()
-                .map(|l| l.trim())
-                .find(|l| !l.is_empty())
-                .unwrap_or("...")
-                .to_string();
-            out.push(CachedChatRow::CodeBlockCollapsedSummary {
-                msg_idx,
-                blk_idx: cur_blk_idx,
-                preview,
-                line_count,
-                user_bubble_w,
-            });
-        } else {
-            let lang_id = language_from_fence_tag(&tag);
-            for cl in &lines {
-                for (_, _, wl) in
-                    wrap_chat_line_segments(canvas, cl, code_wrap_w, FontStyle::ChatCode)
-                {
-                    out.push(CachedChatRow::CodeBlockLine {
-                        text: wl,
-                        lang: lang_id,
-                        user_bubble_w,
-                    });
-                }
-            }
-        }
     };
 
     for raw in content.lines() {
         let trimmed = raw.trim_start();
         if !in_fence {
             if let Some(after) = trimmed.strip_prefix("```") {
-                flush_prose(&mut prose_buf, out);
+                has_code_fence = true;
                 in_fence = true;
                 fence_lang = after.trim().to_string();
                 code_lines.clear();
             } else {
-                prose_buf.push(raw);
+                push_prose(raw, &mut blocks);
             }
         } else if trimmed.starts_with("```") {
             let taken = std::mem::take(&mut code_lines);
             let tag = std::mem::take(&mut fence_lang);
-            push_code_block(tag, taken, blk_idx, out);
-            blk_idx += 1;
+            push_code(tag, taken, &mut blocks);
             in_fence = false;
         } else {
             code_lines.push(raw.to_string());
@@ -786,9 +766,116 @@ fn append_message_body_rows(
     }
 
     if in_fence && !code_lines.is_empty() {
-        push_code_block(fence_lang, code_lines, blk_idx, out);
+        push_code(fence_lang, code_lines, &mut blocks);
+    }
+
+    ParsedChatMessage {
+        blocks,
+        has_code_fence,
+    }
+}
+
+/// 将预解析后的聊天消息按当前 `wrap_w` 折行并输出至 `out`
+#[allow(clippy::too_many_arguments)]
+fn append_message_body_rows_from_parsed(
+    canvas: &SurfaceCanvas,
+    msg_idx: usize,
+    parsed: &ParsedChatMessage,
+    wrap_w: i32,
+    is_user: bool,
+    bubble_w: i32,
+    collapse_overrides: &std::collections::HashMap<(usize, usize), bool>,
+    out: &mut Vec<CachedChatRow>,
+) {
+    let mut blk_idx = 0usize;
+    let user_bubble_w = if is_user { Some(bubble_w) } else { None };
+    let code_wrap_w = if is_user {
+        (bubble_w - 42).max(40)
     } else {
-        flush_prose(&mut prose_buf, out);
+        (wrap_w - 20).max(40)
+    };
+
+    for block in &parsed.blocks {
+        match block {
+            ParsedBodyBlock::ParaSpacer => {
+                if !out.is_empty() {
+                    out.push(CachedChatRow::ParaSpacer { is_user, bubble_w });
+                }
+            }
+            ParsedBodyBlock::ProseLine(pl) => {
+                let base_style = if pl.line_bold {
+                    FontStyle::ChatBodyBold
+                } else {
+                    FontStyle::ChatBody
+                };
+                let eff_wrap_w = (wrap_w - pl.pill_reserve).max(60);
+                for (seg_s, seg_e, seg_txt) in
+                    wrap_chat_line_segments(canvas, &pl.clean, eff_wrap_w, base_style)
+                {
+                    let spans = project_spans_slice(seg_s, seg_e, &pl.spans);
+                    if is_user {
+                        out.push(CachedChatRow::UserLine {
+                            text: seg_txt,
+                            spans,
+                            default_bold: pl.line_bold,
+                            bubble_w,
+                        });
+                    } else {
+                        out.push(CachedChatRow::AgentLine {
+                            text: seg_txt,
+                            spans,
+                            default_bold: pl.line_bold,
+                        });
+                    }
+                }
+            }
+            ParsedBodyBlock::CodeBlock {
+                lang_tag,
+                lang_id,
+                full_code,
+                lines,
+                line_count,
+                preview,
+            } => {
+                let default_collapsed = is_user || *line_count >= 28;
+                let collapsed = collapse_overrides
+                    .get(&(msg_idx, blk_idx))
+                    .copied()
+                    .unwrap_or(default_collapsed);
+                out.push(CachedChatRow::CodeBlockHeader {
+                    msg_idx,
+                    blk_idx,
+                    lang: lang_tag.clone(),
+                    code: Arc::clone(full_code),
+                    line_count: *line_count,
+                    collapsed,
+                    user_bubble_w,
+                });
+                if collapsed {
+                    out.push(CachedChatRow::CodeBlockCollapsedSummary {
+                        msg_idx,
+                        blk_idx,
+                        preview: preview.clone(),
+                        line_count: *line_count,
+                        user_bubble_w,
+                    });
+                } else {
+                    for cl in lines {
+                        for (_, _, wl) in
+                            wrap_chat_line_segments(canvas, cl, code_wrap_w, FontStyle::ChatCode)
+                        {
+                            let spans = Arc::new(highlight_line(&wl, *lang_id));
+                            out.push(CachedChatRow::CodeBlockLine {
+                                text: wl,
+                                spans,
+                                user_bubble_w,
+                            });
+                        }
+                    }
+                }
+                blk_idx += 1;
+            }
+        }
     }
 }
 
@@ -829,14 +916,14 @@ fn code_block_row_bounds(
     }
 }
 
-fn measure_user_bubble_width(
-    root: &std::path::Path,
+fn measure_user_bubble_width_from_parsed(
     canvas: &SurfaceCanvas,
     msg: &ide_agent_hub::AgentChatMessage,
+    parsed: &ParsedChatMessage,
     prose_max_content_w: i32,
     code_max_content_w: i32,
 ) -> i32 {
-    let has_code_fence = msg.content.contains("```");
+    let has_code_fence = parsed.has_code_fence;
     let max_content_w = if has_code_fence {
         code_max_content_w
     } else {
@@ -847,30 +934,32 @@ fn measure_user_bubble_width(
     } else {
         0i32
     };
-    let mut in_fence = false;
-    for raw in msg.content.lines() {
-        let trimmed = raw.trim_start();
-        if trimmed.starts_with("```") {
-            in_fence = !in_fence;
-            max_w = max_w.max(max_content_w);
+    for block in &parsed.blocks {
+        let ParsedBodyBlock::ProseLine(pl) = block else {
             continue;
-        }
-        if in_fence || raw.trim().is_empty() {
-            continue;
-        }
-        let (clean, line_bold, raw_spans) = parse_markdown_inline_line(raw);
-        let pill_reserve = chat_inline_pill_reserve(&raw_spans);
-        let base_style = if line_bold {
+        };
+        let base_style = if pl.line_bold {
             FontStyle::ChatBodyBold
         } else {
             FontStyle::ChatBody
         };
-        let eff_wrap = (max_content_w - pill_reserve).max(60);
-        for (seg_s, seg_e, seg_txt) in wrap_chat_line_segments(canvas, &clean, eff_wrap, base_style)
-        {
-            let spans = project_and_merge_spans(root, &seg_txt, seg_s, seg_e, &raw_spans);
-            let w = measure_chat_spans_x(canvas, &seg_txt, &spans, line_bold, usize::MAX);
+        let eff_wrap = (max_content_w - pl.pill_reserve).max(60);
+        let (full_w, _) = canvas.measure_text(&pl.clean, base_style);
+        if full_w <= eff_wrap {
+            let w = if pl.spans.is_empty() {
+                full_w
+            } else {
+                measure_chat_spans_x(canvas, &pl.clean, &pl.spans, pl.line_bold, usize::MAX)
+            };
             max_w = max_w.max(w);
+        } else {
+            for (seg_s, seg_e, seg_txt) in
+                wrap_chat_line_segments(canvas, &pl.clean, eff_wrap, base_style)
+            {
+                let spans = project_spans_slice(seg_s, seg_e, &pl.spans);
+                let w = measure_chat_spans_x(canvas, &seg_txt, &spans, pl.line_bold, usize::MAX);
+                max_w = max_w.max(w);
+            }
         }
     }
     if !msg.attachments.is_empty() {
@@ -1166,8 +1255,6 @@ impl IdeApplicationState {
             return;
         }
 
-        let chars: Vec<char> = text.chars().collect();
-        let segs = build_normalized_segments(chars.len(), spans);
         let mut cur_x = text_x;
         let right_edge = text_x + max_w;
         let (_, body_h) = canvas.measure_text("Ag中文", FontStyle::ChatBody);
@@ -1185,13 +1272,28 @@ impl IdeApplicationState {
             blend_rgb(t.text_primary, 0xFFFFFF, 0.25)
         };
 
-        for (s, e, kind) in segs {
-            if cur_x >= right_edge {
-                break;
+        let mut char_cursor = 0usize;
+        let mut byte_cursor = 0usize;
+        let mut ci = text.char_indices();
+        let mut advance_to = |target_char: usize| -> usize {
+            while char_cursor < target_char {
+                if let Some((b, ch)) = ci.next() {
+                    byte_cursor = b + ch.len_utf8();
+                    char_cursor += 1;
+                } else {
+                    byte_cursor = text.len();
+                    break;
+                }
             }
-            let chunk: String = chars[s..e].iter().collect();
+            byte_cursor
+        };
+
+        let mut emit_segment = |cur_x: &mut i32, chunk: &str, kind: &ChatSpanKind, hit_regions: &mut Vec<(Rect, HitAction)>| -> bool {
+            if *cur_x >= right_edge {
+                return false;
+            }
             if chunk.is_empty() {
-                continue;
+                return true;
             }
             match kind {
                 ChatSpanKind::Plain => {
@@ -1200,56 +1302,52 @@ impl IdeApplicationState {
                     } else {
                         base_style
                     };
-                    let (cw, _) = canvas.measure_text(&chunk, st);
-                    canvas.draw_text_styled(
-                        cur_x,
+                    *cur_x = canvas.draw_text_styled(
+                        *cur_x,
                         text_y,
-                        &chunk,
+                        chunk,
                         base_color,
-                        right_edge - cur_x,
+                        right_edge - *cur_x,
                         st,
                     );
-                    cur_x += cw;
                 }
                 ChatSpanKind::Bold => {
-                    let (cw, _) = canvas.measure_text(&chunk, FontStyle::ChatBodyBold);
-                    canvas.draw_text_styled(
-                        cur_x,
+                    *cur_x = canvas.draw_text_styled(
+                        *cur_x,
                         text_y,
-                        &chunk,
+                        chunk,
                         base_color,
-                        right_edge - cur_x,
+                        right_edge - *cur_x,
                         FontStyle::ChatBodyBold,
                     );
-                    cur_x += cw;
                 }
                 ChatSpanKind::InlineCode => {
-                    if right_edge - cur_x < 12 {
-                        break;
+                    if right_edge - *cur_x < 12 {
+                        return false;
                     }
-                    let (cw, _) = canvas.measure_text(&chunk, FontStyle::ChatCode);
-                    let pill_w = (cw + 8).min((right_edge - cur_x - 2).max(10));
+                    let (cw, _) = canvas.measure_text(chunk, FontStyle::ChatCode);
+                    let pill_w = (cw + 8).min((right_edge - *cur_x - 2).max(10));
                     let pill_h = (code_h + 3).min(row_rect.h - 2);
-                    let pill_rect = Rect::new(cur_x + 2, text_y + code_y_off - 1, pill_w, pill_h);
+                    let pill_rect = Rect::new(*cur_x + 2, text_y + code_y_off - 1, pill_w, pill_h);
                     canvas.stroke_rounded_rect(pill_rect, 4, inline_pill_border, inline_pill_bg);
                     canvas.draw_text_styled(
                         pill_rect.x + 4,
                         text_y + code_y_off,
-                        &chunk,
+                        chunk,
                         inline_code_fg,
                         (pill_w - 6).max(4),
                         FontStyle::ChatCode,
                     );
-                    cur_x += cw + 12;
+                    *cur_x += cw + 12;
                 }
                 ChatSpanKind::FileLink { path, line } => {
-                    if right_edge - cur_x < 12 {
-                        break;
+                    if right_edge - *cur_x < 12 {
+                        return false;
                     }
-                    let (lw, _) = canvas.measure_text(&chunk, FontStyle::ChatCode);
-                    let pill_w = (lw + 6).min((right_edge - cur_x - 1).max(8));
+                    let (lw, _) = canvas.measure_text(chunk, FontStyle::ChatCode);
+                    let pill_w = (lw + 6).min((right_edge - *cur_x - 1).max(8));
                     let link_rect = Rect::new(
-                        cur_x + 1,
+                        *cur_x + 1,
                         text_y + code_y_off - 1,
                         pill_w,
                         (code_h + 3).min(row_rect.h - 2),
@@ -1276,15 +1374,45 @@ impl IdeApplicationState {
                     canvas.draw_text_styled(
                         link_rect.x + 3,
                         text_y + code_y_off,
-                        &chunk,
+                        chunk,
                         if hovered { 0xFFFFFF } else { t.syn_function },
                         (pill_w - 4).max(4),
                         FontStyle::ChatCode,
                     );
-                    self.hit_regions
-                        .push((link_rect, HitAction::OpenFileAtLine(path, line)));
-                    cur_x += lw + 8;
+                    hit_regions.push((link_rect, HitAction::OpenFileAtLine(path.clone(), *line)));
+                    *cur_x += lw + 8;
                 }
+            }
+            true
+        };
+
+        let mut cur_c = 0usize;
+        for sp in spans {
+            if cur_x >= right_edge {
+                break;
+            }
+            if sp.start_char > cur_c {
+                let b0 = advance_to(cur_c);
+                let b1 = advance_to(sp.start_char);
+                if !emit_segment(&mut cur_x, &text[b0..b1], &ChatSpanKind::Plain, &mut self.hit_regions) {
+                    return;
+                }
+                cur_c = sp.start_char;
+            }
+            let s = sp.start_char.max(cur_c);
+            if sp.end_char > s {
+                let b0 = advance_to(s);
+                let b1 = advance_to(sp.end_char);
+                if !emit_segment(&mut cur_x, &text[b0..b1], &sp.kind, &mut self.hit_regions) {
+                    return;
+                }
+                cur_c = sp.end_char;
+            }
+        }
+        if cur_x < right_edge {
+            let b0 = advance_to(cur_c);
+            if b0 < text.len() {
+                let _ = emit_segment(&mut cur_x, &text[b0..], &ChatSpanKind::Plain, &mut self.hit_regions);
             }
         }
     }
@@ -1298,7 +1426,7 @@ impl IdeApplicationState {
         text_y: i32,
         global_row_idx: usize,
         text: &str,
-        lang: LanguageId,
+        spans: &[ide_syntax::HighlightSpan],
         max_w: i32,
     ) {
         let t = self.theme;
@@ -1321,7 +1449,6 @@ impl IdeApplicationState {
             FontStyle::ChatCode,
         );
 
-        let spans = highlight_line(text, lang);
         let right_edge = text_x + max_w;
         let mut cur_x = text_x;
         for span in spans {
@@ -1779,9 +1906,15 @@ impl IdeApplicationState {
 
         // 1. 动态计算底部 Composer 高度（根据已附加图片缩略图、文件芯片与折叠代码抽屉自适应）
         let attached_items = self.agent_hub.active_session().attached_items.clone();
-        let pasted_snippets = self.agent_hub.active_session().pasted_snippets.clone();
+        let pasted_chips: Vec<(String, String, usize)> = self
+            .agent_hub
+            .active_session()
+            .pasted_snippets
+            .iter()
+            .map(|s| (s.id.clone(), s.language.clone(), s.line_count))
+            .collect();
         let has_images_in_tray = attached_items.iter().any(|it| it.is_image);
-        let has_tray = !attached_items.is_empty() || !pasted_snippets.is_empty();
+        let has_tray = !attached_items.is_empty() || !pasted_chips.is_empty();
         let tray_h = if has_images_in_tray {
             58
         } else if has_tray {
@@ -1789,10 +1922,14 @@ impl IdeApplicationState {
         } else {
             0
         };
-        let expanded_snip = self
-            .expanded_composer_snippet_id
-            .as_ref()
-            .and_then(|eid| pasted_snippets.iter().find(|s| &s.id == eid).cloned());
+        let expanded_snip = self.expanded_composer_snippet_id.as_ref().and_then(|eid| {
+            self.agent_hub
+                .active_session()
+                .pasted_snippets
+                .iter()
+                .find(|s| &s.id == eid)
+                .cloned()
+        });
         let drawer_h = if let Some(ref snip) = expanded_snip {
             let vis = snip.line_count.clamp(2, 5) as i32;
             24 + vis * 16 + 6
@@ -1826,7 +1963,12 @@ impl IdeApplicationState {
         );
 
         let supports_rewind = self.agent_hub.active_cli_supports_checkpoint_rewind();
-        let session_changed_files = self.agent_hub.active_session_changed_files().to_vec();
+        let session_changed_files: Vec<(PathBuf, usize, usize)> = self
+            .agent_hub
+            .active_session_changed_files()
+            .iter()
+            .map(|c| (c.path.clone(), c.added_lines, c.removed_lines))
+            .collect();
         let files_drawer_h = if !session_changed_files.is_empty() {
             if self.agent_changed_files_expanded {
                 let vis_rows = session_changed_files.len().min(5) as i32;
@@ -1853,7 +1995,12 @@ impl IdeApplicationState {
         let chat_h = (chat_bottom_limit - chat_top - 8).max(40);
         let chat_area = Rect::new(rect.x + 8, chat_top, rect.w - 16, chat_h);
         self.agent_chat_area_rect = chat_area;
-        let wrap_w = (chat_area.w - 28).max(80);
+        let raw_wrap_w = (chat_area.w - 28).max(80);
+        let wrap_w = if self.active_splitter_drag.is_some() {
+            ((raw_wrap_w / 12) * 12).max(80)
+        } else {
+            raw_wrap_w
+        };
 
         self.hit_regions
             .push((chat_area, HitAction::FocusAgentChatStream));
@@ -1864,20 +2011,27 @@ impl IdeApplicationState {
         let msg_count = self.agent_hub.messages.len();
         let session_id = self.agent_hub.active_session().id.clone();
 
-        // 若消息包含图片，确保在缓存构建/渲染前加载图像解码
-        let image_paths: Vec<PathBuf> = self
-            .agent_hub
-            .messages
-            .iter()
-            .flat_map(|m| {
-                m.attachments
-                    .iter()
-                    .filter(|a| a.is_image)
-                    .map(|a| a.path.clone())
-            })
-            .collect();
-        for img_p in image_paths {
-            let _ = self.get_or_load_image_preview(&img_p);
+        // 若消息包含图片，确保在缓存构建/渲染前加载图像解码（已缓存时零分配跳过）
+        let has_uncached_img = self.agent_hub.messages.iter().any(|m| {
+            m.attachments
+                .iter()
+                .any(|a| a.is_image && !self.image_preview_cache.contains_key(&a.path))
+        });
+        if has_uncached_img {
+            let image_paths: Vec<PathBuf> = self
+                .agent_hub
+                .messages
+                .iter()
+                .flat_map(|m| {
+                    m.attachments
+                        .iter()
+                        .filter(|a| a.is_image && !self.image_preview_cache.contains_key(&a.path))
+                        .map(|a| a.path.clone())
+                })
+                .collect();
+            for img_p in image_paths {
+                let _ = self.get_or_load_image_preview(&img_p);
+            }
         }
 
         let applied_sig: u64 = self
@@ -1909,17 +2063,17 @@ impl IdeApplicationState {
         let scale_bits = canvas.scale_factor.to_bits();
 
         if msg_count == 0 && !is_busy {
-            self.cached_chat_rows = AgentChatCache {
-                session_id,
-                msg_count: 0,
-                signature: applied_sig,
-                wrap_w,
-                scale_bits,
-                is_busy: false,
-                rows: Vec::new(),
-                row_tops: Vec::new(),
-                total_height: 0,
-            };
+            self.cached_chat_rows.session_id = session_id;
+            self.cached_chat_rows.msg_count = 0;
+            self.cached_chat_rows.signature = applied_sig;
+            self.cached_chat_rows.wrap_w = wrap_w;
+            self.cached_chat_rows.scale_bits = scale_bits;
+            self.cached_chat_rows.is_busy = false;
+            self.cached_chat_rows.rows.clear();
+            self.cached_chat_rows.row_tops.clear();
+            self.cached_chat_rows.total_height = 0;
+            self.cached_chat_rows.parsed_msg_count = 0;
+            self.cached_chat_rows.parsed_msgs.clear();
             self.right_scroll_info = ScrollTrackInfo {
                 track: Rect::new(rect.x + rect.w - 9, chat_top, 6, chat_h),
                 visible: 1,
@@ -1966,7 +2120,7 @@ impl IdeApplicationState {
             canvas,
             composer_rect,
             &attached_items,
-            &pasted_snippets,
+            &pasted_chips,
             expanded_snip.as_ref(),
             tray_h,
             drawer_h,
@@ -2041,12 +2195,54 @@ impl IdeApplicationState {
 
         let cli_short = self.agent_hub.active_provider.compact_name();
         let model = self.agent_hub.active_model();
+        let active_avail = self
+            .agent_hub
+            .providers
+            .iter()
+            .find(|p| p.kind == self.agent_hub.active_provider)
+            .map(|p| p.available)
+            .unwrap_or(false);
         canvas.draw_text_centered(
             Rect::new(card.x + 12, card.y + 76, card.w - 24, 18),
             &format!("{cli_short}  ·  {model}  ·  {}", self.agent_mode.label()),
             t.text_muted,
             FontStyle::ChatMeta,
         );
+
+        let mut grid_y = card.y + 104;
+        if !active_avail {
+            let inst_w = (card.w - 36).min(230);
+            let inst_btn = Rect::new(card.x + (card.w - inst_w) / 2, card.y + 98, inst_w, 26);
+            let ihov = inst_btn.contains(hx, hy);
+            canvas.stroke_rounded_rect(
+                inst_btn,
+                6,
+                t.warning_yellow,
+                if ihov {
+                    t.accent_blue
+                } else {
+                    blend_rgb(t.panel_bg, t.warning_yellow, 0.16)
+                },
+            );
+            let lbl = if self.cli_install_in_progress == Some(self.agent_hub.active_provider) {
+                self.tr("⏳ 正在安装 CLI...", "⏳ Installing CLI...")
+            } else if self.agent_hub.active_provider == AgentProviderKind::GoogleAntigravityAcp {
+                self.tr("⬇ 前往官网下载 Antigravity CLI", "⬇ Get Antigravity CLI")
+            } else {
+                self.tr("⬇ 一键安装当前智能体 CLI", "⬇ Install Active Agent CLI")
+            };
+            canvas.draw_text_centered(
+                inst_btn,
+                lbl,
+                if ihov { 0xFFFFFF } else { t.warning_yellow },
+                FontStyle::ChatMetaBold,
+            );
+            self.hit_regions.push((
+                inst_btn,
+                HitAction::InstallAgentCli(self.agent_hub.active_provider),
+            ));
+            grid_y = card.y + 132;
+        }
 
         let starters: [(&'static str, &'static str, &'static str); 4] = match self.ui_lang {
             UiLanguage::ZhCn => [
@@ -2087,7 +2283,6 @@ impl IdeApplicationState {
             ],
         };
 
-        let grid_y = card.y + 104;
         if card.y + card.h - grid_y >= 104 {
             let gap = 8;
             let tile_w = ((card.w - 28 - gap) / 2).max(76);
@@ -2177,17 +2372,43 @@ impl IdeApplicationState {
             && self.cached_chat_rows.is_busy == is_busy;
 
         if !cache_key_match {
+            let mut ph = DefaultHasher::new();
+            for m in &self.agent_hub.messages {
+                m.role.hash(&mut ph);
+                m.content.hash(&mut ph);
+            }
+            let parsed_sig = ph.finish();
+            let parsed_match = self.cached_chat_rows.parsed_session_id == session_id
+                && self.cached_chat_rows.parsed_msg_count == msg_count
+                && self.cached_chat_rows.parsed_content_sig == parsed_sig
+                && self.cached_chat_rows.parsed_workspace_root == self.workspace_root
+                && self.cached_chat_rows.parsed_msgs.len() == msg_count;
+            if !parsed_match {
+                let parsed: Vec<ParsedChatMessage> = self
+                    .agent_hub
+                    .messages
+                    .iter()
+                    .map(|m| parse_message_body(&self.workspace_root, &m.content))
+                    .collect();
+                self.cached_chat_rows.parsed_session_id = session_id.to_string();
+                self.cached_chat_rows.parsed_msg_count = msg_count;
+                self.cached_chat_rows.parsed_content_sig = parsed_sig;
+                self.cached_chat_rows.parsed_workspace_root = self.workspace_root.clone();
+                self.cached_chat_rows.parsed_msgs = parsed;
+            }
+
             let row_avail_w = (chat_area.w - 20).max(136);
             let user_code_max_content_w = (row_avail_w - 26).max(110);
             let user_prose_max_content_w = (((row_avail_w as f32) * 0.92) as i32 - 26)
                 .clamp(110, user_code_max_content_w);
             let mut rebuilt: Vec<CachedChatRow> = Vec::with_capacity(msg_count * 7 + 6);
             for (msg_idx, msg) in self.agent_hub.messages.iter().enumerate() {
+                let parsed_msg = &self.cached_chat_rows.parsed_msgs[msg_idx];
                 if msg.role == "user" {
-                    let bubble_w = measure_user_bubble_width(
-                        &self.workspace_root,
+                    let bubble_w = measure_user_bubble_width_from_parsed(
                         canvas,
                         msg,
+                        parsed_msg,
                         user_prose_max_content_w,
                         user_code_max_content_w,
                     );
@@ -2211,11 +2432,10 @@ impl IdeApplicationState {
                             bubble_w,
                         });
                     }
-                    append_message_body_rows(
-                        &self.workspace_root,
+                    append_message_body_rows_from_parsed(
                         canvas,
                         msg_idx,
-                        &msg.content,
+                        parsed_msg,
                         (bubble_w - 26).max(60),
                         true,
                         bubble_w,
@@ -2261,11 +2481,10 @@ impl IdeApplicationState {
                             }
                         }
                     }
-                    append_message_body_rows(
-                        &self.workspace_root,
+                    append_message_body_rows_from_parsed(
                         canvas,
                         msg_idx,
-                        &msg.content,
+                        parsed_msg,
                         (wrap_w - 8).max(60),
                         false,
                         0,
@@ -2448,20 +2667,17 @@ impl IdeApplicationState {
             let prev_max_s = self
                 .cached_chat_rows
                 .max_scroll_row_for_height(chat_area.h - 4);
-            let was_at_bottom = self.agent_scroll == usize::MAX || self.agent_scroll >= prev_max_s;
-            let mut cache = AgentChatCache {
-                session_id: session_id.to_string(),
-                msg_count,
-                signature: combined_sig,
-                wrap_w,
-                scale_bits,
-                is_busy,
-                rows: rebuilt,
-                row_tops: Vec::new(),
-                total_height: 0,
-            };
-            cache.recompute_offsets();
-            self.cached_chat_rows = cache;
+            let was_at_bottom = self.agent_scroll == usize::MAX
+                || (!self.cached_chat_rows.rows.is_empty() && self.agent_scroll >= prev_max_s)
+                || (self.cached_chat_rows.msg_count == 0 && self.agent_scroll == 0);
+            self.cached_chat_rows.session_id = session_id.to_string();
+            self.cached_chat_rows.msg_count = msg_count;
+            self.cached_chat_rows.signature = combined_sig;
+            self.cached_chat_rows.wrap_w = wrap_w;
+            self.cached_chat_rows.scale_bits = scale_bits;
+            self.cached_chat_rows.is_busy = is_busy;
+            self.cached_chat_rows.rows = rebuilt;
+            self.cached_chat_rows.recompute_offsets();
             if was_at_bottom {
                 self.agent_scroll = usize::MAX;
             }
@@ -2977,7 +3193,7 @@ impl IdeApplicationState {
                 }
                 CachedChatRow::CodeBlockLine {
                     text,
-                    lang,
+                    spans,
                     user_bubble_w,
                 } => {
                     let (cx, cw) = code_block_row_bounds(
@@ -2999,7 +3215,7 @@ impl IdeApplicationState {
                         cy + 2,
                         *global_row_idx,
                         text,
-                        *lang,
+                        spans,
                         (crect.w - 20).max(20),
                     );
                 }
@@ -3261,7 +3477,8 @@ impl IdeApplicationState {
                         0.95,
                     );
                     let elapsed_secs = self
-                        .agent_busy_started_at
+                        .agent_hub
+                        .active_session_busy_started_at()
                         .map(|st| st.elapsed().as_secs())
                         .unwrap_or(0);
                     let elapsed_str = if elapsed_secs >= 60 {
@@ -3291,11 +3508,31 @@ impl IdeApplicationState {
             visible: vis_count,
             total: total_rows,
         };
+        let scroll_px = self
+            .cached_chat_rows
+            .row_tops
+            .get(self.agent_scroll)
+            .copied()
+            .unwrap_or(0)
+            .max(0) as usize;
+        let max_scroll_px = self
+            .cached_chat_rows
+            .row_tops
+            .get(max_s)
+            .copied()
+            .unwrap_or(0)
+            .max(0) as usize;
+        let vis_px = (chat_area.h - 4).max(1) as usize;
+        let eff_total_px = if max_s > 0 {
+            max_scroll_px.saturating_add(vis_px)
+        } else {
+            self.cached_chat_rows.total_height.max(0) as usize
+        };
         canvas.draw_vertical_scrollbar(
             track,
-            self.agent_scroll,
-            vis_count,
-            total_rows,
+            scroll_px,
+            vis_px,
+            eff_total_px,
             blend_rgb(t.border_color, t.panel_bg, 0.35),
         );
     }
@@ -3342,7 +3579,7 @@ impl IdeApplicationState {
         &mut self,
         canvas: &mut SurfaceCanvas,
         rect: Rect,
-        changed_files: &[ide_agent_hub::SessionFileChange],
+        changed_files: &[(PathBuf, usize, usize)],
         supports_rewind: bool,
     ) {
         let t = self.theme;
@@ -3355,8 +3592,8 @@ impl IdeApplicationState {
         let border = blend_rgb(t.border_color, t.panel_bg, 0.45);
         canvas.stroke_rounded_rect(rect, 7, border, bar_bg);
 
-        let total_add: usize = changed_files.iter().map(|f| f.added_lines).sum();
-        let total_del: usize = changed_files.iter().map(|f| f.removed_lines).sum();
+        let total_add: usize = changed_files.iter().map(|f| f.1).sum();
+        let total_del: usize = changed_files.iter().map(|f| f.2).sum();
         let arrow = if self.agent_changed_files_expanded {
             "▾"
         } else {
@@ -3482,7 +3719,7 @@ impl IdeApplicationState {
             blend_rgb(border, bar_bg, 0.55),
         );
         let mut ry = rect.y + 29;
-        for ch in changed_files.iter().take(5) {
+        for (ch_path, added_lines, removed_lines) in changed_files.iter().take(5) {
             if ry + 20 > rect.y + rect.h - 2 {
                 break;
             }
@@ -3497,11 +3734,10 @@ impl IdeApplicationState {
             if open_r.contains(hx, hy) {
                 canvas.fill_rounded_rect(open_r, 4, blend_rgb(bar_bg, t.text_primary, 0.06));
             }
-            canvas.draw_path_file_icon(open_r.x + 4, ry + 3, &ch.path);
-            let rel = ch
-                .path
+            canvas.draw_path_file_icon(open_r.x + 4, ry + 3, ch_path);
+            let rel = ch_path
                 .strip_prefix(&self.workspace_root)
-                .unwrap_or(&ch.path)
+                .unwrap_or(ch_path)
                 .to_string_lossy()
                 .replace('\\', "/");
             let stats_w = Self::draw_inline_diff_stats(
@@ -3509,8 +3745,8 @@ impl IdeApplicationState {
                 open_r.x + open_r.w - 6,
                 ry + 2,
                 open_r.x + 30,
-                ch.added_lines,
-                ch.removed_lines,
+                *added_lines,
+                *removed_lines,
                 t,
             );
             let name_max_w = (open_r.w - stats_w - 30).max(32);
@@ -3526,7 +3762,7 @@ impl IdeApplicationState {
             self.hit_regions.push((
                 open_r,
                 HitAction::InspectAgentFileDiff {
-                    path: ch.path.clone(),
+                    path: ch_path.clone(),
                     msg_idx: None,
                 },
             ));
@@ -3544,7 +3780,7 @@ impl IdeApplicationState {
                 );
                 self.hit_regions.push((
                     rev_one,
-                    HitAction::RevertSingleAgentChangedFile(ch.path.clone()),
+                    HitAction::RevertSingleAgentChangedFile(ch_path.clone()),
                 ));
             }
             ry += 22;
@@ -3557,7 +3793,7 @@ impl IdeApplicationState {
         canvas: &mut SurfaceCanvas,
         composer_rect: Rect,
         attached_items: &[AgentAttachedItem],
-        pasted_snippets: &[ide_agent_hub::PastedCodeSnippet],
+        pasted_chips: &[(String, String, usize)],
         expanded_snip: Option<&ide_agent_hub::PastedCodeSnippet>,
         tray_h: i32,
         drawer_h: i32,
@@ -3839,10 +4075,10 @@ impl IdeApplicationState {
                 tx += cw_chip + 5;
             }
 
-            for snip in pasted_snippets {
-                let is_exp = self.expanded_composer_snippet_id.as_deref() == Some(snip.id.as_str());
+            for (snip_id, snip_lang, snip_line_count) in pasted_chips {
+                let is_exp = self.expanded_composer_snippet_id.as_deref() == Some(snip_id.as_str());
                 let arrow = if is_exp { "▾" } else { "▸" };
-                let lbl = format!("{arrow} </> {} ({}行)", snip.language, snip.line_count);
+                let lbl = format!("{arrow} </> {snip_lang} ({snip_line_count}行)");
                 let (lw, _) = canvas.measure_text(&lbl, FontStyle::ChatMeta);
                 let sw_chip = (lw + 28).clamp(86, 178);
                 if tx + sw_chip > max_tx {
@@ -3866,7 +4102,7 @@ impl IdeApplicationState {
                 );
                 self.hit_regions.push((
                     chip,
-                    HitAction::ToggleComposerPastedSnippet(snip.id.clone()),
+                    HitAction::ToggleComposerPastedSnippet(snip_id.clone()),
                 ));
                 let rm = Rect::new(chip.x + chip.w - 16, chip.y + 3, 14, 16);
                 canvas.draw_text_centered(
@@ -3880,7 +4116,7 @@ impl IdeApplicationState {
                     FontStyle::ChatMeta,
                 );
                 self.hit_regions
-                    .push((rm, HitAction::RemoveComposerPastedSnippet(snip.id.clone())));
+                    .push((rm, HitAction::RemoveComposerPastedSnippet(snip_id.clone())));
                 tx += sw_chip + 5;
             }
             cursor_y += tray_h;
@@ -4137,7 +4373,7 @@ impl IdeApplicationState {
             let send_hov = send_btn.contains(hx, hy);
             let has_text = !self.agent_chat_input.is_empty()
                 || !attached_items.is_empty()
-                || !pasted_snippets.is_empty();
+                || !pasted_chips.is_empty();
             canvas.fill_rounded_rect(
                 send_btn,
                 6,
@@ -4717,29 +4953,53 @@ impl IdeApplicationState {
                     FontStyle::ChatBody
                 },
             );
-            let badge_txt = if reg.available {
-                reg.active_model
+            if reg.available {
+                let badge_txt = reg
+                    .active_model
                     .rsplit('/')
                     .next()
-                    .unwrap_or(&reg.active_model)
-                    .to_string()
+                    .unwrap_or(&reg.active_model);
+                canvas.draw_text_styled(
+                    row.x + row.w - 122,
+                    row.y + 5,
+                    badge_txt,
+                    t.syn_function,
+                    116,
+                    FontStyle::ChatMeta,
+                );
+                self.hit_regions
+                    .push((row, HitAction::SelectAgentProvider(reg.kind)));
             } else {
-                self.tr("未安装 CLI", "Missing CLI").to_string()
-            };
-            canvas.draw_text_styled(
-                row.x + row.w - 122,
-                row.y + 5,
-                &badge_txt,
-                if reg.available {
-                    t.syn_function
+                self.hit_regions
+                    .push((row, HitAction::SelectAgentProvider(reg.kind)));
+                let inst_btn = Rect::new(row.x + row.w - 104, row.y + 3, 98, 20);
+                let ihov = inst_btn.contains(hx, hy);
+                canvas.stroke_rounded_rect(
+                    inst_btn,
+                    4,
+                    if ihov { t.accent_blue } else { t.warning_yellow },
+                    if ihov {
+                        t.accent_blue
+                    } else {
+                        blend_rgb(t.popup_bg, t.warning_yellow, 0.14)
+                    },
+                );
+                let lbl = if self.cli_install_in_progress == Some(reg.kind) {
+                    self.tr("安装中…", "Installing…")
+                } else if reg.kind == AgentProviderKind::GoogleAntigravityAcp {
+                    self.tr("官网下载", "Get CLI")
                 } else {
-                    t.warning_yellow
-                },
-                116,
-                FontStyle::ChatMeta,
-            );
-            self.hit_regions
-                .push((row, HitAction::SelectAgentProvider(reg.kind)));
+                    self.tr("⬇ 安装 CLI", "⬇ Install")
+                };
+                canvas.draw_text_centered(
+                    inst_btn,
+                    lbl,
+                    if ihov { 0xFFFFFF } else { t.warning_yellow },
+                    FontStyle::ChatMeta,
+                );
+                self.hit_regions
+                    .push((inst_btn, HitAction::InstallAgentCli(reg.kind)));
+            }
             ry += 28;
         }
     }
@@ -4990,8 +5250,8 @@ impl IdeApplicationState {
     pub(crate) fn render_ai_config_modal(&mut self, canvas: &mut SurfaceCanvas, w: i32, h: i32) {
         let t = self.theme;
         let (hx, hy) = self.hover_pos;
-        let mw = 620.min(w - 40);
-        let mh = 436.min(h - 60);
+        let mw = 640.min(w - 40);
+        let mh = 468.min(h - 60);
         let mx = (w - mw) / 2;
         let my = (h - mh) / 4;
         let modal = Rect::new(mx, my, mw, mh);
@@ -5007,8 +5267,8 @@ impl IdeApplicationState {
             mx + 34,
             my + 9,
             self.tr(
-                "本地 CLI 智能体与模型中心  (自动获取 · 无需配置基础地址/Key)",
-                "Local CLI Agents & Models Hub  (Zero-Config Auto Discovery)",
+                "本地 CLI 智能体与模型中心  (自动获取 · 支持一键安装)",
+                "Local CLI Agents & Models Hub  (Auto Discovery & Install)",
             ),
             t.text_primary,
             mw - 108,
@@ -5035,9 +5295,77 @@ impl IdeApplicationState {
         self.hit_regions
             .push((close_btn, HitAction::CloseModalOrPopup));
 
+        // Node.js 运行环境检测提示条
+        let node_bar = Rect::new(mx + 16, my + 40, mw - 32, 26);
+        let node_ready = self.node_env.is_ready();
+        canvas.stroke_rounded_rect(
+            node_bar,
+            5,
+            if node_ready {
+                blend_rgb(t.border_color, t.run_green, 0.45)
+            } else {
+                t.warning_yellow
+            },
+            if node_ready {
+                t.editor_bg
+            } else {
+                blend_rgb(t.popup_bg, t.warning_yellow, 0.12)
+            },
+        );
+        let node_status_msg = if node_ready {
+            let ver = self.node_env.node_version.as_deref().unwrap_or("ready");
+            match self.ui_lang {
+                UiLanguage::ZhCn => {
+                    format!("✓ Node.js 运行环境就绪 ({ver} · npm 可用，支持直接安装 Claude / Codex CLI)")
+                }
+                UiLanguage::EnUs => {
+                    format!("✓ Node.js ready ({ver} · npm available for CLI installation)")
+                }
+            }
+        } else {
+            self.tr(
+                "⚠ 未检测到 Node.js (安装 Claude / Codex 等 CLI 需要 Node.js)",
+                "⚠ Node.js not found (Required to install Claude / Codex CLI)",
+            )
+            .to_string()
+        };
+        canvas.draw_text_ellipsis(
+            node_bar.x + 10,
+            node_bar.y + 5,
+            &node_status_msg,
+            if node_ready {
+                t.run_green
+            } else {
+                t.warning_yellow
+            },
+            node_bar.w - if node_ready { 20 } else { 154 },
+            FontStyle::UiSmall,
+        );
+        if !node_ready {
+            let dl_node_btn = Rect::new(node_bar.x + node_bar.w - 138, node_bar.y + 3, 132, 20);
+            let nhov = dl_node_btn.contains(hx, hy);
+            canvas.fill_rounded_rect(
+                dl_node_btn,
+                4,
+                if nhov {
+                    blend_rgb(t.accent_blue, 0xFFFFFF, 0.12)
+                } else {
+                    t.accent_blue
+                },
+            );
+            canvas.draw_text_centered(
+                dl_node_btn,
+                self.tr("前往官网下载 Node.js", "Download Node.js"),
+                0xFFFFFF,
+                FontStyle::ChatMeta,
+            );
+            self.hit_regions
+                .push((dl_node_btn, HitAction::OpenNodeJsDownloadPage));
+        }
+
         canvas.draw_text_styled(
             mx + 16,
-            my + 44,
+            my + 74,
             self.tr(
                 "1. 本机 CLI 引擎状态 (点击切换活动 CLI):",
                 "1. Detected Local CLI Engines (Click to switch):",
@@ -5046,7 +5374,7 @@ impl IdeApplicationState {
             mw - 130,
             FontStyle::UiBold,
         );
-        let sync_btn = Rect::new(mx + mw - 110, my + 41, 94, 24);
+        let sync_btn = Rect::new(mx + mw - 110, my + 71, 94, 24);
         let sync_hov = sync_btn.contains(hx, hy);
         canvas.stroke_rounded_rect(
             sync_btn,
@@ -5072,7 +5400,7 @@ impl IdeApplicationState {
             .push((sync_btn, HitAction::RefreshLocalCliAgents));
 
         let providers = self.agent_hub.providers.clone();
-        let mut ry = my + 70;
+        let mut ry = my + 100;
         for reg in providers {
             let row = Rect::new(mx + 16, ry, mw - 32, 30);
             let sel = reg.kind == self.agent_hub.active_provider;
@@ -5102,23 +5430,54 @@ impl IdeApplicationState {
                 row.y + 6,
                 reg.kind.display_name(),
                 if sel { 0xFFFFFF } else { t.text_primary },
-                180,
+                174,
                 if sel {
                     FontStyle::UiBold
                 } else {
                     FontStyle::UiRegular
                 },
             );
-            canvas.draw_text_styled(
-                row.x + 210,
+            let status_w = if reg.available {
+                row.w - 220
+            } else {
+                (row.w - 332).max(80)
+            };
+            canvas.draw_text_ellipsis(
+                row.x + 204,
                 row.y + 7,
                 &reg.status_text,
                 if sel { 0xE2E8F0 } else { t.text_secondary },
-                row.w - 220,
+                status_w,
                 FontStyle::CodeMono,
             );
             self.hit_regions
                 .push((row, HitAction::SelectAgentProvider(reg.kind)));
+
+            if !reg.available {
+                let inst_btn = Rect::new(row.x + row.w - 110, row.y + 4, 102, 22);
+                let ihov = inst_btn.contains(hx, hy);
+                canvas.fill_rounded_rect(
+                    inst_btn,
+                    5,
+                    if self.cli_install_in_progress == Some(reg.kind) {
+                        blend_rgb(t.accent_blue, t.panel_bg, 0.35)
+                    } else if ihov {
+                        blend_rgb(t.accent_blue, 0xFFFFFF, 0.12)
+                    } else {
+                        t.accent_blue
+                    },
+                );
+                let inst_lbl = if self.cli_install_in_progress == Some(reg.kind) {
+                    self.tr("⏳ 安装中...", "⏳ Installing...")
+                } else if reg.kind == AgentProviderKind::GoogleAntigravityAcp {
+                    self.tr("官网下载", "Get CLI")
+                } else {
+                    self.tr("⬇ 一键安装", "⬇ Install")
+                };
+                canvas.draw_text_centered(inst_btn, inst_lbl, 0xFFFFFF, FontStyle::UiSmall);
+                self.hit_regions
+                    .push((inst_btn, HitAction::InstallAgentCli(reg.kind)));
+            }
             ry += 34;
         }
 

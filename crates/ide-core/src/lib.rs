@@ -440,6 +440,7 @@ impl MainMenuCategory {
         match self {
             Self::File => vec![
                 MenuEntry::Action(IdeAction::OpenFolder),
+                MenuEntry::Action(IdeAction::OpenFromGitRepo),
                 MenuEntry::Separator,
                 MenuEntry::Action(IdeAction::NewFileInProject),
                 MenuEntry::Action(IdeAction::NewFolderInProject),
@@ -557,6 +558,7 @@ pub enum IdeAction {
     GoToDeclaration,         // Ctrl+B
     // 文件与工作区/项目树操作
     OpenFolder,              // Ctrl+O
+    OpenFromGitRepo,
     NewFileInProject,        // Alt+Insert / Ctrl+N
     NewFolderInProject,      // Ctrl+Alt+N
     DeleteSelectedPath,      // Delete
@@ -628,6 +630,7 @@ impl IdeAction {
     pub fn all() -> &'static [Self] {
         &[
             Self::OpenFolder,
+            Self::OpenFromGitRepo,
             Self::SearchEverywhere,
             Self::FindAction,
             Self::GoToFile,
@@ -699,6 +702,7 @@ impl IdeAction {
             Self::FindInFiles => "Ctrl+Shift+F",
             Self::GoToDeclaration => "Ctrl+B",
             Self::OpenFolder => "Ctrl+O",
+            Self::OpenFromGitRepo => "",
             Self::NewFileInProject => "Alt+Insert",
             Self::NewFolderInProject => "Ctrl+Alt+N",
             Self::DeleteSelectedPath => "Delete",
@@ -770,6 +774,8 @@ impl IdeAction {
         match (self, lang) {
             (Self::OpenFolder, UiLanguage::ZhCn) => "打开文件夹... (切换并加载其他本地项目工作区)",
             (Self::OpenFolder, UiLanguage::EnUs) => "Open Folder... (Switch to another project workspace)",
+            (Self::OpenFromGitRepo, UiLanguage::ZhCn) => "从 Git 仓库打开... (通过远程 Git 地址克隆并打开)",
+            (Self::OpenFromGitRepo, UiLanguage::EnUs) => "Open from Git Repository... (Clone from remote URL)",
             (Self::SearchEverywhere, UiLanguage::ZhCn) => "随处搜索 Search Everywhere (全局搜索文件/符号/命令)",
             (Self::SearchEverywhere, UiLanguage::EnUs) => "Search Everywhere (Files / Symbols / Actions)",
             (Self::FindAction, UiLanguage::ZhCn) => "查找动作 Find Action... (查找并执行 IDE 动作)",
@@ -911,6 +917,8 @@ impl IdeAction {
         match (self, lang) {
             (Self::OpenFolder, UiLanguage::ZhCn) => "打开文件夹...",
             (Self::OpenFolder, UiLanguage::EnUs) => "Open Folder...",
+            (Self::OpenFromGitRepo, UiLanguage::ZhCn) => "从 Git 仓库打开...",
+            (Self::OpenFromGitRepo, UiLanguage::EnUs) => "Open from Git Repository...",
             (Self::SearchEverywhere, UiLanguage::ZhCn) => "随处搜索...",
             (Self::SearchEverywhere, UiLanguage::EnUs) => "Search Everywhere...",
             (Self::FindAction, UiLanguage::ZhCn) => "查找动作...",

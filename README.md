@@ -12,7 +12,7 @@
   </p>
 
   <p>
-    <a href="https://github.com/renyun2/rust-ai-ide/releases/tag/v0.3.0"><img alt="Version 0.3.0" src="https://img.shields.io/badge/version-0.3.0-blue" /></a>
+    <a href="https://github.com/renyun2/rust-ai-ide/releases/tag/v0.4.0"><img alt="Version 0.4.0" src="https://img.shields.io/badge/version-0.4.0-blue" /></a>
     <img alt="Rust 2021" src="https://img.shields.io/badge/Rust-2021-orange?logo=rust&logoColor=white" />
     <img alt="Platforms Windows | Linux | macOS" src="https://img.shields.io/badge/platform-Windows_%7C_Linux_%7C_macOS-0078D4" />
     <img alt="License MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT_OR_Apache--2.0-green" />
@@ -25,7 +25,7 @@
 
 ## Contents
 
-- [What's New in v0.3.0](#whats-new-in-v030)
+- [What's New in v0.4.0](#whats-new-in-v040)
 - [Why RI? (Highlights)](#why-ri-highlights)
 - [Comparison with Other IDEs](#comparison-with-other-ides)
 - [Memory & Performance](#memory--performance)
@@ -44,15 +44,20 @@
 
 ---
 
-## What's New in v0.3.0
+## What's New in v0.4.0
 
-- **Full Java Project Support (Maven, Gradle & Single-File):**
-  - `LanguageId::Java` recognition, Darcula Java syntax highlighting (keywords, `@Override` / `@SpringBootApplication` / `@GetMapping` annotations, string/char literals), **Structure (`Alt+7`)**, go-to-declaration (`Ctrl+B`), and **Gutter Runnable Markers (`▶`)** for `main(String[] args)` and JUnit `@Test` methods (including targeted `mvn test -Dtest=Class#method` and Gradle `--tests` execution).
-  - Auto-detection for **Maven** (`pom.xml`, `mvnw`/`mvnw.cmd`, Spring Boot `spring-boot:run`, Quarkus `quarkus:dev`, JavaFX `javafx:run`, `exec:java`, `compile`, `test`, `package`), **Gradle** (`build.gradle` / `build.gradle.kts`, `gradlew`), and standalone `.java` files.
-  - **LSP & Compiler Diagnostics**: `jdtls` / `java-language-server` discovery plus built-in Maven (`[ERROR] ...:[line,col]`) and `javac`/Gradle (`path:line: error:`) output parsing wired into the Problems panel and AI quick-fix handoff.
-  - **DAP & Scaffolding**: `java-debug` adapter integration with Java call-frame & local variable inspection, smart `.java` package/JUnit/main file templates, and Maven/Gradle file icons.
-- **Controlled-Mode Chrome MCP Bridge (`browser_bridge`):**
-  - Persistent `chrome-devtools-mcp` stdio proxy launches standalone debug Chrome with `--enable-automation` (visible controlled-mode banner), `--disable-background-timer-throttling`, `--disable-renderer-backgrounding`, `--allow-pre-commit-input`, and anti-popup/hang flags so Cursor and local agents can actively click, fill, and automate pages across multi-turn sessions instead of only opening tabs.
+- **Recent Projects Manager (Up to 50 Workspaces):**
+  - Expanded recent workspace history persistence to **50 projects** (`MAX_RECENT_WORKSPACES = 50`) with case-insensitive path deduplication.
+  - The titlebar project switcher now displays up to **10** recent workspaces inline and adds a **"More Recent Projects..."** searchable modal with instant filtering, keyboard navigation, current-window / new-window launch, and entry removal.
+- **Clone from Git Repository & One-Click Git / Agent CLI Setup:**
+  - Added **File → Open from Git Repository...** (`IdeAction::OpenFromGitRepo`) to clone remote HTTPS/SSH repositories with auto-derived folder names and open them directly in the current or a new window.
+  - Added automatic local Git binary detection (`detect_git_executable`) with one-click Git installation when missing, plus one-click installation for **Claude Code**, **OpenAI Codex**, and **Cursor CLI** (with automatic Node.js/npm detection and guided setup).
+- **AI Assistant Scrolling, Splitter & Session Timer Improvements:**
+  - **Smooth Post-Turn Upward Scrolling**: Eliminated upward scroll stutter/snap-back after an AI response completes by preserving manual top-offset scroll anchoring across background polls and upgrading DirectWrite / `cosmic-text` caches to two-generation LRU (`GenerationalTextCache` / `GenerationalCosmicCache`).
+  - **Two-Stage Parsed Chat Cache & Fast Splitter Drag**: Cached parsed markdown/code/file-reference blocks (`ParsedChatMessage`) separately from width-dependent row wrapping, enabling smooth splitter dragging and persistent per-session elapsed turn timers across tab switches.
+- **Reliable Mobile SDK Persistence & System-Native Input/Scrolling:**
+  - Deferred startup Mobile SDK probing until persisted `settings.txt` paths (`Flutter SDK`, `Android SDK`, `JDK`) are restored, prioritized configured `sdk_root/platform-tools/adb`, and prevented unmodified secondary windows from overwriting saved SDK settings.
+  - Added OS-native mouse wheel scroll line & page-scroll detection across Windows, Linux, and macOS, macOS IME commit deduplication, and macOS `.app` bundle code-signing/notarization support in CI releases.
 
 ---
 
@@ -127,10 +132,10 @@ RI distributes self-contained portable packages for all three desktop operating 
 
 | Platform | Release Asset | Contents | Notes |
 | --- | --- | --- | --- |
-| **Windows x86_64** | `RI-v0.3.0-windows-x86_64.zip` | Portable `ide-app.exe` (embedded multi-res ICO, no installer wizard) | Single native executable |
-| **Linux x86_64** | `RI-v0.3.0-linux-x86_64.tar.gz` | `ide-app`, `rust-ai-ide.png`, `rust-ai-ide.desktop` | Stripped native binary + desktop entry |
-| **macOS Apple Silicon (`arm64`)** | `RI-v0.3.0-macos-arm64.zip` | `Rust AI IDE.app` bundle (`Info.plist` + `AppIcon.icns`) | Native `aarch64` bundle |
-| **macOS Intel (`x86_64`)** | `RI-v0.3.0-macos-x86_64.zip` | `Rust AI IDE.app` bundle (`Info.plist` + `AppIcon.icns`) | Native `x86_64` bundle |
+| **Windows x86_64** | `RI-v0.4.0-windows-x86_64.zip` | Portable `ide-app.exe` (embedded multi-res ICO, no installer wizard) | Single native executable |
+| **Linux x86_64** | `RI-v0.4.0-linux-x86_64.tar.gz` | `ide-app`, `rust-ai-ide.png`, `rust-ai-ide.desktop` | Stripped native binary + desktop entry |
+| **macOS Apple Silicon (`arm64`)** | `RI-v0.4.0-macos-arm64.zip` | `Rust AI IDE.app` bundle (`Info.plist` + `AppIcon.icns`) | Native `aarch64` bundle |
+| **macOS Intel (`x86_64`)** | `RI-v0.4.0-macos-x86_64.zip` | `Rust AI IDE.app` bundle (`Info.plist` + `AppIcon.icns`) | Native `x86_64` bundle |
 
 Each archive is accompanied by a `.sha256` checksum file. Extract and run — no installer admin prompt, registry bloat, or background updater service.
 
@@ -140,9 +145,13 @@ Each archive is accompanied by a `.sha256` checksum file. Extract and run — no
 
 ### Run from a Release Archive
 
-- **Windows**: Extract `RI-v0.3.0-windows-x86_64.zip` and double-click `ide-app.exe` (or run `.\ide-app.exe --workspace D:\path\to\project`).
-- **Linux**: Extract `RI-v0.3.0-linux-x86_64.tar.gz` and run `./ide-app --workspace /path/to/project` (ensure GTK3 and a sans/mono system font are installed).
-- **macOS**: Extract `RI-v0.3.0-macos-arm64.zip` (or `x86_64`) and move `Rust AI IDE.app` to `/Applications`.
+- **Windows**: Extract `RI-v0.4.0-windows-x86_64.zip` and double-click `ide-app.exe` (or run `.\ide-app.exe --workspace D:\path\to\project`).
+- **Linux**: Extract `RI-v0.4.0-linux-x86_64.tar.gz` and run `./ide-app --workspace /path/to/project` (ensure GTK3 and a sans/mono system font are installed).
+- **macOS**: Extract `RI-v0.4.0-macos-arm64.zip` (or `x86_64`) and move `Rust AI IDE.app` to `/Applications`. If macOS Gatekeeper reports **"Rust AI IDE" is damaged and can't be opened** (due to the browser download quarantine attribute on unsigned/non-notarized open-source builds), clear the quarantine attribute in Terminal before launching:
+  ```bash
+  xattr -cr "/Applications/Rust AI IDE.app"
+  codesign --force --deep --sign - "/Applications/Rust AI IDE.app"
+  ```
 
 ### Build & Run from Source
 
@@ -333,7 +342,7 @@ rust-ai-ide/
 
 ## Status
 
-Version **0.3.0**. Runs natively on Windows, Linux, and macOS. Visual layout, themes, and keymap follow IntelliJ IDEA New UI; the implementation is independent.
+Version **0.4.0**. Runs natively on Windows, Linux, and macOS. Visual layout, themes, and keymap follow IntelliJ IDEA New UI; the implementation is independent.
 
 ---
 

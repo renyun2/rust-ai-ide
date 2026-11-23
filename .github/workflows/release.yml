@@ -196,9 +196,53 @@ jobs:
           sips -z 128 128   stage/ri_256.png --out stage/AppIcon.iconset/icon_128x128.png >/dev/null
           sips -z 256 256   stage/ri_256.png --out stage/AppIcon.iconset/icon_128x128@2x.png >/dev/null
           sips -z 256 256   stage/ri_256.png --out stage/AppIcon.iconset/icon_256x256.png >/dev/null
-          cp stage/ri_256.png stage/AppIcon.iconset/icon_256x256@2x.png
+          sips -z 512 512   stage/ri_256.png --out stage/AppIcon.iconset/icon_256x256@2x.png >/dev/null
           iconutil -c icns stage/AppIcon.iconset -o "stage/Rust AI IDE.app/Contents/Resources/AppIcon.icns"
 
+      - name: Sign & notarize macOS .app bundle
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          xattr -cr "stage/Rust AI IDE.app"
+          if [ -n "$APPLE_CERTIFICATE_BASE64" ] && [ -n "$APPLE_SIGNING_IDENTITY" ]; then
+            KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+            CERT_PATH="$RUNNER_TEMP/certificate.p12"
+            trap 'rm -f "$CERT_PATH"; security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true' EXIT
+
+            echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > "$CERT_PATH"
+            security create-keychain -p "temp-keychain-pass" "$KEYCHAIN_PATH"
+            security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+            security unlock-keychain -p "temp-keychain-pass" "$KEYCHAIN_PATH"
+            security import "$CERT_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+            security set-key-partition-list -S apple-tool:,apple: -k "temp-keychain-pass" "$KEYCHAIN_PATH"
+            security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+
+            codesign --force --deep --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "stage/Rust AI IDE.app"
+            codesign --verify --deep --strict --verbose=2 "stage/Rust AI IDE.app"
+
+            if [ -n "$APPLE_ID" ] && [ -n "$APPLE_APP_SPECIFIC_PASSWORD" ] && [ -n "$APPLE_TEAM_ID" ]; then
+              ditto -c -k --sequesterRsrc --keepParent "stage/Rust AI IDE.app" "$RUNNER_TEMP/notarize.zip"
+              xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+                --apple-id "$APPLE_ID" \
+                --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+                --team-id "$APPLE_TEAM_ID" \
+                --wait
+              rm -f "$RUNNER_TEMP/notarize.zip"
+              xcrun stapler staple "stage/Rust AI IDE.app"
+            fi
+          else
+            echo "APPLE_CERTIFICATE_BASE64 / APPLE_SIGNING_IDENTITY not set; applying ad-hoc bundle signature."
+            codesign --force --deep --sign - "stage/Rust AI IDE.app"
+            codesign --verify --deep --strict --verbose=2 "stage/Rust AI IDE.app"
+          fi
+
+      - name: Archive macOS .app bundle
+        run: |
           name="RI-${{ github.event.release.tag_name }}-macos-${{ matrix.arch_label }}"
           ditto -c -k --sequesterRsrc --keepParent "stage/Rust AI IDE.app" "dist/$name.zip"
           (cd dist && shasum -a 256 "$name.zip" > "$name.zip.sha256")

@@ -133,11 +133,38 @@ struct IdeWindowHost {
     minimized_trimmed: bool,
     last_wheel_time: Option<Instant>,
     last_wheel_dir: f32,
-    wheel_velocity_boost: f32,
     wheel_accum_y: f32,
     wheel_accum_x: f32,
     last_ime_physical: Option<(i32, i32)>,
     last_bg_rgb: u32,
+    macos_ime_handled_keydown: bool,
+}
+
+#[inline]
+fn should_insert_key_text(
+    is_macos: bool,
+    ime_already_committed: bool,
+    event_text_present: bool,
+) -> bool {
+    if !is_macos {
+        return true;
+    }
+    !ime_already_committed && event_text_present
+}
+
+#[inline]
+fn is_non_visual_key(key: &Key<'_>) -> bool {
+    matches!(
+        key,
+        Key::Process
+            | Key::Shift
+            | Key::Control
+            | Key::Alt
+            | Key::Super
+            | Key::CapsLock
+            | Key::NumLock
+            | Key::ScrollLock
+    )
 }
 
 #[inline]
@@ -148,6 +175,164 @@ fn rgb_to_tao_rgba(rgb: u32) -> RGBA {
         (rgb & 0xFF) as u8,
         255,
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum SystemWheelMode {
+    /// `tao` already scales `LineDelta` by OS settings (Windows `SPI_GETWHEELSCROLLLINES` = N, or macOS AppKit mouse speed).
+    NativeLineDelta,
+    /// Windows `SPI_GETWHEELSCROLLLINES == WHEEL_PAGESCROLL`: `tao` fell back to 3 lines/notch; map each notch to one viewport page.
+    WindowsPageScroll,
+    /// Linux GTK `event.delta()` emits wheel clicks (`±1.0` per detent); multiply by system/DE lines-per-notch.
+    FixedLinesPerNotch(u32),
+}
+
+#[cfg(target_os = "windows")]
+fn query_windows_wheel_scroll_lines() -> u32 {
+    #[link(name = "user32")]
+    extern "system" {
+        fn SystemParametersInfoW(
+            ui_action: u32,
+            ui_param: u32,
+            pv_param: *mut core::ffi::c_void,
+            f_win_ini: u32,
+        ) -> i32;
+    }
+    const SPI_GETWHEELSCROLLLINES: u32 = 0x0068;
+    let mut lines: u32 = 3;
+    unsafe {
+        if SystemParametersInfoW(
+            SPI_GETWHEELSCROLLLINES,
+            0,
+            (&mut lines as *mut u32).cast::<core::ffi::c_void>(),
+            0,
+        ) != 0
+        {
+            lines
+        } else {
+            3
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_kde_wheel_scroll_lines(content: &str) -> Option<u32> {
+    let mut in_kde_section = false;
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_kde_section = line.eq_ignore_ascii_case("[KDE]");
+            continue;
+        }
+        if in_kde_section {
+            if let Some(val) = line.strip_prefix("WheelScrollLines=") {
+                if let Ok(n) = val.trim().parse::<u32>() {
+                    return Some(n.min(100));
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn detect_linux_wheel_scroll_lines() -> u32 {
+    if let Some(home) = env::var_os("HOME") {
+        let kdeglobals = PathBuf::from(home).join(".config").join("kdeglobals");
+        if let Ok(content) = std::fs::read_to_string(kdeglobals) {
+            if let Some(n) = parse_kde_wheel_scroll_lines(&content) {
+                return n;
+            }
+        }
+    }
+    3
+}
+
+fn current_system_wheel_mode() -> SystemWheelMode {
+    #[cfg(target_os = "windows")]
+    {
+        const WHEEL_PAGESCROLL: u32 = u32::MAX;
+        if query_windows_wheel_scroll_lines() == WHEEL_PAGESCROLL {
+            SystemWheelMode::WindowsPageScroll
+        } else {
+            SystemWheelMode::NativeLineDelta
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        SystemWheelMode::NativeLineDelta
+    }
+    #[cfg(target_os = "linux")]
+    {
+        SystemWheelMode::FixedLinesPerNotch(detect_linux_wheel_scroll_lines())
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        SystemWheelMode::FixedLinesPerNotch(3)
+    }
+}
+
+/// Converts a `tao` `MouseScrollDelta` into `(horiz_px, vert_lines)` honoring OS wheel settings.
+fn resolve_wheel_scroll_deltas(
+    delta: &MouseScrollDelta,
+    mode: SystemWheelMode,
+    page_lines: usize,
+    scale_factor: f32,
+    shift_held: bool,
+) -> (f32, f32) {
+    let scale = scale_factor.max(0.5);
+    let px_per_line = (22.0 * scale).max(12.0);
+    match *delta {
+        MouseScrollDelta::LineDelta(x, y) => {
+            let raw_dx = -x;
+            let raw_dy = -y;
+            let vert_lines = match mode {
+                SystemWheelMode::NativeLineDelta => raw_dy,
+                SystemWheelMode::WindowsPageScroll => {
+                    let page = page_lines.saturating_sub(1).max(1) as f32;
+                    (raw_dy / 3.0) * page
+                }
+                SystemWheelMode::FixedLinesPerNotch(n) => raw_dy * (n as f32),
+            };
+            if shift_held && raw_dx.abs() < 0.01 {
+                (vert_lines * 12.0, 0.0)
+            } else {
+                let horiz_px = match mode {
+                    SystemWheelMode::NativeLineDelta | SystemWheelMode::WindowsPageScroll => {
+                        raw_dx * 12.0
+                    }
+                    SystemWheelMode::FixedLinesPerNotch(n) => raw_dx * 12.0 * (n as f32),
+                };
+                (horiz_px, vert_lines)
+            }
+        }
+        MouseScrollDelta::PixelDelta(p) => {
+            let raw_dx_px = (-p.x as f32) / scale;
+            let raw_dy_lines = (-p.y as f32) / px_per_line;
+            if shift_held && raw_dx_px.abs() < 0.01 {
+                ((-p.y as f32) / scale, 0.0)
+            } else {
+                (raw_dx_px, raw_dy_lines)
+            }
+        }
+        _ => (0.0, 0.0),
+    }
+}
+
+fn consume_wheel_accum(accum: &mut f32) -> i32 {
+    let mut whole = accum.trunc() as i32;
+    let rem = *accum - whole as f32;
+    if (rem.abs() - 1.0).abs() < 1e-4 {
+        whole += if rem > 0.0 { 1 } else { -1 };
+        *accum = 0.0;
+    } else {
+        *accum = rem;
+    }
+    whole
 }
 
 fn spawn_ide_window(
@@ -200,7 +385,11 @@ fn spawn_ide_window(
         let _ = proxy_w.send_event(IdeWakeupEvent::Wakeup(wid));
     });
 
-    let mut app_state = IdeApplicationState::new_with_wakeup(workspace_root, Some(wakeup));
+    let mut app_state = if storage_dir.is_some() {
+        IdeApplicationState::new_with_wakeup_deferred_mobile_probe(workspace_root, Some(wakeup))
+    } else {
+        IdeApplicationState::new_with_wakeup(workspace_root, Some(wakeup))
+    };
     if let Some(dir) = storage_dir {
         app_state.restore_from_persistence_dir(dir.to_path_buf());
     }
@@ -244,11 +433,11 @@ fn spawn_ide_window(
         minimized_trimmed: false,
         last_wheel_time: None,
         last_wheel_dir: 0.0,
-        wheel_velocity_boost: 1.0,
         wheel_accum_y: 0.0,
         wheel_accum_x: 0.0,
         last_ime_physical: None,
         last_bg_rgb,
+        macos_ime_handled_keydown: false,
     })
 }
 
@@ -1206,7 +1395,10 @@ fn main() -> Result<()> {
                         .as_ref()
                         .map(|(_, paths)| paths.clone())
                         .unwrap_or_default();
-                    if let Some(host) = windows.remove(&window_id) {
+                    if let Some(mut host) = windows.remove(&window_id) {
+                        if host.app_state.focus == FocusTarget::SettingsModal {
+                            host.app_state.commit_mobile_sdk_locations_from_inputs();
+                        }
                         host.app_state.save_all_persisted_state();
                         drop(host);
                         trim_process_working_set();
@@ -1334,8 +1526,14 @@ impl IdeWindowHost {
                 self.pending_redraw = true;
             }
             WindowEvent::ReceivedImeText(text) => {
-                self.app_state.insert_text_at_focus(&text);
-                self.pending_redraw = true;
+                if !text.is_empty() {
+                    self.app_state.insert_text_at_focus(&text);
+                    self.pending_redraw = true;
+                    #[cfg(target_os = "macos")]
+                    {
+                        self.macos_ime_handled_keydown = true;
+                    }
+                }
             }
             WindowEvent::HoveredFile(path) => {
                 let pos = cursor_pos_in_window(&self.window, &self.surface_canvas, self.cursor_pos);
@@ -1433,6 +1631,7 @@ impl IdeWindowHost {
                 let win_w = self.surface_canvas.width as i32;
                 let win_h = self.surface_canvas.height as i32;
 
+                let splitter_dragging = self.app_state.active_splitter_drag.is_some();
                 let dragged_split = self.app_state.update_splitter_drag(
                     self.cursor_pos.0,
                     self.cursor_pos.1,
@@ -1451,6 +1650,7 @@ impl IdeWindowHost {
                     .update_scrollbar_drag(self.cursor_pos.0, self.cursor_pos.1);
                 let dragged_ide_file = self.left_mouse_down
                     && !dragged_split
+                    && !splitter_dragging
                     && !dragged_scroll
                     && !dragged_dock
                     && self
@@ -1458,6 +1658,7 @@ impl IdeWindowHost {
                         .update_ide_drag(self.cursor_pos.0, self.cursor_pos.1);
                 let dragged_text = self.left_mouse_down
                     && !dragged_split
+                    && !splitter_dragging
                     && !dragged_scroll
                     && !dragged_ide_file
                     && !dragged_dock
@@ -1468,9 +1669,10 @@ impl IdeWindowHost {
                     );
                 if dragged_split || dragged_scroll || dragged_ide_file || dragged_text || dragged_dock {
                     self.pending_redraw = true;
-                } else if self
-                    .app_state
-                    .handle_mouse_move(self.cursor_pos.0, self.cursor_pos.1)
+                } else if !splitter_dragging
+                    && self
+                        .app_state
+                        .handle_mouse_move(self.cursor_pos.0, self.cursor_pos.1)
                 {
                     self.pending_redraw = true;
                 }
@@ -1703,84 +1905,76 @@ impl IdeWindowHost {
                 self.pending_redraw = true;
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let (raw_dx, raw_dy) = match delta {
-                    MouseScrollDelta::LineDelta(x, y) => (-x, -y),
+                let raw_dy_for_zoom = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => -y,
                     MouseScrollDelta::PixelDelta(p) => {
                         let px_per_line =
                             (22.0 * self.surface_canvas.scale_factor).max(12.0) as f64;
-                        ((-p.x / px_per_line) as f32, (-p.y / px_per_line) as f32)
+                        (-p.y / px_per_line) as f32
                     }
-                    _ => (0.0, 0.0),
+                    _ => 0.0,
                 };
 
                 let zoom_mod = self.modifiers.control_key()
                     || (cfg!(target_os = "macos") && self.modifiers.super_key());
                 if zoom_mod && !self.modifiers.alt_key() {
-                    if raw_dy < -0.01 {
+                    if raw_dy_for_zoom < -0.01 {
                         self.app_state.execute_ide_action(IdeAction::ZoomInUi);
                         self.surface_canvas
                             .set_scale_factor(self.app_state.effective_scale());
                         self.pending_redraw = true;
-                    } else if raw_dy > 0.01 {
+                    } else if raw_dy_for_zoom > 0.01 {
                         self.app_state.execute_ide_action(IdeAction::ZoomOutUi);
                         self.surface_canvas
                             .set_scale_factor(self.app_state.effective_scale());
                         self.pending_redraw = true;
                     }
-                } else if raw_dx.abs() > 0.001 || raw_dy.abs() > 0.001 {
-                    let now = Instant::now();
-                    let dir = if raw_dy.abs() > 0.001 {
-                        raw_dy.signum()
-                    } else {
-                        raw_dx.signum()
-                    };
-                    if let Some(prev) = self.last_wheel_time {
-                        let dt_ms = now.duration_since(prev).as_millis();
-                        if dt_ms <= 65 && (dir * self.last_wheel_dir) > 0.0 {
-                            self.wheel_velocity_boost = (self.wheel_velocity_boost + 0.48).min(4.0);
-                        } else if dt_ms > 140 || (dir * self.last_wheel_dir) < 0.0 {
-                            self.wheel_velocity_boost = 1.0;
-                            if (dir * self.last_wheel_dir) < 0.0 {
-                                self.wheel_accum_y = 0.0;
-                                self.wheel_accum_x = 0.0;
-                            }
+                } else {
+                    let wheel_mode = current_system_wheel_mode();
+                    let page_lines = self
+                        .app_state
+                        .wheel_page_lines_at(self.cursor_pos.0, self.cursor_pos.1);
+                    let (dx_px, dy_lines) = resolve_wheel_scroll_deltas(
+                        &delta,
+                        wheel_mode,
+                        page_lines,
+                        self.surface_canvas.scale_factor,
+                        self.modifiers.shift_key(),
+                    );
+                    if dx_px.abs() > 0.001 || dy_lines.abs() > 0.001 {
+                        let now = Instant::now();
+                        let dir = if dy_lines.abs() > 0.001 {
+                            dy_lines.signum()
                         } else {
-                            self.wheel_velocity_boost = (self.wheel_velocity_boost * 0.85).max(1.0);
+                            dx_px.signum()
+                        };
+                        let idle_reset = self
+                            .last_wheel_time
+                            .is_some_and(|prev| now.duration_since(prev).as_millis() > 500);
+                        if idle_reset || (dir * self.last_wheel_dir) < 0.0 {
+                            self.wheel_accum_y = 0.0;
+                            self.wheel_accum_x = 0.0;
                         }
-                    } else {
-                        self.wheel_velocity_boost = 1.0;
-                    }
-                    self.last_wheel_time = Some(now);
-                    if dir != 0.0 {
-                        self.last_wheel_dir = dir;
-                    }
+                        self.last_wheel_time = Some(now);
+                        if dir != 0.0 {
+                            self.last_wheel_dir = dir;
+                        }
 
-                    if self.modifiers.shift_key() && raw_dx.abs() < 0.01 {
-                        self.wheel_accum_x += raw_dy * 36.0 * self.wheel_velocity_boost;
-                    } else {
-                        self.wheel_accum_y += raw_dy * 3.5 * self.wheel_velocity_boost;
-                        self.wheel_accum_x += raw_dx * 36.0 * self.wheel_velocity_boost;
-                    }
+                        self.wheel_accum_y += dy_lines;
+                        self.wheel_accum_x += dx_px;
 
-                    let mut lines_delta = self.wheel_accum_y.trunc() as i32;
-                    if lines_delta == 0 && raw_dy.abs() >= 0.25 {
-                        lines_delta = if raw_dy > 0.0 { 1 } else { -1 };
-                        self.wheel_accum_y = 0.0;
-                    } else {
-                        self.wheel_accum_y -= lines_delta as f32;
-                    }
+                        let lines_delta = consume_wheel_accum(&mut self.wheel_accum_y);
+                        let horiz_px_delta = consume_wheel_accum(&mut self.wheel_accum_x);
 
-                    let horiz_px_delta = self.wheel_accum_x.trunc() as i32;
-                    self.wheel_accum_x -= horiz_px_delta as f32;
-
-                    if lines_delta != 0 || horiz_px_delta != 0 {
-                        self.app_state.handle_mouse_wheel_2d(
-                            self.cursor_pos.0,
-                            self.cursor_pos.1,
-                            lines_delta,
-                            horiz_px_delta,
-                        );
-                        self.pending_redraw = true;
+                        if lines_delta != 0 || horiz_px_delta != 0 {
+                            self.app_state.handle_mouse_wheel_2d(
+                                self.cursor_pos.0,
+                                self.cursor_pos.1,
+                                lines_delta,
+                                horiz_px_delta,
+                            );
+                            self.pending_redraw = true;
+                        }
                     }
                 }
             }
@@ -1789,11 +1983,22 @@ impl IdeWindowHost {
                     KeyEvent {
                         logical_key,
                         state: ElementState::Pressed,
+                        text,
                         ..
                     },
                 ..
             } => {
-                let cmd = self.handle_keyboard_pressed(logical_key);
+                let ime_committed = if cfg!(target_os = "macos") {
+                    std::mem::take(&mut self.macos_ime_handled_keydown)
+                } else {
+                    false
+                };
+                if is_non_visual_key(&logical_key) {
+                    return WindowCommand::None;
+                }
+                let allow_text =
+                    should_insert_key_text(cfg!(target_os = "macos"), ime_committed, text.is_some());
+                let cmd = self.handle_keyboard_pressed(logical_key, allow_text, ime_committed);
                 if cmd == WindowCommand::CloseWindow {
                     return WindowCommand::CloseWindow;
                 }
@@ -1807,7 +2012,12 @@ impl IdeWindowHost {
         WindowCommand::None
     }
 
-    fn handle_keyboard_pressed(&mut self, logical_key: Key<'_>) -> WindowCommand {
+    fn handle_keyboard_pressed(
+        &mut self,
+        logical_key: Key<'_>,
+        allow_text: bool,
+        ime_committed: bool,
+    ) -> WindowCommand {
         let raw_ctrl = self.modifiers.control_key();
         let cmd = cfg!(target_os = "macos") && self.modifiers.super_key();
         let ctrl = raw_ctrl || cmd;
@@ -2037,6 +2247,10 @@ impl IdeWindowHost {
                         Key::Tab => {
                             if let FocusTarget::AiConfigModal(fi) = app_state.focus {
                                 app_state.focus = FocusTarget::AiConfigModal((fi + 1) % 3);
+                            } else if app_state.focus == FocusTarget::CloneGitRepoModal {
+                                app_state.clone_modal_field_focus =
+                                    1 - app_state.clone_modal_field_focus.min(1);
+                                app_state.touch_caret_activity();
                             } else if app_state.focus == FocusTarget::EditorFindInput {
                                 app_state.editor_replace_open = true;
                                 app_state.focus = FocusTarget::EditorReplaceInput;
@@ -2105,6 +2319,8 @@ impl IdeWindowHost {
                                 app_state.cancel_edit_sent_user_message();
                             } else if app_state.focus == FocusTarget::TerminalInput {
                                 app_state.terminal.active_pty_mut().send_raw_bytes(b"\x1b");
+                            } else if app_state.focus == FocusTarget::SettingsModal {
+                                app_state.close_settings_modal();
                             } else {
                                 app_state.focus = FocusTarget::Editor;
                             }
@@ -2129,10 +2345,10 @@ impl IdeWindowHost {
                                 app_state.backspace_at_focus();
                             }
                         }
-                        Key::Space if !ctrl && !alt => {
+                        Key::Space if !ctrl && !alt && allow_text => {
                             app_state.insert_text_at_focus(" ");
                         }
-                        Key::Enter => match app_state.focus {
+                        Key::Enter if !ime_committed => match app_state.focus {
                             FocusTarget::SearchEverywhereModal => {
                                 if let Some(ide_search::SearchEverywhereItem::File {
                                     full_path,
@@ -2310,12 +2526,18 @@ impl IdeWindowHost {
                             FocusTarget::AiConfigModal(_) => {
                                 app_state.save_ai_config_modal();
                             }
+                            FocusTarget::CloneGitRepoModal => {
+                                app_state.submit_git_clone(shift);
+                            }
+                            FocusTarget::NodeMissingModal => {
+                                app_state.recheck_node_and_retry_install();
+                            }
                             FocusTarget::SettingsModal => {
                                 if app_state.settings_sdk_focus.is_some() {
                                     app_state.commit_mobile_sdk_locations_from_inputs();
                                     app_state.settings_sdk_focus = None;
                                 } else {
-                                    app_state.focus = FocusTarget::Editor;
+                                    app_state.close_settings_modal();
                                 }
                             }
                             FocusTarget::OpenProjectChoiceModal => {
@@ -2327,6 +2549,9 @@ impl IdeWindowHost {
                                     }
                                 }
                                 app_state.focus = FocusTarget::Editor;
+                            }
+                            FocusTarget::RecentProjectsModal => {
+                                app_state.confirm_selected_recent_project();
                             }
                             FocusTarget::EditMessageRewindModal => {
                                 app_state.confirm_edit_message_rewind(!shift);
@@ -2427,6 +2652,9 @@ impl IdeWindowHost {
                         Key::PageUp => {
                             if app_state.focus == FocusTarget::TerminalInput {
                                 app_state.terminal.active_pty_mut().send_raw_bytes(b"\x1b[5~");
+                            } else if app_state.focus == FocusTarget::RecentProjectsModal {
+                                let vis = app_state.recent_projects_max_visible.max(1) as isize;
+                                app_state.move_recent_projects_selection(-vis);
                             } else if app_state.focus == FocusTarget::Editor {
                                 let vis = app_state.editor_visible_lines.max(4) as isize;
                                 app_state.active_buffer_mut().move_page(-vis, shift);
@@ -2436,6 +2664,9 @@ impl IdeWindowHost {
                         Key::PageDown => {
                             if app_state.focus == FocusTarget::TerminalInput {
                                 app_state.terminal.active_pty_mut().send_raw_bytes(b"\x1b[6~");
+                            } else if app_state.focus == FocusTarget::RecentProjectsModal {
+                                let vis = app_state.recent_projects_max_visible.max(1) as isize;
+                                app_state.move_recent_projects_selection(vis);
                             } else if app_state.focus == FocusTarget::Editor {
                                 let vis = app_state.editor_visible_lines.max(4) as isize;
                                 app_state.active_buffer_mut().move_page(vis, shift);
@@ -2445,6 +2676,8 @@ impl IdeWindowHost {
                         Key::ArrowUp => {
                             if app_state.focus == FocusTarget::AgentChatInput {
                                 app_state.move_agent_input_vertical(-1, shift, &surface_canvas);
+                            } else if app_state.focus == FocusTarget::RecentProjectsModal {
+                                app_state.move_recent_projects_selection(-1);
                             } else if app_state.focus == FocusTarget::TerminalInput {
                                 app_state.terminal.active_pty_mut().send_raw_bytes(b"\x1b[A");
                             } else if app_state.focus == FocusTarget::Editor {
@@ -2455,6 +2688,8 @@ impl IdeWindowHost {
                         Key::ArrowDown => {
                             if app_state.focus == FocusTarget::AgentChatInput {
                                 app_state.move_agent_input_vertical(1, shift, &surface_canvas);
+                            } else if app_state.focus == FocusTarget::RecentProjectsModal {
+                                app_state.move_recent_projects_selection(1);
                             } else if app_state.focus == FocusTarget::TerminalInput {
                                 app_state.terminal.active_pty_mut().send_raw_bytes(b"\x1b[B");
                             } else if app_state.focus == FocusTarget::Editor {
@@ -2462,11 +2697,125 @@ impl IdeWindowHost {
                                 app_state.ensure_editor_cursor_visible();
                             }
                         }
-                            Key::Character(ch) if !ctrl && !alt => {
+                            Key::Character(ch) if !ctrl && !alt && allow_text => {
                                 app_state.insert_text_at_focus(ch);
                             }
                             _ => {}
                         }
         WindowCommand::None
+    }
+}
+
+#[cfg(test)]
+mod key_ime_tests {
+    use super::{is_non_visual_key, should_insert_key_text};
+    use tao::keyboard::Key;
+
+    #[test]
+    fn macos_deduplicates_received_ime_text_and_ignores_ime_preedit_keys() {
+        // On macOS, non-repeat keydown emits ReceivedImeText first, then KeyboardInput.
+        assert!(!should_insert_key_text(true, true, true));
+        // On macOS IME preedit, KeyboardInput arrives with text == None.
+        assert!(!should_insert_key_text(true, false, false));
+        // On macOS key repeat, interpretKeyEvents is skipped so KeyboardInput inserts text once.
+        assert!(should_insert_key_text(true, false, true));
+        // On Windows/Linux, KeyboardInput text insertion stays enabled.
+        assert!(should_insert_key_text(false, false, true));
+        // Windows IME composition virtual key should not force redundant redraws.
+        assert!(is_non_visual_key(&Key::Process));
+        assert!(!is_non_visual_key(&Key::Character("a")));
+    }
+
+    #[test]
+    fn mouse_wheel_follows_system_scroll_lines_and_page_scroll() {
+        use super::{
+            consume_wheel_accum, parse_kde_wheel_scroll_lines, resolve_wheel_scroll_deltas,
+            SystemWheelMode,
+        };
+        use tao::dpi::PhysicalPosition;
+        use tao::event::MouseScrollDelta;
+
+        // Windows / macOS native LineDelta: 1 notch at system setting = 1, 3, 6 lines.
+        for setting_lines in [1.0f32, 3.0, 6.0] {
+            let (dx, dy) = resolve_wheel_scroll_deltas(
+                &MouseScrollDelta::LineDelta(0.0, -setting_lines),
+                SystemWheelMode::NativeLineDelta,
+                25,
+                1.0,
+                false,
+            );
+            assert_eq!(dx, 0.0);
+            assert_eq!(dy, setting_lines);
+            let mut accum = dy;
+            assert_eq!(consume_wheel_accum(&mut accum), setting_lines as i32);
+            assert_eq!(accum, 0.0);
+        }
+
+        // Windows WHEEL_PAGESCROLL: tao falls back to 3 lines/notch; map back to page - 1.
+        let (dx_page, dy_page) = resolve_wheel_scroll_deltas(
+            &MouseScrollDelta::LineDelta(0.0, -3.0),
+            SystemWheelMode::WindowsPageScroll,
+            30,
+            1.0,
+            false,
+        );
+        assert_eq!(dx_page, 0.0);
+        assert_eq!(dy_page, 29.0);
+
+        // High-resolution fractional wheel (4 ticks of 0.25 with 1-line setting) totals 1 line.
+        let mut accum = 0.0f32;
+        let mut total_lines = 0;
+        for _ in 0..4 {
+            let (_, dy) = resolve_wheel_scroll_deltas(
+                &MouseScrollDelta::LineDelta(0.0, -0.25),
+                SystemWheelMode::NativeLineDelta,
+                20,
+                1.0,
+                false,
+            );
+            accum += dy;
+            total_lines += consume_wheel_accum(&mut accum);
+        }
+        assert_eq!(total_lines, 1);
+        assert_eq!(accum, 0.0);
+
+        // Float precision near 1.0 still consumes cleanly without dropping a line.
+        let mut near_one = 0.99995f32;
+        assert_eq!(consume_wheel_accum(&mut near_one), 1);
+        assert_eq!(near_one, 0.0);
+
+        // macOS trackpad PixelDelta converts physical pixels to exact lines without boost.
+        let (dx_px, dy_lines) = resolve_wheel_scroll_deltas(
+            &MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, -44.0)),
+            SystemWheelMode::NativeLineDelta,
+            20,
+            2.0,
+            false,
+        );
+        assert_eq!(dx_px, 0.0);
+        assert_eq!(dy_lines, 1.0);
+
+        // Shift + vertical wheel maps to horizontal scroll proportional to system lines.
+        let (dx_shift, dy_shift) = resolve_wheel_scroll_deltas(
+            &MouseScrollDelta::LineDelta(0.0, -5.0),
+            SystemWheelMode::NativeLineDelta,
+            20,
+            1.0,
+            true,
+        );
+        assert_eq!(dx_shift, 60.0);
+        assert_eq!(dy_shift, 0.0);
+
+        // Linux KDE WheelScrollLines parser.
+        let kde = "[General]\nName=Test\n[KDE]\nWheelScrollLines=5\n";
+        assert_eq!(parse_kde_wheel_scroll_lines(kde), Some(5));
+        let (_, dy_linux) = resolve_wheel_scroll_deltas(
+            &MouseScrollDelta::LineDelta(0.0, -1.0),
+            SystemWheelMode::FixedLinesPerNotch(5),
+            20,
+            1.0,
+            false,
+        );
+        assert_eq!(dy_linux, 5.0);
     }
 }

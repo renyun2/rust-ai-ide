@@ -202,6 +202,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::Instant;
 use uuid::Uuid;
 
 fn unix_ms() -> u64 {
@@ -258,6 +259,7 @@ struct SessionExecutionSlot {
     cancel_requested: Arc<AtomicBool>,
     active_child_pid: Arc<Mutex<Option<u32>>>,
     streaming_text: Arc<Mutex<Option<StreamingAgentProgress>>>,
+    started_at: Arc<Mutex<Option<Instant>>>,
 }
 
 impl SessionExecutionSlot {
@@ -267,6 +269,7 @@ impl SessionExecutionSlot {
             cancel_requested: Arc::new(AtomicBool::new(false)),
             active_child_pid: Arc::new(Mutex::new(None)),
             streaming_text: Arc::new(Mutex::new(None)),
+            started_at: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -1176,6 +1179,17 @@ impl AgentHub {
             self.checkpoints.clear();
             let seq = self.next_session_seq;
             self.next_session_seq += 1;
+            let prev_id = self.sessions[0].id.clone();
+            {
+                let mut slots = self.session_slots.lock();
+                if let Some(slot) = slots.remove(&prev_id) {
+                    slot.cancel_requested.store(true, Ordering::SeqCst);
+                    Self::kill_slot_process(&slot);
+                    *slot.started_at.lock() = None;
+                    slot.is_busy.store(false, Ordering::SeqCst);
+                }
+                Self::sync_global_busy_flag(&slots, &self.is_busy);
+            }
             let s = &mut self.sessions[0];
             s.id = format!("sess-{}", &Uuid::new_v4().to_string()[..8]);
             s.title = format!("会话 {seq}");
@@ -1280,6 +1294,7 @@ impl AgentHub {
             slot.cancel_requested.store(false, Ordering::SeqCst);
             *slot.active_child_pid.lock() = None;
             *slot.streaming_text.lock() = Some(initial_progress);
+            *slot.started_at.lock() = Some(Instant::now());
             self.is_busy.store(true, Ordering::SeqCst);
             slot
         };
@@ -1298,6 +1313,7 @@ impl AgentHub {
         if let Some(slot) = guard.get(session_id) {
             *slot.active_child_pid.lock() = None;
             *slot.streaming_text.lock() = None;
+            *slot.started_at.lock() = None;
             slot.is_busy.store(false, Ordering::SeqCst);
         }
         Self::sync_global_busy_flag(&guard, global_busy);
@@ -1330,6 +1346,20 @@ impl AgentHub {
             .unwrap_or(false)
     }
 
+    /// Returns when the active session's current busy turn started, preserved across session switches.
+    pub fn active_session_busy_started_at(&self) -> Option<Instant> {
+        let active_id = self.active_session().id.as_str();
+        let slot = {
+            let slots = self.session_slots.lock();
+            slots.get(active_id).cloned()
+        }?;
+        if !slot.is_busy.load(Ordering::Relaxed) {
+            return None;
+        }
+        let started = *slot.started_at.lock();
+        started
+    }
+
     pub fn streaming_progress(&self) -> Option<StreamingAgentProgress> {
         let active_id = self.active_session().id.as_str();
         let slot = {
@@ -1352,6 +1382,12 @@ impl AgentHub {
                     .entry(sid)
                     .or_insert_with(SessionExecutionSlot::new);
                 *slot.streaming_text.lock() = Some(p);
+                {
+                    let mut started = slot.started_at.lock();
+                    if started.is_none() {
+                        *started = Some(Instant::now());
+                    }
+                }
                 slot.is_busy.store(true, Ordering::SeqCst);
                 Self::sync_global_busy_flag(&slots, &self.is_busy);
                 drop(slots);
@@ -1360,6 +1396,7 @@ impl AgentHub {
             None => {
                 if let Some(slot) = slots.get(&sid) {
                     *slot.streaming_text.lock() = None;
+                    *slot.started_at.lock() = None;
                     slot.is_busy.store(false, Ordering::SeqCst);
                 }
                 Self::sync_global_busy_flag(&slots, &self.is_busy);
@@ -1387,6 +1424,7 @@ impl AgentHub {
         }
         slot.cancel_requested.store(true, Ordering::SeqCst);
         Self::kill_slot_process(&slot);
+        *slot.started_at.lock() = None;
         slot.is_busy.store(false, Ordering::SeqCst);
         let partial = slot.streaming_text.lock().take();
         {

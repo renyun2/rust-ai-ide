@@ -761,9 +761,6 @@ fn detect_android_sdk_root(workspace_root: &Path) -> Option<PathBuf> {
 }
 
 fn detect_adb_binary(sdk_root: Option<&Path>) -> Option<PathBuf> {
-    if let Some(in_path) = find_executable_in_path(&["adb.exe", "adb"]) {
-        return Some(in_path);
-    }
     if let Some(root) = sdk_root {
         for rel in ["platform-tools/adb.exe", "platform-tools/adb"] {
             let p = root.join(rel);
@@ -772,7 +769,7 @@ fn detect_adb_binary(sdk_root: Option<&Path>) -> Option<PathBuf> {
             }
         }
     }
-    None
+    find_executable_in_path(&["adb.exe", "adb"])
 }
 
 fn detect_emulator_binary(sdk_root: Option<&Path>) -> Option<PathBuf> {

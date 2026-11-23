@@ -450,8 +450,11 @@ pub fn discover_local_cli_registrations() -> Vec<AgentRegistration> {
         .unwrap_or_else(|| "Gemini 4 Argon (Medium)".to_string());
 
     // 3. Claude Code CLI (`claude.cmd` / `claude`)
-    let claude_path =
-        find_executable_in_path("claude.cmd").or_else(|| find_executable_in_path("claude"));
+    let claude_path = find_cli_binary(
+        &["claude.cmd", "claude.exe", "claude"],
+        home.as_deref(),
+        &[".claude/local/claude.exe", ".claude/local/claude"],
+    );
     let claude_cfg_path = home
         .as_ref()
         .map(|h| h.join(".claude").join("settings.json"))
@@ -492,8 +495,7 @@ pub fn discover_local_cli_registrations() -> Vec<AgentRegistration> {
         .unwrap_or_else(|| "sonnet".to_string());
 
     // 4. OpenAI Codex CLI (`codex.cmd` / `codex`)
-    let codex_path =
-        find_executable_in_path("codex.cmd").or_else(|| find_executable_in_path("codex"));
+    let codex_path = find_cli_binary(&["codex.cmd", "codex.exe", "codex"], home.as_deref(), &[]);
     let codex_cfg_path = home
         .as_ref()
         .map(|h| h.join(".codex").join("config.toml"))
@@ -810,4 +812,354 @@ pub fn strip_ansi_basic(input: &str) -> String {
         }
     }
     out
+}
+
+pub const NODEJS_DOWNLOAD_URL: &str = "https://nodejs.org/";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NodeEnvironmentStatus {
+    pub node_path: Option<PathBuf>,
+    pub npm_path: Option<PathBuf>,
+    pub node_version: Option<String>,
+}
+
+impl NodeEnvironmentStatus {
+    pub fn is_ready(&self) -> bool {
+        self.node_path.is_some() && self.npm_path.is_some()
+    }
+}
+
+fn find_in_env_path(names: &[&str]) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        for name in names {
+            let cand = dir.join(name);
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+fn extra_node_and_npm_dirs(home: Option<&Path>) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            dirs.push(PathBuf::from(appdata).join("npm"));
+        }
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            let p = PathBuf::from(local);
+            dirs.push(p.join("Programs").join("nodejs"));
+            dirs.push(p.join("pnpm"));
+        }
+        for key in ["ProgramFiles", "ProgramFiles(x86)", "NVM_SYMLINK"] {
+            if let Some(base) = std::env::var_os(key) {
+                let p = PathBuf::from(base);
+                dirs.push(p.join("nodejs"));
+                dirs.push(p);
+            }
+        }
+        let _ = home;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Some(h) = home {
+            dirs.push(h.join(".npm-global").join("bin"));
+            dirs.push(h.join(".local").join("bin"));
+            dirs.push(h.join(".nvm").join("current").join("bin"));
+        }
+        dirs.push(PathBuf::from("/opt/homebrew/bin"));
+        dirs.push(PathBuf::from("/usr/local/bin"));
+        dirs.push(PathBuf::from("/usr/bin"));
+    }
+    dirs
+}
+
+fn find_cli_binary(
+    names: &[&str],
+    home: Option<&Path>,
+    home_rel_candidates: &[&str],
+) -> Option<PathBuf> {
+    for name in names {
+        if let Some(p) = find_executable_in_path(name) {
+            return Some(p);
+        }
+    }
+    if let Some(p) = find_in_env_path(names) {
+        return Some(p);
+    }
+    if let Some(h) = home {
+        for rel in home_rel_candidates {
+            let cand = h.join(rel);
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    for dir in extra_node_and_npm_dirs(home) {
+        for name in names {
+            let cand = dir.join(name);
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+/// Detects local Node.js and npm installations (from PATH or standard OS install folders).
+pub fn detect_node_and_npm() -> NodeEnvironmentStatus {
+    let home = user_home_dir();
+    let node_names: &[&str] = if cfg!(target_os = "windows") {
+        &["node.exe", "node"]
+    } else {
+        &["node"]
+    };
+    let npm_names: &[&str] = if cfg!(target_os = "windows") {
+        &["npm.cmd", "npm.exe", "npm"]
+    } else {
+        &["npm"]
+    };
+
+    let node_path = find_cli_binary(node_names, home.as_deref(), &[]);
+    let mut npm_path = node_path.as_ref().and_then(|np| {
+        let dir = np.parent()?;
+        npm_names
+            .iter()
+            .map(|n| dir.join(n))
+            .find(|cand| cand.is_file())
+    });
+    if npm_path.is_none() {
+        npm_path = find_cli_binary(npm_names, home.as_deref(), &[]);
+    }
+
+    let node_version = node_path.as_ref().and_then(|np| {
+        let out = run_cli_with_args(np, &["--version"])?;
+        if !out.status.success() {
+            return None;
+        }
+        let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if v.is_empty() { None } else { Some(v) }
+    });
+
+    NodeEnvironmentStatus {
+        node_path,
+        npm_path,
+        node_version,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CliInstallSpec {
+    pub kind: AgentProviderKind,
+    pub requires_node: bool,
+    pub npm_package: Option<&'static str>,
+    pub install_command_display: &'static str,
+    pub official_url: &'static str,
+}
+
+/// Returns the installation specification for a supported local AI Agent CLI.
+pub fn cli_install_spec(kind: AgentProviderKind) -> CliInstallSpec {
+    match kind {
+        AgentProviderKind::ClaudeCodeCli => CliInstallSpec {
+            kind,
+            requires_node: true,
+            npm_package: Some("@anthropic-ai/claude-code"),
+            install_command_display: "npm install -g @anthropic-ai/claude-code",
+            official_url: "https://docs.anthropic.com/en/docs/claude-code",
+        },
+        AgentProviderKind::OpenAiCodexCli => CliInstallSpec {
+            kind,
+            requires_node: true,
+            npm_package: Some("@openai/codex"),
+            install_command_display: "npm install -g @openai/codex",
+            official_url: "https://github.com/openai/codex",
+        },
+        AgentProviderKind::CursorCli | AgentProviderKind::CursorInlineEngine => CliInstallSpec {
+            kind: AgentProviderKind::CursorCli,
+            requires_node: false,
+            npm_package: None,
+            install_command_display: if cfg!(target_os = "windows") {
+                "irm 'https://cursor.com/install?win32=true' | iex"
+            } else {
+                "curl https://cursor.com/install -fsS | bash"
+            },
+            official_url: "https://cursor.com/cli",
+        },
+        AgentProviderKind::GoogleAntigravityAcp => CliInstallSpec {
+            kind,
+            requires_node: false,
+            npm_package: None,
+            install_command_display: "https://antigravity.google/",
+            official_url: "https://antigravity.google/",
+        },
+        AgentProviderKind::CustomLlmApi => CliInstallSpec {
+            kind,
+            requires_node: false,
+            npm_package: None,
+            install_command_display: "",
+            official_url: "",
+        },
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CliInstallError {
+    MissingNodeJs,
+    OpenDownloadPage(&'static str),
+    CommandFailed(String),
+}
+
+/// Installs the requested Agent CLI in the current environment, checking Node.js first when required.
+pub fn install_agent_cli_blocking(kind: AgentProviderKind) -> Result<String, CliInstallError> {
+    let spec = cli_install_spec(kind);
+    if spec.requires_node {
+        let node = detect_node_and_npm();
+        if !node.is_ready() {
+            return Err(CliInstallError::MissingNodeJs);
+        }
+        let npm_bin = node
+            .npm_path
+            .ok_or(CliInstallError::MissingNodeJs)?;
+        let pkg = spec.npm_package.unwrap_or_default();
+        let mut cmd = build_npm_install_command(&npm_bin, node.node_path.as_deref(), pkg);
+        let output = cmd
+            .output()
+            .map_err(|e| CliInstallError::CommandFailed(format!("无法启动 npm: {e}")))?;
+        if output.status.success() {
+            return Ok(format!(
+                "已成功安装 {} (`npm install -g {pkg}`)",
+                kind.display_name()
+            ));
+        }
+        let stderr = strip_ansi_basic(&String::from_utf8_lossy(&output.stderr));
+        let stdout = strip_ansi_basic(&String::from_utf8_lossy(&output.stdout));
+        let msg = if !stderr.trim().is_empty() {
+            stderr.trim().to_string()
+        } else if !stdout.trim().is_empty() {
+            stdout.trim().to_string()
+        } else {
+            format!("npm install -g {pkg} 失败")
+        };
+        return Err(CliInstallError::CommandFailed(msg));
+    }
+
+    match spec.kind {
+        AgentProviderKind::CursorCli => {
+            #[cfg(target_os = "windows")]
+            let output = {
+                let mut cmd = Command::new("powershell.exe");
+                cmd.args([
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    "irm 'https://cursor.com/install?win32=true' | iex",
+                ])
+                .stdin(Stdio::null())
+                .creation_flags(CREATE_NO_WINDOW);
+                cmd.output()
+            };
+            #[cfg(not(target_os = "windows"))]
+            let output = Command::new("sh")
+                .args(["-c", "curl https://cursor.com/install -fsS | bash"])
+                .stdin(Stdio::null())
+                .output();
+            let out = output.map_err(|e| {
+                CliInstallError::CommandFailed(format!("无法启动 Cursor CLI 安装脚本: {e}"))
+            })?;
+            if out.status.success() {
+                Ok(format!("已成功安装 {}", kind.display_name()))
+            } else {
+                let stderr = strip_ansi_basic(&String::from_utf8_lossy(&out.stderr));
+                let stdout = strip_ansi_basic(&String::from_utf8_lossy(&out.stdout));
+                let msg = if !stderr.trim().is_empty() {
+                    stderr.trim().to_string()
+                } else if !stdout.trim().is_empty() {
+                    stdout.trim().to_string()
+                } else {
+                    "Cursor CLI 安装失败".to_string()
+                };
+                Err(CliInstallError::CommandFailed(msg))
+            }
+        }
+        AgentProviderKind::GoogleAntigravityAcp => {
+            Err(CliInstallError::OpenDownloadPage(spec.official_url))
+        }
+        _ => Err(CliInstallError::CommandFailed(
+            "不支持自动安装该引擎".to_string(),
+        )),
+    }
+}
+
+fn build_npm_install_command(
+    npm_bin: &Path,
+    node_bin: Option<&Path>,
+    pkg: &str,
+) -> Command {
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let ext = npm_bin
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if ext == "cmd" || ext == "bat" {
+            let mut c = Command::new("cmd.exe");
+            c.arg("/C")
+                .arg(npm_bin)
+                .args(["install", "-g", pkg])
+                .stdin(Stdio::null())
+                .creation_flags(CREATE_NO_WINDOW);
+            c
+        } else {
+            let mut c = Command::new(npm_bin);
+            c.args(["install", "-g", pkg])
+                .stdin(Stdio::null())
+                .creation_flags(CREATE_NO_WINDOW);
+            c
+        }
+    };
+    #[cfg(not(target_os = "windows"))]
+    let mut cmd = {
+        let mut c = Command::new(npm_bin);
+        c.args(["install", "-g", pkg]).stdin(Stdio::null());
+        c
+    };
+
+    if let Some(node_dir) = node_bin.and_then(|p| p.parent()) {
+        let existing_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut paths = vec![node_dir.to_path_buf()];
+        paths.extend(std::env::split_paths(&existing_path));
+        if let Ok(joined) = std::env::join_paths(paths) {
+            cmd.env("PATH", joined);
+        }
+    }
+    cmd
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_install_specs_mark_node_requirements() {
+        let claude = cli_install_spec(AgentProviderKind::ClaudeCodeCli);
+        assert!(claude.requires_node);
+        assert_eq!(claude.npm_package, Some("@anthropic-ai/claude-code"));
+
+        let codex = cli_install_spec(AgentProviderKind::OpenAiCodexCli);
+        assert!(codex.requires_node);
+        assert_eq!(codex.npm_package, Some("@openai/codex"));
+
+        let cursor = cli_install_spec(AgentProviderKind::CursorCli);
+        assert!(!cursor.requires_node);
+        assert_eq!(cursor.npm_package, None);
+
+        let agy = cli_install_spec(AgentProviderKind::GoogleAntigravityAcp);
+        assert!(!agy.requires_node);
+        assert_eq!(agy.official_url, "https://antigravity.google/");
+    }
 }

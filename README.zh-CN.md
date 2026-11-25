@@ -12,7 +12,7 @@
   </p>
 
   <p>
-    <a href="https://github.com/renyun2/rust-ai-ide/releases/tag/v0.4.0"><img alt="Version 0.4.0" src="https://img.shields.io/badge/version-0.4.0-blue" /></a>
+    <a href="https://github.com/renyun2/rust-ai-ide/releases/tag/v0.5.0"><img alt="Version 0.5.0" src="https://img.shields.io/badge/version-0.5.0-blue" /></a>
     <img alt="Rust 2021" src="https://img.shields.io/badge/Rust-2021-orange?logo=rust&logoColor=white" />
     <img alt="Platforms Windows | Linux | macOS" src="https://img.shields.io/badge/platform-Windows_%7C_Linux_%7C_macOS-0078D4" />
     <img alt="License MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT_OR_Apache--2.0-green" />
@@ -25,7 +25,7 @@
 
 ## 目录
 
-- [v0.4.0 新特性](#v040-新特性)
+- [v0.5.0 新特性](#v050-新特性)
 - [为什么选择 RI？（核心亮点）](#为什么选择-ri核心亮点)
 - [主流 IDE 横向对比](#主流-ide-横向对比)
 - [内存占用与性能实测](#内存占用与性能实测)
@@ -44,20 +44,17 @@
 
 ---
 
-## v0.4.0 新特性
+## v0.5.0 新特性
 
-- **最近打开项目扩展与管理弹窗（上限提升至 50）：**
-  - 最近工作区持久化列表上限提升至 **50 个**（`MAX_RECENT_WORKSPACES = 50`），支持大小写不敏感路径去重。
-  - 顶部工作区切换下拉菜单直接展示最近 **10 个** 项目，并新增 **「更多最近项目...」** 全量搜索弹窗，支持关键字实时过滤、键盘上下选择、当前窗口切换 / 新窗口打开及单条移除。
-- **从 Git 仓库克隆打开 & Git / Agent CLI 一键安装：**
-  - 文件菜单新增 **「从 Git 仓库打开...」**（`IdeAction::OpenFromGitRepo`），支持输入 HTTPS/SSH 远程地址自动推导本地目录名，一键克隆并在当前或新窗口打开。
-  - 新增本机 Git 自动探测与缺失时一键下载安装，以及 **Claude Code**、**OpenAI Codex**、**Cursor CLI** 一键安装（自动检测 Node.js / npm 环境并提供缺失引导）。
-- **AI 助手滚动流畅度、分栏拖拽与会话计时优化：**
-  - **消除对话结束后向上滚动卡顿与回弹**：修复后台轮询无条件重置滚动位置的问题，保持手动上滚锚点（`ManualOffsetFromTop`），并将 DirectWrite / `cosmic-text` 文本缓存升级为双代 LRU（`GenerationalTextCache` / `GenerationalCosmicCache`），彻底避免全量清空引起的掉帧。
-  - **两阶段消息解析缓存与丝滑分栏拖拽**：将 Markdown/代码块/文件引用解析（`ParsedChatMessage`）与宽度折行分离，右侧分栏拖拽期间零重解析，同时支持多会话切换后保留各自独立运行计时。
-- **移动端 SDK 目录持久化修复与全平台原生滚轮/输入优化：**
-  - 修复启动时 SDK 探测早于 `settings.txt` 持久化恢复导致的二次索要配置问题，优先使用配置的 `sdk_root/platform-tools/adb`，并防止多窗口未修改关闭时覆盖已保存的 SDK 路径。
-  - 接入 Windows / Linux / macOS 系统原生鼠标滚轮行数与翻页设置，修复 macOS 输入法重复上屏问题，并在 Release 工作流中补齐 macOS `.app` 签名与公证流程。
+- **全语言支持扩展（Go、Kotlin、Dart、C/C++、C#、前端、配置与脚本）：**
+  - 全面扩展 `LanguageId`、Darcula/Islands 语法高亮、**Structure（`Alt+7`）** 结构提取、文件类型图标、Markdown 代码块映射及本地 LSP 服务探测，覆盖 **Go**（`gopls`）、**Kotlin**（`kotlin-language-server`）、**Dart**、**C / C++**（`clangd`）、**C#**、**HTML / Vue / Svelte / Astro**、**CSS / SCSS / Sass / Less**、**YAML**、**XML / SVG / XAML**、**SQL** 与 **Shell / PowerShell / Dockerfile / Makefile / CMake**。
+- **工作区代码符号索引 & `Ctrl+悬浮` / `Ctrl+左键` 跳转：**
+  - 在 `ide-search` 中索引全工作区代码符号（类、结构体、函数、接口、枚举、常量），支持 **Search Everywhere（双击 Shift）** 零磁盘 I/O 秒级符号检索。
+  - 新增编辑器 **`Ctrl+鼠标悬浮`** 符号下划线高亮与预览提示，以及 **`Ctrl+鼠标左键` / `Ctrl+B`** 跨文件定义跳转（`find_workspace_symbol_definition`）。
+- **Windows 输入体验、终端多行粘贴与控制台窗口闪烁修复：**
+  - **远程/手机 Unicode 输入与防重复上屏**：兼容 Windows `WM_CHAR` / `VK_PACKET`（`SendInput(KEYEVENTF_UNICODE)`）远程/手机端输入，并消除编辑器与 AI 输入框中由 IME / 按键事件回显导致的字符打字重复两次问题。
+  - **终端多行粘贴顺序与 Bracketed Paste**：在 ConPTY/PSReadLine 粘贴链路中将 `\r\n` / `\n` 统一归一化为 `\r`，并实现 DEC 私有模式 `2004` 括号粘贴包裹，彻底解决多行粘贴首尾行反转问题。
+  - **彻底消除子进程与自更新弹窗闪烁**：直接解析原生 `agy.exe` 替代 `.cmd` 包装脚本，使用纯 Rust `PATH` 查找替代外部 `where` 调用，刷新 `last_check.timestamp` 抑制 `agy.exe --bg-updater` 后台弹窗，并在 Agent、LSP 与 Git 子进程中统一启用 `CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT`。
 
 ---
 
@@ -132,10 +129,10 @@
 
 | 目标平台 | 发行包文件名 | 包内结构 | 说明 |
 | --- | --- | --- | --- |
-| **Windows x86_64** | `RI-v0.4.0-windows-x86_64.zip` | 单文件 `ide-app.exe`（内置多分辨率图标，无需安装向导） | 原生单可执行文件 |
-| **Linux x86_64** | `RI-v0.4.0-linux-x86_64.tar.gz` | `ide-app`、`rust-ai-ide.png`、`rust-ai-ide.desktop` | 剥离符号原生二进制 + 桌面入口 |
-| **macOS Apple Silicon（`arm64`）** | `RI-v0.4.0-macos-arm64.zip` | `Rust AI IDE.app`（含 `Info.plist` 与 `AppIcon.icns`） | 原生 `aarch64` 应用包 |
-| **macOS Intel（`x86_64`）** | `RI-v0.4.0-macos-x86_64.zip` | `Rust AI IDE.app`（含 `Info.plist` 与 `AppIcon.icns`） | 原生 `x86_64` 应用包 |
+| **Windows x86_64** | `RI-v0.5.0-windows-x86_64.zip` | 单文件 `ide-app.exe`（内置多分辨率图标，无需安装向导） | 原生单可执行文件 |
+| **Linux x86_64** | `RI-v0.5.0-linux-x86_64.tar.gz` | `ide-app`、`rust-ai-ide.png`、`rust-ai-ide.desktop` | 剥离符号原生二进制 + 桌面入口 |
+| **macOS Apple Silicon（`arm64`）** | `RI-v0.5.0-macos-arm64.zip` | `Rust AI IDE.app`（含 `Info.plist` 与 `AppIcon.icns`） | 原生 `aarch64` 应用包 |
+| **macOS Intel（`x86_64`）** | `RI-v0.5.0-macos-x86_64.zip` | `Rust AI IDE.app`（含 `Info.plist` 与 `AppIcon.icns`） | 原生 `x86_64` 应用包 |
 
 无需管理员权限、无注册表残留、无后台自动更新守护进程。
 
@@ -145,9 +142,9 @@
 
 ### 直接使用发行包
 
-- **Windows**：解压 `RI-v0.4.0-windows-x86_64.zip`，双击 `ide-app.exe` 启动，或执行 `.\ide-app.exe --workspace D:\path\to\project`。
-- **Linux**：解压 `RI-v0.4.0-linux-x86_64.tar.gz` 并运行 `./ide-app --workspace /path/to/project`（需系统具备 GTK3 及无衬线/等宽字体）。
-- **macOS**：解压 `RI-v0.4.0-macos-arm64.zip`（或 `x86_64`），将 `Rust AI IDE.app` 拖入 `/Applications`。若首次打开提示 **“Rust AI IDE”已损坏，无法打开** 或无法验证开发者（Gatekeeper 对未公证开源应用拦截），在终端执行以下两条命令清除隔离属性后即可正常打开：
+- **Windows**：解压 `RI-v0.5.0-windows-x86_64.zip`，双击 `ide-app.exe` 启动，或执行 `.\ide-app.exe --workspace D:\path\to\project`。
+- **Linux**：解压 `RI-v0.5.0-linux-x86_64.tar.gz` 并运行 `./ide-app --workspace /path/to/project`（需系统具备 GTK3 及无衬线/等宽字体）。
+- **macOS**：解压 `RI-v0.5.0-macos-arm64.zip`（或 `x86_64`），将 `Rust AI IDE.app` 拖入 `/Applications`。若首次打开提示 **“Rust AI IDE”已损坏，无法打开** 或无法验证开发者（Gatekeeper 对未公证开源应用拦截），在终端执行以下两条命令清除隔离属性后即可正常打开：
   ```bash
   xattr -cr "/Applications/Rust AI IDE.app"
   codesign --force --deep --sign - "/Applications/Rust AI IDE.app"
@@ -342,7 +339,7 @@ rust-ai-ide/
 
 ## 现状
 
-版本 **0.4.0**。已支持 Windows、Linux 与 macOS 原生运行。界面布局、配色与快捷键对齐 IntelliJ IDEA New UI，所有实现均为独立纯 Rust 构建。
+版本 **0.5.0**。已支持 Windows、Linux 与 macOS 原生运行。界面布局、配色与快捷键对齐 IntelliJ IDEA New UI，所有实现均为独立纯 Rust 构建。
 
 ---
 

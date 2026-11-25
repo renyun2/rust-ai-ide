@@ -1781,7 +1781,10 @@ mod tests {
         assert!(!grid.bracketed_paste);
     }
 
+    /// Live ConPTY + `powershell.exe` exist only on Windows. Other platforms surface the
+    /// attach warning and never echo the paste, so this check is Windows-only.
     #[test]
+    #[cfg(windows)]
     fn test_live_conpty_multiline_paste_preserves_line_order() {
         let mut tab = LivePtyTab::spawn_powershell("test-paste", Path::new("."), None);
         thread::sleep(Duration::from_millis(800));

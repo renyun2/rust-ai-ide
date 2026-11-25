@@ -25176,7 +25176,11 @@ mod tests {
         let click_y_line3 = state.editor_code_rect.y + 3 * 22 + 10;
         assert!(line2_text.contains("local_helper"));
         state.handle_mouse_click_with_input_mods(click_x_cross, click_y_line3, false, true, &canvas);
-        assert_eq!(state.active_buffer().path, helper_rs);
+        // Indexed paths are canonical (`/private/var` on macOS, long names and `\` on Windows).
+        assert_eq!(
+            clean_workspace_path(state.active_buffer().path.clone()),
+            clean_workspace_path(helper_rs),
+        );
         assert_eq!(state.active_buffer().cursor_line, 0);
 
         let _ = std::fs::remove_dir_all(&root);

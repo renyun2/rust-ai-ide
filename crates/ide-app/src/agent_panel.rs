@@ -371,17 +371,7 @@ impl AgentChatCache {
 }
 
 fn language_from_fence_tag(tag: &str) -> LanguageId {
-    match tag.trim().to_ascii_lowercase().as_str() {
-        "rs" | "rust" => LanguageId::Rust,
-        "ts" | "tsx" | "typescript" => LanguageId::TypeScript,
-        "js" | "jsx" | "mjs" | "cjs" | "javascript" => LanguageId::JavaScript,
-        "py" | "python" => LanguageId::Python,
-        "java" => LanguageId::Java,
-        "json" => LanguageId::Json,
-        "toml" => LanguageId::Toml,
-        "md" | "markdown" => LanguageId::Markdown,
-        _ => LanguageId::PlainText,
-    }
+    LanguageId::from_fence_tag(tag)
 }
 
 fn parse_markdown_inline_line(raw: &str) -> (String, bool, Vec<ChatTextSpan>) {

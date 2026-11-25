@@ -461,18 +461,42 @@ pub struct LspStdioClient {
     next_id: u64,
 }
 
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000 | 0x0000_0400;
+
 impl LspStdioClient {
     pub fn spawn(binary_path: &Path, args: &[&str], workspace_root: &Path) -> Result<Self> {
-        let mut cmd = Command::new(binary_path);
-        cmd.args(args)
-            .current_dir(workspace_root)
+        #[cfg(target_os = "windows")]
+        let mut cmd = {
+            let ext = binary_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if ext == "cmd" || ext == "bat" {
+                let mut c = Command::new("cmd.exe");
+                c.arg("/C").arg(binary_path).args(args);
+                c
+            } else {
+                let mut c = Command::new(binary_path);
+                c.args(args);
+                c
+            }
+        };
+        #[cfg(not(target_os = "windows"))]
+        let mut cmd = {
+            let mut c = Command::new(binary_path);
+            c.args(args);
+            c
+        };
+        cmd.current_dir(workspace_root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         #[cfg(target_os = "windows")]
         {
             use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x0800_0000);
+            cmd.creation_flags(CREATE_NO_WINDOW);
         }
         let mut child = cmd.spawn()?;
         let stdin = child
@@ -588,6 +612,30 @@ fn probe_installed_lsp_servers() -> Vec<LspServerStatus> {
             LanguageId::Java,
             &["jdtls.bat", "jdtls.cmd", "jdtls", "java-language-server"][..],
         ),
+        (
+            LanguageId::Go,
+            &["gopls.exe", "gopls"][..],
+        ),
+        (
+            LanguageId::Kotlin,
+            &[
+                "kotlin-language-server.bat",
+                "kotlin-language-server.cmd",
+                "kotlin-language-server",
+            ][..],
+        ),
+        (
+            LanguageId::Dart,
+            &["dart.bat", "dart.exe", "dart"][..],
+        ),
+        (
+            LanguageId::Cpp,
+            &["clangd.exe", "clangd"][..],
+        ),
+        (
+            LanguageId::CSharp,
+            &["csharp-ls.exe", "csharp-ls", "OmniSharp.exe", "omnisharp"][..],
+        ),
     ];
 
     let mut servers = Vec::new();
@@ -684,6 +732,12 @@ pub fn analyze_source_diagnostics(
                 | LanguageId::JavaScript
                 | LanguageId::Python
                 | LanguageId::Java
+                | LanguageId::Go
+                | LanguageId::Kotlin
+                | LanguageId::Dart
+                | LanguageId::C
+                | LanguageId::Cpp
+                | LanguageId::CSharp
         ) {
             if let Some(pos) = raw_line.find("todo!(").or_else(|| raw_line.find("unimplemented!(")) {
                 if !trimmed.starts_with("//") && !trimmed.starts_with('#') {
@@ -716,14 +770,15 @@ pub fn analyze_source_diagnostics(
                 if c == '#' && lang == LanguageId::Python {
                     break;
                 }
-                if c == '"' {
+                if c == '"' || (c == '`' && matches!(lang, LanguageId::Go | LanguageId::TypeScript | LanguageId::JavaScript)) {
+                    let quote = c;
                     i += 1;
                     while i < chars.len() {
-                        if chars[i] == '\\' {
+                        if quote != '`' && chars[i] == '\\' {
                             i += 2;
                             continue;
                         }
-                        if chars[i] == '"' {
+                        if chars[i] == quote {
                             break;
                         }
                         i += 1;
@@ -731,7 +786,7 @@ pub fn analyze_source_diagnostics(
                     i += 1;
                     continue;
                 }
-                if c == '\'' && lang == LanguageId::Java {
+                if c == '\'' && !matches!(lang, LanguageId::Rust) {
                     i += 1;
                     while i < chars.len() {
                         if chars[i] == '\\' {
@@ -899,7 +954,7 @@ fn run_workspace_compiler_and_lsp_diagnostics(workspace_root: &Path) -> Vec<IdeD
         #[cfg(target_os = "windows")]
         {
             use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x0800_0000);
+            cmd.creation_flags(CREATE_NO_WINDOW);
         }
         if let Ok(output) = cmd.output() {
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1130,20 +1185,30 @@ pub fn decode_lsp_frame<R: BufRead + Read>(reader: &mut R) -> Result<Value> {
 }
 
 pub fn find_executable_in_path(binary: &str) -> Option<PathBuf> {
-    let mut cmd = Command::new("where.exe");
-    cmd.arg(binary).stdin(Stdio::null());
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000);
+    let bin_path = Path::new(binary);
+    if bin_path.is_absolute() && bin_path.is_file() {
+        return Some(bin_path.to_path_buf());
     }
-    if let Ok(output) = cmd.output() {
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if let Some(first_line) = stdout.lines().next() {
-                let p = PathBuf::from(first_line.trim());
-                if p.exists() {
-                    return Some(p);
+    let has_ext = bin_path.extension().is_some();
+    if let Some(path_var) = std::env::var_os("PATH") {
+        #[cfg(target_os = "windows")]
+        let exts: Vec<&str> = if has_ext {
+            vec![""]
+        } else {
+            vec![".exe", ".cmd", ".bat", ".com"]
+        };
+        #[cfg(not(target_os = "windows"))]
+        let exts: Vec<&str> = vec![""];
+
+        for dir in std::env::split_paths(&path_var) {
+            for ext in &exts {
+                let candidate = if ext.is_empty() {
+                    dir.join(binary)
+                } else {
+                    dir.join(format!("{binary}{ext}"))
+                };
+                if candidate.is_file() {
+                    return Some(candidate);
                 }
             }
         }

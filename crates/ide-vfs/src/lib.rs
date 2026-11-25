@@ -636,10 +636,7 @@ impl TextBuffer {
             let l = self.cursor_line.min(self.line_count().saturating_sub(1));
             (l, l)
         };
-        let prefix = match self.language {
-            LanguageId::Python | LanguageId::Toml => "# ",
-            _ => "// ",
-        };
+        let prefix = self.language.line_comment_prefix();
         let prefix_trimmed = prefix.trim();
         let all_commented = (sl..=el).all(|l| {
             let raw = self.line_text(l);
@@ -736,7 +733,7 @@ impl TextBuffer {
     }
 
     pub fn insert_str_at_cursor(&mut self, s: &str) {
-        let normalized = s.replace("\r\n", "\n");
+        let normalized = s.replace("\r\n", "\n").replace('\r', "\n");
         if normalized.is_empty() && !self.has_selection() {
             return;
         }
@@ -1281,6 +1278,9 @@ impl ProjectTreeState {
                 LanguageId::TypeScript | LanguageId::JavaScript => "// Created in Rust AI IDE\nexport function init(): void {\n  console.log('Ready');\n}\n".to_string(),
                 LanguageId::Python => "# Created in Rust AI IDE\ndef main() -> None:\n    print('Ready')\n\nif __name__ == '__main__':\n    main()\n".to_string(),
                 LanguageId::Java => build_java_file_template(&target),
+                LanguageId::Go => "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"Ready\")\n}\n".to_string(),
+                LanguageId::Kotlin => "fun main() {\n    println(\"Ready\")\n}\n".to_string(),
+                LanguageId::Dart => "void main() {\n  print('Ready');\n}\n".to_string(),
                 _ => String::new(),
             };
             fs::write(&target, content)?;

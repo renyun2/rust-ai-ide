@@ -9,7 +9,60 @@ use std::process::{Command, Stdio};
 use std::os::windows::process::CommandExt;
 
 #[cfg(target_os = "windows")]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const CREATE_NO_WINDOW: u32 = 0x0800_0000 | 0x0000_0400;
+
+/// 刷新 Antigravity CLI (`agy.exe`) 的 `last_check.timestamp`，
+/// 防止 `agy.exe` 在后台无头调用时以 `DETACHED_PROCESS` 拉起 `--bg-updater` 自更新子进程，
+/// 进而导致 Windows 11 DefTerm (`OpenConsole.exe` / `conhost.exe`) 弹出并闪烁命令行窗口。
+pub fn suppress_agy_background_updater_window() {
+    let Some(home) = user_home_dir() else {
+        return;
+    };
+    let agy_dir = home.join(".gemini").join("antigravity-cli");
+    if !agy_dir.is_dir() && fs::create_dir_all(&agy_dir).is_err() {
+        return;
+    }
+    let _ = fs::write(agy_dir.join("last_check.timestamp"), b"");
+    let updater_dir = agy_dir.join("updater");
+    if updater_dir.is_dir() {
+        let _ = fs::write(updater_dir.join("last_check.timestamp"), b"");
+    }
+}
+
+/// 若传入的 `bin` 是外层 `.cmd`/`.bat` 包装脚本（如 `agy.cmd`），优先解析为本机原生 `agy.exe`，
+/// 彻底避免每次发消息时额外派生 `cmd.exe /C` 控制台包装进程。
+pub fn resolve_native_agy_binary(bin: &Path) -> PathBuf {
+    let ext = bin
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if ext == "exe" && bin.is_file() {
+        return bin.to_path_buf();
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        let cand = PathBuf::from(local).join("agy").join("bin").join("agy.exe");
+        if cand.is_file() {
+            return cand;
+        }
+    }
+    if let Some(home) = user_home_dir() {
+        let cand = home
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("bin")
+            .join("agy.exe");
+        if cand.is_file() {
+            return cand;
+        }
+    }
+    if let Some(found) = find_executable_in_path("agy.exe") {
+        if found.is_file() {
+            return found;
+        }
+    }
+    bin.to_path_buf()
+}
 
 pub fn user_home_dir() -> Option<PathBuf> {
     std::env::var_os("USERPROFILE")
@@ -389,10 +442,8 @@ pub fn discover_local_cli_registrations() -> Vec<AgentRegistration> {
         .cloned()
         .unwrap_or_else(|| "composer-2.5".to_string());
 
-    // 2. Antigravity CLI (`agy.exe` / `agy`)
+    // 2. Antigravity CLI (`agy.exe` / `agy`) — 优先绑定原生 `agy.exe`，避免命中外层 `.cmd` 包装脚本产生额外 cmd 进程
     let agy_path = find_executable_in_path("agy.exe")
-        .or_else(|| find_executable_in_path("agy.cmd"))
-        .or_else(|| find_executable_in_path("agy"))
         .or_else(|| {
             std::env::var_os("LOCALAPPDATA")
                 .map(|p| PathBuf::from(p).join("agy").join("bin").join("agy.exe"))
@@ -407,7 +458,9 @@ pub fn discover_local_cli_registrations() -> Vec<AgentRegistration> {
                         .join("agy.exe")
                 })
                 .filter(|p| p.exists())
-        });
+        })
+        .or_else(|| find_executable_in_path("agy.cmd"))
+        .or_else(|| find_executable_in_path("agy"));
     let agy_cfg_path = home
         .as_ref()
         .map(|h| {
@@ -670,6 +723,9 @@ pub fn probe_cli_rewind_capabilities(kind: AgentProviderKind, bin: &Path) -> Opt
     if kind == AgentProviderKind::CustomLlmApi {
         return Some((false, false));
     }
+    if kind == AgentProviderKind::GoogleAntigravityAcp {
+        suppress_agy_background_updater_window();
+    }
     let output = run_cli_probe(bin, &["--help"])?;
     let combined = format!(
         "{}\n{}",
@@ -724,12 +780,8 @@ pub fn probe_cursor_cli_list_models(bin: &Path) -> Option<(Vec<String>, Vec<Stri
 
 /// 后台异步探测 `agy.exe` 本机支持的所有模型列表
 pub fn probe_agy_cli_models(bin: &Path) -> Option<Vec<String>> {
-    let mut cmd = Command::new(bin);
-    cmd.args(["--model", "__probe_models__", "-p=probe"])
-        .stdin(Stdio::null());
-    #[cfg(target_os = "windows")]
-    cmd.creation_flags(CREATE_NO_WINDOW);
-    let output = cmd.output().ok()?;
+    suppress_agy_background_updater_window();
+    let output = run_cli_with_args(bin, &["--model", "__probe_models__", "-p=probe"])?;
     let combined = format!(
         "{}\n{}",
         String::from_utf8_lossy(&output.stdout),

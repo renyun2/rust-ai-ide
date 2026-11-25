@@ -983,7 +983,7 @@ fn build_hidden_command(bin: &Path, args: &[&str]) -> Command {
         c
     };
     #[cfg(target_os = "windows")]
-    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    cmd.creation_flags(0x0800_0000 | 0x0000_0400); // CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT
     cmd
 }
 

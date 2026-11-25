@@ -15,7 +15,7 @@ use uuid::Uuid;
 use std::os::windows::process::CommandExt;
 
 #[cfg(target_os = "windows")]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const CREATE_NO_WINDOW: u32 = 0x0800_0000 | 0x0000_0400;
 
 pub fn agent_tool_declarations() -> Vec<Value> {
     vec![

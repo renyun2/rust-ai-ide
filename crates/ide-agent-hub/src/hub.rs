@@ -216,7 +216,7 @@ fn unix_ms() -> u64 {
 use std::os::windows::process::CommandExt;
 
 #[cfg(target_os = "windows")]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const CREATE_NO_WINDOW: u32 = 0x0800_0000 | 0x0000_0400;
 
 struct PendingInlineMeta {
     file_path: PathBuf,
@@ -3611,11 +3611,11 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("rust_ai_ide_diff_tracker_{}", Uuid::new_v4()));
         fs::create_dir_all(&tmp).unwrap();
         let run_git = |args: &[&str]| {
-            Command::new("git")
-                .args(args)
-                .current_dir(&tmp)
-                .output()
-                .expect("git")
+            let mut c = Command::new("git");
+            c.args(args).current_dir(&tmp);
+            #[cfg(target_os = "windows")]
+            c.creation_flags(CREATE_NO_WINDOW);
+            c.output().expect("git")
         };
         assert!(run_git(&["init"]).status.success());
         let _ = run_git(&["config", "user.email", "test@example.com"]);
@@ -3669,11 +3669,11 @@ mod tests {
         let sub = repo.join("packages/web");
         fs::create_dir_all(&sub).unwrap();
         let run_git = |args: &[&str]| {
-            Command::new("git")
-                .args(args)
-                .current_dir(&repo)
-                .output()
-                .expect("git")
+            let mut c = Command::new("git");
+            c.args(args).current_dir(&repo);
+            #[cfg(target_os = "windows")]
+            c.creation_flags(CREATE_NO_WINDOW);
+            c.output().expect("git")
         };
         assert!(run_git(&["init"]).status.success());
         let _ = run_git(&["config", "user.email", "test@example.com"]);

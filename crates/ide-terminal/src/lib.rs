@@ -298,13 +298,34 @@ impl LivePtyTab {
         if text.is_empty() {
             return;
         }
+        let normalized = normalize_terminal_text(text);
         self.ensure_spawned();
         self.clear_selection();
         self.scroll_offset = 0;
         if let Some(b) = &self.backend {
             let guard = b.lock();
             let mut w = guard.writer.lock();
-            let _ = w.write_all(text.as_bytes());
+            let _ = w.write_all(normalized.as_bytes());
+            let _ = w.flush();
+        }
+    }
+
+    /// Pastes clipboard text into the PTY, normalizing newlines to `\r` (avoiding ConPTY/PSReadLine
+    /// treating `\n` as `Ctrl+Enter` / `InsertLineAbove` which reverses multi-line pastes) and
+    /// wrapping with bracketed-paste markers (`\x1b[200~...\x1b[201~`) when mode 2004 is active.
+    pub fn paste_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.ensure_spawned();
+        self.clear_selection();
+        self.scroll_offset = 0;
+        let bracketed = self.grid.lock().bracketed_paste;
+        let payload = format_terminal_paste_payload(text, bracketed);
+        if let Some(b) = &self.backend {
+            let guard = b.lock();
+            let mut w = guard.writer.lock();
+            let _ = w.write_all(payload.as_bytes());
             let _ = w.flush();
         }
     }
@@ -874,6 +895,7 @@ pub struct TerminalGrid {
     scroll_bottom: usize,
     cursor_visible: bool,
     pending_wrap: bool,
+    bracketed_paste: bool,
     current_fg: u32,
     bold: bool,
 }
@@ -896,6 +918,7 @@ impl TerminalGrid {
             scroll_bottom: r - 1,
             cursor_visible: true,
             pending_wrap: false,
+            bracketed_paste: false,
             current_fg: DEFAULT_FG,
             bold: false,
         }
@@ -1370,6 +1393,8 @@ impl VtStreamParser {
                 match (code, final_ch) {
                     (25, 'h') => grid.cursor_visible = true,
                     (25, 'l') => grid.cursor_visible = false,
+                    (2004, 'h') => grid.bracketed_paste = true,
+                    (2004, 'l') => grid.bracketed_paste = false,
                     (1049, 'h') | (1047, 'h') | (47, 'h') => {
                         if grid.alt_backup.is_none() {
                             let backup = grid.screen.clone();
@@ -1680,6 +1705,26 @@ pub fn parse_ansi_colored_spans(line: &str, current_fg: &mut u32) -> Vec<(String
     row_to_styled_line(&grid.screen[0], false).spans
 }
 
+/// Normalizes line endings for ConPTY input: `\r\n` and `\n` become `\r` (Enter),
+/// because PowerShell/PSReadLine interprets bare `\n` (`0x0A`) as `InsertLineAbove`
+/// (`Ctrl+Enter`), which reverses multi-line pastes line-by-line.
+pub fn normalize_terminal_text(text: &str) -> String {
+    text.replace("\r\n", "\r").replace('\n', "\r")
+}
+
+/// Formats clipboard text for terminal paste, normalizing line endings to `\r` and
+/// wrapping with bracketed-paste escape markers when DEC private mode 2004 is enabled.
+pub fn format_terminal_paste_payload(text: &str, bracketed_paste: bool) -> String {
+    let normalized = normalize_terminal_text(text);
+    if !bracketed_paste {
+        return normalized;
+    }
+    let sanitized = normalized
+        .replace("\x1b[200~", "")
+        .replace("\x1b[201~", "");
+    format!("\x1b[200~{sanitized}\x1b[201~")
+}
+
 pub fn strip_ansi_codes(input: &str) -> String {
     let mut fg = DEFAULT_FG;
     parse_ansi_colored_spans(input, &mut fg)
@@ -1710,6 +1755,62 @@ mod tests {
         let snap = grid.snapshot();
         assert_eq!(snap.cursor_line, 1);
         assert_eq!(snap.lines[1].raw_text(), "PS D:\\> echo ok");
+    }
+
+    #[test]
+    fn test_terminal_paste_normalizes_newlines_and_bracketed_mode() {
+        assert_eq!(
+            normalize_terminal_text("echo 1\r\necho 2\necho 3"),
+            "echo 1\recho 2\recho 3"
+        );
+        assert_eq!(
+            format_terminal_paste_payload("line1\nline2\r\nline3", false),
+            "line1\rline2\rline3"
+        );
+        assert_eq!(
+            format_terminal_paste_payload("line1\n\x1b[201~line2", true),
+            "\x1b[200~line1\rline2\x1b[201~"
+        );
+
+        let mut grid = TerminalGrid::new(6, 40);
+        let mut parser = VtStreamParser::new();
+        assert!(!grid.bracketed_paste);
+        parser.feed("\x1b[?2004h", &mut grid);
+        assert!(grid.bracketed_paste);
+        parser.feed("\x1b[?2004l", &mut grid);
+        assert!(!grid.bracketed_paste);
+    }
+
+    #[test]
+    fn test_live_conpty_multiline_paste_preserves_line_order() {
+        let mut tab = LivePtyTab::spawn_powershell("test-paste", Path::new("."), None);
+        thread::sleep(Duration::from_millis(800));
+        tab.paste_text("Write-Output '__PASTE_1__'\nWrite-Output '__PASTE_2__'\nWrite-Output '__PASTE_3__'\n");
+        let start = Instant::now();
+        let mut joined = String::new();
+        let mut ready = false;
+        while start.elapsed() < Duration::from_secs(6) {
+            let snap = tab.snapshot();
+            joined = snap
+                .lines
+                .iter()
+                .map(|l| l.raw_text())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if joined.contains("__PASTE_3__") {
+                ready = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(80));
+        }
+        assert!(ready, "Timed out waiting for pasted commands:\n{joined}");
+        let p1 = joined.find("__PASTE_1__").expect("first line present");
+        let p2 = joined.find("__PASTE_2__").expect("second line present");
+        let p3 = joined.find("__PASTE_3__").expect("third line present");
+        assert!(
+            p1 < p2 && p2 < p3,
+            "Pasted lines appeared out of order (reversed?):\n{joined}"
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use crate::cli_discovery::{
     resolve_agy_model_and_effort, resolve_cursor_model_id, resolve_cursor_node_entry,
-    strip_ansi_basic,
+    resolve_native_agy_binary, strip_ansi_basic, suppress_agy_background_updater_window,
+    user_home_dir,
 };
 use crate::tools::resolve_safe_workspace_path;
 use crate::types::{
@@ -1492,6 +1493,8 @@ fn spawn_cli_process(
             spawn_generic_piped_cli(&params.bin, &params.root, &args, true)
         }
         AgentProviderKind::GoogleAntigravityAcp => {
+            suppress_agy_background_updater_window();
+            let native_bin = resolve_native_agy_binary(&params.bin);
             let mode_str = match params.mode {
                 AgentWorkbenchMode::Ask => "plan",
                 AgentWorkbenchMode::Edit => "accept-edits",
@@ -1524,7 +1527,7 @@ fn spawn_cli_process(
                 combined_prompt.to_string()
             };
             args.push(format!("-p={prompt_arg}"));
-            spawn_generic_piped_cli(&params.bin, &params.root, &args, false)
+            spawn_agy_piped_cli(&native_bin, &params.root, &args)
         }
         AgentProviderKind::ClaudeCodeCli => {
             let perm_mode = match params.mode {
@@ -1587,12 +1590,41 @@ fn spawn_cli_process(
     }
 }
 
-fn spawn_generic_piped_cli(
+fn spawn_agy_piped_cli(bin: &Path, cwd: &Path, args: &[String]) -> std::io::Result<Child> {
+    let mut cmd = build_hidden_piped_cli_command(bin, cwd, args, false);
+    cmd.env("DO_NOT_TRACK", "1")
+        .env("GEMINI_TELEMETRY_ENABLED", "false")
+        .env_remove("GEMINI_API_KEY")
+        .env_remove("GOOGLE_API_KEY")
+        .env_remove("GOOGLE_GEMINI_BASE_URL")
+        .env_remove("GOOGLE_GEMINI_MODEL");
+    if let Some(home) = user_home_dir() {
+        let env_file = home.join(".gemini").join(".env");
+        if let Ok(raw) = fs::read_to_string(&env_file) {
+            for line in raw.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+                if let Some((k, v)) = trimmed.split_once('=') {
+                    let key = k.trim();
+                    let val = v.trim().trim_matches('"').trim_matches('\'');
+                    if !key.is_empty() && !val.is_empty() {
+                        cmd.env(key, val);
+                    }
+                }
+            }
+        }
+    }
+    cmd.spawn()
+}
+
+fn build_hidden_piped_cli_command(
     bin: &Path,
     cwd: &Path,
     args: &[String],
     pipe_stdin: bool,
-) -> std::io::Result<Child> {
+) -> Command {
     let stdin_cfg = || if pipe_stdin { Stdio::piped() } else { Stdio::null() };
 
     #[cfg(target_os = "windows")]
@@ -1610,7 +1642,7 @@ fn spawn_generic_piped_cli(
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .creation_flags(CREATE_NO_WINDOW);
-            return cmd.spawn();
+            return cmd;
         }
     }
 
@@ -1622,7 +1654,16 @@ fn spawn_generic_piped_cli(
         .stderr(Stdio::piped());
     #[cfg(target_os = "windows")]
     cmd.creation_flags(CREATE_NO_WINDOW);
-    cmd.spawn()
+    cmd
+}
+
+fn spawn_generic_piped_cli(
+    bin: &Path,
+    cwd: &Path,
+    args: &[String],
+    pipe_stdin: bool,
+) -> std::io::Result<Child> {
+    build_hidden_piped_cli_command(bin, cwd, args, pipe_stdin).spawn()
 }
 
 /// 从 AI 回复文本中提取工作区内的文件引用（支持 `` `path/file.rs:12` ``、`path/file.rs#L10` 或纯路径）

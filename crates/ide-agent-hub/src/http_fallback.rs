@@ -16,7 +16,7 @@ use std::thread;
 use std::os::windows::process::CommandExt;
 
 #[cfg(target_os = "windows")]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const CREATE_NO_WINDOW: u32 = 0x0800_0000 | 0x0000_0400;
 
 pub fn execute_curl_llm_streaming(
     cfg: &AiApiConfig,

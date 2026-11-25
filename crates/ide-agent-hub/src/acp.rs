@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::os::windows::process::CommandExt;
 
 #[cfg(target_os = "windows")]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const CREATE_NO_WINDOW: u32 = 0x0800_0000 | 0x0000_0400;
 
 /// Google Antigravity / Zed ACP (Agent Client Protocol) JSON-RPC 2.0 标准协议构造与解析器
 pub struct AcpProtocol;
@@ -92,10 +92,33 @@ pub fn execute_acp_stdio_session(
     if parts.is_empty() {
         return Err("ACP 命令为空".to_string());
     }
-    let mut cmd = Command::new(parts[0]);
-    if parts.len() > 1 {
-        cmd.args(&parts[1..]);
-    }
+    crate::cli_discovery::suppress_agy_background_updater_window();
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let lower = parts[0].to_ascii_lowercase();
+        if lower.ends_with(".cmd") || lower.ends_with(".bat") {
+            let mut c = Command::new("cmd");
+            c.arg("/C").arg(parts[0]);
+            if parts.len() > 1 {
+                c.args(&parts[1..]);
+            }
+            c
+        } else {
+            let mut c = Command::new(parts[0]);
+            if parts.len() > 1 {
+                c.args(&parts[1..]);
+            }
+            c
+        }
+    };
+    #[cfg(not(target_os = "windows"))]
+    let mut cmd = {
+        let mut c = Command::new(parts[0]);
+        if parts.len() > 1 {
+            c.args(&parts[1..]);
+        }
+        c
+    };
     cmd.current_dir(root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

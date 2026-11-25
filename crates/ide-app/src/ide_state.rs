@@ -28,8 +28,9 @@ use ide_git::{
 };
 use ide_lsp::{DiagnosticSeverityLevel, LspHub};
 use ide_search::{
-    find_in_files, find_in_files_indexed, index_workspace_files, search_everywhere,
-    search_everywhere_indexed, ContentSearchHit, SearchEverywhereItem, WorkspaceFileEntry,
+    find_in_files, find_in_files_indexed, find_workspace_symbol_definition, index_workspace_files,
+    search_everywhere, search_everywhere_indexed, ContentSearchHit, SearchEverywhereItem,
+    WorkspaceFileEntry,
 };
 use ide_syntax::{
     detect_runnable_gutter_entries, extract_structure_symbols, find_symbol_definition,
@@ -1083,6 +1084,8 @@ pub struct IdeApplicationState {
     mobile_sdk_field_rects: [Rect; 3],
     // 自定义窗口与悬浮态
     pub hover_pos: (i32, i32),
+    pub ctrl_held: bool,
+    pub ctrl_hover_symbol: Option<(usize, usize, usize, String)>,
     pub last_hover_hit_idx: Option<usize>,
     pub last_hover_splitter: Option<DragSplitter>,
     pub last_win_size: (i32, i32),
@@ -1825,6 +1828,8 @@ impl IdeApplicationState {
             mobile_sdk_jdk: TextInputField::single_line(),
             mobile_sdk_field_rects: [Rect::new(0, 0, 0, 0); 3],
             hover_pos: (-1, -1),
+            ctrl_held: false,
+            ctrl_hover_symbol: None,
             last_hover_hit_idx: None,
             last_hover_splitter: None,
             last_win_size: (1560, 940),
@@ -3021,6 +3026,20 @@ impl IdeApplicationState {
         }
     }
 
+    pub fn ensure_workspace_index_started(&self) {
+        if !self.wakeup_enabled {
+            return;
+        }
+        let has_index = self
+            .workspace_files_cache
+            .try_read()
+            .map(|g| g.is_some())
+            .unwrap_or(true);
+        if !has_index && !self.is_indexing_workspace.load(Ordering::Acquire) {
+            let _ = self.search_cmd_tx.send(SearchWorkerCmd::ReindexWorkspace);
+        }
+    }
+
     pub fn trigger_search_everywhere(&mut self, max_results: usize) {
         let query = self.search_query_input.as_str().to_string();
         if let Ok(guard) = self.workspace_files_cache.try_read() {
@@ -3998,20 +4017,36 @@ impl IdeApplicationState {
         }
     }
 
-    /// IDEA `Ctrl+B`: 转到当前光标下符号的声明/定义；若已位于定义处则查找全工作区引用 (Usages)
+    /// IDEA `Ctrl+B` / `Ctrl+Click`: 转到符号的声明/定义；若已位于定义处则查找全工作区引用 (Usages)
     pub fn navigate_to_declaration_or_usages(&mut self) {
-        let symbol = self.active_buffer().word_at_cursor().or_else(|| {
-            self.ensure_structure_symbols_cached()
-                .first()
-                .map(|s| s.name.clone())
+        let symbol = self.active_buffer().word_at_cursor();
+        self.navigate_to_symbol_declaration_or_usages(symbol, true);
+    }
+
+    pub fn navigate_to_symbol_declaration_or_usages(
+        &mut self,
+        symbol: Option<String>,
+        allow_first_structure_fallback: bool,
+    ) {
+        self.ensure_workspace_index_started();
+        let symbol = symbol.or_else(|| {
+            if allow_first_structure_fallback {
+                self.ensure_structure_symbols_cached()
+                    .first()
+                    .map(|s| s.name.clone())
+            } else {
+                None
+            }
         });
         let Some(sym) = symbol else {
-            self.status_notification = self
-                .tr(
-                    "未识别到光标处的符号名称 (Ctrl+B)",
-                    "No symbol found at cursor (Ctrl+B)",
-                )
-                .to_string();
+            if allow_first_structure_fallback {
+                self.status_notification = self
+                    .tr(
+                        "未识别到光标处的符号名称 (Ctrl+B)",
+                        "No symbol found at cursor (Ctrl+B)",
+                    )
+                    .to_string();
+            }
             return;
         };
 
@@ -4023,9 +4058,13 @@ impl IdeApplicationState {
         // 1. 当前文件内查找符号定义
         if let Some((def_line, def_col)) = find_symbol_definition(&active_text, active_lang, &sym) {
             if def_line != cur_line {
+                self.active_editor_diff = None;
+                self.active_media_tab = None;
                 self.active_buffer_mut().set_cursor(def_line, def_col, false);
                 self.scroll_line = def_line.saturating_sub(4);
                 self.ensure_editor_cursor_visible();
+                self.focus = FocusTarget::Editor;
+                self.touch_caret_activity();
                 self.status_notification = format!(
                     "{}: {} ({} {})",
                     self.tr("已跳转至符号定义", "Navigated to symbol"),
@@ -4048,6 +4087,8 @@ impl IdeApplicationState {
                 self.active_buffer_mut().set_cursor(def_line, def_col, false);
                 self.scroll_line = def_line.saturating_sub(4);
                 self.ensure_editor_cursor_visible();
+                self.focus = FocusTarget::Editor;
+                self.touch_caret_activity();
                 self.status_notification = format!(
                     "{}: {} ({}:{})",
                     self.tr("已跨文件跳转至符号定义", "Navigated to definition"),
@@ -4059,6 +4100,40 @@ impl IdeApplicationState {
             }
         }
 
+        let indexed_hit = if let Ok(guard) = self.workspace_files_cache.try_read() {
+            guard.as_ref().and_then(|files| {
+                find_workspace_symbol_definition(
+                    files,
+                    &sym,
+                    Some(&active_path),
+                    Some(active_lang),
+                )
+            })
+        } else {
+            None
+        };
+        if let Some((target_path, def_line, def_col)) = indexed_hit {
+            self.open_file(target_path.clone());
+            self.active_buffer_mut().set_cursor(def_line, def_col, false);
+            self.scroll_line = def_line.saturating_sub(4);
+            self.ensure_editor_cursor_visible();
+            self.focus = FocusTarget::Editor;
+            self.touch_caret_activity();
+            self.status_notification = format!(
+                "{}: {} ({}:{})",
+                self.tr("已跨文件跳转至符号定义", "Navigated to definition"),
+                sym,
+                target_path.file_name().and_then(|n| n.to_str()).unwrap_or("file"),
+                def_line + 1
+            );
+            return;
+        }
+
+        let has_workspace_index = self
+            .workspace_files_cache
+            .try_read()
+            .map(|g| g.is_some())
+            .unwrap_or(false);
         let mut candidate_files: Vec<PathBuf> = if let Ok(guard) = self.workspace_files_cache.try_read() {
             guard
                 .as_ref()
@@ -4076,19 +4151,13 @@ impl IdeApplicationState {
                 .map(|e| e.path.clone())
                 .collect();
         }
-        for path in candidate_files.into_iter().take(180) {
-            if path == active_path {
+        let mut checked_paths: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        for path in candidate_files.into_iter().take(240) {
+            if path == active_path || !checked_paths.insert(path.clone()) {
                 continue;
             }
             let lang = ide_core::LanguageId::from_path(&path);
-            if !matches!(
-                lang,
-                ide_core::LanguageId::Rust
-                    | ide_core::LanguageId::TypeScript
-                    | ide_core::LanguageId::JavaScript
-                    | ide_core::LanguageId::Python
-                    | ide_core::LanguageId::Java
-            ) {
+            if !lang.supports_symbol_indexing() {
                 continue;
             }
             if let Ok(content) = std::fs::read_to_string(&path) {
@@ -4100,6 +4169,8 @@ impl IdeApplicationState {
                     self.active_buffer_mut().set_cursor(def_line, def_col, false);
                     self.scroll_line = def_line.saturating_sub(4);
                     self.ensure_editor_cursor_visible();
+                    self.focus = FocusTarget::Editor;
+                    self.touch_caret_activity();
                     self.status_notification = format!(
                         "{}: {} ({}:{})",
                         self.tr("已跨文件跳转至符号定义", "Navigated to definition"),
@@ -4112,23 +4183,59 @@ impl IdeApplicationState {
             }
         }
 
+        // 若工作区索引尚未就绪（懒加载状态），使用 ripgrep 快速穿透折叠目录检索符号定义
+        if !has_workspace_index {
+            if let Ok(hits) = find_in_files(&self.workspace_root, &sym, 48) {
+                for hit in hits {
+                    let path = hit.path;
+                    if path == active_path || !checked_paths.insert(path.clone()) {
+                        continue;
+                    }
+                    let lang = ide_core::LanguageId::from_path(&path);
+                    if !lang.supports_symbol_indexing() {
+                        continue;
+                    }
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        if let Some((def_line, def_col)) = find_symbol_definition(&content, lang, &sym) {
+                            self.open_file(path.clone());
+                            self.active_buffer_mut().set_cursor(def_line, def_col, false);
+                            self.scroll_line = def_line.saturating_sub(4);
+                            self.ensure_editor_cursor_visible();
+                            self.focus = FocusTarget::Editor;
+                            self.touch_caret_activity();
+                            self.status_notification = format!(
+                                "{}: {} ({}:{})",
+                                self.tr("已跨文件跳转至符号定义", "Navigated to definition"),
+                                sym,
+                                path.file_name().and_then(|n| n.to_str()).unwrap_or("file"),
+                                def_line + 1
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
         // 3. 若光标已在定义处，或未找到单独声明，则自动查找全工作区用法 (Usages)
-        if let Some(first_sym) = self
-            .ensure_structure_symbols_cached()
-            .first()
-            .map(|s| (s.name.clone(), s.line))
-        {
-            if first_sym.1 != cur_line && self.active_buffer().word_at_cursor().is_none() {
-                self.active_buffer_mut().set_cursor(first_sym.1, 0, false);
-                self.scroll_line = first_sym.1.saturating_sub(3);
-                self.status_notification = format!(
-                    "{}: {} ({} {})",
-                    self.tr("已跳转至符号定义", "Navigated to symbol"),
-                    first_sym.0,
-                    self.tr("第", "Line"),
-                    first_sym.1 + 1
-                );
-                return;
+        if allow_first_structure_fallback {
+            if let Some(first_sym) = self
+                .ensure_structure_symbols_cached()
+                .first()
+                .map(|s| (s.name.clone(), s.line))
+            {
+                if first_sym.1 != cur_line && self.active_buffer().word_at_cursor().is_none() {
+                    self.active_buffer_mut().set_cursor(first_sym.1, 0, false);
+                    self.scroll_line = first_sym.1.saturating_sub(3);
+                    self.status_notification = format!(
+                        "{}: {} ({} {})",
+                        self.tr("已跳转至符号定义", "Navigated to symbol"),
+                        first_sym.0,
+                        self.tr("第", "Line"),
+                        first_sym.1 + 1
+                    );
+                    return;
+                }
             }
         }
         self.search_query_input.set_text(&sym);
@@ -5455,6 +5562,13 @@ impl IdeApplicationState {
                 None => {}
             }
         }
+        if self.focus == FocusTarget::TerminalInput {
+            if let Some(clip) = read_windows_clipboard_text() {
+                self.terminal.active_pty_mut().paste_text(&clip);
+                self.touch_caret_activity();
+            }
+            return;
+        }
         if let Some(clip) = read_windows_clipboard_text() {
             self.insert_text_at_focus(&clip);
         }
@@ -5939,7 +6053,45 @@ impl IdeApplicationState {
             self.last_hover_splitter = hover_splitter;
             changed = true;
         }
+        if self.ctrl_held && !self.open_buffers.is_empty() && self.editor_code_rect.contains(x, y) {
+            changed = true;
+        }
         changed
+    }
+
+    pub fn set_ctrl_held(&mut self, held: bool) -> bool {
+        if self.ctrl_held == held {
+            return false;
+        }
+        self.ctrl_held = held;
+        if !held {
+            self.ctrl_hover_symbol = None;
+        } else if self.editor_code_rect.contains(self.hover_pos.0, self.hover_pos.1) {
+            self.ensure_workspace_index_started();
+        }
+        true
+    }
+
+    pub fn refresh_ctrl_hover_symbol(&mut self, x: i32, y: i32, canvas: &SurfaceCanvas) {
+        if !self.ctrl_held
+            || self.open_buffers.is_empty()
+            || self.active_editor_diff.is_some()
+            || self.active_media_tab.is_some()
+            || self.context_menu.is_some()
+            || self.active_overlay_rects.iter().any(|r| r.contains(x, y))
+            || !self.editor_code_rect.contains(x, y)
+        {
+            self.ctrl_hover_symbol = None;
+            return;
+        }
+        let found = self
+            .hit_test_editor(x, y, canvas)
+            .and_then(|(line, col)| {
+                self.active_buffer()
+                    .word_at_pos(line, col)
+                    .map(|(word, sc, ec)| (line, sc, ec, word))
+            });
+        self.ctrl_hover_symbol = found;
     }
 
     /// 命中左/右/底三处面板分割线（与 `render()` 坐标完全对齐）
@@ -6162,6 +6314,9 @@ impl IdeApplicationState {
         }
 
         // 7. 最上层交互区域（I-beam 文本区 vs 手型可点击控件）
+        let ctrl_symbol_link = self.ctrl_held
+            && self.ctrl_hover_symbol.is_some()
+            && self.editor_code_rect.contains(x, y);
         if let Some((_, act)) = self
             .hit_regions
             .iter()
@@ -6169,9 +6324,14 @@ impl IdeApplicationState {
             .find(|(r, _)| r.contains(x, y))
         {
             return match act {
-                HitAction::FocusEditorBody
-                | HitAction::ClickEditorLine
-                | HitAction::FocusTerminalInput
+                HitAction::FocusEditorBody | HitAction::ClickEditorLine => {
+                    if ctrl_symbol_link {
+                        IdeCursorKind::Pointer
+                    } else {
+                        IdeCursorKind::Text
+                    }
+                }
+                HitAction::FocusTerminalInput
                 | HitAction::FocusAgentChatInput
                 | HitAction::FocusAgentChatStream
                 | HitAction::FocusCtrlKPrompt
@@ -6182,9 +6342,15 @@ impl IdeApplicationState {
         }
 
         // 8. 兜底：编辑器与终端内部文本区
-        if self.editor_code_rect.contains(x, y)
-            || (self.bottom_tool == Some(ToolWindowId::Terminal)
-                && self.terminal_content_rect.contains(x, y))
+        if self.editor_code_rect.contains(x, y) {
+            return if ctrl_symbol_link {
+                IdeCursorKind::Pointer
+            } else {
+                IdeCursorKind::Text
+            };
+        }
+        if self.bottom_tool == Some(ToolWindowId::Terminal)
+            && self.terminal_content_rect.contains(x, y)
         {
             return IdeCursorKind::Text;
         }
@@ -8270,6 +8436,18 @@ impl IdeApplicationState {
         self.active_splitter_drag = None;
     }
 
+    pub fn handle_mouse_click_with_input_mods(
+        &mut self,
+        x: i32,
+        y: i32,
+        shift: bool,
+        ctrl: bool,
+        canvas: &SurfaceCanvas,
+    ) {
+        self.ctrl_held = ctrl;
+        self.handle_mouse_click_with_mods(x, y, shift, canvas);
+    }
+
     pub fn handle_mouse_click_with_mods(
         &mut self,
         x: i32,
@@ -8551,12 +8729,30 @@ impl IdeApplicationState {
             }
             HitAction::ClickEditorLine | HitAction::FocusEditorBody => {
                 if let Some((line, col)) = self.hit_test_editor(x, y, canvas) {
-                    self.active_buffer_mut().set_cursor(line, col, shift);
-                    self.ensure_editor_cursor_visible();
-                    self.mouse_drag_target = Some(FocusTarget::Editor);
+                    if self.ctrl_held && !shift && !self.open_buffers.is_empty() {
+                        self.active_buffer_mut().set_cursor(line, col, false);
+                        self.ensure_editor_cursor_visible();
+                        self.mouse_drag_target = None;
+                        self.focus = FocusTarget::Editor;
+                        self.touch_caret_activity();
+                        let sym = self
+                            .active_buffer()
+                            .word_at_pos(line, col)
+                            .map(|(w, _, _)| w);
+                        if sym.is_some() {
+                            self.navigate_to_symbol_declaration_or_usages(sym, false);
+                        }
+                    } else {
+                        self.active_buffer_mut().set_cursor(line, col, shift);
+                        self.ensure_editor_cursor_visible();
+                        self.mouse_drag_target = Some(FocusTarget::Editor);
+                        self.focus = FocusTarget::Editor;
+                        self.touch_caret_activity();
+                    }
+                } else {
+                    self.focus = FocusTarget::Editor;
+                    self.touch_caret_activity();
                 }
-                self.focus = FocusTarget::Editor;
-                self.touch_caret_activity();
             }
             HitAction::ToggleDirectory(dir) => {
                 self.project_tree.toggle_dir(&dir);
@@ -10515,7 +10711,8 @@ impl IdeApplicationState {
             ContextMenuAction::TermPaste => {
                 self.focus = FocusTarget::TerminalInput;
                 if let Some(clip) = read_windows_clipboard_text() {
-                    self.terminal.active_pty_mut().send_text(&clip);
+                    self.terminal.active_pty_mut().paste_text(&clip);
+                    self.touch_caret_activity();
                 }
             }
             ContextMenuAction::TermSelectAll => {
@@ -13528,6 +13725,8 @@ impl IdeApplicationState {
         self.editor_code_rect = code_body_rect;
         self.hit_regions
             .push((code_body_rect, HitAction::FocusEditorBody));
+        self.refresh_ctrl_hover_symbol(hx, hy, canvas);
+        let ctrl_hover_target = self.ctrl_hover_symbol.clone();
 
         canvas.fill_rect(
             Rect::new(rect.x + 1, code_top_y, gutter_w, gutter_full_h),
@@ -13794,6 +13993,24 @@ impl IdeApplicationState {
                         code_clip_rect,
                         font_style,
                     );
+                }
+                if let Some((hl, hsc, hec, _)) = ctrl_hover_target.as_ref() {
+                    if *hl == line_idx && *hec > *hsc {
+                        let p0: String = line_str.chars().take(*hsc).collect();
+                        let p1: String = line_str.chars().take(*hec).collect();
+                        let (w0, _) = canvas.measure_text(&p0, FontStyle::CodeMono);
+                        let (w1, _) = canvas.measure_text(&p1, FontStyle::CodeMono);
+                        let ux0 = (code_start_x - self.editor_scroll_x + w0)
+                            .clamp(code_body_rect.x, right_limit);
+                        let ux1 = (code_start_x - self.editor_scroll_x + w1)
+                            .clamp(code_body_rect.x, right_limit);
+                        if ux1 > ux0 {
+                            canvas.fill_rect(
+                                Rect::new(ux0, row_y + line_h - 3, ux1 - ux0, 1),
+                                t.accent_blue,
+                            );
+                        }
+                    }
                 }
                 if let Some(ref diag) = line_diag {
                     if code_x + 36 < right_limit {
@@ -17944,6 +18161,7 @@ impl IdeApplicationState {
             );
         }
         let file_tag = self.tr("文件", "File");
+        let symbol_tag = self.tr("符号", "Symbol");
         let action_tag = self.tr("动作", "Action");
         let total = results.len();
         let max_rows = 11usize;
@@ -17985,6 +18203,35 @@ impl IdeApplicationState {
                         FontStyle::UiRegular,
                     );
                     self.hit_regions.push((row, HitAction::OpenFile(full_path)));
+                }
+                SearchEverywhereItem::Symbol {
+                    name,
+                    kind,
+                    line,
+                    relative_path,
+                    full_path,
+                    language,
+                } => {
+                    let row_max_w = (mw - 42).max(60);
+                    let display_row = format!(
+                        "[{}·{}]  {}   ({}:{} · {})",
+                        symbol_tag,
+                        kind.icon_badge(),
+                        name,
+                        relative_path,
+                        line,
+                        language.display_name()
+                    );
+                    canvas.draw_text_ellipsis(
+                        mx + 18,
+                        ry + 3,
+                        &display_row,
+                        if hovered { 0xFFFFFF } else { t.syn_type },
+                        row_max_w,
+                        FontStyle::UiRegular,
+                    );
+                    self.hit_regions
+                        .push((row, HitAction::OpenFileAtLine(full_path, Some(line))));
                 }
                 SearchEverywhereItem::Action {
                     action,
@@ -18142,7 +18389,8 @@ impl IdeApplicationState {
                 mw - 42,
                 FontStyle::CodeMono,
             );
-            self.hit_regions.push((row, HitAction::OpenFile(hit.path)));
+            self.hit_regions
+                .push((row, HitAction::OpenFileAtLine(hit.path, Some(hit.line_number))));
             ry += 26;
         }
         canvas.draw_vertical_scrollbar(
@@ -24868,5 +25116,69 @@ mod tests {
         assert_eq!(saved_gs.mobile_sdk.flutter_sdk, r"D:\custom\flutter");
 
         let _ = std::fs::remove_dir_all(&base_tmp);
+    }
+
+    #[test]
+    fn ctrl_left_click_and_hover_index_and_jump_to_definition() {
+        let unique = format!(
+            "rust_ai_ide_ctrl_click_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let root = std::env::temp_dir().join(&unique);
+        let sub = root.join("src/nested");
+        std::fs::create_dir_all(&sub).unwrap();
+        let main_rs = root.join("src/main.rs");
+        let helper_rs = sub.join("helper.rs");
+        std::fs::write(
+            &helper_rs,
+            "pub fn cross_file_target_fn(x: i32) -> i32 {\n    x + 1\n}\n",
+        )
+        .unwrap();
+        let main_src = "fn local_helper() {}\nfn caller() {\n    local_helper();\n    cross_file_target_fn(42);\n}\n";
+        std::fs::write(&main_rs, main_src).unwrap();
+
+        let mut state = IdeApplicationState::new(root.clone());
+        state.open_file(main_rs.clone());
+        let mut canvas = SurfaceCanvas::new(1440, 900);
+        state.render(&mut canvas);
+
+        // Compute screen coordinates for `local_helper` on line 2 (`    local_helper();`)
+        let line2_text = "    local_helper();";
+        let prefix_w = canvas.measure_text("    local_", FontStyle::CodeMono).0;
+        let click_x = state.editor_code_start_x + prefix_w;
+        let click_y_line2 = state.editor_code_rect.y + 2 * 22 + 10;
+
+        // Hovering with Ctrl held highlights the symbol and switches cursor to Pointer
+        state.set_ctrl_held(true);
+        state.handle_mouse_move(click_x, click_y_line2);
+        state.refresh_ctrl_hover_symbol(click_x, click_y_line2, &canvas);
+        assert_eq!(
+            state.ctrl_hover_symbol.as_ref().map(|(_, _, _, w)| w.as_str()),
+            Some("local_helper")
+        );
+        assert_eq!(
+            state.cursor_kind_at(click_x, click_y_line2, 1440, 900),
+            IdeCursorKind::Pointer
+        );
+
+        // Ctrl + Left Click on `local_helper` jumps to line 0
+        state.handle_mouse_click_with_input_mods(click_x, click_y_line2, false, true, &canvas);
+        assert_eq!(state.active_buffer().path, main_rs);
+        assert_eq!(state.active_buffer().cursor_line, 0);
+
+        // Ctrl + Left Click on `cross_file_target_fn` (line 3) jumps across files even when subdir is collapsed
+        state.render(&mut canvas);
+        let prefix_cross_w = canvas.measure_text("    cross_file_", FontStyle::CodeMono).0;
+        let click_x_cross = state.editor_code_start_x + prefix_cross_w;
+        let click_y_line3 = state.editor_code_rect.y + 3 * 22 + 10;
+        assert!(line2_text.contains("local_helper"));
+        state.handle_mouse_click_with_input_mods(click_x_cross, click_y_line3, false, true, &canvas);
+        assert_eq!(state.active_buffer().path, helper_rs);
+        assert_eq!(state.active_buffer().cursor_line, 0);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

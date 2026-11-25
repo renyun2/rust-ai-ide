@@ -1252,6 +1252,7 @@ dependencies = [
  "grep-regex",
  "grep-searcher",
  "ide-core",
+ "ide-syntax",
  "ignore",
  "serde",
 ]

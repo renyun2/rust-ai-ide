@@ -349,7 +349,7 @@ pub fn git_version_string(bin: &Path) -> Option<String> {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000);
+        cmd.creation_flags(0x0800_0000 | 0x0000_0400);
     }
     let out = cmd.output().ok()?;
     if !out.status.success() {
@@ -424,9 +424,13 @@ pub fn install_git_blocking() -> Result<PathBuf, String> {
                     }
                     if dl_cmd.output().is_ok_and(|o| o.status.success()) && installer_path.is_file()
                     {
-                        let run_res = Command::new(&installer_path)
-                            .args(["/VERYSILENT", "/NORESTART", "/NOCANCEL", "/SP-"])
-                            .output();
+                        let mut installer_cmd = Command::new(&installer_path);
+                        installer_cmd.args(["/VERYSILENT", "/NORESTART", "/NOCANCEL", "/SP-"]);
+                        {
+                            use std::os::windows::process::CommandExt;
+                            installer_cmd.creation_flags(0x0800_0000);
+                        }
+                        let run_res = installer_cmd.output();
                         let ok = match run_res {
                             Ok(o) if o.status.success() => true,
                             _ => {
@@ -435,10 +439,19 @@ pub fn install_git_blocking() -> Result<PathBuf, String> {
                                     "Start-Process -FilePath '{}' -ArgumentList '/VERYSILENT','/NORESTART','/NOCANCEL','/SP-' -Verb RunAs -Wait",
                                     installer_path.display().to_string().replace('\'', "''")
                                 );
-                                Command::new("powershell.exe")
-                                    .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps_script])
-                                    .output()
-                                    .is_ok_and(|o| o.status.success())
+                                let mut ps_cmd = Command::new("powershell.exe");
+                                ps_cmd.args([
+                                    "-NoProfile",
+                                    "-ExecutionPolicy",
+                                    "Bypass",
+                                    "-Command",
+                                    &ps_script,
+                                ]);
+                                {
+                                    use std::os::windows::process::CommandExt;
+                                    ps_cmd.creation_flags(0x0800_0000);
+                                }
+                                ps_cmd.output().is_ok_and(|o| o.status.success())
                             }
                         };
                         let _ = std::fs::remove_file(&installer_path);
@@ -586,7 +599,7 @@ pub fn clone_repository_blocking(url: &str, target_dir: &Path) -> Result<PathBuf
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000);
+        cmd.creation_flags(0x0800_0000 | 0x0000_0400);
     }
     let out = cmd
         .output()
@@ -615,7 +628,7 @@ fn git_command(root: &Path) -> Command {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000);
+        cmd.creation_flags(0x0800_0000 | 0x0000_0400);
     }
     cmd
 }

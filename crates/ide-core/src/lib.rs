@@ -225,7 +225,7 @@ impl IdeaTheme {
     }
 }
 
-/// 首发重点支持的编程语言与配置文件类型
+/// 支持的编程语言、标记语言与配置文件类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum LanguageId {
     Rust,
@@ -233,6 +233,18 @@ pub enum LanguageId {
     JavaScript,
     Python,
     Java,
+    Go,
+    Kotlin,
+    Dart,
+    C,
+    Cpp,
+    CSharp,
+    Html,
+    Css,
+    Yaml,
+    Xml,
+    Sql,
+    Shell,
     Json,
     Toml,
     Markdown,
@@ -241,6 +253,30 @@ pub enum LanguageId {
 
 impl LanguageId {
     pub fn from_path(path: &Path) -> Self {
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        match file_name.as_str() {
+            "dockerfile"
+            | "makefile"
+            | "gnumakefile"
+            | "justfile"
+            | ".bashrc"
+            | ".zshrc"
+            | ".profile"
+            | ".bash_profile"
+            | "jenkinsfile" => return Self::Shell,
+            "cmakelists.txt" => return Self::Shell,
+            "go.mod" | "go.sum" | "go.work" => return Self::Go,
+            "cargo.lock" => return Self::Toml,
+            _ => {}
+        }
+        if file_name.starts_with("dockerfile.") || file_name.starts_with(".env") {
+            return Self::Shell;
+        }
+
         match path
             .extension()
             .and_then(|e| e.to_str())
@@ -249,13 +285,55 @@ impl LanguageId {
             .as_str()
         {
             "rs" => Self::Rust,
-            "ts" | "tsx" => Self::TypeScript,
+            "ts" | "tsx" | "mts" | "cts" => Self::TypeScript,
             "js" | "jsx" | "mjs" | "cjs" => Self::JavaScript,
-            "py" | "pyi" => Self::Python,
+            "py" | "pyi" | "pyw" => Self::Python,
             "java" => Self::Java,
-            "json" | "jsonc" => Self::Json,
+            "go" => Self::Go,
+            "kt" | "kts" => Self::Kotlin,
+            "dart" => Self::Dart,
+            "c" | "h" => Self::C,
+            "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" | "ino" => Self::Cpp,
+            "cs" => Self::CSharp,
+            "html" | "htm" | "vue" | "svelte" | "astro" => Self::Html,
+            "css" | "scss" | "sass" | "less" => Self::Css,
+            "yaml" | "yml" => Self::Yaml,
+            "xml" | "svg" | "plist" | "csproj" | "vcxproj" | "props" | "targets" | "pom"
+            | "xaml" => Self::Xml,
+            "sql" => Self::Sql,
+            "sh" | "bash" | "zsh" | "fish" | "ps1" | "psm1" | "psd1" | "bat" | "cmd" => {
+                Self::Shell
+            }
+            "json" | "jsonc" | "json5" | "arb" => Self::Json,
             "toml" => Self::Toml,
-            "md" | "markdown" => Self::Markdown,
+            "md" | "markdown" | "mdx" => Self::Markdown,
+            _ => Self::PlainText,
+        }
+    }
+
+    pub fn from_fence_tag(tag: &str) -> Self {
+        match tag.trim().to_ascii_lowercase().as_str() {
+            "rs" | "rust" => Self::Rust,
+            "ts" | "tsx" | "mts" | "cts" | "typescript" => Self::TypeScript,
+            "js" | "jsx" | "mjs" | "cjs" | "javascript" => Self::JavaScript,
+            "py" | "python" | "python3" => Self::Python,
+            "java" => Self::Java,
+            "go" | "golang" => Self::Go,
+            "kt" | "kts" | "kotlin" => Self::Kotlin,
+            "dart" | "flutter" => Self::Dart,
+            "c" => Self::C,
+            "cpp" | "c++" | "cc" | "cxx" | "hpp" => Self::Cpp,
+            "cs" | "csharp" | "c#" => Self::CSharp,
+            "html" | "htm" | "vue" | "svelte" | "astro" => Self::Html,
+            "css" | "scss" | "sass" | "less" => Self::Css,
+            "yaml" | "yml" => Self::Yaml,
+            "xml" | "svg" | "xaml" => Self::Xml,
+            "sql" | "mysql" | "postgresql" | "postgres" | "sqlite" => Self::Sql,
+            "sh" | "bash" | "zsh" | "shell" | "console" | "ps1" | "pwsh" | "powershell"
+            | "bat" | "cmd" | "dockerfile" => Self::Shell,
+            "json" | "jsonc" | "json5" => Self::Json,
+            "toml" | "ini" => Self::Toml,
+            "md" | "markdown" | "mdx" => Self::Markdown,
             _ => Self::PlainText,
         }
     }
@@ -267,6 +345,18 @@ impl LanguageId {
             Self::JavaScript => "JavaScript",
             Self::Python => "Python",
             Self::Java => "Java",
+            Self::Go => "Go",
+            Self::Kotlin => "Kotlin",
+            Self::Dart => "Dart",
+            Self::C => "C",
+            Self::Cpp => "C++",
+            Self::CSharp => "C#",
+            Self::Html => "HTML / Vue",
+            Self::Css => "CSS / SCSS",
+            Self::Yaml => "YAML",
+            Self::Xml => "XML",
+            Self::Sql => "SQL",
+            Self::Shell => "Shell",
             Self::Json => "JSON",
             Self::Toml => "TOML",
             Self::Markdown => "Markdown",
@@ -281,6 +371,18 @@ impl LanguageId {
             Self::JavaScript => "javascript",
             Self::Python => "python",
             Self::Java => "java",
+            Self::Go => "go",
+            Self::Kotlin => "kotlin",
+            Self::Dart => "dart",
+            Self::C => "c",
+            Self::Cpp => "cpp",
+            Self::CSharp => "csharp",
+            Self::Html => "html",
+            Self::Css => "css",
+            Self::Yaml => "yaml",
+            Self::Xml => "xml",
+            Self::Sql => "sql",
+            Self::Shell => "shellscript",
             Self::Json => "json",
             Self::Toml => "toml",
             Self::Markdown => "markdown",
@@ -294,18 +396,38 @@ impl LanguageId {
             Self::TypeScript | Self::JavaScript => Some("vtsls"),
             Self::Python => Some("pyright-langserver"),
             Self::Java => Some("jdtls"),
+            Self::Go => Some("gopls"),
+            Self::Kotlin => Some("kotlin-language-server"),
+            Self::Dart => Some("dart"),
+            Self::C | Self::Cpp => Some("clangd"),
+            Self::CSharp => Some("csharp-ls"),
             _ => None,
         }
     }
 
     pub fn default_dap_adapter(&self) -> Option<&'static str> {
         match self {
-            Self::Rust => Some("codelldb"),
+            Self::Rust | Self::C | Self::Cpp => Some("codelldb"),
             Self::TypeScript | Self::JavaScript => Some("js-debug"),
             Self::Python => Some("debugpy"),
-            Self::Java => Some("java-debug"),
+            Self::Java | Self::Kotlin => Some("java-debug"),
+            Self::Go => Some("dlv"),
+            Self::Dart => Some("flutter-dap"),
+            Self::CSharp => Some("netcoredbg"),
             _ => None,
         }
+    }
+
+    pub fn line_comment_prefix(&self) -> &'static str {
+        match self {
+            Self::Python | Self::Toml | Self::Yaml | Self::Shell => "# ",
+            Self::Sql => "-- ",
+            _ => "// ",
+        }
+    }
+
+    pub fn supports_symbol_indexing(&self) -> bool {
+        !matches!(self, Self::PlainText)
     }
 }
 

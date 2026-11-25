@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 ide-core = { path = "../ide-core" }
+ide-syntax = { path = "../ide-syntax" }
 anyhow.workspace = true
 ignore.workspace = true
 grep-searcher.workspace = true

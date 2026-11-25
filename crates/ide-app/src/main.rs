@@ -142,14 +142,556 @@ struct IdeWindowHost {
 
 #[inline]
 fn should_insert_key_text(
-    is_macos: bool,
+    require_event_text: bool,
     ime_already_committed: bool,
     event_text_present: bool,
 ) -> bool {
-    if !is_macos {
+    if !require_event_text {
         return true;
     }
     !ime_already_committed && event_text_present
+}
+
+#[inline]
+fn sanitize_insertable_text(raw: &str) -> String {
+    raw.chars()
+        .filter(|&c| !c.is_control() || matches!(c, '\n' | '\r' | '\t'))
+        .collect()
+}
+
+fn resolve_keyboard_insert_text(
+    logical_key: &Key<'_>,
+    event_text: Option<&str>,
+) -> Option<String> {
+    match logical_key {
+        Key::Character(ch) => {
+            if let Some(t) = event_text {
+                let clean = sanitize_insertable_text(t);
+                if !clean.is_empty() {
+                    return Some(clean);
+                }
+            }
+            if cfg!(any(target_os = "windows", target_os = "macos")) {
+                return None;
+            }
+            let clean = sanitize_insertable_text(ch);
+            if clean.is_empty() {
+                None
+            } else {
+                Some(clean)
+            }
+        }
+        Key::Unidentified(_) | Key::Process => {
+            let clean = sanitize_insertable_text(event_text?);
+            if clean.is_empty() {
+                None
+            } else {
+                Some(clean)
+            }
+        }
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod win_text_hook {
+    use super::{sanitize_insertable_text, IdeWakeupEvent};
+    use core::ffi::c_void;
+    use std::cell::RefCell;
+    use std::collections::{HashMap, VecDeque};
+    use std::time::{Duration, Instant};
+    use tao::event_loop::EventLoopProxy;
+    use tao::platform::windows::WindowExtWindows;
+    use tao::window::{Window, WindowId};
+
+    const GWLP_WNDPROC: i32 = -4;
+    const WM_NCDESTROY: u32 = 0x0082;
+    const WM_KEYDOWN: u32 = 0x0100;
+    const WM_KEYUP: u32 = 0x0101;
+    const WM_CHAR: u32 = 0x0102;
+    const WM_DEADCHAR: u32 = 0x0103;
+    const WM_SYSKEYDOWN: u32 = 0x0104;
+    const WM_SYSKEYUP: u32 = 0x0105;
+    const WM_SYSCHAR: u32 = 0x0106;
+    const WM_SYSDEADCHAR: u32 = 0x0107;
+    const WM_UNICHAR: u32 = 0x0109;
+    const UNICODE_NOCHAR: usize = 0xFFFF;
+    const WM_IME_STARTCOMPOSITION: u32 = 0x010D;
+    const WM_IME_ENDCOMPOSITION: u32 = 0x010E;
+    const WM_IME_COMPOSITION: u32 = 0x010F;
+    const WM_IME_CHAR: u32 = 0x0286;
+    const GCS_RESULTSTR: u32 = 0x0800;
+    const WM_KEYFIRST: u32 = 0x0100;
+    const WM_KEYLAST: u32 = 0x0109;
+    const PM_NOREMOVE: u32 = 0x0000;
+    const VK_CONTROL: i32 = 0x11;
+    const VK_MENU: i32 = 0x12;
+    const VK_F4: usize = 0x73;
+
+    #[repr(C)]
+    struct WinPoint {
+        x: i32,
+        y: i32,
+    }
+
+    #[repr(C)]
+    struct WinMsg {
+        hwnd: *mut c_void,
+        message: u32,
+        wparam: usize,
+        lparam: isize,
+        time: u32,
+        pt: WinPoint,
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        #[cfg(target_pointer_width = "64")]
+        fn SetWindowLongPtrW(hwnd: *mut c_void, n_index: i32, dw_new_long: isize) -> isize;
+        #[cfg(target_pointer_width = "32")]
+        #[link_name = "SetWindowLongW"]
+        fn SetWindowLongPtrW(hwnd: *mut c_void, n_index: i32, dw_new_long: isize) -> isize;
+        fn CallWindowProcW(
+            lp_prev_wnd_func: isize,
+            hwnd: *mut c_void,
+            msg: u32,
+            wparam: usize,
+            lparam: isize,
+        ) -> isize;
+        fn PeekMessageW(
+            lp_msg: *mut WinMsg,
+            hwnd: *mut c_void,
+            msg_filter_min: u32,
+            msg_filter_max: u32,
+            remove_msg: u32,
+        ) -> i32;
+        fn GetKeyState(n_virt_key: i32) -> i16;
+    }
+
+    #[link(name = "imm32")]
+    extern "system" {
+        fn ImmGetContext(hwnd: *mut c_void) -> *mut c_void;
+        fn ImmReleaseContext(hwnd: *mut c_void, himc: *mut c_void) -> i32;
+        fn ImmGetCompositionStringW(
+            himc: *mut c_void,
+            dw_index: u32,
+            lp_buf: *mut c_void,
+            dw_buf_len: u32,
+        ) -> i32;
+    }
+
+    struct WinHookEntry {
+        old_wndproc: isize,
+        window_id: WindowId,
+        proxy: EventLoopProxy<IdeWakeupEvent>,
+        in_ime_comp: bool,
+        ime_forwarding_depth: u32,
+        tao_owns_chars: bool,
+        pending_high_surrogate: Option<u16>,
+        pending_text: String,
+        committed_in_comp: String,
+        last_ime_result: Option<String>,
+        suppressed_tao_ime_texts: VecDeque<String>,
+        recent_ime_echo: Option<(String, Instant)>,
+    }
+
+    thread_local! {
+        static HOOKS: RefCell<HashMap<isize, WinHookEntry>> = RefCell::new(HashMap::new());
+    }
+
+    unsafe fn peek_next_kbd_msg(hwnd: *mut c_void) -> Option<u32> {
+        let mut msg = std::mem::MaybeUninit::<WinMsg>::uninit();
+        if PeekMessageW(msg.as_mut_ptr(), hwnd, WM_KEYFIRST, WM_KEYLAST, PM_NOREMOVE) != 0 {
+            Some(msg.assume_init().message)
+        } else {
+            None
+        }
+    }
+
+    unsafe fn imm_get_result_str(hwnd: *mut c_void) -> Option<String> {
+        let himc = ImmGetContext(hwnd);
+        if himc.is_null() {
+            return None;
+        }
+        let byte_len = ImmGetCompositionStringW(himc, GCS_RESULTSTR, std::ptr::null_mut(), 0);
+        let out = if byte_len > 0 {
+            let u16_len = (byte_len as usize) / 2;
+            let mut buf = vec![0u16; u16_len];
+            let got = ImmGetCompositionStringW(
+                himc,
+                GCS_RESULTSTR,
+                buf.as_mut_ptr() as *mut c_void,
+                (u16_len * 2) as u32,
+            );
+            if got > 0 {
+                let actual = (got as usize / 2).min(buf.len());
+                Some(String::from_utf16_lossy(&buf[..actual]))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let _ = ImmReleaseContext(hwnd, himc);
+        out
+    }
+
+    fn decode_utf16_unit(entry: &mut WinHookEntry, unit: u16) -> Option<char> {
+        if (0xD800..=0xDBFF).contains(&unit) {
+            entry.pending_high_surrogate = Some(unit);
+            return None;
+        }
+        if (0xDC00..=0xDFFF).contains(&unit) {
+            if let Some(hi) = entry.pending_high_surrogate.take() {
+                for decoded in char::decode_utf16([hi, unit]) {
+                    if let Ok(ch) = decoded {
+                        if !ch.is_control() || ch == '\n' {
+                            return Some(ch);
+                        }
+                    }
+                }
+            }
+            return None;
+        }
+        entry.pending_high_surrogate = None;
+        if let Some(ch) = char::from_u32(unit as u32) {
+            if !ch.is_control() || ch == '\n' {
+                return Some(ch);
+            }
+        }
+        None
+    }
+
+    fn consume_if_recent_ime_echo(entry: &mut WinHookEntry, ch: char) -> bool {
+        let Some((ref mut pending_echo, at)) = entry.recent_ime_echo else {
+            return false;
+        };
+        if at.elapsed() > Duration::from_millis(80) || pending_echo.is_empty() {
+            entry.recent_ime_echo = None;
+            return false;
+        }
+        if let Some(first) = pending_echo.chars().next() {
+            if first == ch {
+                pending_echo.drain(..first.len_utf8());
+                if pending_echo.is_empty() {
+                    entry.recent_ime_echo = None;
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    fn push_unowned_char(entry: &mut WinHookEntry, ch: char) {
+        if !consume_if_recent_ime_echo(entry, ch) {
+            entry.pending_text.push(ch);
+        }
+    }
+
+    pub fn install(window: &Window, proxy: EventLoopProxy<IdeWakeupEvent>) {
+        let hwnd = window.hwnd() as *mut c_void;
+        let key = hwnd as isize;
+        let installed = HOOKS.with(|m| m.borrow().contains_key(&key));
+        if installed {
+            return;
+        }
+        unsafe {
+            let prev = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, hook_wndproc as *const () as isize);
+            if prev != 0 {
+                HOOKS.with(|m| {
+                    m.borrow_mut().insert(
+                        key,
+                        WinHookEntry {
+                            old_wndproc: prev,
+                            window_id: window.id(),
+                            proxy,
+                            in_ime_comp: false,
+                            ime_forwarding_depth: 0,
+                            tao_owns_chars: false,
+                            pending_high_surrogate: None,
+                            pending_text: String::new(),
+                            committed_in_comp: String::new(),
+                            last_ime_result: None,
+                            suppressed_tao_ime_texts: VecDeque::new(),
+                            recent_ime_echo: None,
+                        },
+                    );
+                });
+            }
+        }
+    }
+
+    pub fn drain_pending_text(window: &Window) -> Option<String> {
+        let key = window.hwnd() as isize;
+        HOOKS.with(|m| {
+            let mut map = m.borrow_mut();
+            let entry = map.get_mut(&key)?;
+            if entry.pending_text.is_empty() {
+                None
+            } else {
+                Some(std::mem::take(&mut entry.pending_text))
+            }
+        })
+    }
+
+    pub fn take_suppressed_ime_text(window: &Window, text: &str) -> bool {
+        let key = window.hwnd() as isize;
+        HOOKS.with(|m| {
+            let mut map = m.borrow_mut();
+            let Some(entry) = map.get_mut(&key) else {
+                return false;
+            };
+            if let Some(pos) = entry.suppressed_tao_ime_texts.iter().position(|s| s == text) {
+                entry.suppressed_tao_ime_texts.drain(..=pos);
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    unsafe extern "system" fn hook_wndproc(
+        hwnd: *mut c_void,
+        msg: u32,
+        wparam: usize,
+        lparam: isize,
+    ) -> isize {
+        let key = hwnd as isize;
+        let old_wndproc = HOOKS.with(|m| m.borrow().get(&key).map(|e| e.old_wndproc));
+        let Some(old_wndproc) = old_wndproc else {
+            return 0;
+        };
+
+        match msg {
+            WM_KEYDOWN | WM_SYSKEYDOWN => {
+                if !(msg == WM_SYSKEYDOWN && wparam == VK_F4) {
+                    let next_msg = peek_next_kbd_msg(hwnd);
+                    let tao_will_own = next_msg.is_some_and(|nm| {
+                        !matches!(nm, WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP)
+                    });
+                    HOOKS.with(|m| {
+                        if let Some(entry) = m.borrow_mut().get_mut(&key) {
+                            entry.tao_owns_chars = tao_will_own;
+                        }
+                    });
+                }
+                CallWindowProcW(old_wndproc, hwnd, msg, wparam, lparam)
+            }
+            WM_DEADCHAR | WM_SYSDEADCHAR => {
+                HOOKS.with(|m| {
+                    if let Some(entry) = m.borrow_mut().get_mut(&key) {
+                        entry.tao_owns_chars = false;
+                    }
+                });
+                CallWindowProcW(old_wndproc, hwnd, msg, wparam, lparam)
+            }
+            WM_IME_STARTCOMPOSITION => {
+                HOOKS.with(|m| {
+                    if let Some(entry) = m.borrow_mut().get_mut(&key) {
+                        entry.in_ime_comp = true;
+                        entry.committed_in_comp.clear();
+                        entry.last_ime_result = None;
+                        entry.pending_high_surrogate = None;
+                    }
+                });
+                CallWindowProcW(old_wndproc, hwnd, msg, wparam, lparam)
+            }
+            WM_IME_COMPOSITION => {
+                if (lparam as u32 & GCS_RESULTSTR) != 0 {
+                    if let Some(raw_res) = imm_get_result_str(hwnd) {
+                        let clean = sanitize_insertable_text(&raw_res);
+                        if !clean.is_empty() {
+                            let wakeup = HOOKS.with(|m| {
+                                if let Some(entry) = m.borrow_mut().get_mut(&key) {
+                                    entry.pending_text.push_str(&clean);
+                                    entry.committed_in_comp.push_str(&clean);
+                                    entry.last_ime_result = Some(raw_res);
+                                    entry.recent_ime_echo = Some((clean, Instant::now()));
+                                    Some((entry.proxy.clone(), entry.window_id))
+                                } else {
+                                    None
+                                }
+                            });
+                            if let Some((proxy, wid)) = wakeup {
+                                let _ = proxy.send_event(IdeWakeupEvent::Wakeup(wid));
+                            }
+                        }
+                    }
+                }
+                HOOKS.with(|m| {
+                    if let Some(entry) = m.borrow_mut().get_mut(&key) {
+                        entry.ime_forwarding_depth = entry.ime_forwarding_depth.saturating_add(1);
+                    }
+                });
+                let res = CallWindowProcW(old_wndproc, hwnd, msg, wparam, lparam);
+                HOOKS.with(|m| {
+                    if let Some(entry) = m.borrow_mut().get_mut(&key) {
+                        entry.ime_forwarding_depth = entry.ime_forwarding_depth.saturating_sub(1);
+                    }
+                });
+                res
+            }
+            WM_IME_ENDCOMPOSITION => {
+                let current_res = imm_get_result_str(hwnd);
+                HOOKS.with(|m| {
+                    if let Some(entry) = m.borrow_mut().get_mut(&key) {
+                        entry.in_ime_comp = false;
+                        let prev = entry.last_ime_result.take();
+                        let committed = std::mem::take(&mut entry.committed_in_comp);
+                        if let Some(cur) = current_res {
+                            if !cur.is_empty()
+                                && (prev.as_deref() == Some(cur.as_str())
+                                    || (!committed.is_empty()
+                                        && sanitize_insertable_text(&cur) == committed))
+                            {
+                                while entry.suppressed_tao_ime_texts.len() >= 16 {
+                                    entry.suppressed_tao_ime_texts.pop_front();
+                                }
+                                entry.suppressed_tao_ime_texts.push_back(cur);
+                            }
+                        }
+                        entry.ime_forwarding_depth = entry.ime_forwarding_depth.saturating_add(1);
+                    }
+                });
+                let res = CallWindowProcW(old_wndproc, hwnd, msg, wparam, lparam);
+                HOOKS.with(|m| {
+                    if let Some(entry) = m.borrow_mut().get_mut(&key) {
+                        entry.ime_forwarding_depth = entry.ime_forwarding_depth.saturating_sub(1);
+                    }
+                });
+                res
+            }
+            WM_IME_CHAR => {
+                let forwarding = HOOKS.with(|m| {
+                    m.borrow()
+                        .get(&key)
+                        .is_some_and(|e| e.ime_forwarding_depth > 0)
+                });
+                if !forwarding {
+                    let wakeup = HOOKS.with(|m| {
+                        let mut map = m.borrow_mut();
+                        let entry = map.get_mut(&key)?;
+                        if let Some(ch) = decode_utf16_unit(entry, wparam as u16) {
+                            push_unowned_char(entry, ch);
+                        }
+                        if entry.pending_text.is_empty() {
+                            None
+                        } else {
+                            Some((entry.proxy.clone(), entry.window_id))
+                        }
+                    });
+                    if let Some((proxy, wid)) = wakeup {
+                        let _ = proxy.send_event(IdeWakeupEvent::Wakeup(wid));
+                    }
+                    return 0;
+                }
+                HOOKS.with(|m| {
+                    if let Some(entry) = m.borrow_mut().get_mut(&key) {
+                        entry.ime_forwarding_depth = entry.ime_forwarding_depth.saturating_add(1);
+                    }
+                });
+                let res = CallWindowProcW(old_wndproc, hwnd, msg, wparam, lparam);
+                HOOKS.with(|m| {
+                    if let Some(entry) = m.borrow_mut().get_mut(&key) {
+                        entry.ime_forwarding_depth = entry.ime_forwarding_depth.saturating_sub(1);
+                    }
+                });
+                res
+            }
+            WM_CHAR | WM_SYSCHAR => {
+                let (tao_owns, from_ime) = HOOKS.with(|m| {
+                    m.borrow()
+                        .get(&key)
+                        .map(|e| (e.tao_owns_chars, e.ime_forwarding_depth > 0 || e.in_ime_comp))
+                        .unwrap_or((false, false))
+                });
+                if tao_owns {
+                    let res = CallWindowProcW(old_wndproc, hwnd, msg, wparam, lparam);
+                    let more_char = matches!(peek_next_kbd_msg(hwnd), Some(WM_CHAR | WM_SYSCHAR));
+                    if !more_char {
+                        HOOKS.with(|m| {
+                            if let Some(entry) = m.borrow_mut().get_mut(&key) {
+                                entry.tao_owns_chars = false;
+                            }
+                        });
+                    }
+                    return res;
+                }
+                if !from_ime {
+                    let ctrl_down = (GetKeyState(VK_CONTROL) as u16 & 0x8000) != 0;
+                    let alt_down = (GetKeyState(VK_MENU) as u16 & 0x8000) != 0;
+                    if !ctrl_down && !alt_down {
+                        let wakeup = HOOKS.with(|m| {
+                            let mut map = m.borrow_mut();
+                            let entry = map.get_mut(&key)?;
+                            if let Some(ch) = decode_utf16_unit(entry, wparam as u16) {
+                                push_unowned_char(entry, ch);
+                            }
+                            if entry.pending_text.is_empty() {
+                                None
+                            } else {
+                                Some((entry.proxy.clone(), entry.window_id))
+                            }
+                        });
+                        if let Some((proxy, wid)) = wakeup {
+                            let _ = proxy.send_event(IdeWakeupEvent::Wakeup(wid));
+                        }
+                        return 0;
+                    }
+                }
+                CallWindowProcW(old_wndproc, hwnd, msg, wparam, lparam)
+            }
+            WM_UNICHAR => {
+                if wparam == UNICODE_NOCHAR {
+                    return 1;
+                }
+                if let Some(ch) = char::from_u32(wparam as u32) {
+                    if !ch.is_control() || ch == '\n' {
+                        let wakeup = HOOKS.with(|m| {
+                            let mut map = m.borrow_mut();
+                            let entry = map.get_mut(&key)?;
+                            push_unowned_char(entry, ch);
+                            if entry.pending_text.is_empty() {
+                                None
+                            } else {
+                                Some((entry.proxy.clone(), entry.window_id))
+                            }
+                        });
+                        if let Some((proxy, wid)) = wakeup {
+                            let _ = proxy.send_event(IdeWakeupEvent::Wakeup(wid));
+                        }
+                        return 0;
+                    }
+                }
+                CallWindowProcW(old_wndproc, hwnd, msg, wparam, lparam)
+            }
+            WM_NCDESTROY => {
+                let res = CallWindowProcW(old_wndproc, hwnd, msg, wparam, lparam);
+                HOOKS.with(|m| {
+                    m.borrow_mut().remove(&key);
+                });
+                res
+            }
+            _ => CallWindowProcW(old_wndproc, hwnd, msg, wparam, lparam),
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+mod win_text_hook {
+    use super::IdeWakeupEvent;
+    use tao::event_loop::EventLoopProxy;
+    use tao::window::Window;
+
+    pub fn install(_window: &Window, _proxy: EventLoopProxy<IdeWakeupEvent>) {}
+
+    pub fn drain_pending_text(_window: &Window) -> Option<String> {
+        None
+    }
+
+    pub fn take_suppressed_ime_text(_window: &Window, _text: &str) -> bool {
+        false
+    }
 }
 
 #[inline]
@@ -373,6 +915,7 @@ fn spawn_ide_window(
     let window = Rc::new(builder.build(elwt)?);
     apply_windows_class_icons(&window);
     apply_windows11_window_style(&window, initial_theme.kind != ThemeKind::IslandsLight);
+    win_text_hook::install(&window, proxy.clone());
 
     let context = Context::new(window.clone())
         .map_err(|e| anyhow::anyhow!("Failed to initialize softbuffer context: {e}"))?;
@@ -1250,6 +1793,9 @@ fn main() -> Result<()> {
         match event {
             Event::UserEvent(IdeWakeupEvent::Wakeup(wid)) => {
                 if let Some(host) = windows.get_mut(&wid) {
+                    if host.drain_pending_win_text() {
+                        host.pending_redraw = true;
+                    }
                     let _ = host.app_state.poll_background_updates();
                     sync_window_title(&host.window, &mut host.app_state);
                     if !host.is_minimized {
@@ -1316,6 +1862,9 @@ fn main() -> Result<()> {
                     let mut all_minimized = !windows.is_empty();
                     let mut newly_trimmed_any = false;
                     for host in windows.values_mut() {
+                        if host.drain_pending_win_text() {
+                            host.pending_redraw = true;
+                        }
                         if host.is_minimized {
                             let _ = host.app_state.poll_background_updates();
                             if !host.minimized_trimmed {
@@ -1487,7 +2036,22 @@ impl IdeWindowHost {
         }
     }
 
+    fn drain_pending_win_text(&mut self) -> bool {
+        if let Some(txt) = win_text_hook::drain_pending_text(&self.window) {
+            if !txt.is_empty() {
+                self.app_state.insert_text_at_focus(&txt);
+                self.app_state.touch_caret_activity();
+                self.surface_canvas
+                    .set_scale_factor(self.app_state.effective_scale());
+                self.pending_redraw = true;
+                return true;
+            }
+        }
+        false
+    }
+
     fn handle_window_event(&mut self, event: WindowEvent<'_>) -> WindowCommand {
+        self.drain_pending_win_text();
         match event {
             WindowEvent::CloseRequested => {
                 return WindowCommand::CloseWindow;
@@ -1497,6 +2061,10 @@ impl IdeWindowHost {
                 if !focused {
                     self.left_mouse_down = false;
                     self.manual_resize = None;
+                    self.modifiers = ModifiersState::default();
+                    if self.app_state.set_ctrl_held(false) {
+                        self.pending_redraw = true;
+                    }
                     self.unfocused_since = Some(Instant::now());
                 } else {
                     self.unfocused_since = None;
@@ -1526,8 +2094,9 @@ impl IdeWindowHost {
                 self.pending_redraw = true;
             }
             WindowEvent::ReceivedImeText(text) => {
-                if !text.is_empty() {
+                if !text.is_empty() && !win_text_hook::take_suppressed_ime_text(&self.window, &text) {
                     self.app_state.insert_text_at_focus(&text);
+                    self.app_state.touch_caret_activity();
                     self.pending_redraw = true;
                     #[cfg(target_os = "macos")]
                     {
@@ -1574,6 +2143,30 @@ impl IdeWindowHost {
                     }
                 }
                 self.modifiers = new_mods;
+                let ctrl_held = (new_mods.control_key()
+                    || (cfg!(target_os = "macos") && new_mods.super_key()))
+                    && !new_mods.alt_key();
+                if self.app_state.set_ctrl_held(ctrl_held) {
+                    self.app_state.refresh_ctrl_hover_symbol(
+                        self.cursor_pos.0,
+                        self.cursor_pos.1,
+                        &self.surface_canvas,
+                    );
+                    sync_window_cursor(
+                        &self.window,
+                        &self.app_state,
+                        &self.surface_canvas,
+                        self.cursor_pos,
+                        &mut self.last_cursor_icon,
+                    );
+                    if self
+                        .app_state
+                        .editor_code_rect
+                        .contains(self.cursor_pos.0, self.cursor_pos.1)
+                    {
+                        self.pending_redraw = true;
+                    }
+                }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 if let Some(rs) = self.manual_resize {
@@ -1675,6 +2268,13 @@ impl IdeWindowHost {
                         .handle_mouse_move(self.cursor_pos.0, self.cursor_pos.1)
                 {
                     self.pending_redraw = true;
+                }
+                if self.app_state.ctrl_held {
+                    self.app_state.refresh_ctrl_hover_symbol(
+                        self.cursor_pos.0,
+                        self.cursor_pos.1,
+                        &self.surface_canvas,
+                    );
                 }
                 sync_window_cursor(
                     &self.window,
@@ -1802,10 +2402,14 @@ impl IdeWindowHost {
 
                     self.app_state
                         .begin_ide_drag_candidate_at(self.cursor_pos.0, self.cursor_pos.1);
-                    self.app_state.handle_mouse_click_with_mods(
+                    let ctrl_click = (self.modifiers.control_key()
+                        || (cfg!(target_os = "macos") && self.modifiers.super_key()))
+                        && !self.modifiers.alt_key();
+                    self.app_state.handle_mouse_click_with_input_mods(
                         self.cursor_pos.0,
                         self.cursor_pos.1,
                         self.modifiers.shift_key(),
+                        ctrl_click,
                         &self.surface_canvas,
                     );
                     self.surface_canvas
@@ -1993,12 +2597,20 @@ impl IdeWindowHost {
                 } else {
                     false
                 };
-                if is_non_visual_key(&logical_key) {
+                if is_non_visual_key(&logical_key) && text.is_none() {
                     return WindowCommand::None;
                 }
-                let allow_text =
-                    should_insert_key_text(cfg!(target_os = "macos"), ime_committed, text.is_some());
-                let cmd = self.handle_keyboard_pressed(logical_key, allow_text, ime_committed);
+                let allow_text = should_insert_key_text(
+                    cfg!(any(target_os = "macos", target_os = "windows")),
+                    ime_committed,
+                    text.is_some(),
+                );
+                let cmd = self.handle_keyboard_pressed(
+                    logical_key,
+                    text.as_deref(),
+                    allow_text,
+                    ime_committed,
+                );
                 if cmd == WindowCommand::CloseWindow {
                     return WindowCommand::CloseWindow;
                 }
@@ -2015,6 +2627,7 @@ impl IdeWindowHost {
     fn handle_keyboard_pressed(
         &mut self,
         logical_key: Key<'_>,
+        key_text: Option<&str>,
         allow_text: bool,
         ime_committed: bool,
     ) -> WindowCommand {
@@ -2350,13 +2963,36 @@ impl IdeWindowHost {
                         }
                         Key::Enter if !ime_committed => match app_state.focus {
                             FocusTarget::SearchEverywhereModal => {
-                                if let Some(ide_search::SearchEverywhereItem::File {
-                                    full_path,
-                                    ..
-                                }) = app_state.search_results.first().cloned()
-                                {
-                                    app_state.open_file(full_path);
-                                    app_state.focus = FocusTarget::Editor;
+                                match app_state.search_results.first().cloned() {
+                                    Some(ide_search::SearchEverywhereItem::File {
+                                        full_path,
+                                        ..
+                                    }) => {
+                                        app_state.open_file(full_path);
+                                        app_state.focus = FocusTarget::Editor;
+                                    }
+                                    Some(ide_search::SearchEverywhereItem::Symbol {
+                                        full_path,
+                                        line,
+                                        ..
+                                    }) => {
+                                        app_state.open_file(full_path);
+                                        let target_line = line.saturating_sub(1);
+                                        app_state
+                                            .active_buffer_mut()
+                                            .set_cursor(target_line, 0, false);
+                                        app_state.scroll_line = target_line.saturating_sub(4);
+                                        app_state.ensure_editor_cursor_visible();
+                                        app_state.focus = FocusTarget::Editor;
+                                    }
+                                    Some(ide_search::SearchEverywhereItem::Action {
+                                        action,
+                                        ..
+                                    }) => {
+                                        app_state.focus = FocusTarget::Editor;
+                                        app_state.execute_ide_action(action);
+                                    }
+                                    _ => {}
                                 }
                             }
                             FocusTarget::FindInFilesModal => {
@@ -2697,8 +3333,12 @@ impl IdeWindowHost {
                                 app_state.ensure_editor_cursor_visible();
                             }
                         }
-                            Key::Character(ch) if !ctrl && !alt && allow_text => {
-                                app_state.insert_text_at_focus(ch);
+                            Key::Character(_) | Key::Unidentified(_) | Key::Process
+                                if !ctrl && !alt && allow_text =>
+                            {
+                                if let Some(txt) = resolve_keyboard_insert_text(&logical_key, key_text) {
+                                    app_state.insert_text_at_focus(&txt);
+                                }
                             }
                             _ => {}
                         }
@@ -2708,8 +3348,8 @@ impl IdeWindowHost {
 
 #[cfg(test)]
 mod key_ime_tests {
-    use super::{is_non_visual_key, should_insert_key_text};
-    use tao::keyboard::Key;
+    use super::{is_non_visual_key, resolve_keyboard_insert_text, should_insert_key_text};
+    use tao::keyboard::{Key, NativeKeyCode};
 
     #[test]
     fn macos_deduplicates_received_ime_text_and_ignores_ime_preedit_keys() {
@@ -2724,6 +3364,35 @@ mod key_ime_tests {
         // Windows IME composition virtual key should not force redundant redraws.
         assert!(is_non_visual_key(&Key::Process));
         assert!(!is_non_visual_key(&Key::Character("a")));
+    }
+
+    #[test]
+    fn resolves_unicode_packet_and_unidentified_key_text_for_remote_input() {
+        // Remote desktop / mobile phone SendInput(KEYEVENTF_UNICODE) produces VK_PACKET -> Key::Unidentified with text.
+        assert_eq!(
+            resolve_keyboard_insert_text(&Key::Unidentified(NativeKeyCode::Windows(0)), Some("你好世界")),
+            Some("你好世界".to_string())
+        );
+        assert_eq!(
+            resolve_keyboard_insert_text(&Key::Unidentified(NativeKeyCode::Windows(0)), Some("hello\x00")),
+            Some("hello".to_string())
+        );
+        assert_eq!(
+            resolve_keyboard_insert_text(&Key::Unidentified(NativeKeyCode::Windows(0)), None),
+            None
+        );
+        assert_eq!(
+            resolve_keyboard_insert_text(&Key::Character("a"), Some("a")),
+            Some("a".to_string())
+        );
+        assert_eq!(
+            resolve_keyboard_insert_text(&Key::Process, Some("a")),
+            Some("a".to_string())
+        );
+        assert_eq!(resolve_keyboard_insert_text(&Key::Process, None), None);
+        if cfg!(any(target_os = "windows", target_os = "macos")) {
+            assert_eq!(resolve_keyboard_insert_text(&Key::Character("a"), None), None);
+        }
     }
 
     #[test]

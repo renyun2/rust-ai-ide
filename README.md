@@ -12,7 +12,7 @@
   </p>
 
   <p>
-    <a href="https://github.com/renyun2/rust-ai-ide/releases/tag/v0.5.0"><img alt="Version 0.5.0" src="https://img.shields.io/badge/version-0.5.0-blue" /></a>
+    <a href="https://github.com/renyun2/rust-ai-ide/releases/tag/v0.6.0"><img alt="Version 0.6.0" src="https://img.shields.io/badge/version-0.6.0-blue" /></a>
     <img alt="Rust 2021" src="https://img.shields.io/badge/Rust-2021-orange?logo=rust&logoColor=white" />
     <img alt="Platforms Windows | Linux | macOS" src="https://img.shields.io/badge/platform-Windows_%7C_Linux_%7C_macOS-0078D4" />
     <img alt="License MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT_OR_Apache--2.0-green" />
@@ -25,7 +25,7 @@
 
 ## Contents
 
-- [What's New in v0.5.0](#whats-new-in-v050)
+- [What's New in v0.6.0](#whats-new-in-v060)
 - [Why RI? (Highlights)](#why-ri-highlights)
 - [Comparison with Other IDEs](#comparison-with-other-ides)
 - [Memory & Performance](#memory--performance)
@@ -44,17 +44,18 @@
 
 ---
 
-## What's New in v0.5.0
+## What's New in v0.6.0
 
-- **Broad Multi-Language Support (Go, Kotlin, Dart, C/C++, C#, Web, Data & Shell):**
-  - Expanded `LanguageId`, Darcula/Islands syntax highlighting, **Structure (`Alt+7`)** symbol extraction, file-type icons, markdown code-fence mapping, and local LSP probing for **Go** (`gopls`), **Kotlin** (`kotlin-language-server`), **Dart**, **C / C++** (`clangd`), **C#**, **HTML / Vue / Svelte / Astro**, **CSS / SCSS / Sass / Less**, **YAML**, **XML / SVG / XAML**, **SQL**, and **Shell / PowerShell / Dockerfile / Makefile / CMake**.
-- **Workspace Symbol Indexing & `Ctrl+Hover` / `Ctrl+Click` Navigation:**
-  - Indexed symbols across workspace files in `ide-search` for instant **Search Everywhere** (`Double Shift`) symbol filtering alongside files, IDE actions, and Agent commands.
-  - Added **`Ctrl+Hover`** symbol underline & preview and **`Ctrl+Click` / `Ctrl+B`** cross-file go-to-definition (`find_workspace_symbol_definition`).
-- **Windows Input, Terminal Multiline Paste & Console Flash Fixes:**
-  - **Remote / Unicode Text Input & Deduplication**: Handled Windows `VK_PACKET` (`SendInput(KEYEVENTF_UNICODE)`) input for remote desktop/mobile keyboards and eliminated duplicate character insertion between Windows `WM_CHAR` / IME echo and `tao` key events in editor and AI input boxes.
-  - **Terminal Multiline & Bracketed Paste**: Normalized `\r\n` / `\n` line endings to `\r` for ConPTY/PSReadLine and added DEC private mode `2004` bracketed-paste support so multi-line terminal pastes preserve exact top-to-bottom line order.
-  - **Silent Child Process & Agent Execution**: Resolved native `agy.exe` directly instead of `.cmd` wrappers, replaced external `where` invocations with pure-Rust `PATH` lookup, refreshed `last_check.timestamp` to suppress `agy.exe --bg-updater` console popups, and applied `CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT` across agent, LSP, and Git subprocesses.
+- **Rich Markdown Preview & Split Editor (`markdown.rs`):**
+  - Added Source / Split / Preview view modes (`MarkdownViewMode`) with GFM tables, GitHub callouts (`[!NOTE]`, `[!TIP]`, `[!IMPORTANT]`, `[!WARNING]`, `[!CAUTION]`), syntax-highlighted code blocks, and clickable URLs & workspace file references.
+- **External Open IPC, CLI Shims & URL Protocol (`external_open.rs`):**
+  - Added single-instance IPC forwarding, `file:line:col` / `--goto` / `+line` CLI argument parsing, custom IDE URL schemes (`idea://`, `vscode://`, `ri://`), and `LAUNCH_EDITOR` / `PATH` CLI shims for one-click jump-to-source from external tools.
+- **Vue / SFC / JSX Multi-Line Highlighting & Hyphenated Word Indexing:**
+  - Extended `HighlightState` for multi-line markup tags, directives (`v-model`, `:prop`, `@event`), mustache expressions (`{{ }}`), `<script>`/`<style>`/`<template>` sections, and SFC comment toggling across Vue, Svelte, Astro, HTML, and JSX/TSX.
+  - Preserved hyphenated identifiers (e.g., `antigravity-cli`) as single tokens during word selection and workspace indexing.
+- **Cross-Window Drag & Drop, Eclipse Keymap & Git / Project Tree Enhancements:**
+  - Added cross-window file/folder drag-and-drop (copy mode into the Project Tree, or path/file-reference drop into AI Agent, Editor, Search, and Terminal inputs) alongside OS file drops.
+  - Added **Eclipse** keymap preset (`KeymapScheme::Eclipse`), Project Tree **Refresh** and **Locate Opened File** (`reveal_path`) actions, hover-open top-left File menu, non-Git workspace **Initialize Repository** workflow (with optional `.gitignore`), and history-aware **AI Commit Message** generation.
 
 ---
 
@@ -129,10 +130,10 @@ RI distributes self-contained portable packages for all three desktop operating 
 
 | Platform | Release Asset | Contents | Notes |
 | --- | --- | --- | --- |
-| **Windows x86_64** | `RI-v0.5.0-windows-x86_64.zip` | Portable `ide-app.exe` (embedded multi-res ICO, no installer wizard) | Single native executable |
-| **Linux x86_64** | `RI-v0.5.0-linux-x86_64.tar.gz` | `ide-app`, `rust-ai-ide.png`, `rust-ai-ide.desktop` | Stripped native binary + desktop entry |
-| **macOS Apple Silicon (`arm64`)** | `RI-v0.5.0-macos-arm64.zip` | `Rust AI IDE.app` bundle (`Info.plist` + `AppIcon.icns`) | Native `aarch64` bundle |
-| **macOS Intel (`x86_64`)** | `RI-v0.5.0-macos-x86_64.zip` | `Rust AI IDE.app` bundle (`Info.plist` + `AppIcon.icns`) | Native `x86_64` bundle |
+| **Windows x86_64** | `RI-v0.6.0-windows-x86_64.zip` | Portable `ide-app.exe` (embedded multi-res ICO, no installer wizard) | Single native executable |
+| **Linux x86_64** | `RI-v0.6.0-linux-x86_64.tar.gz` | `ide-app`, `rust-ai-ide.png`, `rust-ai-ide.desktop` | Stripped native binary + desktop entry |
+| **macOS Apple Silicon (`arm64`)** | `RI-v0.6.0-macos-arm64.zip` | `Rust AI IDE.app` bundle (`Info.plist` + `AppIcon.icns`) | Native `aarch64` bundle |
+| **macOS Intel (`x86_64`)** | `RI-v0.6.0-macos-x86_64.zip` | `Rust AI IDE.app` bundle (`Info.plist` + `AppIcon.icns`) | Native `x86_64` bundle |
 
 Each archive is accompanied by a `.sha256` checksum file. Extract and run — no installer admin prompt, registry bloat, or background updater service.
 
@@ -142,9 +143,9 @@ Each archive is accompanied by a `.sha256` checksum file. Extract and run — no
 
 ### Run from a Release Archive
 
-- **Windows**: Extract `RI-v0.5.0-windows-x86_64.zip` and double-click `ide-app.exe` (or run `.\ide-app.exe --workspace D:\path\to\project`).
-- **Linux**: Extract `RI-v0.5.0-linux-x86_64.tar.gz` and run `./ide-app --workspace /path/to/project` (ensure GTK3 and a sans/mono system font are installed).
-- **macOS**: Extract `RI-v0.5.0-macos-arm64.zip` (or `x86_64`) and move `Rust AI IDE.app` to `/Applications`. If macOS Gatekeeper reports **"Rust AI IDE" is damaged and can't be opened** (due to the browser download quarantine attribute on unsigned/non-notarized open-source builds), clear the quarantine attribute in Terminal before launching:
+- **Windows**: Extract `RI-v0.6.0-windows-x86_64.zip` and double-click `ide-app.exe` (or run `.\ide-app.exe --workspace D:\path\to\project`).
+- **Linux**: Extract `RI-v0.6.0-linux-x86_64.tar.gz` and run `./ide-app --workspace /path/to/project` (ensure GTK3 and a sans/mono system font are installed).
+- **macOS**: Extract `RI-v0.6.0-macos-arm64.zip` (or `x86_64`) and move `Rust AI IDE.app` to `/Applications`. If macOS Gatekeeper reports **"Rust AI IDE" is damaged and can't be opened** (due to the browser download quarantine attribute on unsigned/non-notarized open-source builds), clear the quarantine attribute in Terminal before launching:
   ```bash
   xattr -cr "/Applications/Rust AI IDE.app"
   codesign --force --deep --sign - "/Applications/Rust AI IDE.app"
@@ -339,7 +340,7 @@ rust-ai-ide/
 
 ## Status
 
-Version **0.5.0**. Runs natively on Windows, Linux, and macOS. Visual layout, themes, and keymap follow IntelliJ IDEA New UI; the implementation is independent.
+Version **0.6.0**. Runs natively on Windows, Linux, and macOS. Visual layout, themes, and keymap follow IntelliJ IDEA New UI; the implementation is independent.
 
 ---
 

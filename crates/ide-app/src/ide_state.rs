@@ -106,7 +106,9 @@ pub(crate) fn workspace_paths_equal(a: &Path, b: &Path) -> bool {
     }
     #[cfg(windows)]
     {
-        a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
+        let a_norm = a.to_string_lossy().replace('/', "\\");
+        let b_norm = b.to_string_lossy().replace('/', "\\");
+        a_norm.eq_ignore_ascii_case(&b_norm)
     }
     #[cfg(not(windows))]
     {
@@ -1527,9 +1529,15 @@ fn pick_initial_buffers(workspace_root: &Path, project_tree: &ProjectTreeState) 
         if open_buffers.len() >= 3 {
             break;
         }
-        if cand.is_file() && !open_buffers.iter().any(|b: &TextBuffer| b.path == cand) {
-            if let Ok(buf) = TextBuffer::open(&cand) {
-                open_buffers.push(buf);
+        if cand.is_file() {
+            let cand = clean_workspace_path(cand);
+            if !open_buffers
+                .iter()
+                .any(|b: &TextBuffer| workspace_paths_equal(&b.path, &cand))
+            {
+                if let Ok(buf) = TextBuffer::open(&cand) {
+                    open_buffers.push(buf);
+                }
             }
         }
     }
@@ -5984,7 +5992,8 @@ impl IdeApplicationState {
                 (self.project_tree.root.clone(), tree_area)
             };
 
-            let same_parent = path
+            let clean_drop_path = clean_workspace_path(path.to_path_buf());
+            let same_parent = clean_drop_path
                 .parent()
                 .is_some_and(|p| workspace_paths_equal(p, &target_dir));
             if !path_is_same_or_descendant_tree(path, &target_dir)
@@ -25397,16 +25406,20 @@ mod tests {
         state.handle_mouse_click_with_mods(zoom_in_r.x + 4, zoom_in_r.y + 4, false, &canvas);
         assert_eq!(state.media_tabs[0].zoom_pct, 125);
 
+        let svg_expected = clean_workspace_path(svg_path.clone());
+        let wav_expected = clean_workspace_path(wav_path.clone());
+        let mp4_expected = clean_workspace_path(mp4_path.clone());
+
         // SVG offers View Source action that opens its XML in TextBuffer
         let source_r = state
             .hit_regions
             .iter()
-            .find(|(_, a)| matches!(a, HitAction::OpenMediaAsText(p) if p == &svg_path))
+            .find(|(_, a)| matches!(a, HitAction::OpenMediaAsText(p) if workspace_paths_equal(p, &svg_expected)))
             .map(|(r, _)| *r)
             .expect("svg view source button");
         state.handle_mouse_click_with_mods(source_r.x + 6, source_r.y + 4, false, &canvas);
         assert!(state.active_media_tab.is_none());
-        assert_eq!(state.active_buffer().path, svg_path);
+        assert!(workspace_paths_equal(&state.active_buffer().path, &svg_expected));
 
         // 2. Open WAV and MP4 media preview tabs and render both cleanly
         state.open_file(wav_path.clone());
@@ -25416,7 +25429,7 @@ mod tests {
         assert!(state
             .hit_regions
             .iter()
-            .any(|(_, a)| matches!(a, HitAction::OpenExternalMedia(p) if p == &wav_path)));
+            .any(|(_, a)| matches!(a, HitAction::OpenExternalMedia(p) if workspace_paths_equal(p, &wav_expected))));
 
         state.open_file(mp4_path.clone());
         assert_eq!(state.active_media_tab, Some(2));
@@ -25424,7 +25437,7 @@ mod tests {
         assert!(state
             .hit_regions
             .iter()
-            .any(|(_, a)| matches!(a, HitAction::OpenExternalMedia(p) if p == &mp4_path)));
+            .any(|(_, a)| matches!(a, HitAction::OpenExternalMedia(p) if workspace_paths_equal(p, &mp4_expected))));
 
         // Closing a media tab updates selection cleanly
         let close_r = state
@@ -26965,7 +26978,10 @@ mod tests {
 
         // Ctrl + Left Click on `local_helper` jumps to line 0
         state.handle_mouse_click_with_input_mods(click_x, click_y_line2, false, true, &canvas);
-        assert_eq!(state.active_buffer().path, main_rs);
+        assert_eq!(
+            clean_workspace_path(state.active_buffer().path.clone()),
+            clean_workspace_path(main_rs),
+        );
         assert_eq!(state.active_buffer().cursor_line, 0);
 
         // Ctrl + Left Click on `cross_file_target_fn` (line 3) jumps across files even when subdir is collapsed
@@ -27212,6 +27228,7 @@ fn hello() {}
         std::fs::create_dir_all(&nested_dir).unwrap();
         let target_file = nested_dir.join("LocateMe.vue");
         std::fs::write(&target_file, "<template><div>ok</div></template>\n").unwrap();
+        let target_clean = clean_workspace_path(target_file.clone());
 
         // Add sibling files so tree_scroll behavior is exercised as well.
         for i in 0..24 {
@@ -27227,7 +27244,7 @@ fn hello() {}
             .project_tree
             .visible_entries
             .iter()
-            .any(|e| workspace_paths_equal(&e.path, &target_file)));
+            .any(|e| workspace_paths_equal(&e.path, &target_clean)));
 
         let mut canvas = SurfaceCanvas::new_with_scale(1440, 820, 1.0);
         // Before hovering file header: locate button must NOT appear.
@@ -27265,11 +27282,11 @@ fn hello() {}
             .project_tree
             .visible_entries
             .iter()
-            .position(|e| workspace_paths_equal(&e.path, &target_file))
+            .position(|e| workspace_paths_equal(&e.path, &target_clean))
             .expect("target file should now be visible in project tree");
         assert!(workspace_paths_equal(
             state.project_tree.selected_path.as_deref().unwrap(),
-            &target_file
+            &target_clean
         ));
 
         state.render(&mut canvas);
@@ -27318,11 +27335,14 @@ fn hello() {}
         win_b.right_panel_tab = RightPanelTab::Chat;
         win_b.render(&mut canvas_b);
 
+        let src_file_clean = clean_workspace_path(src_file.clone());
+        let dest_dir_clean = clean_workspace_path(ws_b.join("dest_dir"));
+
         // 1. Source window can initiate drag from its Project Tree
         let (src_row, _, _) = win_a
             .project_entry_rects
             .iter()
-            .find(|(_, p, _)| workspace_paths_equal(p, &src_file))
+            .find(|(_, p, _)| workspace_paths_equal(p, &src_file_clean))
             .cloned()
             .expect("shared.rs row in window A");
         win_a.begin_ide_drag_candidate_at(src_row.x + 10, src_row.y + 10);
@@ -27333,7 +27353,7 @@ fn hello() {}
         let (dest_row, _, is_dir) = win_b
             .project_entry_rects
             .iter()
-            .find(|(_, p, _)| workspace_paths_equal(p, &ws_b.join("dest_dir")))
+            .find(|(_, p, _)| workspace_paths_equal(p, &dest_dir_clean))
             .cloned()
             .expect("dest_dir row in window B");
         assert!(is_dir);
@@ -27354,11 +27374,12 @@ fn hello() {}
             std::fs::read_to_string(&copied_file).unwrap(),
             "pub fn shared() -> i32 { 42 }\n"
         );
+        let copied_file_clean = clean_workspace_path(copied_file.clone());
         assert!(win_b
             .project_tree
             .visible_entries
             .iter()
-            .any(|e| workspace_paths_equal(&e.path, &copied_file)));
+            .any(|e| workspace_paths_equal(&e.path, &copied_file_clean)));
 
         // Copying the folder recursively into Window B's Project Tree empty area (workspace root)
         let empty_tree_x = win_b.left_pane_rect.x + 24;
@@ -27458,11 +27479,12 @@ fn hello() {}
 
         let external_file = root.join("created_externally.rs");
         std::fs::write(&external_file, "pub fn ext() {}\n").unwrap();
+        let external_file_clean = clean_workspace_path(external_file.clone());
         assert!(!state
             .project_tree
             .visible_entries
             .iter()
-            .any(|e| workspace_paths_equal(&e.path, &external_file)));
+            .any(|e| workspace_paths_equal(&e.path, &external_file_clean)));
 
         state.handle_mouse_click_with_mods(
             ref_btn.x + ref_btn.w / 2,
@@ -27474,7 +27496,7 @@ fn hello() {}
             .project_tree
             .visible_entries
             .iter()
-            .any(|e| workspace_paths_equal(&e.path, &external_file)));
+            .any(|e| workspace_paths_equal(&e.path, &external_file_clean)));
 
         // 2. When Git is installed but workspace is NOT initialized, Commit / GitLog / Changes / BranchPopup
         //    show initialization actions instead of normal repo views.

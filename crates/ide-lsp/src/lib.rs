@@ -636,6 +636,18 @@ fn probe_installed_lsp_servers() -> Vec<LspServerStatus> {
             LanguageId::CSharp,
             &["csharp-ls.exe", "csharp-ls", "OmniSharp.exe", "omnisharp"][..],
         ),
+        (
+            LanguageId::Vue,
+            &["vue-language-server.cmd", "vue-language-server"][..],
+        ),
+        (
+            LanguageId::Svelte,
+            &["svelteserver.cmd", "svelteserver"][..],
+        ),
+        (
+            LanguageId::Astro,
+            &["astro-ls.cmd", "astro-ls"][..],
+        ),
     ];
 
     let mut servers = Vec::new();
@@ -685,6 +697,43 @@ pub fn analyze_source_diagnostics(
             });
         }
         return diags;
+    }
+
+    if lang.is_sfc_or_html() {
+        let mut open_sections: Vec<(&str, usize)> = Vec::new();
+        for (idx, raw_line) in source.lines().enumerate() {
+            let line_no = idx + 1;
+            let lower = raw_line.trim().to_ascii_lowercase();
+            for tag in ["template", "script", "style"] {
+                let open_pat = format!("<{tag}");
+                let close_pat = format!("</{tag}>");
+                if lower.starts_with(&open_pat)
+                    && lower
+                        .as_bytes()
+                        .get(open_pat.len())
+                        .is_some_and(|b| b.is_ascii_whitespace() || *b == b'>')
+                    && !lower.contains(&close_pat)
+                    && !lower.ends_with("/>")
+                {
+                    open_sections.push((tag, line_no));
+                } else if lower.contains(&close_pat) {
+                    if let Some(pos) = open_sections.iter().rposition(|(t, _)| *t == tag) {
+                        open_sections.remove(pos);
+                    }
+                }
+            }
+        }
+        for (tag, line_no) in open_sections {
+            diags.push(IdeDiagnostic {
+                file_path: path.to_path_buf(),
+                line: line_no,
+                column: 1,
+                severity: DiagnosticSeverityLevel::Error,
+                message: format!("Unclosed `<{tag}>` block"),
+                source: lang.default_lsp_binary().unwrap_or("syntax").to_string(),
+                quick_fix_suggestion: Some(format!("Add closing `</{tag}>` tag")),
+            });
+        }
     }
 
     let mut bracket_stack: Vec<(char, usize, usize)> = Vec::new();
@@ -1298,6 +1347,14 @@ mod tests {
         .unwrap();
         assert_eq!(maven_diag.line, 15);
         assert_eq!(maven_diag.column, 9);
+
+        let broken_vue = "<template>\n  <div>hello</div>\n";
+        let vue_diags = analyze_source_diagnostics(
+            Path::new("src/App.vue"),
+            LanguageId::Vue,
+            broken_vue,
+        );
+        assert!(vue_diags.iter().any(|d| d.message.contains("<template>")));
         assert_eq!(maven_diag.severity, DiagnosticSeverityLevel::Error);
         assert!(maven_diag.file_path.to_string_lossy().ends_with("App.java"));
 

@@ -58,7 +58,7 @@ pub fn detect_system_dpi_scale() -> f32 {
     1.0
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Rect {
     pub x: i32,
     pub y: i32,
@@ -85,6 +85,11 @@ pub enum FontStyle {
     CodeMonoBold,
     ChatBody,
     ChatBodyBold,
+    ChatBodyItalic,
+    ChatBodyBoldItalic,
+    ChatH1,
+    ChatH2,
+    ChatH3,
     ChatMeta,
     ChatMetaBold,
     ChatCode,
@@ -268,6 +273,9 @@ impl FileIconKind {
             ide_core::LanguageId::C => Self::C,
             ide_core::LanguageId::Cpp => Self::Cpp,
             ide_core::LanguageId::CSharp => Self::CSharp,
+            ide_core::LanguageId::Vue => Self::Vue,
+            ide_core::LanguageId::Svelte => Self::Svelte,
+            ide_core::LanguageId::Astro => Self::Astro,
             ide_core::LanguageId::Html => Self::Html,
             ide_core::LanguageId::Css => Self::Css,
             ide_core::LanguageId::Yaml => Self::Yaml,
@@ -1943,6 +1951,28 @@ impl SurfaceCanvas {
         }
     }
 
+    /// 绘制项目树定位图标（靶心/准星，IDEA Select Opened File）
+    pub fn draw_locate_file_icon(&mut self, x: i32, y: i32, color: u32) {
+        let cx = x + 7;
+        let cy = y + 7;
+        self.stroke_circle(cx, cy, 4.2, 1.35, color);
+        self.fill_circle(cx, cy, 1, color);
+        let fx = cx as f32 + 0.5;
+        let fy = cy as f32 + 0.5;
+        let mut pb = PathBuilder::new();
+        pb.move_to(fx, fy - 6.2);
+        pb.line_to(fx, fy - 3.6);
+        pb.move_to(fx, fy + 3.6);
+        pb.line_to(fx, fy + 6.2);
+        pb.move_to(fx - 6.2, fy);
+        pb.line_to(fx - 3.6, fy);
+        pb.move_to(fx + 3.6, fy);
+        pb.line_to(fx + 6.2, fy);
+        if let Some(path) = pb.finish() {
+            self.stroke_path_round(&path, 1.35, color);
+        }
+    }
+
     /// 绘制刷新图标 ↻
     pub fn draw_refresh_icon(&mut self, x: i32, y: i32, color: u32) {
         self.stroke_circle(x + 7, y + 7, 4.5, 1.4, color);
@@ -3101,10 +3131,10 @@ use windows::Win32::Graphics::DirectWrite::{
     IDWriteGdiInterop, IDWriteInlineObject, IDWritePixelSnapping_Impl, IDWriteRenderingParams,
     IDWriteTextFormat, IDWriteTextLayout, IDWriteTextRenderer, IDWriteTextRenderer_Impl,
     DWRITE_COLOR_F, DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL,
-    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL,
-    DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_GLYPH_RUN, DWRITE_GLYPH_RUN_DESCRIPTION,
-    DWRITE_HIT_TEST_METRICS, DWRITE_MATRIX, DWRITE_MEASURING_MODE, DWRITE_STRIKETHROUGH,
-    DWRITE_TEXT_METRICS, DWRITE_UNDERLINE, DWRITE_WORD_WRAPPING_NO_WRAP,
+    DWRITE_FONT_STYLE_ITALIC, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_BOLD,
+    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_GLYPH_RUN,
+    DWRITE_GLYPH_RUN_DESCRIPTION, DWRITE_HIT_TEST_METRICS, DWRITE_MATRIX, DWRITE_MEASURING_MODE,
+    DWRITE_STRIKETHROUGH, DWRITE_TEXT_METRICS, DWRITE_UNDERLINE, DWRITE_WORD_WRAPPING_NO_WRAP,
 };
 use windows::Win32::Graphics::Gdi::{
     GetCurrentObject, GetObjectW, DIBSECTION, OBJ_BITMAP,
@@ -3304,19 +3334,109 @@ impl DWriteTextEngine {
             st.scale_factor
         };
 
-        let (family, base_size, weight) = match style {
-            FontStyle::UiRegular => ("Microsoft YaHei UI", 14.5f32, DWRITE_FONT_WEIGHT_NORMAL),
-            FontStyle::UiBold => ("Microsoft YaHei UI", 14.5f32, DWRITE_FONT_WEIGHT_SEMI_BOLD),
-            FontStyle::UiSmall => ("Microsoft YaHei UI", 13.5f32, DWRITE_FONT_WEIGHT_NORMAL),
-            FontStyle::CodeMono => ("Cascadia Mono", 15.0f32, DWRITE_FONT_WEIGHT_NORMAL),
-            FontStyle::CodeMonoBold => ("Cascadia Mono", 15.0f32, DWRITE_FONT_WEIGHT_BOLD),
-            FontStyle::ChatBody => ("Segoe UI", 14.0f32, DWRITE_FONT_WEIGHT_NORMAL),
-            FontStyle::ChatBodyBold => ("Segoe UI", 14.0f32, DWRITE_FONT_WEIGHT_SEMI_BOLD),
-            FontStyle::ChatMeta => ("Segoe UI", 12.2f32, DWRITE_FONT_WEIGHT_NORMAL),
-            FontStyle::ChatMetaBold => ("Segoe UI", 12.2f32, DWRITE_FONT_WEIGHT_SEMI_BOLD),
-            FontStyle::ChatCode => ("Cascadia Mono", 12.6f32, DWRITE_FONT_WEIGHT_NORMAL),
-            FontStyle::ChatCodeBold => ("Cascadia Mono", 12.6f32, DWRITE_FONT_WEIGHT_SEMI_BOLD),
-            FontStyle::BadgeMicro => ("Segoe UI", 10.0f32, DWRITE_FONT_WEIGHT_BOLD),
+        let (family, base_size, weight, font_style) = match style {
+            FontStyle::UiRegular => (
+                "Microsoft YaHei UI",
+                14.5f32,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_FONT_STYLE_NORMAL,
+            ),
+            FontStyle::UiBold => (
+                "Microsoft YaHei UI",
+                14.5f32,
+                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                DWRITE_FONT_STYLE_NORMAL,
+            ),
+            FontStyle::UiSmall => (
+                "Microsoft YaHei UI",
+                13.5f32,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_FONT_STYLE_NORMAL,
+            ),
+            FontStyle::CodeMono => (
+                "Cascadia Mono",
+                15.0f32,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_FONT_STYLE_NORMAL,
+            ),
+            FontStyle::CodeMonoBold => (
+                "Cascadia Mono",
+                15.0f32,
+                DWRITE_FONT_WEIGHT_BOLD,
+                DWRITE_FONT_STYLE_NORMAL,
+            ),
+            FontStyle::ChatBody => (
+                "Segoe UI",
+                14.0f32,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_FONT_STYLE_NORMAL,
+            ),
+            FontStyle::ChatBodyBold => (
+                "Segoe UI",
+                14.0f32,
+                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                DWRITE_FONT_STYLE_NORMAL,
+            ),
+            FontStyle::ChatBodyItalic => (
+                "Segoe UI",
+                14.0f32,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_FONT_STYLE_ITALIC,
+            ),
+            FontStyle::ChatBodyBoldItalic => (
+                "Segoe UI",
+                14.0f32,
+                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                DWRITE_FONT_STYLE_ITALIC,
+            ),
+            FontStyle::ChatH1 => (
+                "Segoe UI",
+                19.5f32,
+                DWRITE_FONT_WEIGHT_BOLD,
+                DWRITE_FONT_STYLE_NORMAL,
+            ),
+            FontStyle::ChatH2 => (
+                "Segoe UI",
+                17.0f32,
+                DWRITE_FONT_WEIGHT_BOLD,
+                DWRITE_FONT_STYLE_NORMAL,
+            ),
+            FontStyle::ChatH3 => (
+                "Segoe UI",
+                15.2f32,
+                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                DWRITE_FONT_STYLE_NORMAL,
+            ),
+            FontStyle::ChatMeta => (
+                "Segoe UI",
+                12.2f32,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_FONT_STYLE_NORMAL,
+            ),
+            FontStyle::ChatMetaBold => (
+                "Segoe UI",
+                12.2f32,
+                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                DWRITE_FONT_STYLE_NORMAL,
+            ),
+            FontStyle::ChatCode => (
+                "Cascadia Mono",
+                12.6f32,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_FONT_STYLE_NORMAL,
+            ),
+            FontStyle::ChatCodeBold => (
+                "Cascadia Mono",
+                12.6f32,
+                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                DWRITE_FONT_STYLE_NORMAL,
+            ),
+            FontStyle::BadgeMicro => (
+                "Segoe UI",
+                10.0f32,
+                DWRITE_FONT_WEIGHT_BOLD,
+                DWRITE_FONT_STYLE_NORMAL,
+            ),
         };
         let size = (base_size * scale).max(9.0);
 
@@ -3328,7 +3448,7 @@ impl DWriteTextEngine {
                     PCWSTR(fam_w.as_ptr()),
                     None,
                     weight,
-                    DWRITE_FONT_STYLE_NORMAL,
+                    font_style,
                     DWRITE_FONT_STRETCH_NORMAL,
                     size,
                     PCWSTR(locale_w.as_ptr()),

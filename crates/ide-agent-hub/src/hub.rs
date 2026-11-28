@@ -2026,7 +2026,7 @@ impl AgentHub {
         self.inline_edit.as_ref().unwrap()
     }
 
-    pub fn request_ai_commit_message(&mut self, diff_text: String, changed_files: Vec<String>) {
+    pub fn request_ai_commit_message(&mut self, ctx: ide_git::AiCommitContext) {
         let backend = self.resolve_execution_backend_for(AgentWorkbenchMode::Ask, false);
         if matches!(backend, ExecutionBackend::LocalOffline) {
             *self.async_commit_msg.lock() = Some(Err(
@@ -2047,13 +2047,7 @@ impl AgentHub {
         let dummy_pid = Arc::new(Mutex::new(None));
 
         thread::spawn(move || {
-            let sys = "Generate a concise Conventional Commits message (1 title line <= 72 chars, optional short bullet list). Output ONLY the commit message text without markdown fences.";
-            let diff_clipped: String = diff_text.chars().take(4500).collect();
-            let user = format!(
-                "Changed files:\n{}\n\nDiff:\n{}",
-                changed_files.join("\n"),
-                diff_clipped
-            );
+            let (sys, user) = build_ai_commit_prompt(&ctx);
             let res = match backend {
                 ExecutionBackend::Cli(params) => execute_cli_once(
                     &params,
@@ -2086,7 +2080,7 @@ impl AgentHub {
                 ),
                 ExecutionBackend::LocalOffline => Err("No local CLI available".to_string()),
             }
-            .map(|s| s.trim().trim_matches('`').to_string());
+            .map(|s| sanitize_generated_commit_message(&s));
             *slot.lock() = Some(res);
             if let Some(cb) = wakeup {
                 cb();
@@ -3075,6 +3069,138 @@ impl AgentHub {
     }
 }
 
+fn clip_prompt_chars(s: &str, max_chars: usize) -> (String, bool) {
+    let mut chars = s.chars();
+    let clipped: String = chars.by_ref().take(max_chars).collect();
+    let truncated = chars.next().is_some();
+    (clipped, truncated)
+}
+
+fn build_ai_commit_prompt(ctx: &ide_git::AiCommitContext) -> (&'static str, String) {
+    let sys = "You are an expert software engineer writing a Git commit message.\n\
+Strictly follow the repository's historical commit format, style, language, prefix/type/scope conventions, and any commit template or commitlint rules provided.\n\
+If no repository history or template exists, default to Conventional Commits (`<type>(<scope>): <description>` or `<type>: <description>`).\n\
+Rules:\n\
+- Keep the subject (first) line concise (<= 72 characters) and accurately summarize the diff.\n\
+- Match the historical format (type, scope, gitmoji/tag, casing, language, single-line vs `- ` bullet body) consistently.\n\
+- Do NOT add a trailing period to the subject line unless historical commits do.\n\
+- If including a body, leave exactly one blank line after the subject and use concise `- ...` bullet points.\n\
+- Output ONLY the raw commit message text without markdown code fences, quotes, or explanations.";
+
+    let mut sections: Vec<String> = Vec::new();
+    if !ctx.style_summary.trim().is_empty() {
+        sections.push(format!(
+            "Repository Commit Format & Style:\n{}",
+            ctx.style_summary.trim()
+        ));
+    }
+    if let Some(tpl) = ctx.commit_template.as_deref().filter(|s| !s.trim().is_empty()) {
+        sections.push(format!("Commit Template:\n{}", tpl.trim()));
+    }
+    if let Some(cfg) = ctx.commitlint_config.as_deref().filter(|s| !s.trim().is_empty()) {
+        sections.push(format!("Commitlint Rules:\n{}", cfg.trim()));
+    }
+    if !ctx.recent_commit_messages.is_empty() {
+        let mut hist_lines = String::from("Recent Historical Commits (match this exact format & style):\n");
+        for (idx, msg) in ctx.recent_commit_messages.iter().take(12).enumerate() {
+            hist_lines.push_str(&format!("[{}]\n{}\n", idx + 1, msg.trim()));
+        }
+        sections.push(hist_lines.trim_end().to_string());
+    }
+    if !ctx.changed_files.is_empty() {
+        sections.push(format!("Changed Files:\n{}", ctx.changed_files.join("\n")));
+    } else {
+        sections.push("Changed Files:\n(none)".to_string());
+    }
+
+    let (diff_clipped, was_truncated) = clip_prompt_chars(&ctx.diff_text, 8000);
+    let diff_section = if diff_clipped.trim().is_empty() {
+        "Git Diff:\n(no diff content)".to_string()
+    } else if was_truncated {
+        format!("Git Diff:\n{diff_clipped}\n... [diff truncated]")
+    } else {
+        format!("Git Diff:\n{diff_clipped}")
+    };
+    sections.push(diff_section);
+
+    (sys, sections.join("\n\n"))
+}
+
+fn sanitize_generated_commit_message(raw: &str) -> String {
+    let mut text = raw.replace("\r\n", "\n").replace('\r', "\n").trim().to_string();
+
+    // 剥离完整包裹的 Markdown 代码围栏 (如 ```gitcommit ... ``` / ```text ... ``` / ``` ... ```)
+    if text.starts_with("```") {
+        let lines: Vec<&str> = text.lines().collect();
+        if lines.len() >= 2 {
+            let last_is_fence = lines.last().is_some_and(|l| l.trim() == "```");
+            let end_idx = if last_is_fence {
+                lines.len() - 1
+            } else {
+                lines.len()
+            };
+            text = lines[1..end_idx].join("\n").trim().to_string();
+        }
+    }
+
+    // 剥离模型偶尔附带的前置说明行
+    let preamble_prefixes = [
+        "commit message:",
+        "generated commit message:",
+        "here is the commit message:",
+        "here's the commit message:",
+        "提交信息:",
+        "提交信息：",
+        "以下是生成的提交信息:",
+        "以下是生成的提交信息：",
+    ];
+    loop {
+        let mut lines = text.lines();
+        let Some(first) = lines.next() else {
+            break;
+        };
+        let first_low = first.trim().to_ascii_lowercase();
+        let rest = lines.collect::<Vec<_>>().join("\n");
+        if !rest.trim().is_empty()
+            && preamble_prefixes.iter().any(|p| first_low == *p)
+        {
+            text = rest.trim().to_string();
+            continue;
+        }
+        break;
+    }
+
+    // 剥离整段被成对引号或反引号包裹的情况
+    for q in ['"', '\'', '`'] {
+        if text.len() >= 2 && text.starts_with(q) && text.ends_with(q) {
+            let inner = &text[q.len_utf8()..text.len() - q.len_utf8()];
+            if !inner.trim().is_empty() {
+                text = inner.trim().to_string();
+            }
+        }
+    }
+
+    // 规范化行尾空白与多余空行
+    let mut out_lines: Vec<&str> = Vec::new();
+    let mut blank_run = 0usize;
+    for line in text.lines() {
+        let trimmed_end = line.trim_end();
+        if trimmed_end.is_empty() {
+            if !out_lines.is_empty() && blank_run == 0 {
+                out_lines.push("");
+                blank_run = 1;
+            }
+        } else {
+            blank_run = 0;
+            out_lines.push(trimmed_end);
+        }
+    }
+    while out_lines.last().is_some_and(|l| l.is_empty()) {
+        out_lines.pop();
+    }
+    out_lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4022,5 +4148,38 @@ mod tests {
         );
 
         let _ = fs::remove_file(&hist_path);
+    }
+
+    #[test]
+    fn test_ai_commit_prompt_includes_history_and_sanitizes_output() {
+        let ctx = ide_git::AiCommitContext {
+            diff_text: "diff --git a/src/lib.rs b/src/lib.rs\n+fn hello() {}\n".to_string(),
+            changed_files: vec!["M src/lib.rs".to_string()],
+            recent_commit_messages: vec![
+                "feat(git): support history-aware commit style".to_string(),
+                "fix(agent): clean up fence parsing".to_string(),
+            ],
+            style_summary: "- Format convention: Conventional Commits".to_string(),
+            commit_template: Some("# <type>(<scope>): <subject>".to_string()),
+            commitlint_config: Some("{\"extends\": [\"@commitlint/config-conventional\"]}".to_string()),
+        };
+        let (sys, user) = build_ai_commit_prompt(&ctx);
+        assert!(sys.contains("historical commit format"));
+        assert!(user.contains("Repository Commit Format & Style:"));
+        assert!(user.contains("Commit Template:"));
+        assert!(user.contains("Commitlint Rules:"));
+        assert!(user.contains("feat(git): support history-aware commit style"));
+        assert!(user.contains("M src/lib.rs"));
+
+        let fenced = "```gitcommit\nfeat(git): generate commit from history\n\n- Include recent commits\n```";
+        assert_eq!(
+            sanitize_generated_commit_message(fenced),
+            "feat(git): generate commit from history\n\n- Include recent commits"
+        );
+        let with_preamble = "Commit message:\n\n\"fix(agent): trim preamble and quotes\"";
+        assert_eq!(
+            sanitize_generated_commit_message(with_preamble),
+            "fix(agent): trim preamble and quotes"
+        );
     }
 }

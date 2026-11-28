@@ -2,8 +2,10 @@
 
 mod agent_panel;
 mod canvas;
+mod external_open;
 mod ide_state;
 mod image_preview;
+mod markdown;
 mod persistence;
 mod svg_icon;
 #[cfg(not(target_os = "windows"))]
@@ -14,13 +16,18 @@ use crate::canvas::{
     detect_system_dpi_scale, render_ri_icon_rgba, save_ri_icon_ico, save_ri_icon_png,
     SurfaceCanvas,
 };
+use crate::external_open::{
+    ensure_editor_shims, ensure_windows_url_protocol, infer_workspace_for_file, parse_cli_args,
+    path_is_inside_workspace, start_ipc_server, try_forward_via_ipc, EditorIntegrationPaths,
+    ExternalOpenTarget,
+};
 use crate::ide_state::{
     duplicate_open_count, session_windows_after_close, workspace_paths_equal,
     write_windows_clipboard_text, FocusTarget, IdeApplicationState, IdeCursorKind,
     TextInputNavAction, WindowControlCmd,
 };
 use anyhow::Result;
-use ide_core::{IdeAction, IdeaTheme, MainMenuCategory, ThemeKind, ToolWindowId};
+use ide_core::{IdeAction, IdeaTheme, KeymapScheme, MainMenuCategory, ThemeKind, ToolWindowId};
 use softbuffer::{Context, Surface};
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -91,9 +98,10 @@ fn trim_process_working_set() {
 #[cfg(not(target_os = "windows"))]
 fn trim_process_working_set() {}
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum IdeWakeupEvent {
     Wakeup(WindowId),
+    ExternalOpen(Vec<ExternalOpenTarget>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -882,6 +890,7 @@ fn spawn_ide_window(
     proxy: &EventLoopProxy<IdeWakeupEvent>,
     workspace_root: PathBuf,
     storage_dir: Option<&Path>,
+    external_integration: Option<&EditorIntegrationPaths>,
     window_icon: Option<Icon>,
     taskbar_icon: Option<Icon>,
     initial_theme: IdeaTheme,
@@ -935,6 +944,9 @@ fn spawn_ide_window(
     };
     if let Some(dir) = storage_dir {
         app_state.restore_from_persistence_dir(dir.to_path_buf());
+    }
+    if let Some(paths) = external_integration {
+        app_state.set_external_integration(paths.clone());
     }
     let last_bg_rgb = app_state.theme.window_bg;
     window.set_background_color(Some(rgb_to_tao_rgba(last_bg_rgb)));
@@ -1266,10 +1278,11 @@ fn schedule_attention_frames(
     if ui_test_mode {
         return;
     }
-    if windows
-        .values()
-        .any(|host| host.app_state.window_attention_until.is_some())
-    {
+    if windows.values().any(|host| {
+        host.app_state.window_attention_until.is_some()
+            || host.app_state.external_drag_hover.is_some()
+            || host.app_state.active_ide_drag.is_some()
+    }) {
         *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(16));
     }
 }
@@ -1346,6 +1359,306 @@ fn to_tao_cursor(kind: IdeCursorKind) -> CursorIcon {
         IdeCursorKind::Pointer => CursorIcon::Hand,
         IdeCursorKind::EwResize => CursorIcon::EwResize,
         IdeCursorKind::NsResize => CursorIcon::NsResize,
+        IdeCursorKind::Copy => CursorIcon::Copy,
+        IdeCursorKind::Grabbing => CursorIcon::Grabbing,
+        IdeCursorKind::NoDrop => CursorIcon::NoDrop,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CrossWindowDragState {
+    source_window_id: WindowId,
+    path: PathBuf,
+}
+
+#[cfg(target_os = "windows")]
+fn set_mouse_capture(window: &tao::window::Window) {
+    use tao::platform::windows::WindowExtWindows;
+    #[link(name = "user32")]
+    extern "system" {
+        fn SetCapture(hwnd: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+    }
+    unsafe {
+        let _ = SetCapture(window.hwnd() as *mut core::ffi::c_void);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn set_mouse_capture(_window: &tao::window::Window) {}
+
+#[cfg(target_os = "windows")]
+fn release_mouse_capture() {
+    #[link(name = "user32")]
+    extern "system" {
+        fn ReleaseCapture() -> i32;
+    }
+    unsafe {
+        let _ = ReleaseCapture();
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn release_mouse_capture() {}
+
+#[cfg(target_os = "windows")]
+fn is_left_mouse_button_down() -> bool {
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetAsyncKeyState(v_key: i32) -> i16;
+    }
+    const VK_LBUTTON: i32 = 0x01;
+    unsafe { (GetAsyncKeyState(VK_LBUTTON) as u16 & 0x8000) != 0 }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_left_mouse_button_down() -> bool {
+    true
+}
+
+#[cfg(target_os = "windows")]
+fn global_cursor_pos() -> Option<(i32, i32)> {
+    use windows::Win32::Foundation::POINT;
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetCursorPos(lp_point: *mut POINT) -> i32;
+    }
+    let mut pt = POINT { x: 0, y: 0 };
+    unsafe {
+        if GetCursorPos(&mut pt) != 0 {
+            Some((pt.x, pt.y))
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn global_cursor_pos() -> Option<(i32, i32)> {
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn find_ide_window_at_screen_pos(
+    windows: &HashMap<WindowId, IdeWindowHost>,
+    screen_pt: (i32, i32),
+) -> Option<(WindowId, (i32, i32))> {
+    use tao::platform::windows::WindowExtWindows;
+    use windows::Win32::Foundation::{HWND, POINT};
+    use windows::Win32::Graphics::Gdi::ScreenToClient;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn WindowFromPoint(point: POINT) -> *mut core::ffi::c_void;
+        fn GetAncestor(hwnd: *mut core::ffi::c_void, ga_flags: u32) -> *mut core::ffi::c_void;
+    }
+    const GA_ROOT: u32 = 2;
+
+    let pt = POINT {
+        x: screen_pt.0,
+        y: screen_pt.1,
+    };
+    let hit_hwnd = unsafe { WindowFromPoint(pt) };
+    if hit_hwnd.is_null() {
+        return None;
+    }
+    let root_hwnd = unsafe {
+        let anc = GetAncestor(hit_hwnd, GA_ROOT);
+        if anc.is_null() {
+            hit_hwnd
+        } else {
+            anc
+        }
+    };
+    for (&wid, host) in windows {
+        if host.is_minimized || !host.window.is_visible() {
+            continue;
+        }
+        if host.window.hwnd() as isize == root_hwnd as isize {
+            let mut client_pt = pt;
+            let ok = unsafe {
+                ScreenToClient(
+                    HWND(host.window.hwnd() as *mut core::ffi::c_void),
+                    &mut client_pt,
+                )
+                .as_bool()
+            };
+            if ok {
+                let logical = host
+                    .surface_canvas
+                    .to_logical_pos(client_pt.x as f64, client_pt.y as f64);
+                return Some((wid, logical));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "windows"))]
+fn find_ide_window_at_screen_pos(
+    windows: &HashMap<WindowId, IdeWindowHost>,
+    screen_pt: (i32, i32),
+) -> Option<(WindowId, (i32, i32))> {
+    for (&wid, host) in windows {
+        if host.is_minimized || !host.window.is_visible() {
+            continue;
+        }
+        let Ok(pos) = host.window.inner_position() else {
+            continue;
+        };
+        let size = host.window.inner_size();
+        let rx = screen_pt.0 - pos.x;
+        let ry = screen_pt.1 - pos.y;
+        if rx >= 0 && ry >= 0 && rx < size.width as i32 && ry < size.height as i32 {
+            let logical = host.surface_canvas.to_logical_pos(rx as f64, ry as f64);
+            return Some((wid, logical));
+        }
+    }
+    None
+}
+
+fn sync_cross_window_drag_hover(
+    windows: &mut HashMap<WindowId, IdeWindowHost>,
+    drag: &CrossWindowDragState,
+) {
+    let target = global_cursor_pos()
+        .and_then(|pt| find_ide_window_at_screen_pos(windows, pt))
+        .or_else(|| {
+            windows.get(&drag.source_window_id).and_then(|src| {
+                let (cx, cy) = src.cursor_pos;
+                let w = src.surface_canvas.width as i32;
+                let h = src.surface_canvas.height as i32;
+                if cx >= 0 && cy >= 0 && cx < w && cy < h {
+                    Some((drag.source_window_id, (cx, cy)))
+                } else {
+                    None
+                }
+            })
+        });
+
+    for (&wid, host) in windows.iter_mut() {
+        if target.as_ref().is_some_and(|(tid, _)| *tid == wid) {
+            let (_, local_pos) = target.unwrap();
+            if wid == drag.source_window_id {
+                host.app_state.external_drag_hover = None;
+                let next = Some((drag.path.clone(), local_pos));
+                if host.app_state.active_ide_drag != next {
+                    host.app_state.active_ide_drag = next;
+                    host.pending_redraw = true;
+                }
+            } else {
+                host.app_state.active_ide_drag = None;
+                let next = Some((drag.path.clone(), local_pos));
+                if host.app_state.external_drag_hover != next {
+                    host.app_state.external_drag_hover = next;
+                    host.pending_redraw = true;
+                }
+            }
+            host.cursor_pos = local_pos;
+        } else {
+            if host.app_state.active_ide_drag.take().is_some()
+                || host.app_state.external_drag_hover.take().is_some()
+            {
+                host.pending_redraw = true;
+            }
+        }
+    }
+
+    let desired_icon = match target {
+        Some((tid, (lx, ly))) => {
+            if let Some(thost) = windows.get(&tid) {
+                let w = thost.surface_canvas.width as i32;
+                let h = thost.surface_canvas.height as i32;
+                to_tao_cursor(thost.app_state.cursor_kind_at(lx, ly, w, h))
+            } else {
+                CursorIcon::NoDrop
+            }
+        }
+        None => CursorIcon::NoDrop,
+    };
+    if let Some(src_host) = windows.get_mut(&drag.source_window_id) {
+        if src_host.last_cursor_icon != desired_icon {
+            src_host.window.set_cursor_icon(desired_icon);
+            src_host.last_cursor_icon = desired_icon;
+        }
+    }
+}
+
+fn clear_all_window_drags(windows: &mut HashMap<WindowId, IdeWindowHost>) {
+    for host in windows.values_mut() {
+        host.left_mouse_down = false;
+        host.app_state.pending_ide_drag = None;
+        if host.app_state.active_ide_drag.take().is_some()
+            || host.app_state.external_drag_hover.take().is_some()
+        {
+            host.pending_redraw = true;
+        }
+    }
+}
+
+fn finish_cross_window_drag(
+    windows: &mut HashMap<WindowId, IdeWindowHost>,
+    drag: CrossWindowDragState,
+) {
+    release_mouse_capture();
+    let target = global_cursor_pos().and_then(|pt| find_ide_window_at_screen_pos(windows, pt));
+    clear_all_window_drags(windows);
+    if let Some(src_host) = windows.get_mut(&drag.source_window_id) {
+        src_host.app_state.end_dock_drag(
+            src_host.cursor_pos.0,
+            src_host.cursor_pos.1,
+            src_host.surface_canvas.width as i32,
+            src_host.surface_canvas.height as i32,
+        );
+        src_host.app_state.end_splitter_drag();
+        src_host.app_state.end_scrollbar_drag();
+        src_host.app_state.end_mouse_text_drag();
+        sync_window_cursor(
+            &src_host.window,
+            &src_host.app_state,
+            &src_host.surface_canvas,
+            src_host.cursor_pos,
+            &mut src_host.last_cursor_icon,
+        );
+        src_host.pending_redraw = true;
+    }
+
+    if let Some((target_wid, (lx, ly))) = target {
+        let is_cross = target_wid != drag.source_window_id;
+        if let Some(target_host) = windows.get_mut(&target_wid) {
+            let _ = target_host
+                .app_state
+                .handle_ide_drag_drop_at(drag.path, lx, ly, is_cross);
+            target_host.cursor_pos = (lx, ly);
+            sync_window_cursor(
+                &target_host.window,
+                &target_host.app_state,
+                &target_host.surface_canvas,
+                (lx, ly),
+                &mut target_host.last_cursor_icon,
+            );
+            target_host.pending_redraw = true;
+            target_host.window.request_redraw();
+            if is_cross {
+                target_host.is_minimized = false;
+                target_host.is_focused = true;
+                activate_os_window(&target_host.window);
+            }
+        }
+    }
+}
+
+fn cancel_cross_window_drag(windows: &mut HashMap<WindowId, IdeWindowHost>) {
+    release_mouse_capture();
+    clear_all_window_drags(windows);
+    for host in windows.values_mut() {
+        sync_window_cursor(
+            &host.window,
+            &host.app_state,
+            &host.surface_canvas,
+            host.cursor_pos,
+            &mut host.last_cursor_icon,
+        );
+        host.window.request_redraw();
     }
 }
 
@@ -1430,28 +1743,128 @@ fn existing_session_dirs(paths: &[PathBuf]) -> Vec<PathBuf> {
     out
 }
 
-fn parse_explicit_workspace_arg(args: &[String]) -> Option<PathBuf> {
-    let mut i = 1;
-    while i < args.len() {
-        if args[i] == "--workspace" {
-            if let Some(next) = args.get(i + 1) {
-                let p = PathBuf::from(next);
-                if p.is_dir() {
-                    return Some(p);
+fn resolve_external_file_path(
+    windows: &HashMap<WindowId, IdeWindowHost>,
+    path: &Path,
+    cwd: Option<&Path>,
+) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    if let Some(base) = cwd {
+        let candidate = base.join(path);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    for host in windows.values() {
+        let candidate = host.app_state.workspace_root.join(path);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    path.to_path_buf()
+}
+
+fn preferred_window_for_file(
+    windows: &HashMap<WindowId, IdeWindowHost>,
+    path: &Path,
+) -> Option<WindowId> {
+    let mut best_match: Option<(WindowId, usize, bool)> = None;
+    for (&id, host) in windows {
+        let ws = &host.app_state.workspace_root;
+        if path_is_inside_workspace(path, ws) {
+            let depth = ws.as_os_str().len();
+            let replace = match best_match {
+                None => true,
+                Some((_, prev_depth, prev_focused)) => {
+                    depth > prev_depth || (depth == prev_depth && host.is_focused && !prev_focused)
+                }
+            };
+            if replace {
+                best_match = Some((id, depth, host.is_focused));
+            }
+        }
+    }
+    if let Some((id, _, _)) = best_match {
+        return Some(id);
+    }
+    windows
+        .iter()
+        .find(|(_, host)| host.is_focused && !host.is_minimized)
+        .map(|(id, _)| *id)
+        .or_else(|| {
+            windows
+                .iter()
+                .find(|(_, host)| host.is_focused)
+                .map(|(id, _)| *id)
+        })
+        .or_else(|| windows.keys().next().copied())
+}
+
+fn deliver_external_targets(
+    windows: &mut HashMap<WindowId, IdeWindowHost>,
+    targets: &[ExternalOpenTarget],
+) {
+    for target in targets {
+        match target {
+            ExternalOpenTarget::OpenWorkspace { path, .. } => {
+                if let Some((&existing_id, _)) = windows
+                    .iter()
+                    .find(|(_, host)| workspace_paths_equal(&host.app_state.workspace_root, path))
+                {
+                    if let Some(host) = windows.get_mut(&existing_id) {
+                        host.is_minimized = false;
+                        host.is_focused = true;
+                        activate_os_window(&host.window);
+                        host.pending_redraw = true;
+                        host.window.request_redraw();
+                    }
+                } else if path.is_dir() {
+                    let target_id = windows
+                        .iter()
+                        .find(|(_, h)| h.is_focused)
+                        .map(|(id, _)| *id)
+                        .or_else(|| windows.keys().next().copied());
+                    if let Some(host) = target_id.and_then(|id| windows.get_mut(&id)) {
+                        host.app_state.pending_new_windows.push(path.clone());
+                    }
                 }
             }
-        }
-        i += 1;
-    }
-    for arg in args.iter().skip(1) {
-        if !arg.starts_with('-') {
-            let p = PathBuf::from(arg);
-            if p.is_dir() {
-                return Some(p);
+            ExternalOpenTarget::OpenFile {
+                path,
+                line,
+                column,
+                cwd,
+                ..
+            } => {
+                let resolved = resolve_external_file_path(windows, path, cwd.as_deref());
+                let Some(id) = preferred_window_for_file(windows, &resolved) else {
+                    continue;
+                };
+                for (&wid, host) in windows.iter_mut() {
+                    host.is_focused = wid == id;
+                }
+                let Some(host) = windows.get_mut(&id) else {
+                    continue;
+                };
+                host.app_state.close_top_menu();
+                host.app_state.context_menu = None;
+                host.app_state
+                    .open_file_at_line_col(resolved, *line, *column);
+                host.is_minimized = false;
+                host.is_focused = true;
+                host.window.set_visible(true);
+                activate_os_window(&host.window);
+                host.pending_redraw = true;
+                host.window.request_redraw();
             }
         }
     }
-    None
+}
+
+fn parse_explicit_workspace_arg(args: &[String]) -> Option<PathBuf> {
+    parse_cli_args(args, env::current_dir().ok().as_deref()).explicit_workspace
 }
 
 fn parse_workspace_arg(args: &[String]) -> PathBuf {
@@ -1479,13 +1892,29 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
+    let self_check_mode = args.iter().any(|a| a == "--self-check");
+    let ui_test_mode = args.iter().any(|a| a == "--ui-test");
     let storage_dir = persistence::default_storage_dir();
+    let cwd = env::current_dir().ok();
+    let parsed_cli = parse_cli_args(&args, cwd.as_deref());
+    if !self_check_mode && !ui_test_mode && !parsed_cli.targets.is_empty() {
+        if try_forward_via_ipc(storage_dir.as_deref(), &parsed_cli.targets) {
+            return Ok(());
+        }
+    }
+
     let saved_global: persistence::PersistedGlobalSettings = storage_dir
         .as_deref()
         .and_then(|d| persistence::load_json(&persistence::global_settings_path(d)))
         .unwrap_or_default();
-    let ui_test_mode = args.iter().any(|a| a == "--ui-test");
-    let explicit_workspace = parse_explicit_workspace_arg(&args);
+    let explicit_workspace = parsed_cli.explicit_workspace.clone().or_else(|| {
+        parsed_cli.targets.iter().find_map(|t| match t {
+            ExternalOpenTarget::OpenFile { path, .. } => {
+                infer_workspace_for_file(path, &saved_global.open_windows)
+            }
+            ExternalOpenTarget::OpenWorkspace { path, .. } => Some(path.clone()),
+        })
+    });
     let saved_session = if explicit_workspace.is_none() && !ui_test_mode {
         existing_session_dirs(&saved_global.open_windows)
     } else {
@@ -1496,7 +1925,7 @@ fn main() -> Result<()> {
         .or_else(|| saved_global.last_workspace.clone().filter(|p| p.is_dir()))
         .unwrap_or_else(|| parse_workspace_arg(&args));
 
-    if args.iter().any(|a| a == "--self-check") {
+    if self_check_mode {
         let sys_scale = detect_system_dpi_scale();
         let mut state = IdeApplicationState::new(workspace_root);
         state.system_dpi_scale = sys_scale;
@@ -1578,6 +2007,23 @@ fn main() -> Result<()> {
 
     let event_loop = EventLoopBuilder::<IdeWakeupEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
+    let external_integration = if !ui_test_mode {
+        let paths = storage_dir.as_deref().and_then(ensure_editor_shims);
+        if let Some(ref p) = paths {
+            let _ = ensure_windows_url_protocol(&p.exe_path);
+        }
+        paths
+    } else {
+        None
+    };
+    let mut ipc_guard = if !ui_test_mode {
+        let ipc_proxy = proxy.clone();
+        start_ipc_server(storage_dir.as_deref(), move |targets| {
+            let _ = ipc_proxy.send_event(IdeWakeupEvent::ExternalOpen(targets));
+        })
+    } else {
+        None
+    };
 
     let (init_log_w, init_log_h) =
         if saved_global.window_width >= 800 && saved_global.window_height >= 540 {
@@ -1606,6 +2052,7 @@ fn main() -> Result<()> {
         &proxy,
         workspace_root,
         storage_dir.as_deref(),
+        external_integration.as_ref(),
         shared_window_icon.clone(),
         shared_taskbar_icon.clone(),
         initial_theme,
@@ -1631,6 +2078,7 @@ fn main() -> Result<()> {
                 &proxy,
                 root,
                 storage_dir.as_deref(),
+                external_integration.as_ref(),
                 shared_window_icon.clone(),
                 shared_taskbar_icon.clone(),
                 initial_theme,
@@ -1675,9 +2123,13 @@ fn main() -> Result<()> {
             host.window.set_focus();
         }
     }
+    if !parsed_cli.targets.is_empty() {
+        deliver_external_targets(&mut windows, &parsed_cli.targets);
+    }
     let mut ui_test_frames: u32 = 0;
     let mut recent_reopen: Option<(WindowId, u32, Instant)> = None;
     let mut close_burst: Option<(Instant, Vec<PathBuf>)> = None;
+    let mut active_cross_drag: Option<CrossWindowDragState> = None;
 
     event_loop.run(move |event, elwt, control_flow| {
         let mut any_anim = false;
@@ -1737,6 +2189,7 @@ fn main() -> Result<()> {
                     &proxy,
                     target_path.clone(),
                     storage_dir.as_deref(),
+                    external_integration.as_ref(),
                     shared_window_icon.clone(),
                     shared_taskbar_icon.clone(),
                     initial_theme,
@@ -1791,6 +2244,14 @@ fn main() -> Result<()> {
         };
 
         match event {
+            Event::LoopDestroyed => {
+                let _ = ipc_guard.take();
+            }
+            Event::UserEvent(IdeWakeupEvent::ExternalOpen(targets)) => {
+                deliver_external_targets(&mut windows, &targets);
+                spawn_pending(&mut windows);
+                schedule_attention_frames(&windows, control_flow, ui_test_mode);
+            }
             Event::UserEvent(IdeWakeupEvent::Wakeup(wid)) => {
                 if let Some(host) = windows.get_mut(&wid) {
                     if host.drain_pending_win_text() {
@@ -1806,6 +2267,30 @@ fn main() -> Result<()> {
                 schedule_attention_frames(&windows, control_flow, ui_test_mode);
             }
             Event::MainEventsCleared => {
+                if let Some(ref drag) = active_cross_drag {
+                    if !is_left_mouse_button_down() {
+                        if let Some(drag) = active_cross_drag.take() {
+                            finish_cross_window_drag(&mut windows, drag);
+                        }
+                    } else {
+                        sync_cross_window_drag_hover(&mut windows, drag);
+                    }
+                } else {
+                    for host in windows.values_mut() {
+                        if let Some((path, old_pos)) = host.app_state.external_drag_hover.clone() {
+                            let cur = cursor_pos_in_window(
+                                &host.window,
+                                &host.surface_canvas,
+                                host.cursor_pos,
+                            );
+                            if cur != old_pos {
+                                host.cursor_pos = cur;
+                                host.app_state.external_drag_hover = Some((path, cur));
+                                host.pending_redraw = true;
+                            }
+                        }
+                    }
+                }
                 spawn_pending(&mut windows);
                 schedule_attention_frames(&windows, control_flow, ui_test_mode);
                 if ui_test_mode {
@@ -1930,12 +2415,90 @@ fn main() -> Result<()> {
             Event::WindowEvent {
                 window_id, event, ..
             } => {
-                let cmd = if let Some(host) = windows.get_mut(&window_id) {
-                    host.handle_window_event(event)
+                let mut handled_by_cross_drag = false;
+                if let Some(ref drag) = active_cross_drag {
+                    match &event {
+                        WindowEvent::MouseInput {
+                            state: ElementState::Released,
+                            button: MouseButton::Left,
+                            ..
+                        } => {
+                            if let Some(finished) = active_cross_drag.take() {
+                                finish_cross_window_drag(&mut windows, finished);
+                            }
+                            handled_by_cross_drag = true;
+                        }
+                        WindowEvent::CursorMoved { position, .. }
+                            if window_id == drag.source_window_id =>
+                        {
+                            if let Some(src_host) = windows.get_mut(&window_id) {
+                                src_host.cursor_pos = src_host
+                                    .surface_canvas
+                                    .to_logical_pos(position.x, position.y);
+                            }
+                            if !is_left_mouse_button_down() {
+                                if let Some(finished) = active_cross_drag.take() {
+                                    finish_cross_window_drag(&mut windows, finished);
+                                }
+                            } else {
+                                sync_cross_window_drag_hover(&mut windows, drag);
+                            }
+                            handled_by_cross_drag = true;
+                        }
+                        WindowEvent::KeyboardInput {
+                            event:
+                                KeyEvent {
+                                    logical_key: Key::Escape,
+                                    state: ElementState::Pressed,
+                                    ..
+                                },
+                            ..
+                        } => {
+                            active_cross_drag = None;
+                            cancel_cross_window_drag(&mut windows);
+                            handled_by_cross_drag = true;
+                        }
+                        WindowEvent::Focused(false) if window_id == drag.source_window_id => {
+                            if !is_left_mouse_button_down() {
+                                active_cross_drag = None;
+                                cancel_cross_window_drag(&mut windows);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                let cmd = if handled_by_cross_drag {
+                    WindowCommand::None
+                } else if let Some(host) = windows.get_mut(&window_id) {
+                    let cmd = host.handle_window_event(event);
+                    if active_cross_drag.is_none() && host.left_mouse_down {
+                        if let Some((ref drag_path, _)) = host.app_state.active_ide_drag {
+                            let drag = CrossWindowDragState {
+                                source_window_id: window_id,
+                                path: drag_path.clone(),
+                            };
+                            set_mouse_capture(&host.window);
+                            active_cross_drag = Some(drag);
+                        }
+                    }
+                    cmd
                 } else {
                     WindowCommand::None
                 };
+                if let Some(ref drag) = active_cross_drag {
+                    if !handled_by_cross_drag {
+                        sync_cross_window_drag_hover(&mut windows, drag);
+                    }
+                }
                 if cmd == WindowCommand::CloseWindow {
+                    if active_cross_drag
+                        .as_ref()
+                        .is_some_and(|d| d.source_window_id == window_id)
+                    {
+                        active_cross_drag = None;
+                        cancel_cross_window_drag(&mut windows);
+                    }
                     if close_burst.is_none() {
                         let snapshot = collect_open_paths(&windows, &session_order);
                         close_burst = Some((Instant::now(), snapshot));
@@ -2095,6 +2658,7 @@ impl IdeWindowHost {
             }
             WindowEvent::ReceivedImeText(text) => {
                 if !text.is_empty() && !win_text_hook::take_suppressed_ime_text(&self.window, &text) {
+                    self.last_shift_press = None;
                     self.app_state.insert_text_at_focus(&text);
                     self.app_state.touch_caret_activity();
                     self.pending_redraw = true;
@@ -2124,23 +2688,14 @@ impl IdeWindowHost {
                 self.pending_redraw = true;
             }
             WindowEvent::ModifiersChanged(new_mods) => {
-                if new_mods.shift_key()
-                    && !self.modifiers.shift_key()
-                    && !new_mods.control_key()
-                    && !new_mods.alt_key()
-                {
-                    let now = Instant::now();
-                    if let Some(prev) = self.last_shift_press {
-                        if now.duration_since(prev) <= Duration::from_millis(400) {
-                            self.app_state.execute_ide_action(IdeAction::SearchEverywhere);
-                            self.last_shift_press = None;
-                            self.pending_redraw = true;
-                        } else {
-                            self.last_shift_press = Some(now);
-                        }
-                    } else {
-                        self.last_shift_press = Some(now);
-                    }
+                if process_double_shift_modifier_event(
+                    &mut self.app_state,
+                    self.modifiers,
+                    new_mods,
+                    &mut self.last_shift_press,
+                    Instant::now(),
+                ) {
+                    self.pending_redraw = true;
                 }
                 self.modifiers = new_mods;
                 let ctrl_held = (new_mods.control_key()
@@ -2297,6 +2852,7 @@ impl IdeWindowHost {
                 ..
             } => match state {
                 ElementState::Pressed => {
+                    self.last_shift_press = None;
                     self.app_state.dismiss_startup_animation();
                     self.left_mouse_down = true;
                     let win_w = self.surface_canvas.width as i32;
@@ -2600,6 +3156,7 @@ impl IdeWindowHost {
                 if is_non_visual_key(&logical_key) && text.is_none() {
                     return WindowCommand::None;
                 }
+                self.last_shift_press = None;
                 let allow_text = should_insert_key_text(
                     cfg!(any(target_os = "macos", target_os = "windows")),
                     ime_committed,
@@ -2631,13 +3188,67 @@ impl IdeWindowHost {
         allow_text: bool,
         ime_committed: bool,
     ) -> WindowCommand {
-        let raw_ctrl = self.modifiers.control_key();
-        let cmd = cfg!(target_os = "macos") && self.modifiers.super_key();
+        dispatch_keyboard_pressed(
+            &mut self.app_state,
+            &mut self.surface_canvas,
+            self.modifiers,
+            logical_key,
+            key_text,
+            allow_text,
+            ime_committed,
+        )
+    }
+}
+
+fn process_double_shift_modifier_event(
+    app_state: &mut IdeApplicationState,
+    prev_mods: ModifiersState,
+    new_mods: ModifiersState,
+    last_shift_press: &mut Option<Instant>,
+    now: Instant,
+) -> bool {
+    if app_state.suppresses_double_shift() {
+        *last_shift_press = None;
+        return false;
+    }
+    if new_mods.shift_key()
+        && !prev_mods.shift_key()
+        && !new_mods.control_key()
+        && !new_mods.alt_key()
+        && !new_mods.super_key()
+    {
+        if let Some(prev) = *last_shift_press {
+            if now.duration_since(prev) <= Duration::from_millis(400) {
+                app_state.execute_ide_action(IdeAction::SearchEverywhere);
+                *last_shift_press = None;
+                return true;
+            }
+        }
+        *last_shift_press = Some(now);
+    }
+    false
+}
+
+fn dispatch_keyboard_pressed(
+    app_state: &mut IdeApplicationState,
+    surface_canvas: &mut SurfaceCanvas,
+    modifiers: ModifiersState,
+    logical_key: Key<'_>,
+    key_text: Option<&str>,
+    allow_text: bool,
+    ime_committed: bool,
+) -> WindowCommand {
+        let raw_ctrl = modifiers.control_key();
+        let cmd = cfg!(target_os = "macos") && modifiers.super_key();
         let ctrl = raw_ctrl || cmd;
-        let alt = self.modifiers.alt_key();
-        let shift = self.modifiers.shift_key();
-        let app_state = &mut self.app_state;
-        let surface_canvas = &mut self.surface_canvas;
+        let alt = modifiers.alt_key();
+        let shift = modifiers.shift_key();
+        let keymap = app_state.keymap_scheme;
+        let block_global_shortcuts = app_state.is_text_input_focused()
+            || !matches!(
+                app_state.focus,
+                FocusTarget::Editor | FocusTarget::AgentChatStream
+            );
 
         match &logical_key {
                         #[cfg(target_os = "macos")]
@@ -2645,62 +3256,271 @@ impl IdeWindowHost {
                             return WindowCommand::CloseWindow;
                         }
                         #[cfg(target_os = "macos")]
-                        Key::Character(ch) if cmd && !alt && !shift && ch.eq_ignore_ascii_case("w") => {
+                        Key::Character(ch)
+                            if cmd
+                                && !alt
+                                && !shift
+                                && !block_global_shortcuts
+                                && ch.eq_ignore_ascii_case("w") =>
+                        {
                             app_state.execute_ide_action(IdeAction::CloseActiveTab);
                         }
                         #[cfg(target_os = "macos")]
-                        Key::Character(ch) if cmd && !alt && !shift && *ch == "," => {
+                        Key::Character(ch)
+                            if cmd
+                                && !alt
+                                && !shift
+                                && !block_global_shortcuts
+                                && *ch == "," =>
+                        {
                             app_state.execute_ide_action(IdeAction::OpenSettingsModal);
                         }
-                        // 1. IDEA + Cursor 组合快捷键
-                        Key::Character(ch) if ctrl && alt && ch.eq_ignore_ascii_case("s") => {
+                        // 1. Ctrl+Alt 组合快捷键
+                        Key::Character(ch)
+                            if ctrl
+                                && alt
+                                && !shift
+                                && !block_global_shortcuts
+                                && ch.eq_ignore_ascii_case("s") =>
+                        {
                             app_state.execute_ide_action(IdeAction::OpenSettingsModal);
                         }
-                        Key::Character(ch) if ctrl && alt && ch.eq_ignore_ascii_case("u") => {
+                        Key::Character(ch)
+                            if ctrl
+                                && alt
+                                && !shift
+                                && !block_global_shortcuts
+                                && ch.eq_ignore_ascii_case("u") =>
+                        {
                             app_state.execute_ide_action(IdeAction::SwitchUiLanguage);
                         }
-                        Key::Character(ch) if ctrl && alt && ch.eq_ignore_ascii_case("l") => {
+                        Key::Character(ch)
+                            if ctrl
+                                && alt
+                                && !shift
+                                && !block_global_shortcuts
+                                && keymap == KeymapScheme::IntelliJIdea
+                                && ch.eq_ignore_ascii_case("l") =>
+                        {
                             app_state.execute_ide_action(IdeAction::ReformatCode);
                         }
-                        Key::Character(ch) if ctrl && alt && ch.eq_ignore_ascii_case("z") => {
+                        Key::Character(ch)
+                            if ctrl
+                                && alt
+                                && !shift
+                                && !block_global_shortcuts
+                                && ch.eq_ignore_ascii_case("z") =>
+                        {
                             app_state.execute_ide_action(IdeAction::RevertLastCheckpoint);
                         }
-                        Key::Character(ch) if ctrl && alt && ch.eq_ignore_ascii_case("n") => {
+                        Key::Character(ch)
+                            if ctrl
+                                && alt
+                                && !shift
+                                && !block_global_shortcuts
+                                && keymap == KeymapScheme::IntelliJIdea
+                                && ch.eq_ignore_ascii_case("n") =>
+                        {
                             app_state.execute_ide_action(IdeAction::NewFolderInProject);
                         }
-                        Key::Character(ch) if ctrl && shift && ch.eq_ignore_ascii_case("a") => {
+                        Key::Character(ch)
+                            if ctrl
+                                && alt
+                                && !shift
+                                && !block_global_shortcuts
+                                && ch.eq_ignore_ascii_case("b") =>
+                        {
+                            app_state.execute_ide_action(IdeAction::GitNewBranch);
+                        }
+                        // 2. Ctrl+Shift 组合快捷键 (IDEA / Eclipse)
+                        Key::Character(ch)
+                            if ctrl
+                                && shift
+                                && !alt
+                                && !block_global_shortcuts
+                                && keymap == KeymapScheme::IntelliJIdea
+                                && ch.eq_ignore_ascii_case("a") =>
+                        {
                             app_state.execute_ide_action(IdeAction::FindAction);
                         }
-                        Key::Character(ch) if ctrl && shift && ch.eq_ignore_ascii_case("n") => {
+                        Key::Character(ch)
+                            if ctrl
+                                && shift
+                                && !alt
+                                && !block_global_shortcuts
+                                && keymap == KeymapScheme::Eclipse
+                                && ch.eq_ignore_ascii_case("l") =>
+                        {
+                            app_state.execute_ide_action(IdeAction::FindAction);
+                        }
+                        Key::Character(ch)
+                            if ctrl
+                                && shift
+                                && !alt
+                                && !block_global_shortcuts
+                                && keymap == KeymapScheme::IntelliJIdea
+                                && ch.eq_ignore_ascii_case("n") =>
+                        {
                             app_state.execute_ide_action(IdeAction::GoToFile);
                         }
-                        Key::Character(ch) if ctrl && shift && ch.eq_ignore_ascii_case("f") => {
-                            app_state.execute_ide_action(IdeAction::FindInFiles);
+                        Key::Character(ch)
+                            if ctrl
+                                && shift
+                                && !alt
+                                && !block_global_shortcuts
+                                && keymap == KeymapScheme::Eclipse
+                                && ch.eq_ignore_ascii_case("r") =>
+                        {
+                            app_state.execute_ide_action(IdeAction::GoToFile);
                         }
-                        Key::Character(ch) if ctrl && shift && ch.eq_ignore_ascii_case("k") => {
+                        Key::Character(ch)
+                            if ctrl
+                                && shift
+                                && !alt
+                                && !block_global_shortcuts
+                                && ch.eq_ignore_ascii_case("f") =>
+                        {
+                            if keymap == KeymapScheme::Eclipse {
+                                app_state.execute_ide_action(IdeAction::ReformatCode);
+                            } else {
+                                app_state.execute_ide_action(IdeAction::FindInFiles);
+                            }
+                        }
+                        Key::Character(ch)
+                            if ctrl
+                                && shift
+                                && !alt
+                                && !block_global_shortcuts
+                                && keymap == KeymapScheme::Eclipse
+                                && ch.eq_ignore_ascii_case("c") =>
+                        {
+                            app_state.execute_ide_action(IdeAction::ToggleLineComment);
+                        }
+                        Key::Character(ch)
+                            if ctrl
+                                && shift
+                                && !alt
+                                && !block_global_shortcuts
+                                && keymap == KeymapScheme::Eclipse
+                                && ch.eq_ignore_ascii_case("b") =>
+                        {
+                            app_state.execute_ide_action(IdeAction::ToggleBreakpoint);
+                        }
+                        Key::Character(ch)
+                            if ctrl
+                                && shift
+                                && !alt
+                                && !block_global_shortcuts
+                                && ch.eq_ignore_ascii_case("k") =>
+                        {
                             app_state.execute_ide_action(IdeAction::GitPush);
                         }
-                        Key::Character(ch) if ctrl && shift && ch.eq_ignore_ascii_case("g") => {
+                        Key::Character(ch)
+                            if ctrl
+                                && shift
+                                && !alt
+                                && !block_global_shortcuts
+                                && ch.eq_ignore_ascii_case("g") =>
+                        {
                             app_state.execute_ide_action(IdeAction::GitBranches);
                         }
-                        Key::Character(ch) if ctrl && shift && ch.eq_ignore_ascii_case("z") => {
+                        Key::Character(ch)
+                            if ctrl
+                                && shift
+                                && !alt
+                                && (!block_global_shortcuts || app_state.active_text_input().is_some())
+                                && ch.eq_ignore_ascii_case("z") =>
+                        {
                             app_state.execute_ide_action(IdeAction::RedoEdit);
                         }
-                        Key::Character(ch) if ctrl && !alt && !shift && ch.eq_ignore_ascii_case("o") => {
+                        // 3. Alt+Shift 组合快捷键 (Eclipse Refactor / New / Run)
+                        Key::Character(ch)
+                            if alt
+                                && shift
+                                && !ctrl
+                                && !block_global_shortcuts
+                                && keymap == KeymapScheme::Eclipse
+                                && ch.eq_ignore_ascii_case("r") =>
+                        {
+                            app_state.execute_ide_action(IdeAction::RenameSymbol);
+                        }
+                        Key::Character(ch)
+                            if alt
+                                && shift
+                                && !ctrl
+                                && !block_global_shortcuts
+                                && keymap == KeymapScheme::Eclipse
+                                && ch.eq_ignore_ascii_case("n") =>
+                        {
+                            app_state.execute_ide_action(IdeAction::NewFolderInProject);
+                        }
+                        Key::Character(ch)
+                            if alt
+                                && shift
+                                && !ctrl
+                                && !block_global_shortcuts
+                                && keymap == KeymapScheme::Eclipse
+                                && ch.eq_ignore_ascii_case("x") =>
+                        {
+                            app_state.execute_ide_action(IdeAction::RunCurrentFile);
+                        }
+                        // 4. Ctrl 单修饰组合快捷键
+                        Key::Character(ch)
+                            if ctrl
+                                && !alt
+                                && !shift
+                                && !block_global_shortcuts
+                                && ch.eq_ignore_ascii_case("o") =>
+                        {
                             app_state.execute_ide_action(IdeAction::OpenFolder);
                         }
-                        Key::Character(ch) if ctrl && !alt && !shift && ch.eq_ignore_ascii_case("f") => {
+                        Key::Character(ch)
+                            if ctrl
+                                && !alt
+                                && !shift
+                                && (!block_global_shortcuts
+                                    || matches!(
+                                        app_state.focus,
+                                        FocusTarget::EditorFindInput | FocusTarget::EditorReplaceInput
+                                    ))
+                                && ch.eq_ignore_ascii_case("f") =>
+                        {
                             app_state.open_editor_find_bar(false);
                         }
                         Key::Character(ch)
                             if ctrl
                                 && !alt
                                 && !shift
-                                && (ch.eq_ignore_ascii_case("r") || ch.eq_ignore_ascii_case("h")) =>
+                                && (!block_global_shortcuts
+                                    || matches!(
+                                        app_state.focus,
+                                        FocusTarget::EditorFindInput | FocusTarget::EditorReplaceInput
+                                    ))
+                                && ch.eq_ignore_ascii_case("r") =>
                         {
                             app_state.open_editor_find_bar(true);
                         }
-                        Key::Character(ch) if ctrl && !alt && !shift && ch.eq_ignore_ascii_case("g") => {
+                        Key::Character(ch)
+                            if ctrl
+                                && !alt
+                                && !shift
+                                && !block_global_shortcuts
+                                && ch.eq_ignore_ascii_case("h") =>
+                        {
+                            if keymap == KeymapScheme::Eclipse {
+                                app_state.execute_ide_action(IdeAction::FindInFiles);
+                            } else {
+                                app_state.open_editor_find_bar(true);
+                            }
+                        }
+                        Key::Character(ch)
+                            if ctrl
+                                && !alt
+                                && !shift
+                                && !block_global_shortcuts
+                                && keymap == KeymapScheme::IntelliJIdea
+                                && ch.eq_ignore_ascii_case("g") =>
+                        {
                             app_state.open_go_to_line_modal();
                         }
                         Key::Character(ch) if ctrl && !alt && !shift && ch.eq_ignore_ascii_case("a") => {
@@ -2729,23 +3549,79 @@ impl IdeWindowHost {
                                 let pty = app_state.terminal.active_pty_mut();
                                 pty.clear();
                                 pty.send_raw_bytes(b"\x0c");
+                            } else if !block_global_shortcuts && keymap == KeymapScheme::Eclipse {
+                                app_state.open_go_to_line_modal();
                             }
                         }
-                        Key::Character(ch) if ctrl && ch.eq_ignore_ascii_case("p") => {
+                        Key::Character(ch)
+                            if ctrl
+                                && !alt
+                                && !shift
+                                && !block_global_shortcuts
+                                && keymap == KeymapScheme::Eclipse
+                                && ch.eq_ignore_ascii_case("w") =>
+                        {
+                            app_state.execute_ide_action(IdeAction::CloseActiveTab);
+                        }
+                        Key::Character(ch)
+                            if ctrl
+                                && !alt
+                                && !shift
+                                && !block_global_shortcuts
+                                && keymap == KeymapScheme::Eclipse
+                                && *ch == "1" =>
+                        {
+                            app_state.execute_ide_action(IdeAction::ShowIntentionActions);
+                        }
+                        Key::Character(ch)
+                            if ctrl
+                                && !alt
+                                && !shift
+                                && !block_global_shortcuts
+                                && keymap == KeymapScheme::Eclipse
+                                && *ch == "3" =>
+                        {
                             app_state.execute_ide_action(IdeAction::SearchEverywhere);
                         }
-                        Key::Character(ch) if ctrl && ch.eq_ignore_ascii_case("s") => {
+                        Key::Character(ch)
+                            if ctrl
+                                && !alt
+                                && !shift
+                                && !block_global_shortcuts
+                                && ch.eq_ignore_ascii_case("p") =>
+                        {
+                            app_state.execute_ide_action(IdeAction::SearchEverywhere);
+                        }
+                        Key::Character(ch)
+                            if ctrl
+                                && !alt
+                                && !shift
+                                && !block_global_shortcuts
+                                && ch.eq_ignore_ascii_case("s") =>
+                        {
                             app_state.execute_ide_action(IdeAction::SaveActiveFile);
                         }
-                        Key::Character(ch) if ctrl && ch.eq_ignore_ascii_case("d") => {
+                        Key::Character(ch) if ctrl && !alt && !shift && ch.eq_ignore_ascii_case("d") => {
                             if app_state.focus == FocusTarget::TerminalInput {
                                 app_state.terminal.active_pty_mut().send_raw_bytes(b"\x04");
-                            } else {
-                                app_state.execute_ide_action(IdeAction::DuplicateLine);
+                            } else if !block_global_shortcuts {
+                                if keymap == KeymapScheme::Eclipse {
+                                    app_state.execute_ide_action(IdeAction::DeleteLine);
+                                } else {
+                                    app_state.execute_ide_action(IdeAction::DuplicateLine);
+                                }
                             }
                         }
-                        Key::Character(ch) if ctrl && ch.eq_ignore_ascii_case("y") => {
-                            if app_state.active_text_input().is_some() {
+                        Key::Character(ch)
+                            if ctrl
+                                && !alt
+                                && !shift
+                                && (!block_global_shortcuts || app_state.active_text_input().is_some())
+                                && ch.eq_ignore_ascii_case("y") =>
+                        {
+                            if keymap == KeymapScheme::Eclipse {
+                                app_state.execute_ide_action(IdeAction::RedoEdit);
+                            } else if app_state.active_text_input().is_some() {
                                 app_state.execute_ide_action(IdeAction::RedoEdit);
                             } else if app_state.agent_hub.inline_edit.is_some() {
                                 app_state.accept_inline_diff();
@@ -2753,91 +3629,236 @@ impl IdeWindowHost {
                                 app_state.execute_ide_action(IdeAction::DeleteLine);
                             }
                         }
-                        Key::Character(ch) if ctrl && ch.eq_ignore_ascii_case("b") => {
+                        Key::Character(ch)
+                            if ctrl
+                                && !alt
+                                && !shift
+                                && !block_global_shortcuts
+                                && keymap == KeymapScheme::IntelliJIdea
+                                && ch.eq_ignore_ascii_case("b") =>
+                        {
                             app_state.execute_ide_action(IdeAction::GoToDeclaration);
                         }
-                        Key::Character(ch) if ctrl && ch.eq_ignore_ascii_case("t") => {
+                        Key::Character(ch)
+                            if ctrl
+                                && !alt
+                                && !shift
+                                && !block_global_shortcuts
+                                && ch.eq_ignore_ascii_case("t") =>
+                        {
                             app_state.execute_ide_action(IdeAction::GitPull);
                         }
-                        Key::Character(ch) if ctrl && ch.eq_ignore_ascii_case("n") => {
+                        Key::Character(ch)
+                            if ctrl
+                                && !alt
+                                && !shift
+                                && !block_global_shortcuts
+                                && ch.eq_ignore_ascii_case("n") =>
+                        {
                             app_state.execute_ide_action(IdeAction::NewFileInProject);
                         }
-                        Key::Character(ch) if ctrl && *ch == "/" => {
+                        Key::Character(ch)
+                            if ctrl
+                                && !alt
+                                && !shift
+                                && !block_global_shortcuts
+                                && *ch == "/" =>
+                        {
                             app_state.execute_ide_action(IdeAction::ToggleLineComment);
                         }
-                        Key::Character(ch) if ctrl && *ch == "`" => {
+                        Key::Character(ch)
+                            if ctrl
+                                && !alt
+                                && !shift
+                                && !block_global_shortcuts
+                                && *ch == "`" =>
+                        {
                             app_state.execute_ide_action(IdeAction::SwitchTheme);
                         }
-                        Key::Character(ch) if ctrl && !alt && (*ch == "=" || *ch == "+") => {
+                        Key::Character(ch)
+                            if ctrl
+                                && !alt
+                                && !block_global_shortcuts
+                                && (*ch == "=" || *ch == "+") =>
+                        {
                             app_state.execute_ide_action(IdeAction::ZoomInUi);
                             surface_canvas.set_scale_factor(app_state.effective_scale());
                         }
-                        Key::Character(ch) if ctrl && !alt && *ch == "-" => {
+                        Key::Character(ch)
+                            if ctrl && !alt && !block_global_shortcuts && *ch == "-" =>
+                        {
                             app_state.execute_ide_action(IdeAction::ZoomOutUi);
                             surface_canvas.set_scale_factor(app_state.effective_scale());
                         }
-                        Key::Character(ch) if ctrl && !alt && *ch == "0" => {
+                        Key::Character(ch)
+                            if ctrl && !alt && !block_global_shortcuts && *ch == "0" =>
+                        {
                             app_state.execute_ide_action(IdeAction::ResetUiZoom);
                             surface_canvas.set_scale_factor(app_state.effective_scale());
                         }
-                        Key::Character(ch) if ctrl && ch.eq_ignore_ascii_case("z") => {
+                        Key::Character(ch)
+                            if ctrl
+                                && !alt
+                                && !shift
+                                && (!block_global_shortcuts || app_state.active_text_input().is_some())
+                                && ch.eq_ignore_ascii_case("z") =>
+                        {
                             app_state.execute_ide_action(IdeAction::UndoEdit);
                         }
                         // Alt+0..9 IDEA Tool Window 快捷键
-                        Key::Character(ch) if alt && *ch == "1" => {
+                        Key::Character(ch)
+                            if alt && !ctrl && !shift && !block_global_shortcuts && *ch == "1" =>
+                        {
                             app_state.execute_ide_action(IdeAction::ToggleProjectWindow);
                         }
-                        Key::Character(ch) if alt && *ch == "0" => {
+                        Key::Character(ch)
+                            if alt && !ctrl && !shift && !block_global_shortcuts && *ch == "0" =>
+                        {
                             app_state.execute_ide_action(IdeAction::ToggleCommitWindow);
                         }
-                        Key::Character(ch) if alt && *ch == "7" => {
+                        Key::Character(ch)
+                            if alt && !ctrl && !shift && !block_global_shortcuts && *ch == "7" =>
+                        {
                             app_state.execute_ide_action(IdeAction::ToggleStructureWindow);
                         }
-                        Key::Character(ch) if alt && *ch == "8" => {
+                        Key::Character(ch)
+                            if alt && !ctrl && !shift && !block_global_shortcuts && *ch == "8" =>
+                        {
                             app_state.execute_ide_action(IdeAction::ToggleAgentHubWindow);
                         }
-                        Key::Character(ch) if alt && *ch == "9" => {
+                        Key::Character(ch)
+                            if alt && !ctrl && !shift && !block_global_shortcuts && *ch == "9" =>
+                        {
                             app_state.execute_ide_action(IdeAction::GitShowLog);
                         }
-                        // 功能键 F4..F12
-                        Key::F4 if ctrl => {
+                        // 功能键 F3..F12 (适配 IntelliJ IDEA / Eclipse 双方案)
+                        Key::F3
+                            if !ctrl
+                                && !alt
+                                && !shift
+                                && !block_global_shortcuts
+                                && keymap == KeymapScheme::Eclipse =>
+                        {
+                            app_state.execute_ide_action(IdeAction::GoToDeclaration);
+                        }
+                        Key::F4 if ctrl && !alt && !shift && !block_global_shortcuts => {
                             app_state.execute_ide_action(IdeAction::CloseActiveTab);
                         }
-                        Key::F6 if shift => {
-                            app_state.execute_ide_action(IdeAction::RenameSymbol);
-                        }
-                        Key::F7 if !ctrl && !alt && !shift => {
+                        Key::F5
+                            if !ctrl
+                                && !alt
+                                && !shift
+                                && !block_global_shortcuts
+                                && keymap == KeymapScheme::Eclipse =>
+                        {
                             app_state.debug_step_into();
                         }
-                        Key::F8 if ctrl => {
-                            app_state.execute_ide_action(IdeAction::ToggleBreakpoint);
+                        Key::F6
+                            if shift
+                                && !ctrl
+                                && !alt
+                                && !block_global_shortcuts
+                                && keymap == KeymapScheme::IntelliJIdea =>
+                        {
+                            app_state.execute_ide_action(IdeAction::RenameSymbol);
                         }
-                        Key::F8 if shift => {
-                            app_state.debug_step_out();
-                        }
-                        Key::F8 if !ctrl && !alt && !shift => {
+                        Key::F6
+                            if !ctrl
+                                && !alt
+                                && !shift
+                                && !block_global_shortcuts
+                                && keymap == KeymapScheme::Eclipse =>
+                        {
                             app_state.debug_step_over();
                         }
-                        Key::F9 if shift => {
+                        Key::F7 if !ctrl && !alt && !shift && !block_global_shortcuts => {
+                            if keymap == KeymapScheme::Eclipse {
+                                app_state.debug_step_out();
+                            } else {
+                                app_state.debug_step_into();
+                            }
+                        }
+                        Key::F8
+                            if ctrl
+                                && !alt
+                                && !shift
+                                && !block_global_shortcuts
+                                && keymap == KeymapScheme::IntelliJIdea =>
+                        {
+                            app_state.execute_ide_action(IdeAction::ToggleBreakpoint);
+                        }
+                        Key::F8
+                            if shift
+                                && !ctrl
+                                && !alt
+                                && !block_global_shortcuts
+                                && keymap == KeymapScheme::IntelliJIdea =>
+                        {
+                            app_state.debug_step_out();
+                        }
+                        Key::F8 if !ctrl && !alt && !shift && !block_global_shortcuts => {
+                            if keymap == KeymapScheme::Eclipse {
+                                app_state.debug_continue();
+                            } else {
+                                app_state.debug_step_over();
+                            }
+                        }
+                        Key::F9
+                            if shift
+                                && !ctrl
+                                && !alt
+                                && !block_global_shortcuts
+                                && keymap == KeymapScheme::IntelliJIdea =>
+                        {
                             app_state.execute_ide_action(IdeAction::DebugActiveConfig);
                         }
-                        Key::F9 if !ctrl && !alt && !shift => {
+                        Key::F9
+                            if !ctrl
+                                && !alt
+                                && !shift
+                                && !block_global_shortcuts
+                                && keymap == KeymapScheme::IntelliJIdea =>
+                        {
                             app_state.debug_continue();
                         }
-                        Key::F10 if ctrl && shift => {
+                        Key::F10 if ctrl && shift && !alt && !block_global_shortcuts => {
                             app_state.execute_ide_action(IdeAction::RunCurrentFile);
                         }
-                        Key::F10 if shift => {
+                        Key::F10
+                            if shift
+                                && !ctrl
+                                && !alt
+                                && !block_global_shortcuts
+                                && keymap == KeymapScheme::IntelliJIdea =>
+                        {
                             app_state.execute_ide_action(IdeAction::RunActiveConfig);
                         }
-                        Key::F12 if alt => {
+                        Key::F11
+                            if ctrl
+                                && !alt
+                                && !shift
+                                && !block_global_shortcuts
+                                && keymap == KeymapScheme::Eclipse =>
+                        {
+                            app_state.execute_ide_action(IdeAction::RunActiveConfig);
+                        }
+                        Key::F11
+                            if !ctrl
+                                && !alt
+                                && !shift
+                                && !block_global_shortcuts
+                                && keymap == KeymapScheme::Eclipse =>
+                        {
+                            app_state.execute_ide_action(IdeAction::DebugActiveConfig);
+                        }
+                        Key::F12 if alt && !ctrl && !shift && !block_global_shortcuts => {
                             app_state.execute_ide_action(IdeAction::ToggleTerminalWindow);
                         }
-                        Key::Insert if alt => {
+                        Key::Insert if alt && !block_global_shortcuts => {
                             app_state.execute_ide_action(IdeAction::NewFileInProject);
                         }
                         Key::Delete => {
-                            if alt {
+                            if alt && !block_global_shortcuts {
                                 app_state.execute_ide_action(IdeAction::DeleteSelectedPath);
                             } else if app_state.focus == FocusTarget::TerminalInput {
                                 app_state.terminal.active_pty_mut().send_raw_bytes(b"\x1b[3~");
@@ -2869,7 +3890,12 @@ impl IdeWindowHost {
                                 app_state.focus = FocusTarget::EditorReplaceInput;
                             } else if app_state.focus == FocusTarget::EditorReplaceInput {
                                 app_state.focus = FocusTarget::EditorFindInput;
-                            } else if app_state.agent_hub.inline_edit.is_some() {
+                            } else if app_state.agent_hub.inline_edit.is_some()
+                                && matches!(
+                                    app_state.focus,
+                                    FocusTarget::Editor | FocusTarget::CtrlKPrompt
+                                )
+                            {
                                 app_state.accept_inline_diff();
                             } else if app_state.focus == FocusTarget::TerminalInput {
                                 app_state.terminal.active_pty_mut().send_raw_bytes(b"\t");
@@ -3154,7 +4180,11 @@ impl IdeWindowHost {
                                 pty.send_raw_bytes(b"\r");
                             }
                             FocusTarget::GitCommitInput => {
-                                app_state.submit_git_commit(false);
+                                if shift {
+                                    app_state.insert_text_at_focus("\n");
+                                } else {
+                                    app_state.submit_git_commit(false);
+                                }
                             }
                             FocusTarget::GitLogSearchInput => {
                                 app_state.git_log_scroll = 0;
@@ -3310,8 +4340,12 @@ impl IdeWindowHost {
                             }
                         }
                         Key::ArrowUp => {
-                            if app_state.focus == FocusTarget::AgentChatInput {
+                            if ctrl && alt && !shift && keymap == KeymapScheme::Eclipse && app_state.focus == FocusTarget::Editor {
+                                app_state.execute_ide_action(IdeAction::DuplicateLine);
+                            } else if app_state.focus == FocusTarget::AgentChatInput {
                                 app_state.move_agent_input_vertical(-1, shift, &surface_canvas);
+                            } else if app_state.focus == FocusTarget::GitCommitInput {
+                                app_state.move_git_commit_input_vertical(-1, shift, &surface_canvas);
                             } else if app_state.focus == FocusTarget::RecentProjectsModal {
                                 app_state.move_recent_projects_selection(-1);
                             } else if app_state.focus == FocusTarget::TerminalInput {
@@ -3322,8 +4356,12 @@ impl IdeWindowHost {
                             }
                         }
                         Key::ArrowDown => {
-                            if app_state.focus == FocusTarget::AgentChatInput {
+                            if ctrl && alt && !shift && keymap == KeymapScheme::Eclipse && app_state.focus == FocusTarget::Editor {
+                                app_state.execute_ide_action(IdeAction::DuplicateLine);
+                            } else if app_state.focus == FocusTarget::AgentChatInput {
                                 app_state.move_agent_input_vertical(1, shift, &surface_canvas);
+                            } else if app_state.focus == FocusTarget::GitCommitInput {
+                                app_state.move_git_commit_input_vertical(1, shift, &surface_canvas);
                             } else if app_state.focus == FocusTarget::RecentProjectsModal {
                                 app_state.move_recent_projects_selection(1);
                             } else if app_state.focus == FocusTarget::TerminalInput {
@@ -3343,7 +4381,6 @@ impl IdeWindowHost {
                             _ => {}
                         }
         WindowCommand::None
-    }
 }
 
 #[cfg(test)]
@@ -3486,5 +4523,313 @@ mod key_ime_tests {
             false,
         );
         assert_eq!(dy_linux, 5.0);
+    }
+}
+
+#[cfg(test)]
+mod external_open_tests {
+    use crate::external_open::{
+        parse_cli_args, path_is_inside_workspace, split_path_and_position, ExternalOpenTarget,
+    };
+    use std::path::Path;
+
+    #[test]
+    fn external_open_parses_file_line_column() {
+        let file = std::env::temp_dir().join("rust-ai-ide-open-probe.txt");
+        std::fs::write(&file, "probe\n").unwrap();
+        let args = vec![
+            "ide-app.exe".to_string(),
+            file.display().to_string(),
+            "12".to_string(),
+            "4".to_string(),
+        ];
+        let parsed = parse_cli_args(&args, None);
+        assert_eq!(
+            parsed.targets,
+            vec![ExternalOpenTarget::OpenFile {
+                path: file.clone(),
+                line: Some(12),
+                column: Some(4),
+                cwd: None,
+                new_window: false,
+            }]
+        );
+
+        let combined = format!("{}:8:2", file.display());
+        let (path, line, col) = split_path_and_position(&combined);
+        assert_eq!(path, file.display().to_string());
+        assert_eq!(line, Some(8));
+        assert_eq!(col, Some(2));
+        assert!(path_is_inside_workspace(
+            Path::new(r"D:\work\full\light-ai\frontend\src\App.vue"),
+            Path::new(r"D:\work\full\light-ai"),
+        ));
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn eclipse_keymap_dispatches_classic_shortcuts() {
+        use super::{dispatch_keyboard_pressed, FocusTarget, IdeApplicationState, SurfaceCanvas};
+        use ide_core::KeymapScheme;
+        use tao::keyboard::{Key, ModifiersState};
+
+        let root = std::env::temp_dir().join(format!(
+            "rust_ai_ide_eclipse_dispatch_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let app_file = root.join("demo.ts");
+        std::fs::write(&app_file, "const alpha = 1;\nconst beta = 2;\n").unwrap();
+
+        let mut state = IdeApplicationState::new(root.clone());
+        state.wakeup_enabled = false;
+        state.open_file(app_file);
+        state.focus = FocusTarget::Editor;
+        state.keymap_scheme = KeymapScheme::Eclipse;
+        let mut canvas = SurfaceCanvas::new_with_scale(1280, 720, 1.0);
+
+        // Ctrl+Alt+Down -> DuplicateLine in Eclipse
+        state.active_buffer_mut().set_cursor(0, 0, false);
+        dispatch_keyboard_pressed(
+            &mut state,
+            &mut canvas,
+            ModifiersState::CONTROL | ModifiersState::ALT,
+            Key::ArrowDown,
+            None,
+            false,
+            false,
+        );
+        assert_eq!(state.active_buffer().line_text(1), "const alpha = 1;");
+
+        // Ctrl+D -> DeleteLine in Eclipse
+        state.active_buffer_mut().set_cursor(1, 0, false);
+        dispatch_keyboard_pressed(
+            &mut state,
+            &mut canvas,
+            ModifiersState::CONTROL,
+            Key::Character("d"),
+            None,
+            false,
+            false,
+        );
+        assert_eq!(state.active_buffer().line_text(1), "const beta = 2;");
+
+        // Ctrl+Y -> RedoEdit in Eclipse (after Undo)
+        dispatch_keyboard_pressed(
+            &mut state,
+            &mut canvas,
+            ModifiersState::CONTROL,
+            Key::Character("z"),
+            None,
+            false,
+            false,
+        );
+        assert_eq!(state.active_buffer().line_text(1), "const alpha = 1;");
+        dispatch_keyboard_pressed(
+            &mut state,
+            &mut canvas,
+            ModifiersState::CONTROL,
+            Key::Character("y"),
+            None,
+            false,
+            false,
+        );
+        assert_eq!(state.active_buffer().line_text(1), "const beta = 2;");
+
+        // Ctrl+H -> FindInFilesModal in Eclipse
+        dispatch_keyboard_pressed(
+            &mut state,
+            &mut canvas,
+            ModifiersState::CONTROL,
+            Key::Character("h"),
+            None,
+            false,
+            false,
+        );
+        assert_eq!(state.focus, FocusTarget::FindInFilesModal);
+        state.focus = FocusTarget::Editor;
+
+        // Ctrl+L -> GoToLineModal in Eclipse
+        dispatch_keyboard_pressed(
+            &mut state,
+            &mut canvas,
+            ModifiersState::CONTROL,
+            Key::Character("l"),
+            None,
+            false,
+            false,
+        );
+        assert_eq!(state.focus, FocusTarget::GoToLineModal);
+        state.focus = FocusTarget::Editor;
+
+        // Ctrl+3 -> SearchEverywhereModal in Eclipse
+        dispatch_keyboard_pressed(
+            &mut state,
+            &mut canvas,
+            ModifiersState::CONTROL,
+            Key::Character("3"),
+            None,
+            false,
+            false,
+        );
+        assert_eq!(state.focus, FocusTarget::SearchEverywhereModal);
+        state.focus = FocusTarget::Editor;
+
+        // Alt+Shift+R -> RenameSymbolModal in Eclipse when caret is on identifier
+        state.active_buffer_mut().set_cursor(0, 7, false);
+        dispatch_keyboard_pressed(
+            &mut state,
+            &mut canvas,
+            ModifiersState::ALT | ModifiersState::SHIFT,
+            Key::Character("r"),
+            None,
+            false,
+            false,
+        );
+        assert_eq!(state.focus, FocusTarget::RenameSymbolModal);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn text_inputs_suppress_double_shift_and_global_shortcuts() {
+        use super::{
+            dispatch_keyboard_pressed, process_double_shift_modifier_event, FocusTarget,
+            IdeApplicationState, SurfaceCanvas,
+        };
+        use std::time::{Duration, Instant};
+        use tao::keyboard::{Key, ModifiersState};
+
+        let root = std::env::temp_dir().join(format!(
+            "rust_ai_ide_input_shortcut_guard_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("main.rs");
+        std::fs::write(&file, "fn main() {\n    let x = 1;\n}\n").unwrap();
+
+        let mut state = IdeApplicationState::new(root.clone());
+        state.wakeup_enabled = false;
+        state.open_file(file);
+        let mut canvas = SurfaceCanvas::new_with_scale(1280, 720, 1.0);
+        let t0 = Instant::now();
+
+        // 1. In GitCommitInput and AgentChatInput, Double-Shift must NOT trigger SearchEverywhere.
+        for input_focus in [
+            FocusTarget::GitCommitInput,
+            FocusTarget::AgentChatInput,
+            FocusTarget::TerminalInput,
+            FocusTarget::EditorFindInput,
+        ] {
+            state.focus = input_focus;
+            let mut last_shift = None;
+            assert!(!process_double_shift_modifier_event(
+                &mut state,
+                ModifiersState::empty(),
+                ModifiersState::SHIFT,
+                &mut last_shift,
+                t0,
+            ));
+            assert!(!process_double_shift_modifier_event(
+                &mut state,
+                ModifiersState::empty(),
+                ModifiersState::SHIFT,
+                &mut last_shift,
+                t0 + Duration::from_millis(120),
+            ));
+            assert_eq!(state.focus, input_focus);
+        }
+
+        // 2. While GitCommitInput or AgentChatInput is focused, global/editor shortcuts do not fire,
+        //    while input editing/undo/redo still works.
+        state.focus = FocusTarget::GitCommitInput;
+        state.git_commit_input.set_text("feat: initial");
+        let before_editor_text = state.active_buffer().text();
+
+        // Ctrl+D, Ctrl+/, Ctrl+Shift+A, Ctrl+P, Alt+1 must be ignored.
+        for (mods, key) in [
+            (ModifiersState::CONTROL, Key::Character("d")),
+            (ModifiersState::CONTROL, Key::Character("/")),
+            (
+                ModifiersState::CONTROL | ModifiersState::SHIFT,
+                Key::Character("a"),
+            ),
+            (ModifiersState::CONTROL, Key::Character("p")),
+            (ModifiersState::ALT, Key::Character("1")),
+            (ModifiersState::ALT, Key::Delete),
+        ] {
+            dispatch_keyboard_pressed(&mut state, &mut canvas, mods, key, None, false, false);
+            assert_eq!(state.focus, FocusTarget::GitCommitInput);
+            assert_eq!(state.active_buffer().text(), before_editor_text);
+        }
+
+        // Ctrl+A + Backspace + Ctrl+Z + Ctrl+Y operate on GitCommitInput itself.
+        dispatch_keyboard_pressed(
+            &mut state,
+            &mut canvas,
+            ModifiersState::CONTROL,
+            Key::Character("a"),
+            None,
+            false,
+            false,
+        );
+        dispatch_keyboard_pressed(
+            &mut state,
+            &mut canvas,
+            ModifiersState::empty(),
+            Key::Backspace,
+            None,
+            false,
+            false,
+        );
+        assert_eq!(state.git_commit_input.as_str(), "");
+        dispatch_keyboard_pressed(
+            &mut state,
+            &mut canvas,
+            ModifiersState::CONTROL,
+            Key::Character("z"),
+            None,
+            false,
+            false,
+        );
+        assert_eq!(state.git_commit_input.as_str(), "feat: initial");
+
+        // Same for AgentChatInput.
+        state.focus = FocusTarget::AgentChatInput;
+        dispatch_keyboard_pressed(
+            &mut state,
+            &mut canvas,
+            ModifiersState::CONTROL | ModifiersState::SHIFT,
+            Key::Character("f"),
+            None,
+            false,
+            false,
+        );
+        assert_eq!(state.focus, FocusTarget::AgentChatInput);
+
+        // 3. In Editor, two standalone Shift presses within 400ms DO trigger SearchEverywhere,
+        //    whereas Shift presses separated by a character key reset last_shift_press.
+        state.focus = FocusTarget::Editor;
+        let mut last_shift = None;
+        assert!(!process_double_shift_modifier_event(
+            &mut state,
+            ModifiersState::empty(),
+            ModifiersState::SHIFT,
+            &mut last_shift,
+            t0,
+        ));
+        assert!(last_shift.is_some());
+        assert!(process_double_shift_modifier_event(
+            &mut state,
+            ModifiersState::empty(),
+            ModifiersState::SHIFT,
+            &mut last_shift,
+            t0 + Duration::from_millis(150),
+        ));
+        assert_eq!(state.focus, FocusTarget::SearchEverywhereModal);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

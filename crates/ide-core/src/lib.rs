@@ -239,6 +239,9 @@ pub enum LanguageId {
     C,
     Cpp,
     CSharp,
+    Vue,
+    Svelte,
+    Astro,
     Html,
     Css,
     Yaml,
@@ -295,7 +298,10 @@ impl LanguageId {
             "c" | "h" => Self::C,
             "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" | "ino" => Self::Cpp,
             "cs" => Self::CSharp,
-            "html" | "htm" | "vue" | "svelte" | "astro" => Self::Html,
+            "vue" => Self::Vue,
+            "svelte" => Self::Svelte,
+            "astro" => Self::Astro,
+            "html" | "htm" => Self::Html,
             "css" | "scss" | "sass" | "less" => Self::Css,
             "yaml" | "yml" => Self::Yaml,
             "xml" | "svg" | "plist" | "csproj" | "vcxproj" | "props" | "targets" | "pom"
@@ -324,7 +330,10 @@ impl LanguageId {
             "c" => Self::C,
             "cpp" | "c++" | "cc" | "cxx" | "hpp" => Self::Cpp,
             "cs" | "csharp" | "c#" => Self::CSharp,
-            "html" | "htm" | "vue" | "svelte" | "astro" => Self::Html,
+            "vue" => Self::Vue,
+            "svelte" => Self::Svelte,
+            "astro" => Self::Astro,
+            "html" | "htm" => Self::Html,
             "css" | "scss" | "sass" | "less" => Self::Css,
             "yaml" | "yml" => Self::Yaml,
             "xml" | "svg" | "xaml" => Self::Xml,
@@ -351,7 +360,10 @@ impl LanguageId {
             Self::C => "C",
             Self::Cpp => "C++",
             Self::CSharp => "C#",
-            Self::Html => "HTML / Vue",
+            Self::Vue => "Vue",
+            Self::Svelte => "Svelte",
+            Self::Astro => "Astro",
+            Self::Html => "HTML",
             Self::Css => "CSS / SCSS",
             Self::Yaml => "YAML",
             Self::Xml => "XML",
@@ -377,6 +389,9 @@ impl LanguageId {
             Self::C => "c",
             Self::Cpp => "cpp",
             Self::CSharp => "csharp",
+            Self::Vue => "vue",
+            Self::Svelte => "svelte",
+            Self::Astro => "astro",
             Self::Html => "html",
             Self::Css => "css",
             Self::Yaml => "yaml",
@@ -401,6 +416,9 @@ impl LanguageId {
             Self::Dart => Some("dart"),
             Self::C | Self::Cpp => Some("clangd"),
             Self::CSharp => Some("csharp-ls"),
+            Self::Vue => Some("vue-language-server"),
+            Self::Svelte => Some("svelteserver"),
+            Self::Astro => Some("astro-ls"),
             _ => None,
         }
     }
@@ -408,7 +426,9 @@ impl LanguageId {
     pub fn default_dap_adapter(&self) -> Option<&'static str> {
         match self {
             Self::Rust | Self::C | Self::Cpp => Some("codelldb"),
-            Self::TypeScript | Self::JavaScript => Some("js-debug"),
+            Self::TypeScript | Self::JavaScript | Self::Vue | Self::Svelte | Self::Astro => {
+                Some("js-debug")
+            }
             Self::Python => Some("debugpy"),
             Self::Java | Self::Kotlin => Some("java-debug"),
             Self::Go => Some("dlv"),
@@ -428,6 +448,105 @@ impl LanguageId {
 
     pub fn supports_symbol_indexing(&self) -> bool {
         !matches!(self, Self::PlainText)
+    }
+
+    pub fn is_sfc_or_html(&self) -> bool {
+        matches!(self, Self::Vue | Self::Svelte | Self::Astro | Self::Html)
+    }
+}
+
+/// 快捷键映射方案（支持 IntelliJ IDEA 默认方案与 Eclipse 经典方案）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum KeymapScheme {
+    IntelliJIdea,
+    Eclipse,
+}
+
+impl Default for KeymapScheme {
+    fn default() -> Self {
+        Self::IntelliJIdea
+    }
+}
+
+impl KeymapScheme {
+    pub fn all() -> &'static [Self] {
+        &[Self::IntelliJIdea, Self::Eclipse]
+    }
+
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            Self::IntelliJIdea => "IntelliJ IDEA",
+            Self::Eclipse => "Eclipse",
+        }
+    }
+
+    pub fn display_name_i18n(&self, lang: UiLanguage) -> &'static str {
+        match (self, lang) {
+            (Self::IntelliJIdea, UiLanguage::ZhCn) => "IntelliJ IDEA（默认）",
+            (Self::IntelliJIdea, UiLanguage::EnUs) => "IntelliJ IDEA (Default)",
+            (Self::Eclipse, UiLanguage::ZhCn) => "Eclipse（经典快捷键）",
+            (Self::Eclipse, UiLanguage::EnUs) => "Eclipse (Classic)",
+        }
+    }
+
+    pub fn short_label(&self) -> &'static str {
+        match self {
+            Self::IntelliJIdea => "IDEA",
+            Self::Eclipse => "Eclipse",
+        }
+    }
+
+    pub fn next(&self) -> Self {
+        match self {
+            Self::IntelliJIdea => Self::Eclipse,
+            Self::Eclipse => Self::IntelliJIdea,
+        }
+    }
+
+    pub fn editor_find_label(&self) -> &'static str {
+        "Ctrl+F"
+    }
+
+    pub fn editor_replace_label(&self) -> &'static str {
+        match self {
+            Self::IntelliJIdea => "Ctrl+R",
+            Self::Eclipse => "Ctrl+F / Ctrl+R",
+        }
+    }
+
+    pub fn go_to_line_label(&self) -> &'static str {
+        match self {
+            Self::IntelliJIdea => "Ctrl+G",
+            Self::Eclipse => "Ctrl+L",
+        }
+    }
+
+    pub fn debug_step_into_label(&self) -> &'static str {
+        match self {
+            Self::IntelliJIdea => "F7",
+            Self::Eclipse => "F5",
+        }
+    }
+
+    pub fn debug_step_over_label(&self) -> &'static str {
+        match self {
+            Self::IntelliJIdea => "F8",
+            Self::Eclipse => "F6",
+        }
+    }
+
+    pub fn debug_step_out_label(&self) -> &'static str {
+        match self {
+            Self::IntelliJIdea => "Shift+F8",
+            Self::Eclipse => "F7",
+        }
+    }
+
+    pub fn debug_continue_label(&self) -> &'static str {
+        match self {
+            Self::IntelliJIdea => "F9",
+            Self::Eclipse => "F8",
+        }
     }
 }
 
@@ -817,74 +936,149 @@ impl IdeAction {
     }
 
     pub fn shortcut_label(&self) -> &'static str {
-        match self {
-            Self::SearchEverywhere => "Double Shift",
-            Self::FindAction => "Ctrl+Shift+A",
-            Self::GoToFile => "Ctrl+Shift+N",
-            Self::FindInFiles => "Ctrl+Shift+F",
-            Self::GoToDeclaration => "Ctrl+B",
-            Self::OpenFolder => "Ctrl+O",
-            Self::OpenFromGitRepo => "",
-            Self::NewFileInProject => "Alt+Insert",
-            Self::NewFolderInProject => "Ctrl+Alt+N",
-            Self::DeleteSelectedPath => "Delete",
-            Self::SaveActiveFile => "Ctrl+S",
-            Self::CloseActiveTab => "Ctrl+F4",
-            Self::UndoEdit => "Ctrl+Z",
-            Self::RedoEdit => "Ctrl+Shift+Z",
-            Self::DuplicateLine => "Ctrl+D",
-            Self::DeleteLine => "Ctrl+Back",
-            Self::ToggleLineComment => "Ctrl+/",
-            Self::ReformatCode => "Ctrl+Alt+L",
-            Self::RenameSymbol => "Shift+F6",
-            Self::ShowIntentionActions => "Alt+Enter",
-            Self::InlineAiEdit => "Ctrl+K",
-            Self::SendSelectionToAgent => "Alt+L",
-            Self::AcceptInlineDiff => "Tab",
-            Self::RejectInlineDiff => "Esc",
-            Self::RevertLastCheckpoint => "Ctrl+Alt+Z",
-            Self::SwitchToAntigravity => "Alt+G",
-            Self::SwitchToClaudeCode => "Alt+C",
-            Self::SwitchToCodexCli => "Alt+X",
-            Self::RunActiveConfig => "Shift+F10",
-            Self::RunCurrentFile => "Ctrl+Shift+F10",
-            Self::DebugActiveConfig => "Shift+F9",
-            Self::ToggleBreakpoint => "Ctrl+F8",
-            Self::CheckMobileDevicesAndSdk => "",
-            Self::GitCommitPopup => "Alt+0",
-            Self::GitPull => "Ctrl+T",
-            Self::GitPush => "Ctrl+Shift+K",
-            Self::GitFetch => "",
-            Self::GitMerge => "",
-            Self::GitRebase => "",
-            Self::GitBranches => "Ctrl+Shift+G",
-            Self::GitNewBranch => "Ctrl+Alt+B",
-            Self::GitNewTag => "",
-            Self::GitStashChanges => "",
-            Self::GitUnstashChanges => "",
-            Self::GitResetHead => "",
-            Self::GitRollback => "",
-            Self::GitShowDiff => "",
-            Self::GitAnnotateBlame => "",
-            Self::GitFileHistory => "",
-            Self::GitRollbackCurrentFile => "",
-            Self::GitShowLog => "Alt+9",
-            Self::GitManageRemotes => "",
-            Self::ToggleProjectWindow => "Alt+1",
-            Self::ToggleCommitWindow => "Alt+0",
-            Self::ToggleStructureWindow => "Alt+7",
-            Self::ToggleAgentHubWindow => "Alt+8",
-            Self::ToggleTerminalWindow => "Alt+F12",
-            Self::OpenSettingsModal => "Ctrl+Alt+S",
-            Self::SwitchTheme => "Ctrl+`",
-            Self::SwitchUiLanguage => "Ctrl+Alt+U",
-            Self::ZoomInUi => "Ctrl+=",
-            Self::ZoomOutUi => "Ctrl+-",
-            Self::ResetUiZoom => "Ctrl+0",
-            Self::WidenLeftPanel => "Ctrl+Shift+Right",
-            Self::NarrowLeftPanel => "Ctrl+Shift+Left",
-            Self::WidenRightPanel => "Ctrl+Alt+Left",
-            Self::RaiseBottomPanel => "Ctrl+Shift+Up",
+        self.shortcut_label_for(KeymapScheme::IntelliJIdea)
+    }
+
+    pub fn shortcut_label_for(&self, scheme: KeymapScheme) -> &'static str {
+        match scheme {
+            KeymapScheme::IntelliJIdea => match self {
+                Self::SearchEverywhere => "Double Shift",
+                Self::FindAction => "Ctrl+Shift+A",
+                Self::GoToFile => "Ctrl+Shift+N",
+                Self::FindInFiles => "Ctrl+Shift+F",
+                Self::GoToDeclaration => "Ctrl+B",
+                Self::OpenFolder => "Ctrl+O",
+                Self::OpenFromGitRepo => "",
+                Self::NewFileInProject => "Alt+Insert",
+                Self::NewFolderInProject => "Ctrl+Alt+N",
+                Self::DeleteSelectedPath => "Delete",
+                Self::SaveActiveFile => "Ctrl+S",
+                Self::CloseActiveTab => "Ctrl+F4",
+                Self::UndoEdit => "Ctrl+Z",
+                Self::RedoEdit => "Ctrl+Shift+Z",
+                Self::DuplicateLine => "Ctrl+D",
+                Self::DeleteLine => "Ctrl+Y",
+                Self::ToggleLineComment => "Ctrl+/",
+                Self::ReformatCode => "Ctrl+Alt+L",
+                Self::RenameSymbol => "Shift+F6",
+                Self::ShowIntentionActions => "Alt+Enter",
+                Self::InlineAiEdit => "Ctrl+K",
+                Self::SendSelectionToAgent => "Alt+L",
+                Self::AcceptInlineDiff => "Tab",
+                Self::RejectInlineDiff => "Esc",
+                Self::RevertLastCheckpoint => "Ctrl+Alt+Z",
+                Self::SwitchToAntigravity => "Alt+G",
+                Self::SwitchToClaudeCode => "Alt+C",
+                Self::SwitchToCodexCli => "Alt+X",
+                Self::RunActiveConfig => "Shift+F10",
+                Self::RunCurrentFile => "Ctrl+Shift+F10",
+                Self::DebugActiveConfig => "Shift+F9",
+                Self::ToggleBreakpoint => "Ctrl+F8",
+                Self::CheckMobileDevicesAndSdk => "",
+                Self::GitCommitPopup => "Alt+0",
+                Self::GitPull => "Ctrl+T",
+                Self::GitPush => "Ctrl+Shift+K",
+                Self::GitFetch => "",
+                Self::GitMerge => "",
+                Self::GitRebase => "",
+                Self::GitBranches => "Ctrl+Shift+G",
+                Self::GitNewBranch => "Ctrl+Alt+B",
+                Self::GitNewTag => "",
+                Self::GitStashChanges => "",
+                Self::GitUnstashChanges => "",
+                Self::GitResetHead => "",
+                Self::GitRollback => "",
+                Self::GitShowDiff => "",
+                Self::GitAnnotateBlame => "",
+                Self::GitFileHistory => "",
+                Self::GitRollbackCurrentFile => "",
+                Self::GitShowLog => "Alt+9",
+                Self::GitManageRemotes => "",
+                Self::ToggleProjectWindow => "Alt+1",
+                Self::ToggleCommitWindow => "Alt+0",
+                Self::ToggleStructureWindow => "Alt+7",
+                Self::ToggleAgentHubWindow => "Alt+8",
+                Self::ToggleTerminalWindow => "Alt+F12",
+                Self::OpenSettingsModal => "Ctrl+Alt+S",
+                Self::SwitchTheme => "Ctrl+`",
+                Self::SwitchUiLanguage => "Ctrl+Alt+U",
+                Self::ZoomInUi => "Ctrl+=",
+                Self::ZoomOutUi => "Ctrl+-",
+                Self::ResetUiZoom => "Ctrl+0",
+                Self::WidenLeftPanel => "Ctrl+Shift+Right",
+                Self::NarrowLeftPanel => "Ctrl+Shift+Left",
+                Self::WidenRightPanel => "Ctrl+Alt+Left",
+                Self::RaiseBottomPanel => "Ctrl+Shift+Up",
+            },
+            KeymapScheme::Eclipse => match self {
+                Self::SearchEverywhere => "Ctrl+3",
+                Self::FindAction => "Ctrl+Shift+L",
+                Self::GoToFile => "Ctrl+Shift+R",
+                Self::FindInFiles => "Ctrl+H",
+                Self::GoToDeclaration => "F3",
+                Self::OpenFolder => "Ctrl+O",
+                Self::OpenFromGitRepo => "",
+                Self::NewFileInProject => "Ctrl+N",
+                Self::NewFolderInProject => "Alt+Shift+N",
+                Self::DeleteSelectedPath => "Delete",
+                Self::SaveActiveFile => "Ctrl+S",
+                Self::CloseActiveTab => "Ctrl+W",
+                Self::UndoEdit => "Ctrl+Z",
+                Self::RedoEdit => "Ctrl+Y",
+                Self::DuplicateLine => "Ctrl+Alt+Down",
+                Self::DeleteLine => "Ctrl+D",
+                Self::ToggleLineComment => "Ctrl+/",
+                Self::ReformatCode => "Ctrl+Shift+F",
+                Self::RenameSymbol => "Alt+Shift+R",
+                Self::ShowIntentionActions => "Ctrl+1",
+                Self::InlineAiEdit => "Ctrl+K",
+                Self::SendSelectionToAgent => "Alt+L",
+                Self::AcceptInlineDiff => "Tab",
+                Self::RejectInlineDiff => "Esc",
+                Self::RevertLastCheckpoint => "Ctrl+Alt+Z",
+                Self::SwitchToAntigravity => "Alt+G",
+                Self::SwitchToClaudeCode => "Alt+C",
+                Self::SwitchToCodexCli => "Alt+X",
+                Self::RunActiveConfig => "Ctrl+F11",
+                Self::RunCurrentFile => "Alt+Shift+X",
+                Self::DebugActiveConfig => "F11",
+                Self::ToggleBreakpoint => "Ctrl+Shift+B",
+                Self::CheckMobileDevicesAndSdk => "",
+                Self::GitCommitPopup => "Alt+0",
+                Self::GitPull => "Ctrl+T",
+                Self::GitPush => "Ctrl+Shift+K",
+                Self::GitFetch => "",
+                Self::GitMerge => "",
+                Self::GitRebase => "",
+                Self::GitBranches => "Ctrl+Shift+G",
+                Self::GitNewBranch => "Ctrl+Alt+B",
+                Self::GitNewTag => "",
+                Self::GitStashChanges => "",
+                Self::GitUnstashChanges => "",
+                Self::GitResetHead => "",
+                Self::GitRollback => "",
+                Self::GitShowDiff => "",
+                Self::GitAnnotateBlame => "",
+                Self::GitFileHistory => "",
+                Self::GitRollbackCurrentFile => "",
+                Self::GitShowLog => "Alt+9",
+                Self::GitManageRemotes => "",
+                Self::ToggleProjectWindow => "Alt+1",
+                Self::ToggleCommitWindow => "Alt+0",
+                Self::ToggleStructureWindow => "Alt+7",
+                Self::ToggleAgentHubWindow => "Alt+8",
+                Self::ToggleTerminalWindow => "Alt+F12",
+                Self::OpenSettingsModal => "Ctrl+Alt+S",
+                Self::SwitchTheme => "Ctrl+`",
+                Self::SwitchUiLanguage => "Ctrl+Alt+U",
+                Self::ZoomInUi => "Ctrl+=",
+                Self::ZoomOutUi => "Ctrl+-",
+                Self::ResetUiZoom => "Ctrl+0",
+                Self::WidenLeftPanel => "Ctrl+Shift+Right",
+                Self::NarrowLeftPanel => "Ctrl+Shift+Left",
+                Self::WidenRightPanel => "Ctrl+Alt+Left",
+                Self::RaiseBottomPanel => "Ctrl+Shift+Up",
+            },
         }
     }
 
@@ -1190,6 +1384,26 @@ mod tests {
         assert_eq!(java.lsp_language_id(), "java");
         assert_eq!(java.default_lsp_binary(), Some("jdtls"));
         assert_eq!(java.default_dap_adapter(), Some("java-debug"));
+
+        let vue = LanguageId::from_path(Path::new("src/App.vue"));
+        assert_eq!(vue, LanguageId::Vue);
+        assert_eq!(vue.display_name(), "Vue");
+        assert_eq!(vue.lsp_language_id(), "vue");
+        assert_eq!(vue.default_lsp_binary(), Some("vue-language-server"));
+        assert_eq!(vue.default_dap_adapter(), Some("js-debug"));
+        assert_eq!(LanguageId::from_path(Path::new("src/App.svelte")), LanguageId::Svelte);
+        assert_eq!(LanguageId::from_path(Path::new("src/pages/index.astro")), LanguageId::Astro);
+        assert_eq!(LanguageId::from_fence_tag("vue"), LanguageId::Vue);
+
+        assert_eq!(KeymapScheme::default(), KeymapScheme::IntelliJIdea);
+        assert_eq!(KeymapScheme::IntelliJIdea.next(), KeymapScheme::Eclipse);
+        assert_eq!(IdeAction::DeleteLine.shortcut_label_for(KeymapScheme::Eclipse), "Ctrl+D");
+        assert_eq!(IdeAction::DuplicateLine.shortcut_label_for(KeymapScheme::Eclipse), "Ctrl+Alt+Down");
+        assert_eq!(IdeAction::ReformatCode.shortcut_label_for(KeymapScheme::Eclipse), "Ctrl+Shift+F");
+        assert_eq!(IdeAction::GoToDeclaration.shortcut_label_for(KeymapScheme::Eclipse), "F3");
+        assert_eq!(IdeAction::RenameSymbol.shortcut_label_for(KeymapScheme::Eclipse), "Alt+Shift+R");
+        assert_eq!(IdeAction::FindInFiles.shortcut_label_for(KeymapScheme::Eclipse), "Ctrl+H");
+
         let t = ThemeKind::IslandsDark.next();
         assert_eq!(t, ThemeKind::DarculaClassic);
     }

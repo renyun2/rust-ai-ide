@@ -1,6 +1,7 @@
 use crate::canvas::{FontStyle, Rect};
 use cosmic_text::{
-    Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache, SwashContent, Weight, Wrap,
+    Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Style, SwashCache, SwashContent, Weight,
+    Wrap,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -205,20 +206,25 @@ impl CosmicTextEngine {
         }
     }
 
-    fn style_spec(style: FontStyle) -> (bool, f32, Weight) {
+    fn style_spec(style: FontStyle) -> (bool, f32, Weight, Style) {
         match style {
-            FontStyle::UiRegular => (false, 14.5, Weight::NORMAL),
-            FontStyle::UiBold => (false, 14.5, Weight::SEMIBOLD),
-            FontStyle::UiSmall => (false, 13.5, Weight::NORMAL),
-            FontStyle::CodeMono => (true, 15.0, Weight::NORMAL),
-            FontStyle::CodeMonoBold => (true, 15.0, Weight::BOLD),
-            FontStyle::ChatBody => (false, 14.0, Weight::NORMAL),
-            FontStyle::ChatBodyBold => (false, 14.0, Weight::SEMIBOLD),
-            FontStyle::ChatMeta => (false, 12.2, Weight::NORMAL),
-            FontStyle::ChatMetaBold => (false, 12.2, Weight::SEMIBOLD),
-            FontStyle::ChatCode => (true, 12.6, Weight::NORMAL),
-            FontStyle::ChatCodeBold => (true, 12.6, Weight::SEMIBOLD),
-            FontStyle::BadgeMicro => (false, 10.0, Weight::BOLD),
+            FontStyle::UiRegular => (false, 14.5, Weight::NORMAL, Style::Normal),
+            FontStyle::UiBold => (false, 14.5, Weight::SEMIBOLD, Style::Normal),
+            FontStyle::UiSmall => (false, 13.5, Weight::NORMAL, Style::Normal),
+            FontStyle::CodeMono => (true, 15.0, Weight::NORMAL, Style::Normal),
+            FontStyle::CodeMonoBold => (true, 15.0, Weight::BOLD, Style::Normal),
+            FontStyle::ChatBody => (false, 14.0, Weight::NORMAL, Style::Normal),
+            FontStyle::ChatBodyBold => (false, 14.0, Weight::SEMIBOLD, Style::Normal),
+            FontStyle::ChatBodyItalic => (false, 14.0, Weight::NORMAL, Style::Italic),
+            FontStyle::ChatBodyBoldItalic => (false, 14.0, Weight::SEMIBOLD, Style::Italic),
+            FontStyle::ChatH1 => (false, 19.5, Weight::BOLD, Style::Normal),
+            FontStyle::ChatH2 => (false, 17.0, Weight::BOLD, Style::Normal),
+            FontStyle::ChatH3 => (false, 15.2, Weight::SEMIBOLD, Style::Normal),
+            FontStyle::ChatMeta => (false, 12.2, Weight::NORMAL, Style::Normal),
+            FontStyle::ChatMetaBold => (false, 12.2, Weight::SEMIBOLD, Style::Normal),
+            FontStyle::ChatCode => (true, 12.6, Weight::NORMAL, Style::Normal),
+            FontStyle::ChatCodeBold => (true, 12.6, Weight::SEMIBOLD, Style::Normal),
+            FontStyle::BadgeMicro => (false, 10.0, Weight::BOLD, Style::Normal),
         }
     }
 
@@ -233,7 +239,7 @@ impl CosmicTextEngine {
             st.scale_factor
         };
 
-        let (is_mono, base_size, weight) = Self::style_spec(style);
+        let (is_mono, base_size, weight, font_style) = Self::style_spec(style);
         let phys_font_size = (base_size * scale).max(9.0);
         let phys_line_height = (phys_font_size * 1.32).ceil();
         let metrics = Metrics::new(phys_font_size, phys_line_height);
@@ -244,7 +250,10 @@ impl CosmicTextEngine {
         } else {
             Family::SansSerif
         };
-        let attrs = Attrs::new().family(family).weight(weight);
+        let attrs = Attrs::new()
+            .family(family)
+            .weight(weight)
+            .style(font_style);
 
         let mut buffer = Buffer::new(&mut fonts.font_system, metrics);
         {

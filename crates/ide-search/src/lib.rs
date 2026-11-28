@@ -2,7 +2,7 @@ use anyhow::Result;
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::sinks::UTF8;
 use grep_searcher::SearcherBuilder;
-use ide_core::{IdeAction, LanguageId};
+use ide_core::{IdeAction, KeymapScheme, LanguageId};
 use ide_syntax::{extract_structure_symbols, find_symbol_definition, SymbolKind};
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
@@ -309,7 +309,12 @@ pub fn find_in_files_indexed(
     Ok(hits)
 }
 
-fn push_actions_and_agents(q: &str, max_results: usize, items: &mut Vec<SearchEverywhereItem>) {
+fn push_actions_and_agents(
+    q: &str,
+    max_results: usize,
+    keymap: KeymapScheme,
+    items: &mut Vec<SearchEverywhereItem>,
+) {
     // 1. 匹配 IDE Actions
     let actions = [
         IdeAction::RunActiveConfig,
@@ -334,7 +339,7 @@ fn push_actions_and_agents(q: &str, max_results: usize, items: &mut Vec<SearchEv
             items.push(SearchEverywhereItem::Action {
                 action,
                 title: title.to_string(),
-                shortcut: action.shortcut_label().to_string(),
+                shortcut: action.shortcut_label_for(keymap).to_string(),
             });
         }
     }
@@ -367,9 +372,19 @@ pub fn search_everywhere_indexed(
     query: &str,
     max_results: usize,
 ) -> Vec<SearchEverywhereItem> {
+    search_everywhere_indexed_with_keymap(files, query, max_results, KeymapScheme::IntelliJIdea)
+}
+
+/// 支持按当前快捷键方案渲染动作快捷键标签的 Search Everywhere 检索
+pub fn search_everywhere_indexed_with_keymap(
+    files: &[WorkspaceFileEntry],
+    query: &str,
+    max_results: usize,
+    keymap: KeymapScheme,
+) -> Vec<SearchEverywhereItem> {
     let q = query.trim().to_ascii_lowercase();
     let mut items = Vec::with_capacity(max_results);
-    push_actions_and_agents(&q, max_results, &mut items);
+    push_actions_and_agents(&q, max_results, keymap, &mut items);
 
     for file in files {
         if items.len() >= max_results {

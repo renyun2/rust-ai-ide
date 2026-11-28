@@ -36,6 +36,53 @@ pub struct HighlightSpan {
     pub kind: TokenKind,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum MarkupSection {
+    #[default]
+    Markup,
+    ScriptTs,
+    ScriptJs,
+    Style,
+    AstroFrontmatter,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum OpenMarkupTagKind {
+    #[default]
+    None,
+    Generic,
+    ScriptJs,
+    ScriptTs,
+    Style,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum MarkupAttrQuote {
+    #[default]
+    None,
+    Double,
+    Single,
+    DirectiveDouble,
+    DirectiveSingle,
+}
+
+/// 跨行语法高亮状态机（支持 Vue/Svelte/Astro SFC 区块、跨行标签/属性、多行注释与模板字符串）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct HighlightState {
+    pub section: MarkupSection,
+    pub in_block_comment: bool,
+    pub in_html_comment: bool,
+    pub in_template_string: bool,
+    pub astro_frontmatter_done: bool,
+    pub seen_non_empty: bool,
+    pub open_markup_tag: OpenMarkupTagKind,
+    pub markup_attr_quote: MarkupAttrQuote,
+    pub markup_last_attr_was_directive: bool,
+    pub markup_pending_lang_attr: bool,
+    pub in_mustache: bool,
+    pub brace_expr_depth: u16,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SymbolKind {
     Function,
@@ -114,6 +161,11 @@ const TS_JS_KEYWORDS: &[&str] = &[
 
 const TS_JS_BUILTIN_TYPES: &[&str] = &[
     "string", "number", "boolean", "bigint", "symbol", "object", "any", "unknown", "never",
+];
+
+const VUE_SVELTE_MACROS: &[&str] = &[
+    "defineProps", "defineEmits", "defineModel", "defineExpose", "defineOptions", "defineSlots",
+    "withDefaults", "$state", "$derived", "$effect", "$props", "$bindable", "$inspect",
 ];
 
 const PYTHON_KEYWORDS: &[&str] = &[
@@ -309,17 +361,35 @@ fn is_block_comment_continuation(trimmed: &str, lang: LanguageId) -> bool {
 
 /// 对单行代码执行针对全部支持语言的 IDEA Islands Dark / Darcula 风格语法高亮切分
 pub fn highlight_line(line: &str, lang: LanguageId) -> Vec<HighlightSpan> {
+    let mut state = HighlightState::default();
+    highlight_line_with_state(line, lang, &mut state)
+}
+
+/// 仅推进跨行高亮状态机（用于可视区域之前的行快速同步 `<script>`/`<style>`/多行注释状态）
+pub fn advance_highlight_state(line: &str, lang: LanguageId, state: &mut HighlightState) {
+    let _ = highlight_line_with_state(line, lang, state);
+}
+
+/// 带跨行状态的单行语法高亮（支持 Vue / Svelte / Astro / HTML 嵌入式区块与多行注释）
+pub fn highlight_line_with_state(
+    line: &str,
+    lang: LanguageId,
+    state: &mut HighlightState,
+) -> Vec<HighlightSpan> {
     if line.is_empty() {
         return Vec::new();
     }
 
     match lang {
         LanguageId::Markdown => return highlight_markdown_line(line),
-        LanguageId::Html | LanguageId::Xml => return highlight_markup_line(line),
-        LanguageId::Json => return highlight_json_line(line),
+        LanguageId::Vue | LanguageId::Svelte | LanguageId::Astro | LanguageId::Html => {
+            return highlight_sfc_or_html_line(line, lang, state);
+        }
+        LanguageId::Xml => return highlight_markup_line_with_state(line, lang, state),
+        LanguageId::Json => return highlight_json_line_with_state(line, state),
         LanguageId::Toml => return highlight_toml_line(line),
         LanguageId::Yaml => return highlight_yaml_line(line),
-        LanguageId::Css => return highlight_css_line(line),
+        LanguageId::Css => return highlight_css_line_with_state(line, state),
         LanguageId::Sql => return highlight_sql_line(line),
         LanguageId::PlainText => {
             return vec![HighlightSpan {
@@ -330,26 +400,79 @@ pub fn highlight_line(line: &str, lang: LanguageId) -> Vec<HighlightSpan> {
         _ => {}
     }
 
-    let trimmed = line.trim_start();
+    highlight_code_line_with_state(line, lang, state)
+}
+
+fn highlight_code_line_with_state(
+    line: &str,
+    lang: LanguageId,
+    state: &mut HighlightState,
+) -> Vec<HighlightSpan> {
+    if line.is_empty() {
+        return Vec::new();
+    }
+    let mut spans = Vec::new();
+    let mut rest = line;
+
+    if state.in_block_comment && uses_slash_comments(lang) {
+        if let Some(end_rel) = rest.find("*/") {
+            let end_idx = end_rel + 2;
+            spans.push(HighlightSpan {
+                text: rest[..end_idx].to_string(),
+                kind: TokenKind::Comment,
+            });
+            state.in_block_comment = false;
+            rest = &rest[end_idx..];
+            if rest.is_empty() {
+                return spans;
+            }
+        } else {
+            return vec![HighlightSpan {
+                text: line.to_string(),
+                kind: TokenKind::Comment,
+            }];
+        }
+    }
+
+    if state.in_template_string
+        && matches!(lang, LanguageId::TypeScript | LanguageId::JavaScript | LanguageId::Go)
+    {
+        let chars: Vec<char> = rest.chars().collect();
+        let (consumed, closed) = consume_template_string(&chars, 0, lang, &mut spans);
+        state.in_template_string = !closed;
+        let tail: String = chars[consumed..].iter().collect();
+        if tail.is_empty() {
+            return spans;
+        }
+        rest = &rest[rest.len() - tail.len()..];
+    }
+
+    let trimmed = rest.trim_start();
     if (uses_slash_comments(lang)
         && (trimmed.starts_with("//") || is_block_comment_continuation(trimmed, lang)))
         || (uses_hash_comments(lang) && trimmed.starts_with('#'))
     {
-        return vec![HighlightSpan {
-            text: line.to_string(),
+        if trimmed.starts_with("/*") && !trimmed.contains("*/") && uses_slash_comments(lang) {
+            state.in_block_comment = true;
+        }
+        spans.push(HighlightSpan {
+            text: rest.to_string(),
             kind: TokenKind::Comment,
-        }];
+        });
+        return spans;
     }
 
     if lang == LanguageId::Rust && (trimmed.starts_with("#[") || trimmed.starts_with("#![")) {
-        return vec![HighlightSpan {
-            text: line.to_string(),
+        spans.push(HighlightSpan {
+            text: rest.to_string(),
             kind: TokenKind::MacroOrDecorator,
-        }];
+        });
+        return spans;
     }
 
     if matches!(lang, LanguageId::C | LanguageId::Cpp) && trimmed.starts_with('#') {
-        return highlight_c_preprocessor_line(line);
+        spans.extend(highlight_c_preprocessor_line(rest));
+        return spans;
     }
 
     if lang == LanguageId::CSharp
@@ -357,28 +480,36 @@ pub fn highlight_line(line: &str, lang: LanguageId) -> Vec<HighlightSpan> {
         && trimmed.ends_with(']')
         && trimmed.len() > 2
     {
-        return vec![HighlightSpan {
-            text: line.to_string(),
+        spans.push(HighlightSpan {
+            text: rest.to_string(),
             kind: TokenKind::MacroOrDecorator,
-        }];
+        });
+        return spans;
     }
 
     if matches!(lang, LanguageId::Python | LanguageId::TypeScript)
         && trimmed.starts_with('@')
         && !trimmed.contains('(')
     {
-        return vec![HighlightSpan {
-            text: line.to_string(),
+        spans.push(HighlightSpan {
+            text: rest.to_string(),
             kind: TokenKind::MacroOrDecorator,
-        }];
+        });
+        return spans;
     }
 
     let keywords = language_keywords(lang);
     let builtin_types = language_builtin_types(lang);
 
-    let mut spans = Vec::new();
-    let chars: Vec<char> = line.chars().collect();
+    let chars: Vec<char> = rest.chars().collect();
     let mut i = 0;
+
+    if matches!(lang, LanguageId::TypeScript | LanguageId::JavaScript)
+        && state.open_markup_tag != OpenMarkupTagKind::None
+    {
+        let (next_i, _) = consume_markup_tag_body(&chars, 0, lang, state, &mut spans);
+        i = next_i;
+    }
 
     while i < chars.len() {
         let c = chars[i];
@@ -392,17 +523,22 @@ pub fn highlight_line(line: &str, lang: LanguageId) -> Vec<HighlightSpan> {
             });
             break;
         }
-        // 行内块注释 /* ... */
+        // 行内或跨行块注释 /* ... */
         if c == '/' && i + 1 < chars.len() && chars[i + 1] == '*' && uses_slash_comments(lang) {
             let start = i;
             i += 2;
-            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+            let mut closed = false;
+            while i + 1 < chars.len() {
+                if chars[i] == '*' && chars[i + 1] == '/' {
+                    i += 2;
+                    closed = true;
+                    break;
+                }
                 i += 1;
             }
-            if i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == '/' {
-                i += 2;
-            } else {
+            if !closed {
                 i = chars.len();
+                state.in_block_comment = true;
             }
             let comment: String = chars[start..i].iter().collect();
             spans.push(HighlightSpan {
@@ -419,6 +555,16 @@ pub fn highlight_line(line: &str, lang: LanguageId) -> Vec<HighlightSpan> {
                 kind: TokenKind::Comment,
             });
             break;
+        }
+
+        // JSX / TSX 标签检测（如 <MyComponent prop={val}>, <div>, </div>, <>）
+        if c == '<'
+            && matches!(lang, LanguageId::TypeScript | LanguageId::JavaScript)
+            && is_jsx_tag_start(&chars, i)
+        {
+            let (next_i, _) = consume_markup_tag(&chars, i, lang, state, &mut spans);
+            i = next_i;
+            continue;
         }
 
         // 注解 / 装饰器 (@Override, @SpringBootApplication, @Composable, @Component)
@@ -450,14 +596,45 @@ pub fn highlight_line(line: &str, lang: LanguageId) -> Vec<HighlightSpan> {
             continue;
         }
 
-        // Shell / PowerShell / Dart / Kotlin 变量引用 ($VAR, ${VAR}, $env:PATH)
+        // Shell / PowerShell / Dart / Kotlin 变量引用 / Svelte runes ($state, $derived, $effect)
         if c == '$'
-            && matches!(lang, LanguageId::Shell | LanguageId::Kotlin | LanguageId::Dart)
+            && matches!(
+                lang,
+                LanguageId::Shell
+                    | LanguageId::Kotlin
+                    | LanguageId::Dart
+                    | LanguageId::TypeScript
+                    | LanguageId::JavaScript
+            )
             && i + 1 < chars.len()
             && (chars[i + 1].is_ascii_alphanumeric()
-                || matches!(chars[i + 1], '_' | '{' | '(' | '?' | '@' | '*'))
+                || matches!(chars[i + 1], '_' | '{' | '(' | '?' | '@' | '*' | ':'))
         {
             let start = i;
+            if matches!(lang, LanguageId::TypeScript | LanguageId::JavaScript) {
+                i += 1;
+                if i < chars.len() && chars[i] == ':' {
+                    i += 1;
+                    spans.push(HighlightSpan {
+                        text: "$:".to_string(),
+                        kind: TokenKind::MacroOrDecorator,
+                    });
+                    continue;
+                }
+                while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let tok: String = chars[start..i].iter().collect();
+                let kind = if VUE_SVELTE_MACROS.contains(&tok.as_str()) {
+                    TokenKind::MacroOrDecorator
+                } else if i < chars.len() && chars[i] == '(' {
+                    TokenKind::Function
+                } else {
+                    TokenKind::Plain
+                };
+                spans.push(HighlightSpan { text: tok, kind });
+                continue;
+            }
             i += 1;
             if i < chars.len() && chars[i] == '{' {
                 i += 1;
@@ -551,23 +728,35 @@ pub fn highlight_line(line: &str, lang: LanguageId) -> Vec<HighlightSpan> {
             }
         }
 
-        // 字符串字面量 ("...", '...', `...`)
-        if c == '"'
-            || (c == '\'' && lang != LanguageId::Rust)
-            || (c == '`'
-                && matches!(
-                    lang,
-                    LanguageId::TypeScript
-                        | LanguageId::JavaScript
-                        | LanguageId::Go
-                        | LanguageId::Shell
-                ))
+        // 模板字符串 `...${expr}...`
+        if c == '`'
+            && matches!(
+                lang,
+                LanguageId::TypeScript
+                    | LanguageId::JavaScript
+                    | LanguageId::Go
+                    | LanguageId::Shell
+            )
         {
+            spans.push(HighlightSpan {
+                text: "`".to_string(),
+                kind: TokenKind::String,
+            });
+            let (next_i, closed) = consume_template_string(&chars, i + 1, lang, &mut spans);
+            if !closed && matches!(lang, LanguageId::TypeScript | LanguageId::JavaScript | LanguageId::Go) {
+                state.in_template_string = true;
+            }
+            i = next_i;
+            continue;
+        }
+
+        // 字符串字面量 ("...", '...')
+        if c == '"' || (c == '\'' && lang != LanguageId::Rust) {
             let quote = c;
             let start = i;
             i += 1;
             while i < chars.len() {
-                if quote != '`' && chars[i] == '\\' {
+                if chars[i] == '\\' {
                     i += 2;
                     continue;
                 }
@@ -588,7 +777,14 @@ pub fn highlight_line(line: &str, lang: LanguageId) -> Vec<HighlightSpan> {
         // 标识符、关键字、类型、函数或字段属性
         if c.is_ascii_alphabetic() || c == '_' {
             let start = i;
-            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+            while i < chars.len()
+                && (chars[i].is_ascii_alphanumeric()
+                    || chars[i] == '_'
+                    || (lang == LanguageId::Shell
+                        && chars[i] == '-'
+                        && i + 1 < chars.len()
+                        && (chars[i + 1].is_ascii_alphanumeric() || chars[i + 1] == '_')))
+            {
                 i += 1;
             }
             // Rust 宏调用 foo!
@@ -610,7 +806,11 @@ pub fn highlight_line(line: &str, lang: LanguageId) -> Vec<HighlightSpan> {
                 && chars[i] == ':'
                 && (i + 1 >= chars.len() || chars[i + 1] != ':');
 
-            let kind = if keywords.contains(&word.as_str()) {
+            let kind = if matches!(lang, LanguageId::TypeScript | LanguageId::JavaScript)
+                && VUE_SVELTE_MACROS.contains(&word.as_str())
+            {
+                TokenKind::MacroOrDecorator
+            } else if keywords.contains(&word.as_str()) {
                 TokenKind::Keyword
             } else if builtin_types.contains(&word.as_str())
                 || word
@@ -660,6 +860,8 @@ pub fn highlight_line(line: &str, lang: LanguageId) -> Vec<HighlightSpan> {
             && chars[i] != '#'
             && chars[i] != '@'
             && chars[i] != '$'
+            && !(matches!(lang, LanguageId::TypeScript | LanguageId::JavaScript)
+                && chars[i] == '<')
             && !(lang == LanguageId::Shell && chars[i] == '-')
         {
             i += 1;
@@ -672,6 +874,146 @@ pub fn highlight_line(line: &str, lang: LanguageId) -> Vec<HighlightSpan> {
     }
 
     spans
+}
+
+fn consume_template_string(
+    chars: &[char],
+    mut i: usize,
+    lang: LanguageId,
+    spans: &mut Vec<HighlightSpan>,
+) -> (usize, bool) {
+    let mut seg_start = i;
+    while i < chars.len() {
+        if chars[i] == '\\' {
+            i = (i + 2).min(chars.len());
+            continue;
+        }
+        if matches!(lang, LanguageId::TypeScript | LanguageId::JavaScript)
+            && chars[i] == '$'
+            && i + 1 < chars.len()
+            && chars[i + 1] == '{'
+        {
+            if i > seg_start {
+                spans.push(HighlightSpan {
+                    text: chars[seg_start..i].iter().collect(),
+                    kind: TokenKind::String,
+                });
+            }
+            spans.push(HighlightSpan {
+                text: "${".to_string(),
+                kind: TokenKind::MacroOrDecorator,
+            });
+            i += 2;
+            let expr_start = i;
+            let mut depth = 1usize;
+            while i < chars.len() && depth > 0 {
+                if chars[i] == '{' {
+                    depth += 1;
+                } else if chars[i] == '}' {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                i += 1;
+            }
+            let expr: String = chars[expr_start..i].iter().collect();
+            if !expr.is_empty() {
+                spans.extend(highlight_inline_js_expr(&expr));
+            }
+            if i < chars.len() && chars[i] == '}' {
+                spans.push(HighlightSpan {
+                    text: "}".to_string(),
+                    kind: TokenKind::MacroOrDecorator,
+                });
+                i += 1;
+            }
+            seg_start = i;
+            continue;
+        }
+        if chars[i] == '`' {
+            if i > seg_start {
+                spans.push(HighlightSpan {
+                    text: chars[seg_start..i].iter().collect(),
+                    kind: TokenKind::String,
+                });
+            }
+            spans.push(HighlightSpan {
+                text: "`".to_string(),
+                kind: TokenKind::String,
+            });
+            return (i + 1, true);
+        }
+        i += 1;
+    }
+    if i > seg_start {
+        spans.push(HighlightSpan {
+            text: chars[seg_start..i].iter().collect(),
+            kind: TokenKind::String,
+        });
+    }
+    (i, false)
+}
+
+fn highlight_inline_js_expr(expr: &str) -> Vec<HighlightSpan> {
+    let mut local_state = HighlightState::default();
+    highlight_code_line_with_state(expr, LanguageId::TypeScript, &mut local_state)
+}
+
+fn is_jsx_tag_start(chars: &[char], idx: usize) -> bool {
+    if idx + 1 >= chars.len() {
+        return false;
+    }
+    let next = chars[idx + 1];
+    // Fragment `<>` or closing tag `</tag>` / `</>`
+    if next == '>' || next == '/' {
+        return true;
+    }
+    if !next.is_ascii_alphabetic() && next != '_' {
+        return false;
+    }
+    // Check character immediately before `<` (skipping whitespace)
+    let mut prev_pos = idx;
+    let mut prev_non_ws = None;
+    while prev_pos > 0 {
+        prev_pos -= 1;
+        if !chars[prev_pos].is_whitespace() {
+            prev_non_ws = Some(prev_pos);
+            break;
+        }
+    }
+    let allowed_context = match prev_non_ws {
+        None => true,
+        Some(p) => {
+            let ch = chars[p];
+            if matches!(ch, '=' | '(' | '[' | '{' | ',' | ':' | '?' | '!' | '&' | '|' | '>' | ';') {
+                true
+            } else if ch.is_ascii_alphabetic() {
+                let mut w_start = p;
+                while w_start > 0 && (chars[w_start - 1].is_ascii_alphanumeric() || chars[w_start - 1] == '_') {
+                    w_start -= 1;
+                }
+                let prev_word: String = chars[w_start..=p].iter().collect();
+                matches!(prev_word.as_str(), "return" | "yield" | "await" | "case" | "default")
+            } else {
+                false
+            }
+        }
+    };
+    if !allowed_context {
+        return false;
+    }
+    // Distinguish `<T>(x: T) => ...` generic arrow functions from `<Tag ...>` JSX tags
+    let mut j = idx + 1;
+    while j < chars.len()
+        && (chars[j].is_ascii_alphanumeric() || matches!(chars[j], '_' | '.' | '-' | ':'))
+    {
+        j += 1;
+    }
+    if j < chars.len() && chars[j] == '>' && j + 1 < chars.len() && chars[j + 1] == '(' {
+        return false;
+    }
+    j >= chars.len() || chars[j].is_whitespace() || matches!(chars[j], '>' | '/')
 }
 
 fn highlight_c_preprocessor_line(line: &str) -> Vec<HighlightSpan> {
@@ -703,16 +1045,40 @@ fn highlight_c_preprocessor_line(line: &str) -> Vec<HighlightSpan> {
     }]
 }
 
-fn highlight_json_line(line: &str) -> Vec<HighlightSpan> {
-    let trimmed = line.trim_start();
-    if trimmed.starts_with("//") || is_block_comment_continuation(trimmed, LanguageId::Json) {
-        return vec![HighlightSpan {
-            text: line.to_string(),
-            kind: TokenKind::Comment,
-        }];
-    }
-    let chars: Vec<char> = line.chars().collect();
+fn highlight_json_line_with_state(line: &str, state: &mut HighlightState) -> Vec<HighlightSpan> {
     let mut spans = Vec::new();
+    let mut rest = line;
+    if state.in_block_comment {
+        if let Some(end_rel) = rest.find("*/") {
+            let end_idx = end_rel + 2;
+            spans.push(HighlightSpan {
+                text: rest[..end_idx].to_string(),
+                kind: TokenKind::Comment,
+            });
+            state.in_block_comment = false;
+            rest = &rest[end_idx..];
+            if rest.is_empty() {
+                return spans;
+            }
+        } else {
+            return vec![HighlightSpan {
+                text: line.to_string(),
+                kind: TokenKind::Comment,
+            }];
+        }
+    }
+    let trimmed = rest.trim_start();
+    if trimmed.starts_with("//") || is_block_comment_continuation(trimmed, LanguageId::Json) {
+        if trimmed.starts_with("/*") && !trimmed.contains("*/") {
+            state.in_block_comment = true;
+        }
+        spans.push(HighlightSpan {
+            text: rest.to_string(),
+            kind: TokenKind::Comment,
+        });
+        return spans;
+    }
+    let chars: Vec<char> = rest.chars().collect();
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
@@ -1097,17 +1463,200 @@ fn highlight_yaml_line(line: &str) -> Vec<HighlightSpan> {
     spans
 }
 
-fn highlight_markup_line(line: &str) -> Vec<HighlightSpan> {
+fn find_ascii_ci(haystack: &str, needle_lower: &str) -> Option<usize> {
+    let h_bytes = haystack.as_bytes();
+    let n_bytes = needle_lower.as_bytes();
+    if n_bytes.is_empty() || h_bytes.len() < n_bytes.len() {
+        return None;
+    }
+    h_bytes
+        .windows(n_bytes.len())
+        .position(|w| w.eq_ignore_ascii_case(n_bytes))
+}
+
+fn is_ts_lang_value(val: &str) -> bool {
+    matches!(
+        val.trim().to_ascii_lowercase().as_str(),
+        "ts" | "tsx" | "typescript"
+    )
+}
+
+fn highlight_sfc_or_html_line(
+    line: &str,
+    lang: LanguageId,
+    state: &mut HighlightState,
+) -> Vec<HighlightSpan> {
     let trimmed = line.trim();
-    if trimmed.starts_with("<!--") && trimmed.ends_with("-->") {
+
+    if lang == LanguageId::Astro
+        && !state.astro_frontmatter_done
+        && state.section == MarkupSection::Markup
+        && !state.seen_non_empty
+        && trimmed == "---"
+    {
+        state.seen_non_empty = true;
+        state.section = MarkupSection::AstroFrontmatter;
         return vec![HighlightSpan {
             text: line.to_string(),
-            kind: TokenKind::Comment,
+            kind: TokenKind::MacroOrDecorator,
         }];
     }
-    let chars: Vec<char> = line.chars().collect();
+
+    if state.section == MarkupSection::AstroFrontmatter {
+        if !state.in_block_comment && !state.in_template_string && trimmed == "---" {
+            state.section = MarkupSection::Markup;
+            state.astro_frontmatter_done = true;
+            return vec![HighlightSpan {
+                text: line.to_string(),
+                kind: TokenKind::MacroOrDecorator,
+            }];
+        }
+        return highlight_code_line_with_state(line, LanguageId::TypeScript, state);
+    }
+
+    if !trimmed.is_empty() {
+        state.seen_non_empty = true;
+    }
+
+    if matches!(
+        state.section,
+        MarkupSection::ScriptTs | MarkupSection::ScriptJs
+    ) {
+        let script_lang = if state.section == MarkupSection::ScriptTs {
+            LanguageId::TypeScript
+        } else {
+            LanguageId::JavaScript
+        };
+        if !state.in_block_comment && !state.in_template_string {
+            if let Some(close_pos) = find_ascii_ci(line, "</script") {
+                let mut spans = highlight_code_line_with_state(&line[..close_pos], script_lang, state);
+                state.section = MarkupSection::Markup;
+                state.in_block_comment = false;
+                state.in_template_string = false;
+                state.open_markup_tag = OpenMarkupTagKind::None;
+                state.markup_attr_quote = MarkupAttrQuote::None;
+                state.markup_last_attr_was_directive = false;
+                state.markup_pending_lang_attr = false;
+                spans.extend(highlight_sfc_or_html_line(&line[close_pos..], lang, state));
+                return spans;
+            }
+        }
+        return highlight_code_line_with_state(line, script_lang, state);
+    }
+
+    if state.section == MarkupSection::Style {
+        if !state.in_block_comment {
+            if let Some(close_pos) = find_ascii_ci(line, "</style") {
+                let mut spans = highlight_css_line_with_state(&line[..close_pos], state);
+                state.section = MarkupSection::Markup;
+                state.in_block_comment = false;
+                spans.extend(highlight_sfc_or_html_line(&line[close_pos..], lang, state));
+                return spans;
+            }
+        }
+        return highlight_css_line_with_state(line, state);
+    }
+
+    highlight_markup_line_with_state(line, lang, state)
+}
+
+fn highlight_markup_line_with_state(
+    line: &str,
+    lang: LanguageId,
+    state: &mut HighlightState,
+) -> Vec<HighlightSpan> {
     let mut spans = Vec::new();
+    let mut rest = line;
+
+    if state.in_html_comment {
+        if let Some(end_rel) = rest.find("-->") {
+            let end_idx = end_rel + 3;
+            spans.push(HighlightSpan {
+                text: rest[..end_idx].to_string(),
+                kind: TokenKind::Comment,
+            });
+            state.in_html_comment = false;
+            rest = &rest[end_idx..];
+            if rest.is_empty() {
+                return spans;
+            }
+        } else {
+            return vec![HighlightSpan {
+                text: line.to_string(),
+                kind: TokenKind::Comment,
+            }];
+        }
+    }
+
+    let chars: Vec<char> = rest.chars().collect();
     let mut i = 0;
+
+    if state.open_markup_tag != OpenMarkupTagKind::None {
+        let (next_i, entered_section) =
+            consume_markup_tag_body(&chars, 0, lang, state, &mut spans);
+        i = next_i;
+        if entered_section && i < chars.len() {
+            let tail: String = chars[i..].iter().collect();
+            spans.extend(highlight_sfc_or_html_line(&tail, lang, state));
+            return spans;
+        }
+    }
+
+    if state.in_mustache && matches!(lang, LanguageId::Vue | LanguageId::Html) {
+        let expr_start = i;
+        while i + 1 < chars.len() && !(chars[i] == '}' && chars[i + 1] == '}') {
+            i += 1;
+        }
+        if i + 1 < chars.len() && chars[i] == '}' && chars[i + 1] == '}' {
+            let expr: String = chars[expr_start..i].iter().collect();
+            if !expr.is_empty() {
+                spans.extend(highlight_inline_js_expr(&expr));
+            }
+            spans.push(HighlightSpan {
+                text: "}}".to_string(),
+                kind: TokenKind::MacroOrDecorator,
+            });
+            state.in_mustache = false;
+            i += 2;
+        } else {
+            let expr: String = chars[expr_start..].iter().collect();
+            if !expr.is_empty() {
+                spans.extend(highlight_inline_js_expr(&expr));
+            }
+            return spans;
+        }
+    }
+
+    if state.brace_expr_depth > 0 && matches!(lang, LanguageId::Svelte | LanguageId::Astro) {
+        let expr_start = i;
+        let mut depth = state.brace_expr_depth as usize;
+        while i < chars.len() && depth > 0 {
+            if chars[i] == '{' {
+                depth += 1;
+            } else if chars[i] == '}' {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            i += 1;
+        }
+        let expr: String = chars[expr_start..i].iter().collect();
+        if !expr.is_empty() {
+            spans.extend(highlight_inline_js_expr(&expr));
+        }
+        if depth == 0 && i < chars.len() && chars[i] == '}' {
+            spans.push(HighlightSpan {
+                text: "}".to_string(),
+                kind: TokenKind::MacroOrDecorator,
+            });
+            state.brace_expr_depth = 0;
+            i += 1;
+        } else {
+            state.brace_expr_depth = depth as u16;
+            return spans;
+        }
+    }
 
     while i < chars.len() {
         // HTML/XML comment <!-- ... -->
@@ -1119,15 +1668,18 @@ fn highlight_markup_line(line: &str) -> Vec<HighlightSpan> {
         {
             let start = i;
             i += 4;
-            while i + 2 < chars.len()
-                && !(chars[i] == '-' && chars[i + 1] == '-' && chars[i + 2] == '>')
-            {
+            let mut closed = false;
+            while i + 2 < chars.len() {
+                if chars[i] == '-' && chars[i + 1] == '-' && chars[i + 2] == '>' {
+                    i += 3;
+                    closed = true;
+                    break;
+                }
                 i += 1;
             }
-            if i + 2 < chars.len() {
-                i += 3;
-            } else {
+            if !closed {
                 i = chars.len();
+                state.in_html_comment = true;
             }
             spans.push(HighlightSpan {
                 text: chars[start..i].iter().collect(),
@@ -1154,113 +1706,112 @@ fn highlight_markup_line(line: &str) -> Vec<HighlightSpan> {
         // Tag `<tag attr="val">` or `</tag>`
         if chars[i] == '<'
             && i + 1 < chars.len()
-            && (chars[i + 1].is_ascii_alphabetic() || chars[i + 1] == '/')
+            && (chars[i + 1].is_ascii_alphabetic() || chars[i + 1] == '/' || chars[i + 1] == '>')
         {
-            let open_start = i;
-            i += 1;
-            if i < chars.len() && chars[i] == '/' {
-                i += 1;
-            }
-            spans.push(HighlightSpan {
-                text: chars[open_start..i].iter().collect(),
-                kind: TokenKind::Keyword,
-            });
-            let tag_start = i;
-            while i < chars.len()
-                && (chars[i].is_ascii_alphanumeric() || matches!(chars[i], '-' | '_' | ':'))
-            {
-                i += 1;
-            }
-            if i > tag_start {
-                let tag_name: String = chars[tag_start..i].iter().collect();
-                let is_component = tag_name
-                    .chars()
-                    .next()
-                    .map(|ch| ch.is_ascii_uppercase())
-                    .unwrap_or(false);
-                spans.push(HighlightSpan {
-                    text: tag_name,
-                    kind: if is_component {
-                        TokenKind::Type
-                    } else {
-                        TokenKind::Keyword
-                    },
-                });
-            }
-            // Attributes inside tag until '>'
-            while i < chars.len() && chars[i] != '>' {
-                if chars[i].is_whitespace() {
-                    let ws_start = i;
-                    while i < chars.len() && chars[i].is_whitespace() {
-                        i += 1;
-                    }
-                    spans.push(HighlightSpan {
-                        text: chars[ws_start..i].iter().collect(),
-                        kind: TokenKind::Plain,
-                    });
-                    continue;
-                }
-                if chars[i] == '"' || chars[i] == '\'' {
-                    let quote = chars[i];
-                    let s_start = i;
-                    i += 1;
-                    while i < chars.len() && chars[i] != quote {
-                        if chars[i] == '\\' {
-                            i += 1;
-                        }
-                        i += 1;
-                    }
-                    if i < chars.len() {
-                        i += 1;
-                    }
-                    spans.push(HighlightSpan {
-                        text: chars[s_start..i].iter().collect(),
-                        kind: TokenKind::String,
-                    });
-                    continue;
-                }
-                if chars[i].is_ascii_alphabetic() || matches!(chars[i], '@' | ':' | '_' | 'v') {
-                    let a_start = i;
-                    while i < chars.len()
-                        && (chars[i].is_ascii_alphanumeric()
-                            || matches!(chars[i], '-' | '_' | ':' | '@' | '.'))
-                    {
-                        i += 1;
-                    }
-                    let attr: String = chars[a_start..i].iter().collect();
-                    let kind = if attr.starts_with('@')
-                        || attr.starts_with(':')
-                        || attr.starts_with("v-")
-                    {
-                        TokenKind::MacroOrDecorator
-                    } else {
-                        TokenKind::FieldOrProperty
-                    };
-                    spans.push(HighlightSpan { text: attr, kind });
-                    continue;
-                }
-                spans.push(HighlightSpan {
-                    text: chars[i].to_string(),
-                    kind: if chars[i] == '/' {
-                        TokenKind::Keyword
-                    } else {
-                        TokenKind::Plain
-                    },
-                });
-                i += 1;
-            }
-            if i < chars.len() && chars[i] == '>' {
-                spans.push(HighlightSpan {
-                    text: ">".to_string(),
-                    kind: TokenKind::Keyword,
-                });
-                i += 1;
+            let (next_i, entered_section) =
+                consume_markup_tag(&chars, i, lang, state, &mut spans);
+            i = next_i;
+            if entered_section && i < chars.len() {
+                let tail: String = chars[i..].iter().collect();
+                spans.extend(highlight_sfc_or_html_line(&tail, lang, state));
+                break;
             }
             continue;
         }
+
+        // Vue / HTML mustache interpolation `{{ expr }}`
+        if i + 1 < chars.len()
+            && chars[i] == '{'
+            && chars[i + 1] == '{'
+            && matches!(lang, LanguageId::Vue | LanguageId::Html)
+        {
+            spans.push(HighlightSpan {
+                text: "{{".to_string(),
+                kind: TokenKind::MacroOrDecorator,
+            });
+            i += 2;
+            let expr_start = i;
+            while i + 1 < chars.len() && !(chars[i] == '}' && chars[i + 1] == '}') {
+                i += 1;
+            }
+            if i + 1 < chars.len() && chars[i] == '}' && chars[i + 1] == '}' {
+                let expr: String = chars[expr_start..i].iter().collect();
+                if !expr.is_empty() {
+                    spans.extend(highlight_inline_js_expr(&expr));
+                }
+                spans.push(HighlightSpan {
+                    text: "}}".to_string(),
+                    kind: TokenKind::MacroOrDecorator,
+                });
+                i += 2;
+            } else {
+                let expr: String = chars[expr_start..].iter().collect();
+                if !expr.is_empty() {
+                    spans.extend(highlight_inline_js_expr(&expr));
+                }
+                state.in_mustache = true;
+                break;
+            }
+            continue;
+        }
+
+        // Svelte / Astro template interpolation & control blocks `{#if ...}`, `{:else}`, `{/if}`, `{@html ...}`, `{expr}`
+        if chars[i] == '{' && matches!(lang, LanguageId::Svelte | LanguageId::Astro) {
+            spans.push(HighlightSpan {
+                text: "{".to_string(),
+                kind: TokenKind::MacroOrDecorator,
+            });
+            i += 1;
+            if lang == LanguageId::Svelte
+                && i < chars.len()
+                && matches!(chars[i], '#' | ':' | '/' | '@')
+            {
+                let tag_start = i;
+                i += 1;
+                while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                spans.push(HighlightSpan {
+                    text: chars[tag_start..i].iter().collect(),
+                    kind: TokenKind::Keyword,
+                });
+            }
+            let expr_start = i;
+            let mut depth = 1usize;
+            while i < chars.len() && depth > 0 {
+                if chars[i] == '{' {
+                    depth += 1;
+                } else if chars[i] == '}' {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                i += 1;
+            }
+            let expr: String = chars[expr_start..i].iter().collect();
+            if !expr.is_empty() {
+                spans.extend(highlight_inline_js_expr(&expr));
+            }
+            if depth == 0 && i < chars.len() && chars[i] == '}' {
+                spans.push(HighlightSpan {
+                    text: "}".to_string(),
+                    kind: TokenKind::MacroOrDecorator,
+                });
+                i += 1;
+            } else {
+                state.brace_expr_depth = depth as u16;
+                break;
+            }
+            continue;
+        }
+
         let start = i;
         i += 1;
-        while i < chars.len() && chars[i] != '<' {
+        while i < chars.len()
+            && chars[i] != '<'
+            && !(chars[i] == '{' && matches!(lang, LanguageId::Vue | LanguageId::Svelte | LanguageId::Astro | LanguageId::Html))
+        {
             i += 1;
         }
         spans.push(HighlightSpan {
@@ -1271,18 +1822,356 @@ fn highlight_markup_line(line: &str) -> Vec<HighlightSpan> {
     spans
 }
 
-fn highlight_css_line(line: &str) -> Vec<HighlightSpan> {
-    let trimmed = line.trim_start();
-    if trimmed.starts_with("//") || is_block_comment_continuation(trimmed, LanguageId::Css) {
-        return vec![HighlightSpan {
-            text: line.to_string(),
-            kind: TokenKind::Comment,
-        }];
+fn is_framework_directive_attr(attr: &str) -> bool {
+    attr.starts_with('@')
+        || attr.starts_with(':')
+        || attr.starts_with('#')
+        || attr.starts_with("v-")
+        || attr.starts_with("on:")
+        || attr.starts_with("bind:")
+        || attr.starts_with("class:")
+        || attr.starts_with("style:")
+        || attr.starts_with("use:")
+        || attr.starts_with("transition:")
+        || attr.starts_with("in:")
+        || attr.starts_with("out:")
+        || attr.starts_with("animate:")
+        || attr.starts_with("let:")
+        || attr.starts_with("client:")
+        || attr.starts_with("set:")
+        || attr.starts_with("is:")
+        || attr.starts_with("define:")
+}
+
+fn consume_markup_tag(
+    chars: &[char],
+    mut i: usize,
+    lang: LanguageId,
+    state: &mut HighlightState,
+    spans: &mut Vec<HighlightSpan>,
+) -> (usize, bool) {
+    let open_start = i;
+    i += 1;
+    let is_closing = i < chars.len() && chars[i] == '/';
+    if is_closing {
+        i += 1;
     }
-    let chars: Vec<char> = line.chars().collect();
+    spans.push(HighlightSpan {
+        text: chars[open_start..i].iter().collect(),
+        kind: TokenKind::Keyword,
+    });
+    let tag_start = i;
+    while i < chars.len()
+        && (chars[i].is_ascii_alphanumeric() || matches!(chars[i], '-' | '_' | ':' | '.'))
+    {
+        i += 1;
+    }
+    let mut open_kind = OpenMarkupTagKind::Generic;
+    if i > tag_start {
+        let tag_name: String = chars[tag_start..i].iter().collect();
+        if !is_closing && matches!(lang, LanguageId::Vue | LanguageId::Svelte | LanguageId::Astro | LanguageId::Html) {
+            if tag_name.eq_ignore_ascii_case("script") {
+                open_kind = OpenMarkupTagKind::ScriptJs;
+            } else if tag_name.eq_ignore_ascii_case("style") {
+                open_kind = OpenMarkupTagKind::Style;
+            }
+        }
+        let is_component = tag_name
+            .chars()
+            .next()
+            .map(|ch| ch.is_ascii_uppercase())
+            .unwrap_or(false)
+            || tag_name.contains('.')
+            || tag_name.contains('-')
+            || tag_name.starts_with("svelte:")
+            || matches!(
+                tag_name.as_str(),
+                "slot" | "component" | "transition" | "transition-group" | "keep-alive" | "teleport" | "suspense" | "Fragment"
+            );
+        spans.push(HighlightSpan {
+            text: tag_name,
+            kind: if is_component {
+                TokenKind::Type
+            } else {
+                TokenKind::Keyword
+            },
+        });
+    }
+    state.open_markup_tag = open_kind;
+    state.markup_attr_quote = MarkupAttrQuote::None;
+    state.markup_last_attr_was_directive = false;
+    state.markup_pending_lang_attr = false;
+    consume_markup_tag_body(chars, i, lang, state, spans)
+}
+
+fn consume_markup_quoted_attr(
+    chars: &[char],
+    mut i: usize,
+    quote: char,
+    include_open_quote: bool,
+    is_directive: bool,
+    state: &mut HighlightState,
+    spans: &mut Vec<HighlightSpan>,
+) -> usize {
+    let open_idx = i;
+    if include_open_quote {
+        i += 1;
+    }
+    let inner_start = i;
+    while i < chars.len() && chars[i] != quote {
+        if chars[i] == '\\' {
+            i += 1;
+        }
+        if i < chars.len() {
+            i += 1;
+        }
+    }
+    let inner_end = i;
+    let closed = i < chars.len() && chars[i] == quote;
+    if closed {
+        i += 1;
+    }
+    let inner: String = chars[inner_start..inner_end].iter().collect();
+    if state.markup_pending_lang_attr
+        && state.open_markup_tag == OpenMarkupTagKind::ScriptJs
+        && is_ts_lang_value(&inner)
+    {
+        state.open_markup_tag = OpenMarkupTagKind::ScriptTs;
+    }
+
+    if is_directive {
+        if include_open_quote {
+            spans.push(HighlightSpan {
+                text: quote.to_string(),
+                kind: TokenKind::String,
+            });
+        }
+        if !inner.is_empty() {
+            spans.extend(highlight_inline_js_expr(&inner));
+        }
+        if closed {
+            spans.push(HighlightSpan {
+                text: quote.to_string(),
+                kind: TokenKind::String,
+            });
+        }
+    } else if i > open_idx {
+        spans.push(HighlightSpan {
+            text: chars[open_idx..i].iter().collect(),
+            kind: TokenKind::String,
+        });
+    }
+
+    if closed {
+        state.markup_attr_quote = MarkupAttrQuote::None;
+        state.markup_last_attr_was_directive = false;
+        state.markup_pending_lang_attr = false;
+    } else {
+        state.markup_attr_quote = match (quote, is_directive) {
+            ('"', true) => MarkupAttrQuote::DirectiveDouble,
+            ('\'', true) => MarkupAttrQuote::DirectiveSingle,
+            ('"', false) => MarkupAttrQuote::Double,
+            _ => MarkupAttrQuote::Single,
+        };
+    }
+    i
+}
+
+fn consume_markup_tag_body(
+    chars: &[char],
+    mut i: usize,
+    lang: LanguageId,
+    state: &mut HighlightState,
+    spans: &mut Vec<HighlightSpan>,
+) -> (usize, bool) {
+    if state.markup_attr_quote != MarkupAttrQuote::None {
+        let (quote, is_directive) = match state.markup_attr_quote {
+            MarkupAttrQuote::Double => ('"', false),
+            MarkupAttrQuote::Single => ('\'', false),
+            MarkupAttrQuote::DirectiveDouble => ('"', true),
+            MarkupAttrQuote::DirectiveSingle => ('\'', true),
+            MarkupAttrQuote::None => ('"', false),
+        };
+        i = consume_markup_quoted_attr(chars, i, quote, false, is_directive, state, spans);
+        if state.markup_attr_quote != MarkupAttrQuote::None {
+            return (i, false);
+        }
+    }
+
+    let mut last_non_ws_was_slash = false;
+    while i < chars.len() && chars[i] != '>' {
+        if chars[i].is_whitespace() {
+            let ws_start = i;
+            while i < chars.len() && chars[i].is_whitespace() {
+                i += 1;
+            }
+            spans.push(HighlightSpan {
+                text: chars[ws_start..i].iter().collect(),
+                kind: TokenKind::Plain,
+            });
+            continue;
+        }
+        // JSX / Svelte / Astro attribute expression `{...}`
+        if chars[i] == '{' {
+            spans.push(HighlightSpan {
+                text: "{".to_string(),
+                kind: TokenKind::MacroOrDecorator,
+            });
+            i += 1;
+            let expr_start = i;
+            let mut depth = 1usize;
+            while i < chars.len() && depth > 0 {
+                if chars[i] == '{' {
+                    depth += 1;
+                } else if chars[i] == '}' {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                i += 1;
+            }
+            let expr: String = chars[expr_start..i].iter().collect();
+            if !expr.is_empty() {
+                spans.extend(highlight_inline_js_expr(&expr));
+            }
+            if i < chars.len() && chars[i] == '}' {
+                spans.push(HighlightSpan {
+                    text: "}".to_string(),
+                    kind: TokenKind::MacroOrDecorator,
+                });
+                i += 1;
+            }
+            state.markup_last_attr_was_directive = false;
+            state.markup_pending_lang_attr = false;
+            last_non_ws_was_slash = false;
+            continue;
+        }
+        if chars[i] == '"' || chars[i] == '\'' {
+            let quote = chars[i];
+            let is_dir = state.markup_last_attr_was_directive
+                && matches!(
+                    lang,
+                    LanguageId::Vue
+                        | LanguageId::Svelte
+                        | LanguageId::Astro
+                        | LanguageId::TypeScript
+                        | LanguageId::JavaScript
+                );
+            i = consume_markup_quoted_attr(chars, i, quote, true, is_dir, state, spans);
+            last_non_ws_was_slash = false;
+            if state.markup_attr_quote != MarkupAttrQuote::None {
+                return (i, false);
+            }
+            continue;
+        }
+        if chars[i].is_ascii_alphabetic() || matches!(chars[i], '@' | ':' | '#' | '_' | '$') {
+            let a_start = i;
+            while i < chars.len()
+                && (chars[i].is_ascii_alphanumeric()
+                    || matches!(chars[i], '-' | '_' | ':' | '@' | '#' | '.' | '[' | ']'))
+            {
+                i += 1;
+            }
+            let attr: String = chars[a_start..i].iter().collect();
+            let is_dir = is_framework_directive_attr(&attr);
+            state.markup_last_attr_was_directive = is_dir;
+            state.markup_pending_lang_attr = attr.eq_ignore_ascii_case("lang");
+            last_non_ws_was_slash = false;
+            spans.push(HighlightSpan {
+                text: attr,
+                kind: if is_dir {
+                    TokenKind::MacroOrDecorator
+                } else {
+                    TokenKind::FieldOrProperty
+                },
+            });
+            continue;
+        }
+        if chars[i] != '=' {
+            state.markup_last_attr_was_directive = false;
+            state.markup_pending_lang_attr = false;
+        }
+        last_non_ws_was_slash = chars[i] == '/';
+        spans.push(HighlightSpan {
+            text: chars[i].to_string(),
+            kind: if chars[i] == '/' {
+                TokenKind::Keyword
+            } else {
+                TokenKind::Plain
+            },
+        });
+        i += 1;
+    }
+
+    let mut entered_section = false;
+    if i < chars.len() && chars[i] == '>' {
+        spans.push(HighlightSpan {
+            text: ">".to_string(),
+            kind: TokenKind::Keyword,
+        });
+        i += 1;
+        if !last_non_ws_was_slash && lang != LanguageId::Xml {
+            match state.open_markup_tag {
+                OpenMarkupTagKind::ScriptTs => {
+                    state.section = MarkupSection::ScriptTs;
+                    entered_section = true;
+                }
+                OpenMarkupTagKind::ScriptJs => {
+                    state.section = MarkupSection::ScriptJs;
+                    entered_section = true;
+                }
+                OpenMarkupTagKind::Style => {
+                    state.section = MarkupSection::Style;
+                    entered_section = true;
+                }
+                OpenMarkupTagKind::Generic | OpenMarkupTagKind::None => {}
+            }
+        }
+        state.open_markup_tag = OpenMarkupTagKind::None;
+        state.markup_last_attr_was_directive = false;
+        state.markup_pending_lang_attr = false;
+    }
+    (i, entered_section)
+}
+
+fn highlight_css_line_with_state(line: &str, state: &mut HighlightState) -> Vec<HighlightSpan> {
     let mut spans = Vec::new();
+    let mut rest = line;
+    if state.in_block_comment {
+        if let Some(end_rel) = rest.find("*/") {
+            let end_idx = end_rel + 2;
+            spans.push(HighlightSpan {
+                text: rest[..end_idx].to_string(),
+                kind: TokenKind::Comment,
+            });
+            state.in_block_comment = false;
+            rest = &rest[end_idx..];
+            if rest.is_empty() {
+                return spans;
+            }
+        } else {
+            return vec![HighlightSpan {
+                text: line.to_string(),
+                kind: TokenKind::Comment,
+            }];
+        }
+    }
+
+    let trimmed = rest.trim_start();
+    if trimmed.starts_with("//") || is_block_comment_continuation(trimmed, LanguageId::Css) {
+        if trimmed.starts_with("/*") && !trimmed.contains("*/") {
+            state.in_block_comment = true;
+        }
+        spans.push(HighlightSpan {
+            text: rest.to_string(),
+            kind: TokenKind::Comment,
+        });
+        return spans;
+    }
+    let chars: Vec<char> = rest.chars().collect();
     let mut i = 0;
-    let has_colon_no_brace = line.contains(':') && !line.contains('{');
+    let has_colon_no_brace = rest.contains(':') && !rest.contains('{');
     let mut seen_colon = false;
 
     while i < chars.len() {
@@ -1290,13 +2179,18 @@ fn highlight_css_line(line: &str) -> Vec<HighlightSpan> {
         if c == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
             let start = i;
             i += 2;
-            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+            let mut closed = false;
+            while i + 1 < chars.len() {
+                if chars[i] == '*' && chars[i + 1] == '/' {
+                    i += 2;
+                    closed = true;
+                    break;
+                }
                 i += 1;
             }
-            if i + 1 < chars.len() {
-                i += 2;
-            } else {
+            if !closed {
                 i = chars.len();
+                state.in_block_comment = true;
             }
             spans.push(HighlightSpan {
                 text: chars[start..i].iter().collect(),
@@ -1339,6 +2233,22 @@ fn highlight_css_line(line: &str) -> Vec<HighlightSpan> {
             continue;
         }
         if c == ':' {
+            // Vue/CSS pseudo-selectors like :deep(), :slotted(), :global(), :hover
+            if i + 1 < chars.len() && chars[i + 1].is_ascii_alphabetic() && (!seen_colon || !has_colon_no_brace) {
+                let start = i;
+                i += 1;
+                while i < chars.len() && (chars[i].is_ascii_alphanumeric() || matches!(chars[i], '-' | '_')) {
+                    i += 1;
+                }
+                let pseudo: String = chars[start..i].iter().collect();
+                let kind = if matches!(pseudo.as_str(), ":deep" | ":slotted" | ":global") {
+                    TokenKind::MacroOrDecorator
+                } else {
+                    TokenKind::Keyword
+                };
+                spans.push(HighlightSpan { text: pseudo, kind });
+                continue;
+            }
             seen_colon = true;
             spans.push(HighlightSpan {
                 text: ":".to_string(),
@@ -1398,7 +2308,9 @@ fn highlight_css_line(line: &str) -> Vec<HighlightSpan> {
                 i += 1;
             }
             let word: String = chars[start..i].iter().collect();
-            let kind = if !seen_colon && has_colon_no_brace {
+            let kind = if word == "v-bind" {
+                TokenKind::MacroOrDecorator
+            } else if !seen_colon && has_colon_no_brace {
                 TokenKind::FieldOrProperty
             } else if word == "!important" || CSS_KEYWORDS.contains(&word.as_str()) {
                 TokenKind::Keyword
@@ -1626,12 +2538,35 @@ fn highlight_markdown_line(line: &str) -> Vec<HighlightSpan> {
 /// 提取文件的 Structure 符号大纲（用于 IDEA 左侧 Structure 面板、顶部 Breadcrumbs 面包屑导航及全局符号索引）
 pub fn extract_structure_symbols(source: &str, lang: LanguageId) -> Vec<StructureSymbol> {
     let mut symbols = Vec::new();
+    let mut in_sfc_script = false;
+    let mut in_open_script_tag = false;
+    let mut open_script_sym_idx: Option<usize> = None;
+    let mut in_astro_frontmatter = false;
+    let mut astro_fm_done = false;
+    let mut seen_non_empty = false;
 
     for (line_idx, raw_line) in source.lines().enumerate() {
         let line = raw_line.trim();
         if line.is_empty() {
             continue;
         }
+        if lang == LanguageId::Astro && !astro_fm_done {
+            if !seen_non_empty && line == "---" {
+                seen_non_empty = true;
+                in_astro_frontmatter = true;
+                continue;
+            }
+            if in_astro_frontmatter {
+                if line == "---" {
+                    in_astro_frontmatter = false;
+                    astro_fm_done = true;
+                } else if let Some(sym) = extract_ts_js_structure_symbol(line, line_idx) {
+                    symbols.push(sym);
+                }
+                continue;
+            }
+        }
+        seen_non_empty = true;
         match lang {
             LanguageId::Rust => {
                 if let Some(rest) = line
@@ -1727,89 +2662,8 @@ pub fn extract_structure_symbols(source: &str, lang: LanguageId) -> Vec<Structur
                 }
             }
             LanguageId::TypeScript | LanguageId::JavaScript => {
-                if let Some(rest) = line
-                    .strip_prefix("export function ")
-                    .or_else(|| line.strip_prefix("export default function "))
-                    .or_else(|| line.strip_prefix("export async function "))
-                    .or_else(|| line.strip_prefix("async function "))
-                    .or_else(|| line.strip_prefix("function "))
-                {
-                    if let Some(name) = rest.split(['(', '<', ' ']).next() {
-                        if !name.trim().is_empty() {
-                            symbols.push(StructureSymbol {
-                                name: name.trim().to_string(),
-                                kind: SymbolKind::Function,
-                                line: line_idx,
-                            });
-                        }
-                    }
-                } else if let Some(rest) = line
-                    .strip_prefix("export class ")
-                    .or_else(|| line.strip_prefix("export default class "))
-                    .or_else(|| line.strip_prefix("export abstract class "))
-                    .or_else(|| line.strip_prefix("abstract class "))
-                    .or_else(|| line.strip_prefix("class "))
-                {
-                    if let Some(name) = rest.split(['{', ' ', '<']).next() {
-                        if !name.trim().is_empty() {
-                            symbols.push(StructureSymbol {
-                                name: name.trim().to_string(),
-                                kind: SymbolKind::Class,
-                                line: line_idx,
-                            });
-                        }
-                    }
-                } else if let Some(rest) = line
-                    .strip_prefix("export interface ")
-                    .or_else(|| line.strip_prefix("interface "))
-                    .or_else(|| line.strip_prefix("export type "))
-                    .or_else(|| line.strip_prefix("type "))
-                {
-                    if let Some(name) = rest.split(['{', ' ', '<', '=']).next() {
-                        if !name.trim().is_empty() {
-                            symbols.push(StructureSymbol {
-                                name: name.trim().to_string(),
-                                kind: SymbolKind::Interface,
-                                line: line_idx,
-                            });
-                        }
-                    }
-                } else if let Some(rest) = line
-                    .strip_prefix("export enum ")
-                    .or_else(|| line.strip_prefix("export const enum "))
-                    .or_else(|| line.strip_prefix("enum "))
-                {
-                    if let Some(name) = rest.split(['{', ' ']).next() {
-                        if !name.trim().is_empty() {
-                            symbols.push(StructureSymbol {
-                                name: name.trim().to_string(),
-                                kind: SymbolKind::Enum,
-                                line: line_idx,
-                            });
-                        }
-                    }
-                } else if let Some(rest) = line
-                    .strip_prefix("export const ")
-                    .or_else(|| line.strip_prefix("const "))
-                {
-                    if let Some((lhs, rhs)) = rest.split_once('=') {
-                        let name = lhs.split([':', ' ']).next().unwrap_or("").trim();
-                        let rhs_t = rhs.trim();
-                        if !name.is_empty()
-                            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                        {
-                            let kind = if rhs_t.contains("=>") || rhs_t.starts_with("function") {
-                                SymbolKind::Function
-                            } else {
-                                SymbolKind::Constant
-                            };
-                            symbols.push(StructureSymbol {
-                                name: name.to_string(),
-                                kind,
-                                line: line_idx,
-                            });
-                        }
-                    }
+                if let Some(sym) = extract_ts_js_structure_symbol(line, line_idx) {
+                    symbols.push(sym);
                 }
             }
             LanguageId::Python => {
@@ -2024,14 +2878,71 @@ pub fn extract_structure_symbols(source: &str, lang: LanguageId) -> Vec<Structur
                     }
                 }
             }
-            LanguageId::Html | LanguageId::Xml => {
-                for tag in ["<template", "<script", "<style"] {
-                    if line.starts_with(tag) {
-                        symbols.push(StructureSymbol {
-                            name: tag.trim_start_matches('<').to_string(),
-                            kind: SymbolKind::Struct,
-                            line: line_idx,
-                        });
+            LanguageId::Vue | LanguageId::Svelte | LanguageId::Astro | LanguageId::Html | LanguageId::Xml => {
+                if in_open_script_tag {
+                    let lower = line.to_ascii_lowercase();
+                    if lower.contains("setup") {
+                        if let Some(idx) = open_script_sym_idx {
+                            symbols[idx].name = "script setup".to_string();
+                        }
+                    }
+                    if lower.contains('>') {
+                        in_open_script_tag = false;
+                        open_script_sym_idx = None;
+                        if !lower.contains("</script") && !lower.trim_end().ends_with("/>") {
+                            in_sfc_script = true;
+                        }
+                    }
+                    continue;
+                }
+                if in_sfc_script {
+                    if find_ascii_ci(line, "</script").is_some() {
+                        in_sfc_script = false;
+                    } else if let Some(sym) = extract_ts_js_structure_symbol(line, line_idx) {
+                        symbols.push(sym);
+                    }
+                    continue;
+                }
+                let lower = line.to_ascii_lowercase();
+                if lower == "<script"
+                    || (lower.starts_with("<script")
+                        && lower
+                            .as_bytes()
+                            .get(7)
+                            .is_some_and(|b| b.is_ascii_whitespace() || *b == b'>'))
+                {
+                    let label = if lower.contains("setup") {
+                        "script setup"
+                    } else {
+                        "script"
+                    };
+                    let sym_idx = symbols.len();
+                    symbols.push(StructureSymbol {
+                        name: label.to_string(),
+                        kind: SymbolKind::Struct,
+                        line: line_idx,
+                    });
+                    if !lower.contains('>') {
+                        in_open_script_tag = true;
+                        open_script_sym_idx = Some(sym_idx);
+                    } else if !lower.contains("</script") && !lower.trim_end().ends_with("/>") {
+                        in_sfc_script = true;
+                    }
+                } else {
+                    for tag in ["<template", "<style"] {
+                        if lower == tag
+                            || (lower.starts_with(tag)
+                                && lower
+                                    .as_bytes()
+                                    .get(tag.len())
+                                    .is_some_and(|b| b.is_ascii_whitespace() || *b == b'>'))
+                        {
+                            symbols.push(StructureSymbol {
+                                name: tag.trim_start_matches('<').to_string(),
+                                kind: SymbolKind::Struct,
+                                line: line_idx,
+                            });
+                        }
                     }
                 }
                 if let Some(id_pos) = line.find("id=\"") {
@@ -2090,7 +3001,11 @@ pub fn find_symbol_definition(
             "let ",
             "for ",
         ],
-        LanguageId::TypeScript | LanguageId::JavaScript => &[
+        LanguageId::TypeScript
+        | LanguageId::JavaScript
+        | LanguageId::Vue
+        | LanguageId::Svelte
+        | LanguageId::Astro => &[
             "export const ",
             "export let ",
             "const ",
@@ -2364,6 +3279,94 @@ pub fn detect_runnable_gutter_entries(source: &str, lang: LanguageId) -> Vec<Run
     }
 
     entries
+}
+
+fn extract_ts_js_structure_symbol(line: &str, line_idx: usize) -> Option<StructureSymbol> {
+    if let Some(rest) = line
+        .strip_prefix("export function ")
+        .or_else(|| line.strip_prefix("export default function "))
+        .or_else(|| line.strip_prefix("export async function "))
+        .or_else(|| line.strip_prefix("async function "))
+        .or_else(|| line.strip_prefix("function "))
+    {
+        if let Some(name) = rest.split(['(', '<', ' ']).next() {
+            if !name.trim().is_empty() {
+                return Some(StructureSymbol {
+                    name: name.trim().to_string(),
+                    kind: SymbolKind::Function,
+                    line: line_idx,
+                });
+            }
+        }
+    } else if let Some(rest) = line
+        .strip_prefix("export class ")
+        .or_else(|| line.strip_prefix("export default class "))
+        .or_else(|| line.strip_prefix("export abstract class "))
+        .or_else(|| line.strip_prefix("abstract class "))
+        .or_else(|| line.strip_prefix("class "))
+    {
+        if let Some(name) = rest.split(['{', ' ', '<']).next() {
+            if !name.trim().is_empty() {
+                return Some(StructureSymbol {
+                    name: name.trim().to_string(),
+                    kind: SymbolKind::Class,
+                    line: line_idx,
+                });
+            }
+        }
+    } else if let Some(rest) = line
+        .strip_prefix("export interface ")
+        .or_else(|| line.strip_prefix("interface "))
+        .or_else(|| line.strip_prefix("export type "))
+        .or_else(|| line.strip_prefix("type "))
+    {
+        if let Some(name) = rest.split(['{', ' ', '<', '=']).next() {
+            if !name.trim().is_empty() {
+                return Some(StructureSymbol {
+                    name: name.trim().to_string(),
+                    kind: SymbolKind::Interface,
+                    line: line_idx,
+                });
+            }
+        }
+    } else if let Some(rest) = line
+        .strip_prefix("export enum ")
+        .or_else(|| line.strip_prefix("export const enum "))
+        .or_else(|| line.strip_prefix("enum "))
+    {
+        if let Some(name) = rest.split(['{', ' ']).next() {
+            if !name.trim().is_empty() {
+                return Some(StructureSymbol {
+                    name: name.trim().to_string(),
+                    kind: SymbolKind::Enum,
+                    line: line_idx,
+                });
+            }
+        }
+    } else if let Some(rest) = line
+        .strip_prefix("export const ")
+        .or_else(|| line.strip_prefix("const "))
+        .or_else(|| line.strip_prefix("export let "))
+        .or_else(|| line.strip_prefix("let "))
+    {
+        if let Some((lhs, rhs)) = rest.split_once('=') {
+            let name = lhs.split([':', ' ']).next().unwrap_or("").trim();
+            let rhs_t = rhs.trim();
+            if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                let kind = if rhs_t.contains("=>") || rhs_t.starts_with("function") {
+                    SymbolKind::Function
+                } else {
+                    SymbolKind::Constant
+                };
+                return Some(StructureSymbol {
+                    name: name.to_string(),
+                    kind,
+                    line: line_idx,
+                });
+            }
+        }
+    }
+    None
 }
 
 fn is_valid_ident(s: &str) -> bool {
@@ -2963,5 +3966,217 @@ public class DemoApp {
         let md_syms = extract_structure_symbols("# Architecture\n## Indexing\n", LanguageId::Markdown);
         assert_eq!(md_syms.len(), 2);
         assert_eq!(md_syms[0].name, "Architecture");
+    }
+
+    #[test]
+    fn test_vue_svelte_astro_and_jsx_highlighting_and_symbols() {
+        let vue_src = "\
+<script setup lang=\"ts\">
+import { ref } from 'vue'
+const count = ref<number>(0)
+function increment() {
+  count.value++
+}
+</script>
+
+<template>
+  <MyButton v-if=\"count >= 0\" @click=\"increment\" :disabled=\"false\" #default>
+    <span>{{ count + 1 }}</span>
+  </MyButton>
+</template>
+
+<style scoped lang=\"scss\">
+:deep(.btn) {
+  color: #3574F0;
+}
+</style>
+";
+        let mut state = HighlightState::default();
+        let line_spans: Vec<Vec<HighlightSpan>> = vue_src
+            .lines()
+            .map(|l| highlight_line_with_state(l, LanguageId::Vue, &mut state))
+            .collect();
+
+        // <script setup lang="ts"> line
+        assert!(line_spans[0]
+            .iter()
+            .any(|s| s.text == "script" && s.kind == TokenKind::Keyword));
+        // Inside <script setup lang="ts">: TS keywords & generics don't break into HTML tags
+        assert!(line_spans[2]
+            .iter()
+            .any(|s| s.text == "const" && s.kind == TokenKind::Keyword));
+        assert!(line_spans[2]
+            .iter()
+            .any(|s| s.text == "number" && s.kind == TokenKind::Type));
+        assert!(line_spans[3]
+            .iter()
+            .any(|s| s.text == "increment" && s.kind == TokenKind::Function));
+        // Inside <template>: PascalCase component, directives, and {{ }} interpolation
+        assert!(line_spans[9]
+            .iter()
+            .any(|s| s.text == "MyButton" && s.kind == TokenKind::Type));
+        assert!(line_spans[9]
+            .iter()
+            .any(|s| s.text == "v-if" && s.kind == TokenKind::MacroOrDecorator));
+        assert!(line_spans[9]
+            .iter()
+            .any(|s| s.text == "@click" && s.kind == TokenKind::MacroOrDecorator));
+        assert!(line_spans[9]
+            .iter()
+            .any(|s| s.text == ":disabled" && s.kind == TokenKind::MacroOrDecorator));
+        assert!(line_spans[9]
+            .iter()
+            .any(|s| s.text == "#default" && s.kind == TokenKind::MacroOrDecorator));
+        assert!(line_spans[10]
+            .iter()
+            .any(|s| s.text == "{{" && s.kind == TokenKind::MacroOrDecorator));
+        // Inside <style scoped>: CSS/SCSS & :deep()
+        assert!(line_spans[15]
+            .iter()
+            .any(|s| s.text == ":deep" && s.kind == TokenKind::MacroOrDecorator));
+        assert!(line_spans[16]
+            .iter()
+            .any(|s| s.text == "#3574F0" && s.kind == TokenKind::Number));
+
+        let vue_syms = extract_structure_symbols(vue_src, LanguageId::Vue);
+        assert!(vue_syms.iter().any(|s| s.name == "script setup"));
+        assert!(vue_syms.iter().any(|s| s.name == "template"));
+        assert!(vue_syms.iter().any(|s| s.name == "style"));
+        assert!(vue_syms.iter().any(|s| s.name == "increment" && s.kind == SymbolKind::Function));
+        assert!(find_symbol_definition(vue_src, LanguageId::Vue, "count").is_some());
+
+        // Svelte
+        let svelte_src = "<script lang=\"ts\">\nlet n = $state(0)\n</script>\n{#if n > 0}<Card on:click={inc}>{n}</Card>{/if}\n";
+        let mut s_state = HighlightState::default();
+        let s_spans: Vec<Vec<HighlightSpan>> = svelte_src
+            .lines()
+            .map(|l| highlight_line_with_state(l, LanguageId::Svelte, &mut s_state))
+            .collect();
+        assert!(s_spans[1]
+            .iter()
+            .any(|s| s.text == "$state" && s.kind == TokenKind::MacroOrDecorator));
+        assert!(s_spans[3]
+            .iter()
+            .any(|s| s.text == "#if" && s.kind == TokenKind::Keyword));
+        assert!(s_spans[3]
+            .iter()
+            .any(|s| s.text == "on:click" && s.kind == TokenKind::MacroOrDecorator));
+
+        // Astro frontmatter
+        let astro_src = "---\nconst title = 'Hello'\n---\n<Layout client:load>{title}</Layout>\n";
+        let mut a_state = HighlightState::default();
+        let a_spans: Vec<Vec<HighlightSpan>> = astro_src
+            .lines()
+            .map(|l| highlight_line_with_state(l, LanguageId::Astro, &mut a_state))
+            .collect();
+        assert!(a_spans[1]
+            .iter()
+            .any(|s| s.text == "const" && s.kind == TokenKind::Keyword));
+        assert!(a_spans[3]
+            .iter()
+            .any(|s| s.text == "Layout" && s.kind == TokenKind::Type));
+        assert!(a_spans[3]
+            .iter()
+            .any(|s| s.text == "client:load" && s.kind == TokenKind::MacroOrDecorator));
+
+        // TSX JSX tag highlighting
+        let tsx_spans = highlight_line("return <MyCard title=\"ok\" count={1} />", LanguageId::TypeScript);
+        assert!(tsx_spans
+            .iter()
+            .any(|s| s.text == "MyCard" && s.kind == TokenKind::Type));
+        assert!(tsx_spans
+            .iter()
+            .any(|s| s.text == "title" && s.kind == TokenKind::FieldOrProperty));
+
+        // Multi-line Vue component tag, multi-line <script setup lang="ts">, multi-line attr & {{ }}
+        let multiline_vue = "\
+<script
+  setup
+  lang=\"ts\"
+>
+const count = ref<number>(0)
+</script>
+
+<template>
+  <EstimateModalThFilter
+    v-model=\"modalFilterRemarks\"
+    col-key=\"modal.inst.remarks\"
+    :default-width=\"80\"
+    title=\"备注用途\"
+    :options=\"modalRemarksOptions\"
+    cell-class=\"px-1 py-1 align-top\"
+  />
+  <div>
+    {{
+      count + 1
+    }}
+  </div>
+</template>
+";
+        let mut mv_state = HighlightState::default();
+        let mv_spans: Vec<Vec<HighlightSpan>> = multiline_vue
+            .lines()
+            .map(|l| highlight_line_with_state(l, LanguageId::Vue, &mut mv_state))
+            .collect();
+        assert!(mv_spans[4]
+            .iter()
+            .any(|s| s.text == "const" && s.kind == TokenKind::Keyword));
+        assert!(mv_spans[4]
+            .iter()
+            .any(|s| s.text == "number" && s.kind == TokenKind::Type));
+        assert!(mv_spans[8]
+            .iter()
+            .any(|s| s.text == "EstimateModalThFilter" && s.kind == TokenKind::Type));
+        assert!(mv_spans[9]
+            .iter()
+            .any(|s| s.text == "v-model" && s.kind == TokenKind::MacroOrDecorator));
+        assert!(mv_spans[9]
+            .iter()
+            .any(|s| s.text == "\"" && s.kind == TokenKind::String));
+        assert!(mv_spans[10]
+            .iter()
+            .any(|s| s.text == "col-key" && s.kind == TokenKind::FieldOrProperty));
+        assert!(mv_spans[10]
+            .iter()
+            .any(|s| s.text == "\"modal.inst.remarks\"" && s.kind == TokenKind::String));
+        assert!(mv_spans[11]
+            .iter()
+            .any(|s| s.text == ":default-width" && s.kind == TokenKind::MacroOrDecorator));
+        assert!(mv_spans[11]
+            .iter()
+            .any(|s| s.text == "80" && s.kind == TokenKind::Number));
+        assert!(mv_spans[12]
+            .iter()
+            .any(|s| s.text == "title" && s.kind == TokenKind::FieldOrProperty));
+        assert!(mv_spans[13]
+            .iter()
+            .any(|s| s.text == ":options" && s.kind == TokenKind::MacroOrDecorator));
+        assert!(mv_spans[14]
+            .iter()
+            .any(|s| s.text == "cell-class" && s.kind == TokenKind::FieldOrProperty));
+        assert!(mv_spans[15]
+            .iter()
+            .any(|s| s.text == ">" && s.kind == TokenKind::Keyword));
+        assert!(mv_spans[18]
+            .iter()
+            .any(|s| s.text == "1" && s.kind == TokenKind::Number));
+
+        let mv_syms = extract_structure_symbols(multiline_vue, LanguageId::Vue);
+        assert!(mv_syms.iter().any(|s| s.name == "script setup"));
+        assert!(mv_syms.iter().any(|s| s.name == "count"));
+
+        // Multi-line TSX JSX tag
+        let multiline_tsx = "return (\n  <MyCard\n    title=\"ok\"\n  />\n)";
+        let mut tsx_state = HighlightState::default();
+        let tsx_ml_spans: Vec<Vec<HighlightSpan>> = multiline_tsx
+            .lines()
+            .map(|l| highlight_line_with_state(l, LanguageId::TypeScript, &mut tsx_state))
+            .collect();
+        assert!(tsx_ml_spans[2]
+            .iter()
+            .any(|s| s.text == "title" && s.kind == TokenKind::FieldOrProperty));
+        assert!(tsx_ml_spans[2]
+            .iter()
+            .any(|s| s.text == "\"ok\"" && s.kind == TokenKind::String));
     }
 }

@@ -144,6 +144,7 @@ pub struct GitBlameLine {
 #[derive(Debug, Clone)]
 struct GitSnapshot {
     git_installed: bool,
+    is_git_repo: bool,
     git_binary_path: Option<PathBuf>,
     git_version: Option<String>,
     current_branch: String,
@@ -164,6 +165,9 @@ struct GitSnapshot {
 #[derive(Debug)]
 enum GitWorkerCmd {
     Refresh,
+    InitRepo {
+        create_gitignore: bool,
+    },
     StageAll,
     UnstageAll,
     ToggleStageFile {
@@ -219,7 +223,17 @@ enum GitWorkerCmd {
     LoadCommitDetail(String),
     LoadFileHistory(PathBuf),
     LoadFileBlame(PathBuf),
-    AiCommitDiff,
+    AiCommitDiff(Vec<PathBuf>),
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AiCommitContext {
+    pub diff_text: String,
+    pub changed_files: Vec<String>,
+    pub recent_commit_messages: Vec<String>,
+    pub style_summary: String,
+    pub commit_template: Option<String>,
+    pub commitlint_config: Option<String>,
 }
 
 #[derive(Debug)]
@@ -243,7 +257,7 @@ enum GitWorkerEvent {
     },
     AiDiffReady {
         snapshot: GitSnapshot,
-        diff_text: String,
+        context: AiCommitContext,
     },
 }
 
@@ -252,12 +266,13 @@ pub struct GitPollOutcome {
     pub changed: bool,
     pub notification: Option<String>,
     pub clear_commit_input: bool,
-    pub ai_diff_ready: Option<(String, Vec<String>)>,
+    pub ai_diff_ready: Option<AiCommitContext>,
 }
 
 pub struct GitEngine {
     pub root: PathBuf,
     pub git_installed: bool,
+    pub is_git_repo: bool,
     pub git_binary_path: Option<PathBuf>,
     pub git_version: Option<String>,
     pub current_branch: String,
@@ -981,6 +996,7 @@ fn collect_snapshot(root: &Path) -> GitSnapshot {
     let Some(ref git_bin) = git_binary_path else {
         return GitSnapshot {
             git_installed: false,
+            is_git_repo: false,
             git_binary_path: None,
             git_version: None,
             current_branch: "main".to_string(),
@@ -999,6 +1015,37 @@ fn collect_snapshot(root: &Path) -> GitSnapshot {
         };
     };
     let git_version = git_version_string(git_bin);
+    let is_git_repo = git_command(root)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .map(|o| {
+            o.status.success()
+                && String::from_utf8_lossy(&o.stdout)
+                    .trim()
+                    .eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false);
+    if !is_git_repo {
+        return GitSnapshot {
+            git_installed: true,
+            is_git_repo: false,
+            git_binary_path,
+            git_version,
+            current_branch: "main".to_string(),
+            local_branches: vec!["main".to_string()],
+            remote_branches: Vec::new(),
+            tags: Vec::new(),
+            ahead_behind: (0, 0),
+            stashes: Vec::new(),
+            remotes: Vec::new(),
+            in_rebase: false,
+            in_merge: false,
+            changed_files: Vec::new(),
+            working_diffs: HashMap::new(),
+            recent_commits: Vec::new(),
+            head_detail: None,
+        };
+    }
 
     let (branch_res, status_res, log_res, diff_res) = thread::scope(|s| {
         let h_branch = s.spawn(|| {
@@ -1225,6 +1272,7 @@ fn collect_snapshot(root: &Path) -> GitSnapshot {
 
     GitSnapshot {
         git_installed: true,
+        is_git_repo: true,
         git_binary_path,
         git_version,
         current_branch: branch_res.0,
@@ -1495,6 +1543,53 @@ fn spawn_git_worker(
                                 snapshot,
                                 notification: None,
                                 output: None,
+                                clear_commit_input: false,
+                            },
+                        );
+                    }
+                    GitWorkerCmd::InitRepo { create_gitignore } => {
+                        let out = git_command(&root).arg("init").output();
+                        let (ok, mut msg) = match out {
+                            Ok(o) if o.status.success() => {
+                                let stdout = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                                (
+                                    true,
+                                    if stdout.is_empty() {
+                                        format!("Initialized Git repository in {}", root.display())
+                                    } else {
+                                        stdout
+                                    },
+                                )
+                            }
+                            Ok(o) => {
+                                let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                                (
+                                    false,
+                                    if err.is_empty() {
+                                        "Git init failed".to_string()
+                                    } else {
+                                        err
+                                    },
+                                )
+                            }
+                            Err(e) => (false, format!("Git init failed: {e}")),
+                        };
+                        if ok && create_gitignore {
+                            let gi_path = root.join(".gitignore");
+                            if !gi_path.exists() {
+                                if std::fs::write(&gi_path, build_default_gitignore(&root)).is_ok()
+                                {
+                                    msg.push_str(" (+ .gitignore)");
+                                }
+                            }
+                        }
+                        let snapshot = collect_snapshot(&root);
+                        notify(
+                            &event_tx,
+                            GitWorkerEvent::SnapshotUpdated {
+                                snapshot,
+                                notification: Some(msg.clone()),
+                                output: Some(msg),
                                 clear_commit_input: false,
                             },
                         );
@@ -2289,43 +2384,86 @@ fn spawn_git_worker(
                         let lines = collect_file_blame(&root, &path);
                         notify(&event_tx, GitWorkerEvent::FileBlameLoaded { path, lines });
                     }
-                    GitWorkerCmd::AiCommitDiff => {
-                        let (snapshot, diff_text) = thread::scope(|s| {
-                            let h_snap = s.spawn(|| collect_snapshot(&root));
-                            let h_diff = s.spawn(|| {
-                                git_command(&root)
-                                    .args(["diff", "HEAD"])
-                                    .output()
-                                    .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-                                    .unwrap_or_default()
+                    GitWorkerCmd::AiCommitDiff(selected_files) => {
+                        let (snapshot, mut diff_text, mut recent_commit_messages, (commit_template, commitlint_config)) =
+                            thread::scope(|s| {
+                                let h_snap = s.spawn(|| collect_snapshot(&root));
+                                let h_diff = s.spawn(|| collect_ai_commit_diff(&root, &selected_files));
+                                let h_hist = s.spawn(|| collect_recent_commit_messages(&root, 20));
+                                let h_conv = s.spawn(|| collect_commit_conventions(&root));
+                                (
+                                    h_snap.join().unwrap_or_else(|_| empty_git_snapshot()),
+                                    h_diff.join().unwrap_or_default(),
+                                    h_hist.join().unwrap_or_default(),
+                                    h_conv.join().unwrap_or((None, None)),
+                                )
                             });
-                            (
-                                h_snap.join().unwrap_or_else(|_| GitSnapshot {
-                                    git_installed: detect_git_executable().is_some(),
-                                    git_binary_path: detect_git_executable(),
-                                    git_version: None,
-                                    current_branch: "main".to_string(),
-                                    local_branches: vec!["main".to_string()],
-                                    remote_branches: Vec::new(),
-                                    tags: Vec::new(),
-                                    ahead_behind: (0, 0),
-                                    stashes: Vec::new(),
-                                    remotes: Vec::new(),
-                                    in_rebase: false,
-                                    in_merge: false,
-                                    changed_files: Vec::new(),
-                                    working_diffs: HashMap::new(),
-                                    recent_commits: Vec::new(),
-                                    head_detail: None,
-                                }),
-                                h_diff.join().unwrap_or_default(),
-                            )
-                        });
+
+                        if recent_commit_messages.is_empty() {
+                            recent_commit_messages = snapshot
+                                .recent_commits
+                                .iter()
+                                .filter(|c| !c.is_merge)
+                                .take(15)
+                                .map(|c| c.subject.clone())
+                                .filter(|s| !s.trim().is_empty())
+                                .collect();
+                        }
+
+                        let selected_set: HashSet<&PathBuf> = selected_files.iter().collect();
+                        let target_changes: Vec<&GitChangedFile> = if selected_set.is_empty() {
+                            snapshot.changed_files.iter().collect()
+                        } else {
+                            let filtered: Vec<&GitChangedFile> = snapshot
+                                .changed_files
+                                .iter()
+                                .filter(|c| selected_set.contains(&c.path))
+                                .collect();
+                            if filtered.is_empty() {
+                                snapshot.changed_files.iter().collect()
+                            } else {
+                                filtered
+                            }
+                        };
+
+                        let changed_files: Vec<String> = target_changes
+                            .iter()
+                            .map(|c| {
+                                let rel = c
+                                    .path
+                                    .strip_prefix(&root)
+                                    .unwrap_or(&c.path)
+                                    .to_string_lossy()
+                                    .replace('\\', "/");
+                                format!("{} {}", c.status.badge_str(), rel)
+                            })
+                            .collect();
+
+                        append_untracked_diff_previews(
+                            &root,
+                            &target_changes,
+                            &snapshot.working_diffs,
+                            &mut diff_text,
+                        );
+
+                        let style_summary = summarize_commit_history(
+                            &recent_commit_messages,
+                            commit_template.as_deref(),
+                            commitlint_config.as_deref(),
+                        );
+
                         notify(
                             &event_tx,
                             GitWorkerEvent::AiDiffReady {
                                 snapshot,
-                                diff_text,
+                                context: AiCommitContext {
+                                    diff_text,
+                                    changed_files,
+                                    recent_commit_messages,
+                                    style_summary,
+                                    commit_template,
+                                    commitlint_config,
+                                },
                             },
                         );
                     }
@@ -2357,9 +2495,11 @@ impl GitEngine {
         let root_buf = root.to_path_buf();
         let (cmd_tx, event_rx, pending_refresh, is_busy) =
             spawn_git_worker(root_buf.clone(), wakeup);
+        let is_git_repo = root_buf.join(".git").exists();
         let engine = Self {
             root: root_buf,
             git_installed: detect_git_executable().is_some(),
+            is_git_repo,
             git_binary_path: detect_git_executable(),
             git_version: None,
             current_branch: "main".to_string(),
@@ -2395,6 +2535,7 @@ impl GitEngine {
 
     fn apply_snapshot(&mut self, snapshot: GitSnapshot) {
         self.git_installed = snapshot.git_installed;
+        self.is_git_repo = snapshot.is_git_repo;
         self.git_binary_path = snapshot.git_binary_path;
         self.git_version = snapshot.git_version;
         self.current_branch = snapshot.current_branch;
@@ -2535,6 +2676,13 @@ impl GitEngine {
                 self.pending_refresh.store(false, Ordering::Release);
             }
         }
+    }
+
+    /// 在当前工作区执行 `git init`（可选同步生成适配项目类型的 `.gitignore`）
+    pub fn request_init_repo(&self, create_gitignore: bool) {
+        let _ = self
+            .cmd_tx
+            .send(GitWorkerCmd::InitRepo { create_gitignore });
     }
 
     pub fn request_stage_all(&mut self) {
@@ -2772,7 +2920,9 @@ impl GitEngine {
     }
 
     pub fn request_ai_commit_diff(&self) -> bool {
-        self.cmd_tx.send(GitWorkerCmd::AiCommitDiff).is_ok()
+        self.cmd_tx
+            .send(GitWorkerCmd::AiCommitDiff(self.checked_commit_files()))
+            .is_ok()
     }
 
     pub fn poll_updates(&mut self) -> GitPollOutcome {
@@ -2821,17 +2971,9 @@ impl GitEngine {
                     }
                     self.file_blames.insert(path, lines);
                 }
-                GitWorkerEvent::AiDiffReady {
-                    snapshot,
-                    diff_text,
-                } => {
-                    let changed_files: Vec<String> = snapshot
-                        .changed_files
-                        .iter()
-                        .map(|c| format!("{:?}: {}", c.status, c.path.display()))
-                        .collect();
+                GitWorkerEvent::AiDiffReady { snapshot, context } => {
                     self.apply_snapshot(snapshot);
-                    outcome.ai_diff_ready = Some((diff_text, changed_files));
+                    outcome.ai_diff_ready = Some(context);
                 }
             }
         }
@@ -2961,8 +3103,16 @@ impl GitEngine {
         Ok(msg)
     }
 
-    /// 根据当前变更文件列表自动生成规范的 Conventional Commit 消息
+    /// 根据仓库历史格式与当前变更文件列表生成规范的 Commit 消息（本地快速回退）
     pub fn generate_ai_commit_message(&mut self) -> String {
+        let hist: Vec<String> = self
+            .recent_commits
+            .iter()
+            .filter(|c| !c.is_merge)
+            .take(20)
+            .map(|c| c.subject.clone())
+            .collect();
+        let profile = analyze_commit_history(&hist);
         let count = self.changed_files.len();
         let sample_names: Vec<String> = self
             .changed_files
@@ -2970,17 +3120,778 @@ impl GitEngine {
             .take(3)
             .filter_map(|f| f.path.file_name().and_then(|n| n.to_str()).map(|s| s.to_string()))
             .collect();
-        let msg = if sample_names.is_empty() {
-            "feat(ide): update workspace modules and multi-agent integration".to_string()
+        let inferred_scope = infer_scope_from_changes(&self.root, &self.changed_files, &profile.top_scopes);
+        let commit_type = infer_commit_type_from_changes(&self.changed_files, &profile.top_types);
+        let desc = if sample_names.is_empty() {
+            match profile.language {
+                CommitSubjectLanguage::Chinese => "更新工作区模块变更".to_string(),
+                CommitSubjectLanguage::English | CommitSubjectLanguage::Mixed => {
+                    "update workspace modules".to_string()
+                }
+            }
         } else {
-            format!(
-                "feat(ide): update {} ({} files changed)",
-                sample_names.join(", "),
-                count
-            )
+            match profile.language {
+                CommitSubjectLanguage::Chinese => format!("更新 {} 等 {} 个文件", sample_names.join("、"), count),
+                CommitSubjectLanguage::English | CommitSubjectLanguage::Mixed => {
+                    format!("update {} ({} files changed)", sample_names.join(", "), count)
+                }
+            }
+        };
+
+        let msg = match profile.convention {
+            CommitConventionKind::ConventionalCommits => {
+                if profile.uses_scopes {
+                    if let Some(scope) = inferred_scope {
+                        format!("{commit_type}({scope}): {desc}")
+                    } else {
+                        format!("{commit_type}: {desc}")
+                    }
+                } else {
+                    format!("{commit_type}: {desc}")
+                }
+            }
+            CommitConventionKind::GitmojiConventional => {
+                let emoji = profile.top_gitmoji.as_deref().unwrap_or("✨");
+                if let Some(scope) = inferred_scope.filter(|_| profile.uses_scopes) {
+                    format!("{emoji} {commit_type}({scope}): {desc}")
+                } else {
+                    format!("{emoji} {commit_type}: {desc}")
+                }
+            }
+            CommitConventionKind::Gitmoji => {
+                let emoji = profile.top_gitmoji.as_deref().unwrap_or("✨");
+                format!("{emoji} {desc}")
+            }
+            CommitConventionKind::BracketTag => {
+                let tag = profile
+                    .top_bracket_tag
+                    .as_deref()
+                    .unwrap_or(commit_type.as_str());
+                format!("[{tag}] {desc}")
+            }
+            CommitConventionKind::TicketPrefix => format!("{commit_type}: {desc}"),
+            CommitConventionKind::Plain => {
+                if profile.lowercase_subject {
+                    desc
+                } else {
+                    capitalize_first_ascii(&desc)
+                }
+            }
         };
         self.commit_message_draft = msg.clone();
         msg
+    }
+}
+
+fn build_default_gitignore(root: &Path) -> String {
+    let mut lines = vec![
+        "# Generated by Rust AI IDE",
+        ".DS_Store",
+        "Thumbs.db",
+        ".idea/",
+        "*.log",
+        ".env",
+    ];
+    if root.join("Cargo.toml").is_file() {
+        lines.push("/target/");
+    }
+    if root.join("package.json").is_file() {
+        lines.push("node_modules/");
+        lines.push("dist/");
+    }
+    if root.join("pyproject.toml").is_file() || root.join("requirements.txt").is_file() {
+        lines.push("__pycache__/");
+        lines.push(".venv/");
+        lines.push("*.pyc");
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
+}
+
+fn empty_git_snapshot() -> GitSnapshot {
+    GitSnapshot {
+        git_installed: detect_git_executable().is_some(),
+        is_git_repo: false,
+        git_binary_path: detect_git_executable(),
+        git_version: None,
+        current_branch: "main".to_string(),
+        local_branches: vec!["main".to_string()],
+        remote_branches: Vec::new(),
+        tags: Vec::new(),
+        ahead_behind: (0, 0),
+        stashes: Vec::new(),
+        remotes: Vec::new(),
+        in_rebase: false,
+        in_merge: false,
+        changed_files: Vec::new(),
+        working_diffs: HashMap::new(),
+        recent_commits: Vec::new(),
+        head_detail: None,
+    }
+}
+
+fn clip_chars(s: &str, max_chars: usize) -> String {
+    let mut chars = s.chars();
+    let clipped: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{clipped}...")
+    } else {
+        clipped
+    }
+}
+
+fn collect_ai_commit_diff(root: &Path, selected_files: &[PathBuf]) -> String {
+    let mut cmd = git_command(root);
+    cmd.args(["diff", "HEAD"]);
+    if !selected_files.is_empty() && selected_files.len() <= 40 {
+        cmd.arg("--");
+        for path in selected_files {
+            let rel = path.strip_prefix(root).unwrap_or(path);
+            cmd.arg(rel);
+        }
+    }
+    let Ok(output) = cmd.output() else {
+        return String::new();
+    };
+    if output.status.success() {
+        return String::from_utf8_lossy(&output.stdout).to_string();
+    }
+    // 非 Git 仓库时不再重复执行 git diff --cached；仅在无 HEAD 的新仓库回退到暂存区 diff
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.to_ascii_lowercase().contains("not a git repository") || !selected_files.is_empty() {
+        return String::new();
+    }
+    git_command(root)
+        .args(["diff", "--cached"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default()
+}
+
+fn append_untracked_diff_previews(
+    root: &Path,
+    target_changes: &[&GitChangedFile],
+    working_diffs: &HashMap<PathBuf, Vec<DiffLine>>,
+    diff_text: &mut String,
+) {
+    let mut untracked_added = 0usize;
+    for ch in target_changes {
+        if ch.status != GitFileStatusKind::Untracked {
+            continue;
+        }
+        if untracked_added >= 6 {
+            break;
+        }
+        let Some(lines) = working_diffs.get(&ch.path) else {
+            continue;
+        };
+        if lines.is_empty() {
+            continue;
+        }
+        let rel = ch
+            .path
+            .strip_prefix(root)
+            .unwrap_or(&ch.path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if !diff_text.is_empty() && !diff_text.ends_with('\n') {
+            diff_text.push('\n');
+        }
+        diff_text.push_str(&format!("--- /dev/null\n+++ b/{rel}\n"));
+        for dl in lines.iter().take(40) {
+            diff_text.push('+');
+            diff_text.push_str(&dl.content);
+            diff_text.push('\n');
+        }
+        untracked_added += 1;
+    }
+}
+
+fn collect_recent_commit_messages(root: &Path, limit: usize) -> Vec<String> {
+    let limit_str = limit.max(1).to_string();
+    let parse_records = |raw: &str| -> Vec<String> {
+        raw.split('\x1e')
+            .map(|entry| entry.replace("\r\n", "\n").replace('\r', "\n").trim().to_string())
+            .filter(|entry| !entry.is_empty() && !entry.starts_with("Revert \""))
+            .take(15)
+            .map(|entry| clip_chars(&entry, 450))
+            .collect()
+    };
+
+    if let Ok(output) = git_command(root)
+        .args([
+            "log",
+            "-n",
+            &limit_str,
+            "--no-merges",
+            "--pretty=format:%B%x1e",
+        ])
+        .output()
+    {
+        if output.status.success() {
+            let parsed = parse_records(&String::from_utf8_lossy(&output.stdout));
+            if !parsed.is_empty() {
+                return parsed;
+            }
+            if let Ok(all_out) = git_command(root)
+                .args(["log", "-n", &limit_str, "--pretty=format:%B%x1e"])
+                .output()
+            {
+                if all_out.status.success() {
+                    return parse_records(&String::from_utf8_lossy(&all_out.stdout));
+                }
+            }
+        }
+    }
+    Vec::new()
+}
+
+fn read_small_text_file(path: &Path, max_bytes: u64, max_chars: usize) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() == 0 || meta.len() > max_bytes {
+        return None;
+    }
+    let text = std::fs::read_to_string(path).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(clip_chars(trimmed, max_chars))
+}
+
+fn collect_commit_conventions(root: &Path) -> (Option<String>, Option<String>) {
+    let mut template_candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(out) = git_command(root)
+        .args(["config", "--get", "commit.template"])
+        .output()
+    {
+        if out.status.success() {
+            let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !raw.is_empty() {
+                let p = PathBuf::from(&raw);
+                template_candidates.push(if p.is_absolute() { p } else { root.join(p) });
+            }
+        }
+    }
+    template_candidates.push(root.join(".gitmessage"));
+    template_candidates.push(root.join(".gitmessage.txt"));
+
+    let commit_template = template_candidates
+        .into_iter()
+        .find_map(|p| read_small_text_file(&p, 16 * 1024, 1500));
+
+    let commitlint_candidates = [
+        ".commitlintrc",
+        ".commitlintrc.json",
+        ".commitlintrc.yml",
+        ".commitlintrc.yaml",
+        ".commitlintrc.js",
+        ".commitlintrc.cjs",
+        "commitlint.config.js",
+        "commitlint.config.cjs",
+        "commitlint.config.mjs",
+        "commitlint.config.ts",
+    ];
+    let commitlint_config = commitlint_candidates
+        .iter()
+        .find_map(|name| read_small_text_file(&root.join(name), 16 * 1024, 1500));
+
+    (commit_template, commitlint_config)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitConventionKind {
+    ConventionalCommits,
+    GitmojiConventional,
+    Gitmoji,
+    BracketTag,
+    TicketPrefix,
+    Plain,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitSubjectLanguage {
+    English,
+    Chinese,
+    Mixed,
+}
+
+#[derive(Debug, Clone)]
+pub struct CommitHistoryProfile {
+    pub sample_count: usize,
+    pub convention: CommitConventionKind,
+    pub uses_scopes: bool,
+    pub top_types: Vec<String>,
+    pub top_scopes: Vec<String>,
+    pub top_gitmoji: Option<String>,
+    pub top_bracket_tag: Option<String>,
+    pub language: CommitSubjectLanguage,
+    pub lowercase_subject: bool,
+    pub uses_trailing_period: bool,
+    pub uses_bullet_body: bool,
+    pub multiline_ratio_pct: usize,
+}
+
+fn contains_cjk(s: &str) -> bool {
+    s.chars()
+        .any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c) || ('\u{3400}'..='\u{4DBF}').contains(&c))
+}
+
+fn extract_leading_gitmoji(s: &str) -> Option<(&str, &str)> {
+    let trimmed = s.trim_start();
+    if let Some(rest) = trimmed.strip_prefix(':') {
+        if let Some(end) = rest.find(':') {
+            let code = &rest[..end];
+            if !code.is_empty()
+                && code.len() <= 24
+                && code
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                let after = rest[end + 1..].trim_start();
+                if !after.is_empty() {
+                    return Some((&trimmed[..end + 2], after));
+                }
+            }
+        }
+    }
+    let first = trimmed.chars().next()?;
+    let cp = first as u32;
+    let is_emoji = (0x1F300..=0x1FAFF).contains(&cp)
+        || (0x2600..=0x27BF).contains(&cp)
+        || matches!(first, '⚡' | '✨' | '🔥' | '✅' | '📝' | '🐛' | '🚀' | '🔧' | '♻' | '🎨' | '📦' | '🔒' | '🔖');
+    if is_emoji {
+        let mut idx = first.len_utf8();
+        for ch in trimmed[idx..].chars() {
+            if ch == '\u{FE0F}' || ch == '\u{200D}' {
+                idx += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        let after = trimmed[idx..].trim_start();
+        if !after.is_empty() {
+            return Some((&trimmed[..idx], after));
+        }
+    }
+    None
+}
+
+fn parse_conventional_prefix(s: &str) -> Option<(String, Option<String>, &str)> {
+    let trimmed = s.trim_start();
+    let colon_pos = trimmed.find(':')?;
+    if colon_pos < 2 || colon_pos > 48 {
+        return None;
+    }
+    let after_colon = &trimmed[colon_pos + 1..];
+    if !after_colon.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let header = trimmed[..colon_pos].strip_suffix('!').unwrap_or(&trimmed[..colon_pos]);
+    let (kind, scope) = if let Some(open) = header.find('(') {
+        if !header.ends_with(')') || open < 2 {
+            return None;
+        }
+        let kind = &header[..open];
+        let scope = &header[open + 1..header.len() - 1];
+        if scope.is_empty()
+            || !scope
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/' | '.' | ' '))
+        {
+            return None;
+        }
+        (kind, Some(scope.to_string()))
+    } else {
+        (header, None)
+    };
+    if kind.len() < 2
+        || kind.len() > 16
+        || !kind.chars().all(|c| c.is_ascii_alphabetic() || c == '-' || c == '_')
+    {
+        return None;
+    }
+    Some((kind.to_ascii_lowercase(), scope, after_colon.trim_start()))
+}
+
+fn parse_bracket_tag(s: &str) -> Option<(String, &str)> {
+    let trimmed = s.trim_start();
+    let (open, close) = if trimmed.starts_with('[') {
+        ('[', ']')
+    } else if trimmed.starts_with('【') {
+        ('【', '】')
+    } else {
+        return None;
+    };
+    let inner_start = open.len_utf8();
+    let close_rel = trimmed[inner_start..].find(close)?;
+    let tag = trimmed[inner_start..inner_start + close_rel].trim();
+    let rest = trimmed[inner_start + close_rel + close.len_utf8()..].trim_start();
+    if tag.is_empty() || tag.chars().count() > 24 || rest.is_empty() {
+        return None;
+    }
+    Some((tag.to_string(), rest))
+}
+
+fn parse_ticket_prefix(s: &str) -> Option<&str> {
+    let trimmed = s.trim_start();
+    if let Some(rest) = trimmed.strip_prefix('#') {
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() {
+            let tail = rest[digits.len()..].trim_start_matches(':').trim_start();
+            if !tail.is_empty() {
+                return Some(tail);
+            }
+        }
+    }
+    let dash_pos = trimmed.find('-')?;
+    if (2..=10).contains(&dash_pos)
+        && trimmed[..dash_pos]
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+    {
+        let after_dash = &trimmed[dash_pos + 1..];
+        let digits: String = after_dash.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() {
+            let tail = after_dash[digits.len()..].trim_start_matches(':').trim_start();
+            if !tail.is_empty() {
+                return Some(tail);
+            }
+        }
+    }
+    None
+}
+
+fn top_keys_by_freq(counts: HashMap<String, usize>, limit: usize) -> Vec<String> {
+    let mut items: Vec<(String, usize)> = counts.into_iter().collect();
+    items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    items.into_iter().take(limit).map(|(k, _)| k).collect()
+}
+
+pub fn analyze_commit_history(messages: &[String]) -> CommitHistoryProfile {
+    if messages.is_empty() {
+        return CommitHistoryProfile {
+            sample_count: 0,
+            convention: CommitConventionKind::ConventionalCommits,
+            uses_scopes: true,
+            top_types: vec!["feat".into(), "fix".into(), "refactor".into(), "chore".into()],
+            top_scopes: Vec::new(),
+            top_gitmoji: None,
+            top_bracket_tag: None,
+            language: CommitSubjectLanguage::English,
+            lowercase_subject: true,
+            uses_trailing_period: false,
+            uses_bullet_body: false,
+            multiline_ratio_pct: 0,
+        };
+    }
+
+    let mut conv_count = 0usize;
+    let mut gitmoji_conv_count = 0usize;
+    let mut gitmoji_plain_count = 0usize;
+    let mut bracket_count = 0usize;
+    let mut ticket_count = 0usize;
+    let mut scoped_count = 0usize;
+
+    let mut type_freq: HashMap<String, usize> = HashMap::new();
+    let mut scope_freq: HashMap<String, usize> = HashMap::new();
+    let mut emoji_freq: HashMap<String, usize> = HashMap::new();
+    let mut bracket_freq: HashMap<String, usize> = HashMap::new();
+
+    let mut cjk_count = 0usize;
+    let mut lower_count = 0usize;
+    let mut upper_count = 0usize;
+    let mut period_count = 0usize;
+    let mut multiline_count = 0usize;
+    let mut bullet_body_count = 0usize;
+
+    for raw in messages {
+        let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
+        let mut lines = normalized.lines();
+        let subject = lines.next().unwrap_or("").trim();
+        if subject.is_empty() {
+            continue;
+        }
+        let body_lines: Vec<&str> = lines
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        if !body_lines.is_empty() {
+            multiline_count += 1;
+            if body_lines
+                .iter()
+                .any(|l| l.starts_with("- ") || l.starts_with("* "))
+            {
+                bullet_body_count += 1;
+            }
+        }
+
+        if subject.ends_with('.') || subject.ends_with('。') {
+            period_count += 1;
+        }
+
+        let desc_part = if let Some((emoji, after_emoji)) = extract_leading_gitmoji(subject) {
+            *emoji_freq.entry(emoji.to_string()).or_insert(0) += 1;
+            if let Some((kind, scope, desc)) = parse_conventional_prefix(after_emoji) {
+                gitmoji_conv_count += 1;
+                *type_freq.entry(kind).or_insert(0) += 1;
+                if let Some(sc) = scope {
+                    scoped_count += 1;
+                    *scope_freq.entry(sc).or_insert(0) += 1;
+                }
+                desc
+            } else {
+                gitmoji_plain_count += 1;
+                after_emoji
+            }
+        } else if let Some((kind, scope, desc)) = parse_conventional_prefix(subject) {
+            conv_count += 1;
+            *type_freq.entry(kind).or_insert(0) += 1;
+            if let Some(sc) = scope {
+                scoped_count += 1;
+                *scope_freq.entry(sc).or_insert(0) += 1;
+            }
+            desc
+        } else if let Some((tag, desc)) = parse_bracket_tag(subject) {
+            bracket_count += 1;
+            *bracket_freq.entry(tag).or_insert(0) += 1;
+            desc
+        } else if let Some(desc) = parse_ticket_prefix(subject) {
+            ticket_count += 1;
+            desc
+        } else {
+            subject
+        };
+
+        if contains_cjk(desc_part) {
+            cjk_count += 1;
+        }
+        if let Some(first_alpha) = desc_part.chars().find(|c| c.is_ascii_alphabetic()) {
+            if first_alpha.is_ascii_lowercase() {
+                lower_count += 1;
+            } else {
+                upper_count += 1;
+            }
+        }
+    }
+
+    let sample_count = messages.len().max(1);
+    let convention = {
+        let candidates = [
+            (CommitConventionKind::ConventionalCommits, conv_count),
+            (CommitConventionKind::GitmojiConventional, gitmoji_conv_count),
+            (CommitConventionKind::Gitmoji, gitmoji_plain_count),
+            (CommitConventionKind::BracketTag, bracket_count),
+            (CommitConventionKind::TicketPrefix, ticket_count),
+        ];
+        candidates
+            .into_iter()
+            .filter(|(_, c)| *c * 10 >= sample_count * 3)
+            .max_by_key(|(_, c)| *c)
+            .map(|(k, _)| k)
+            .unwrap_or(CommitConventionKind::Plain)
+    };
+
+    let conv_total = conv_count + gitmoji_conv_count;
+    let uses_scopes = conv_total > 0 && scoped_count * 3 >= conv_total;
+    let language = if cjk_count * 10 >= sample_count * 6 {
+        CommitSubjectLanguage::Chinese
+    } else if cjk_count * 10 >= sample_count * 2 {
+        CommitSubjectLanguage::Mixed
+    } else {
+        CommitSubjectLanguage::English
+    };
+
+    let top_types = top_keys_by_freq(type_freq, 6);
+    let top_scopes = top_keys_by_freq(scope_freq, 8);
+    let top_gitmoji = top_keys_by_freq(emoji_freq, 1).into_iter().next();
+    let top_bracket_tag = top_keys_by_freq(bracket_freq, 1).into_iter().next();
+
+    CommitHistoryProfile {
+        sample_count,
+        convention,
+        uses_scopes,
+        top_types,
+        top_scopes,
+        top_gitmoji,
+        top_bracket_tag,
+        language,
+        lowercase_subject: lower_count >= upper_count,
+        uses_trailing_period: period_count * 2 > sample_count,
+        uses_bullet_body: bullet_body_count * 4 >= sample_count,
+        multiline_ratio_pct: (multiline_count * 100) / sample_count,
+    }
+}
+
+pub fn summarize_commit_history(
+    messages: &[String],
+    commit_template: Option<&str>,
+    commitlint_config: Option<&str>,
+) -> String {
+    let p = analyze_commit_history(messages);
+    if p.sample_count == 0 {
+        let mut out = String::from(
+            "No prior commit history found in repository.\n\
+             - Default convention: Conventional Commits (`<type>(<scope>): <description>` or `<type>: <description>`).\n\
+             - Keep the title <= 72 chars, lowercase description start, no trailing period.",
+        );
+        if commit_template.is_some() {
+            out.push_str("\n- Follow the repository commit template provided below.");
+        }
+        if commitlint_config.is_some() {
+            out.push_str("\n- Satisfy the repository commitlint rules provided below.");
+        }
+        return out;
+    }
+
+    let conv_desc = match p.convention {
+        CommitConventionKind::ConventionalCommits => {
+            if p.uses_scopes {
+                "Conventional Commits WITH optional scope: `<type>(<scope>): <description>` (or `<type>: <description>` when cross-cutting)"
+            } else {
+                "Conventional Commits WITHOUT frequent scopes: `<type>: <description>`"
+            }
+        }
+        CommitConventionKind::GitmojiConventional => {
+            "Gitmoji + Conventional Commits: `<emoji> <type>(<scope>): <description>`"
+        }
+        CommitConventionKind::Gitmoji => "Gitmoji prefix: `<emoji> <description>`",
+        CommitConventionKind::BracketTag => "Bracket tag prefix: `[tag] <description>` or `【标签】<description>`",
+        CommitConventionKind::TicketPrefix => "Ticket/Issue ID prefix followed by concise description",
+        CommitConventionKind::Plain => "Concise plain subject line (matching the exact style of recent commits)",
+    };
+
+    let lang_desc = match p.language {
+        CommitSubjectLanguage::Chinese => "Chinese (中文描述)",
+        CommitSubjectLanguage::English => "English",
+        CommitSubjectLanguage::Mixed => "Match recent commit language (Chinese/English mix observed)",
+    };
+
+    let casing_desc = if p.lowercase_subject {
+        "lowercase initial letter in description"
+    } else {
+        "capitalized initial letter in description"
+    };
+
+    let body_desc = if p.uses_bullet_body {
+        format!(
+            "Multi-line bullet body is common ({}% multiline): use a single line for small focused edits, or add a blank line + concise `- ` bullet points for multi-part changes.",
+            p.multiline_ratio_pct
+        )
+    } else if p.multiline_ratio_pct >= 25 {
+        format!(
+            "Body paragraphs appear in {}% of commits; include a short body only for complex multi-part changes.",
+            p.multiline_ratio_pct
+        )
+    } else {
+        "Strictly single-line commit messages in history: output ONLY a single title line (no body)."
+            .to_string()
+    };
+
+    let mut lines = vec![
+        format!("- Analyzed {} recent non-merge commits.", p.sample_count),
+        format!("- Format convention: {conv_desc}"),
+    ];
+    if !p.top_types.is_empty() {
+        lines.push(format!("- Common commit types: {}", p.top_types.join(", ")));
+    }
+    if !p.top_scopes.is_empty() {
+        lines.push(format!("- Observed scopes: {}", p.top_scopes.join(", ")));
+    }
+    lines.push(format!(
+        "- Subject language & style: {lang_desc}; {casing_desc}; {}",
+        if p.uses_trailing_period {
+            "trailing period allowed"
+        } else {
+            "no trailing period"
+        }
+    ));
+    lines.push(format!("- Body structure: {body_desc}"));
+    if commit_template.is_some() {
+        lines.push("- Follow the repository commit template provided below.".to_string());
+    }
+    if commitlint_config.is_some() {
+        lines.push("- Strictly adhere to the repository commitlint config provided below.".to_string());
+    }
+    lines.join("\n")
+}
+
+fn infer_scope_from_changes(
+    root: &Path,
+    changed_files: &[GitChangedFile],
+    top_scopes: &[String],
+) -> Option<String> {
+    let mut candidates: HashMap<String, usize> = HashMap::new();
+    for ch in changed_files {
+        let rel = ch.path.strip_prefix(root).unwrap_or(&ch.path);
+        for comp in rel.components() {
+            let part = comp.as_os_str().to_string_lossy();
+            if matches!(part.as_ref(), "src" | "crates" | "packages" | "apps" | "lib" | "tests") {
+                continue;
+            }
+            if part.contains('.') {
+                continue;
+            }
+            *candidates.entry(part.to_string()).or_insert(0) += 1;
+            break;
+        }
+    }
+    for scope in top_scopes {
+        if candidates.contains_key(scope) {
+            return Some(scope.clone());
+        }
+    }
+    top_keys_by_freq(candidates, 1)
+        .into_iter()
+        .next()
+        .or_else(|| top_scopes.first().cloned())
+}
+
+fn infer_commit_type_from_changes(
+    changed_files: &[GitChangedFile],
+    top_types: &[String],
+) -> String {
+    if !changed_files.is_empty() {
+        let all_docs = changed_files.iter().all(|f| {
+            f.path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("txt"))
+        });
+        if all_docs {
+            return "docs".to_string();
+        }
+        let all_tests = changed_files.iter().all(|f| {
+            let s = f.path.to_string_lossy().to_ascii_lowercase();
+            s.contains("test") || s.contains("spec")
+        });
+        if all_tests {
+            return "test".to_string();
+        }
+        let has_added = changed_files
+            .iter()
+            .any(|f| matches!(f.status, GitFileStatusKind::Added | GitFileStatusKind::Untracked));
+        if has_added {
+            return "feat".to_string();
+        }
+    }
+    top_types
+        .iter()
+        .find(|t| matches!(t.as_str(), "fix" | "feat" | "refactor" | "chore"))
+        .cloned()
+        .unwrap_or_else(|| "feat".to_string())
+}
+
+fn capitalize_first_ascii(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_lowercase() => {
+            let mut out = first.to_ascii_uppercase().to_string();
+            out.push_str(chars.as_str());
+            out
+        }
+        _ => s.to_string(),
     }
 }
 
@@ -3239,5 +4150,130 @@ mod tests {
             Some("awesome-ide")
         );
         assert_eq!(derive_repo_name_from_url("   "), None);
+    }
+
+    #[test]
+    fn test_commit_history_style_analysis_and_ai_context() {
+        // 1. Conventional commits with scopes + bullet bodies
+        let conv_msgs = vec![
+            "feat(ide-app): add markdown preview\n\n- Support tables\n- Add toolbar".to_string(),
+            "fix(agent): preserve unicode env".to_string(),
+            "perf(ide-app): cache wrapped rows\n\n- Avoid clone".to_string(),
+            "chore(release): bump version".to_string(),
+        ];
+        let profile = analyze_commit_history(&conv_msgs);
+        assert_eq!(profile.convention, CommitConventionKind::ConventionalCommits);
+        assert!(profile.uses_scopes);
+        assert!(profile.top_scopes.contains(&"ide-app".to_string()));
+        assert_eq!(profile.language, CommitSubjectLanguage::English);
+        assert!(profile.uses_bullet_body);
+
+        // 2. Bracket tag + Chinese commits
+        let zh_msgs = vec![
+            "【功能】新增用户登录校验".to_string(),
+            "【修复】解决并发提交空指针异常".to_string(),
+            "【重构】拆分订单状态机".to_string(),
+        ];
+        let zh_profile = analyze_commit_history(&zh_msgs);
+        assert_eq!(zh_profile.convention, CommitConventionKind::BracketTag);
+        assert_eq!(zh_profile.language, CommitSubjectLanguage::Chinese);
+
+        // 3. Gitmoji + Conventional Commits
+        let gm_msgs = vec![
+            "✨ feat(ui): add dark theme".to_string(),
+            "🐛 fix(api): handle timeout".to_string(),
+        ];
+        let gm_profile = analyze_commit_history(&gm_msgs);
+        assert_eq!(gm_profile.convention, CommitConventionKind::GitmojiConventional);
+        assert!(matches!(gm_profile.top_gitmoji.as_deref(), Some("✨" | "🐛")));
+
+        // 4. End-to-end AiCommitDiff collects history, style summary, and commit template
+        let tmp = std::env::temp_dir().join(format!("rust_ai_ide_ai_ctx_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let _ = git_command(&tmp).args(["init"]).output();
+        ensure_git_identity(&tmp);
+        fs::write(tmp.join(".gitmessage"), "# <type>(<scope>): <subject>\n").unwrap();
+        let f_path = tmp.join("src_mod.rs");
+        fs::write(&f_path, "pub fn a() {}\n").unwrap();
+        let _ = git_command(&tmp).args(["add", "-A"]).output();
+        let _ = git_command(&tmp)
+            .args(["commit", "-m", "feat(core): initial module\n\n- Add src_mod.rs"])
+            .output();
+        let _ = git_command(&tmp)
+            .args(["commit", "--allow-empty", "-m", "fix(core): handle edge case"])
+            .output();
+
+        fs::write(&f_path, "pub fn a() -> i32 { 42 }\n").unwrap();
+        let mut engine = GitEngine::open(&tmp);
+        assert!(engine.request_ai_commit_diff());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut got_ctx: Option<AiCommitContext> = None;
+        while Instant::now() < deadline {
+            let outcome = engine.poll_updates();
+            if let Some(ctx) = outcome.ai_diff_ready {
+                got_ctx = Some(ctx);
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let ctx = got_ctx.expect("AiCommitContext should be produced");
+        assert!(ctx.diff_text.contains("pub fn a() -> i32 { 42 }"));
+        assert!(ctx
+            .recent_commit_messages
+            .iter()
+            .any(|m| m.contains("feat(core): initial module")));
+        assert!(ctx.style_summary.contains("Conventional Commits"));
+        assert!(ctx.commit_template.as_deref().is_some_and(|t| t.contains("<type>(<scope>)")));
+
+        let fallback = engine.generate_ai_commit_message();
+        assert!(fallback.starts_with("fix(") || fallback.starts_with("feat("));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_non_git_workspace_detection_and_init_repo() {
+        if detect_git_executable().is_none() {
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!(
+            "rust_ai_ide_git_init_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+        fs::write(tmp.join("main.rs"), "fn main() {}\n").unwrap();
+
+        let mut engine = GitEngine::open(&tmp);
+        assert!(engine.has_loaded_snapshot);
+        assert!(engine.git_installed);
+        assert!(!engine.is_git_repo);
+
+        engine.request_init_repo(true);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let outcome = engine.poll_updates();
+            if outcome.changed && engine.is_git_repo {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(engine.is_git_repo);
+        assert!(tmp.join(".git").exists());
+        let gi = fs::read_to_string(tmp.join(".gitignore")).unwrap();
+        assert!(gi.contains("/target/"));
+        assert!(engine
+            .changed_files
+            .iter()
+            .any(|f| f.path.file_name().and_then(|n| n.to_str()) == Some("main.rs")));
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

@@ -77,6 +77,7 @@ pub struct LivePtyTab {
     spawn_attempted: bool,
     pending_rows: u16,
     pending_cols: u16,
+    extra_env: Vec<(String, String)>,
     backend: Option<Arc<Mutex<PtyTabBackend>>>,
 }
 
@@ -125,8 +126,13 @@ impl LivePtyTab {
             spawn_attempted: false,
             pending_rows: rows as u16,
             pending_cols: cols as u16,
+            extra_env: Vec::new(),
             backend: None,
         }
+    }
+
+    pub fn set_extra_env(&mut self, env: Vec<(String, String)>) {
+        self.extra_env = env;
     }
 
     pub fn spawn_powershell(
@@ -174,6 +180,9 @@ impl LivePtyTab {
             cmd.cwd(&self.cwd);
             cmd.env("TERM", "xterm-256color");
             cmd.env("COLORTERM", "truecolor");
+            for (key, val) in &self.extra_env {
+                cmd.env(key, val);
+            }
 
             if let Ok(child) = pair.slave.spawn_command(cmd) {
                 let shell_pid = child.process_id();
@@ -631,6 +640,7 @@ pub struct TerminalSession {
     pub active_tab: usize,
     pub cwd: PathBuf,
     pub input_buffer: String,
+    extra_env: Vec<(String, String)>,
     on_output: Option<PtyWakeupCallback>,
 }
 
@@ -650,17 +660,29 @@ impl TerminalSession {
             active_tab: 0,
             cwd: cwd.to_path_buf(),
             input_buffer: String::new(),
+            extra_env: Vec::new(),
             on_output,
+        }
+    }
+
+    /// Sets environment variables (e.g. `LAUNCH_EDITOR`, `REACT_EDITOR`) injected into all
+    /// newly spawned terminal tabs and RunConfiguration shells.
+    pub fn set_extra_env(&mut self, env: Vec<(String, String)>) {
+        self.extra_env = env.clone();
+        for tab in &mut self.tabs {
+            tab.set_extra_env(env.clone());
         }
     }
 
     pub fn add_new_tab(&mut self) {
         let idx = self.tabs.len() + 1;
-        let tab = LivePtyTab::spawn_powershell(
+        let mut tab = LivePtyTab::new_lazy(
             format!("PowerShell ({idx})"),
             &self.cwd,
             self.on_output.clone(),
         );
+        tab.set_extra_env(self.extra_env.clone());
+        tab.ensure_spawned();
         self.tabs.push(tab);
         self.active_tab = self.tabs.len() - 1;
     }
@@ -716,12 +738,13 @@ impl TerminalSession {
             existing
         } else {
             let tab_title = format!("▶ {title}");
-            let tab = LivePtyTab::new_lazy_bound(
+            let mut tab = LivePtyTab::new_lazy_bound(
                 tab_title,
                 &self.cwd,
                 Some(run_key.to_string()),
                 self.on_output.clone(),
             );
+            tab.set_extra_env(self.extra_env.clone());
             self.tabs.push(tab);
             self.tabs.len() - 1
         };

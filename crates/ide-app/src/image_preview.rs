@@ -932,6 +932,14 @@ pub fn detect_pasted_code_snippet(text: &str) -> Option<(String, String, usize)>
     let lines: Vec<&str> = normalized.lines().collect();
     let line_count = lines.len();
     let total_chars = normalized.chars().count();
+    let looks_like_markup = normalized.contains("<template")
+        || normalized.contains("</template>")
+        || normalized.contains("v-model")
+        || normalized.contains("v-if=")
+        || normalized.contains("v-for=")
+        || normalized.contains("v-bind")
+        || normalized.contains("@click")
+        || (normalized.contains('<') && normalized.contains("/>"));
     let looks_like_code = normalized.contains("fn ")
         || normalized.contains("impl ")
         || normalized.contains("struct ")
@@ -943,6 +951,7 @@ pub fn detect_pasted_code_snippet(text: &str) -> Option<(String, String, usize)>
         || (normalized.contains('{') && normalized.contains('}'))
         || normalized.contains("=>")
         || normalized.contains("::")
+        || looks_like_markup
         || lines
             .iter()
             .any(|l| l.starts_with("    ") || l.starts_with('\t'));
@@ -965,6 +974,25 @@ pub fn detect_pasted_code_snippet(text: &str) -> Option<(String, String, usize)>
         || (normalized.contains("import ") && !normalized.contains(';'))
     {
         "python"
+    } else if normalized.contains("<template")
+        || normalized.contains("</template>")
+        || normalized.contains("<script setup")
+        || normalized.contains("v-model")
+        || normalized.contains("v-if=")
+        || normalized.contains("v-for=")
+        || normalized.contains("v-bind")
+        || normalized.contains("v-on")
+        || normalized.contains("@click")
+        || (normalized.contains('<')
+            && (normalized.contains(" :") || normalized.contains("\n"))
+            && (normalized.contains("/>") || normalized.contains("</")))
+    {
+        "vue"
+    } else if normalized.contains("<!doctype")
+        || normalized.contains("<!DOCTYPE")
+        || normalized.contains("<html")
+    {
+        "html"
     } else if normalized.contains("interface ")
         || normalized.contains("function ")
         || normalized.contains("const ")
@@ -1018,6 +1046,10 @@ mod tests {
         let detected = detect_pasted_code_snippet(code).expect("multi-line rust code detected");
         assert_eq!(detected.1, "rust");
         assert_eq!(detected.2, 5);
+
+        let vue_code = "<EstimateModalThFilter\n  v-model=\"modalFilterRemarks\"\n  col-key=\"modal.inst.remarks\"\n  :default-width=\"80\"\n/>";
+        let vue_det = detect_pasted_code_snippet(vue_code).expect("multi-line vue code detected");
+        assert_eq!(vue_det.1, "vue");
     }
 
     #[test]

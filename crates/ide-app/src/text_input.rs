@@ -491,14 +491,25 @@ impl TextInputField {
             return;
         }
         let pos = char_idx.min(chars.len().saturating_sub(1));
-        let is_word = |c: char| c.is_alphanumeric() || c == '_' || !c.is_ascii();
-        let target_is_word = is_word(chars[pos]);
+        let is_base = |c: char| c.is_alphanumeric() || c == '_' || !c.is_ascii();
+        let is_word_at = |idx: usize| -> bool {
+            let ch = chars[idx];
+            if is_base(ch) {
+                return true;
+            }
+            ch == '-'
+                && idx > 0
+                && idx + 1 < chars.len()
+                && is_base(chars[idx - 1])
+                && is_base(chars[idx + 1])
+        };
+        let target_is_word = is_word_at(pos);
         let mut s = pos;
-        while s > 0 && is_word(chars[s - 1]) == target_is_word && chars[s - 1] != '\n' {
+        while s > 0 && is_word_at(s - 1) == target_is_word && chars[s - 1] != '\n' {
             s -= 1;
         }
         let mut e = pos + 1;
-        while e < chars.len() && is_word(chars[e]) == target_is_word && chars[e] != '\n' {
+        while e < chars.len() && is_word_at(e) == target_is_word && chars[e] != '\n' {
             e += 1;
         }
         self.selection_anchor = Some(s);
@@ -1213,5 +1224,17 @@ mod tests {
         assert_eq!(segs.len(), 2);
         let (line, col) = f.cursor_line_and_col(&segs);
         assert_eq!((line, col), (1, 0));
+    }
+
+    #[test]
+    fn text_input_select_word_keeps_hyphenated_identifiers_together() {
+        let mut f = TextInputField::single_line();
+        f.set_text("run antigravity-cli --help");
+        f.select_word_at(6);
+        assert_eq!(f.selected_text().as_deref(), Some("antigravity-cli"));
+        f.select_word_at(15);
+        assert_eq!(f.selected_text().as_deref(), Some("antigravity-cli"));
+        f.select_word_at(23);
+        assert_eq!(f.selected_text().as_deref(), Some("help"));
     }
 }

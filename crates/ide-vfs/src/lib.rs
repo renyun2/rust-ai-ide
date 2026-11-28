@@ -211,13 +211,13 @@ impl TextBuffer {
             return;
         }
         let idx = c.min(chars.len().saturating_sub(1));
-        let kind = char_word_kind(chars[idx]);
+        let kind = char_word_kind_at(&chars, idx);
         let mut start = idx;
-        while start > 0 && char_word_kind(chars[start - 1]) == kind {
+        while start > 0 && char_word_kind_at(&chars, start - 1) == kind {
             start -= 1;
         }
         let mut end = idx + 1;
-        while end < chars.len() && char_word_kind(chars[end]) == kind {
+        while end < chars.len() && char_word_kind_at(&chars, end) == kind {
             end += 1;
         }
         self.selection_anchor = Some((l, start));
@@ -233,19 +233,19 @@ impl TextBuffer {
         if chars.is_empty() {
             return None;
         }
-        let probe = if c < chars.len() && char_word_kind(chars[c]) == WordCharKind::Word {
+        let probe = if c < chars.len() && char_word_kind_at(&chars, c) == WordCharKind::Word {
             c
-        } else if c > 0 && char_word_kind(chars[c - 1]) == WordCharKind::Word {
+        } else if c > 0 && char_word_kind_at(&chars, c - 1) == WordCharKind::Word {
             c - 1
         } else {
             return None;
         };
         let mut start = probe;
-        while start > 0 && char_word_kind(chars[start - 1]) == WordCharKind::Word {
+        while start > 0 && char_word_kind_at(&chars, start - 1) == WordCharKind::Word {
             start -= 1;
         }
         let mut end = probe + 1;
-        while end < chars.len() && char_word_kind(chars[end]) == WordCharKind::Word {
+        while end < chars.len() && char_word_kind_at(&chars, end) == WordCharKind::Word {
             end += 1;
         }
         let word: String = chars[start..end].iter().collect();
@@ -260,10 +260,7 @@ impl TextBuffer {
     pub fn word_at_cursor(&self) -> Option<String> {
         if let Some(sel) = self.selected_text() {
             let trimmed = sel.trim();
-            if !trimmed.is_empty()
-                && !trimmed.contains('\n')
-                && trimmed.chars().all(|ch| ch.is_alphanumeric() || ch == '_')
-            {
+            if !trimmed.is_empty() && !trimmed.contains('\n') && is_word_token_str(trimmed) {
                 return Some(trimmed.to_string());
             }
         }
@@ -378,13 +375,8 @@ impl TextBuffer {
         let mut word_hits = Vec::new();
         for (line, sc, ec) in all_hits {
             let chars: Vec<char> = self.line_text(line).chars().collect();
-            let prev_is_word = sc > 0
-                && chars
-                    .get(sc - 1)
-                    .is_some_and(|c| char_word_kind(*c) == WordCharKind::Word);
-            let next_is_word = chars
-                .get(ec)
-                .is_some_and(|c| char_word_kind(*c) == WordCharKind::Word);
+            let prev_is_word = sc > 0 && char_word_kind_at(&chars, sc - 1) == WordCharKind::Word;
+            let next_is_word = ec < chars.len() && char_word_kind_at(&chars, ec) == WordCharKind::Word;
             if !prev_is_word && !next_is_word {
                 word_hits.push((line, sc, ec));
             }
@@ -627,6 +619,65 @@ impl TextBuffer {
         self.mark_modified();
     }
 
+    fn detect_sfc_comment_style(&self, target_line: usize) -> (&'static str, Option<&'static str>) {
+        if !matches!(
+            self.language,
+            LanguageId::Vue | LanguageId::Svelte | LanguageId::Astro | LanguageId::Html | LanguageId::Xml
+        ) {
+            return (self.language.line_comment_prefix(), None);
+        }
+        if self.language == LanguageId::Xml {
+            return ("<!-- ", Some(" -->"));
+        }
+        let mut in_script = false;
+        let mut in_style = false;
+        let mut in_fm = false;
+        let mut fm_done = false;
+        let mut seen_non_empty = false;
+        for l in 0..=target_line.min(self.line_count().saturating_sub(1)) {
+            let line = self.line_text(l);
+            let t = line.trim();
+            if self.language == LanguageId::Astro && !fm_done {
+                if !seen_non_empty && t == "---" {
+                    seen_non_empty = true;
+                    in_fm = true;
+                    continue;
+                }
+                if in_fm {
+                    if t == "---" {
+                        in_fm = false;
+                        fm_done = true;
+                    }
+                    continue;
+                }
+            }
+            if !t.is_empty() {
+                seen_non_empty = true;
+            }
+            let lower = t.to_ascii_lowercase();
+            if in_script {
+                if lower.contains("</script") {
+                    in_script = false;
+                }
+            } else if in_style {
+                if lower.contains("</style") {
+                    in_style = false;
+                }
+            } else if lower.starts_with("<script") && !lower.contains("</script") && !lower.ends_with("/>") {
+                in_script = true;
+            } else if lower.starts_with("<style") && !lower.contains("</style") && !lower.ends_with("/>") {
+                in_style = true;
+            }
+        }
+        if in_script || in_fm {
+            ("// ", None)
+        } else if in_style {
+            ("/* ", Some(" */"))
+        } else {
+            ("<!-- ", Some(" -->"))
+        }
+    }
+
     /// IDEA `Ctrl+/`: 切换选中行或当前行的行注释
     pub fn toggle_line_comment(&mut self) {
         let (sl, el) = if let Some(((s, _), (e, ec))) = self.selection_range() {
@@ -636,12 +687,15 @@ impl TextBuffer {
             let l = self.cursor_line.min(self.line_count().saturating_sub(1));
             (l, l)
         };
-        let prefix = self.language.line_comment_prefix();
+        let (prefix, suffix) = self.detect_sfc_comment_style(sl);
         let prefix_trimmed = prefix.trim();
+        let suffix_trimmed = suffix.map(|s| s.trim());
         let all_commented = (sl..=el).all(|l| {
             let raw = self.line_text(l);
-            let t = raw.trim_start();
-            t.is_empty() || t.starts_with(prefix_trimmed)
+            let t = raw.trim();
+            t.is_empty()
+                || (t.starts_with(prefix_trimmed)
+                    && suffix_trimmed.is_none_or(|sfx| t.ends_with(sfx)))
         });
         let mut out_lines = Vec::with_capacity(el - sl + 1);
         for l in sl..=el {
@@ -650,15 +704,29 @@ impl TextBuffer {
             let leading = raw.len() - trimmed_start.len();
             let indent = &raw[..leading];
             if all_commented {
-                if let Some(rest) = trimmed_start.strip_prefix(prefix) {
-                    out_lines.push(format!("{indent}{rest}"));
+                let mut inner = if let Some(rest) = trimmed_start.strip_prefix(prefix) {
+                    rest
                 } else if let Some(rest) = trimmed_start.strip_prefix(prefix_trimmed) {
-                    out_lines.push(format!("{indent}{rest}"));
+                    rest
                 } else {
                     out_lines.push(raw);
+                    continue;
+                };
+                if let Some(sfx) = suffix {
+                    let t_end = inner.trim_end();
+                    inner = t_end
+                        .strip_suffix(sfx)
+                        .or_else(|| t_end.strip_suffix(sfx.trim()))
+                        .unwrap_or(t_end);
                 }
+                out_lines.push(format!("{indent}{inner}"));
             } else if trimmed_start.is_empty() {
                 out_lines.push(raw);
+            } else if let Some(sfx) = suffix {
+                out_lines.push(format!(
+                    "{indent}{prefix}{}{sfx}",
+                    trimmed_start.trim_end()
+                ));
             } else {
                 out_lines.push(format!("{indent}{prefix}{trimmed_start}"));
             }
@@ -825,15 +893,20 @@ impl TextBuffer {
 
     pub fn reformat_basic(&mut self) {
         let original = self.text();
-        let mut lines: Vec<String> = original
-            .lines()
-            .map(|l| l.trim_end().to_string())
-            .collect();
-        while lines.last().is_some_and(|l| l.is_empty()) {
-            lines.pop();
-        }
-        let mut formatted = lines.join("\n");
-        formatted.push('\n');
+        let formatted = if self.language == LanguageId::Markdown {
+            format_markdown_source(&original)
+        } else {
+            let mut lines: Vec<String> = original
+                .lines()
+                .map(|l| l.trim_end().to_string())
+                .collect();
+            while lines.last().is_some_and(|l| l.is_empty()) {
+                lines.pop();
+            }
+            let mut out = lines.join("\n");
+            out.push('\n');
+            out
+        };
         if formatted == original {
             return;
         }
@@ -952,8 +1025,8 @@ impl TextBuffer {
             i -= 1;
         }
         if i > 0 {
-            let kind = char_word_kind(chars[i - 1]);
-            while i > 0 && char_word_kind(chars[i - 1]) == kind {
+            let kind = char_word_kind_at(&chars, i - 1);
+            while i > 0 && char_word_kind_at(&chars, i - 1) == kind {
                 i -= 1;
             }
         }
@@ -975,8 +1048,8 @@ impl TextBuffer {
                 i += 1;
             }
         } else {
-            let kind = char_word_kind(chars[i]);
-            while i < chars.len() && char_word_kind(chars[i]) == kind {
+            let kind = char_word_kind_at(&chars, i);
+            while i < chars.len() && char_word_kind_at(&chars, i) == kind {
                 i += 1;
             }
             while i < chars.len() && chars[i].is_whitespace() {
@@ -1149,14 +1222,36 @@ fn is_bracket_char(ch: char) -> bool {
     matches!(ch, '(' | ')' | '[' | ']' | '{' | '}')
 }
 
-fn char_word_kind(ch: char) -> WordCharKind {
-    if ch.is_alphanumeric() || ch == '_' {
+#[inline]
+fn is_base_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+#[inline]
+fn is_connector_hyphen(chars: &[char], idx: usize) -> bool {
+    chars.get(idx).copied() == Some('-')
+        && idx > 0
+        && idx + 1 < chars.len()
+        && is_base_word_char(chars[idx - 1])
+        && is_base_word_char(chars[idx + 1])
+}
+
+#[inline]
+fn char_word_kind_at(chars: &[char], idx: usize) -> WordCharKind {
+    let ch = chars[idx];
+    if is_base_word_char(ch) || is_connector_hyphen(chars, idx) {
         WordCharKind::Word
     } else if ch.is_whitespace() {
         WordCharKind::Space
     } else {
         WordCharKind::Punct
     }
+}
+
+fn is_word_token_str(s: &str) -> bool {
+    let chars: Vec<char> = s.chars().collect();
+    !chars.is_empty()
+        && (0..chars.len()).all(|idx| char_word_kind_at(&chars, idx) == WordCharKind::Word)
 }
 
 /// 左侧 Project 工具窗口的文件树节点
@@ -1227,7 +1322,80 @@ impl ProjectTreeState {
 
     pub fn rebuild(&mut self) {
         self.visible_entries.clear();
-        self.collect_visible(&self.root.clone(), 0, 250);
+        self.collect_visible(&self.root.clone(), 0, 2000);
+    }
+
+    /// Re-sync visible tree entries with the filesystem while keeping valid expanded folders.
+    pub fn refresh(&mut self) {
+        let root = self.root.clone();
+        self.expanded_dirs.retain(|p| p == &root || p.is_dir());
+        if let Some(sel) = &self.selected_path {
+            if !sel.exists() {
+                self.selected_path = None;
+            }
+        }
+        self.rebuild();
+    }
+
+    /// 展开目标文件所在的全部祖先目录并选中该文件，返回其在 `visible_entries` 中的索引
+    pub fn reveal_path(&mut self, target: &Path) -> Option<usize> {
+        let mut rel_components: Vec<std::ffi::OsString> = Vec::new();
+        let mut cur = Some(target);
+        let mut matched_root = false;
+        while let Some(p) = cur {
+            if paths_equal_tree(p, &self.root) {
+                matched_root = true;
+                break;
+            }
+            if let Some(name) = p.file_name() {
+                rel_components.push(name.to_os_string());
+            }
+            cur = p.parent();
+        }
+        if !matched_root || rel_components.is_empty() {
+            return None;
+        }
+        rel_components.reverse();
+
+        let mut walker = self.root.clone();
+        self.expanded_dirs.insert(walker.clone());
+        for (idx, comp) in rel_components.iter().enumerate() {
+            let is_last = idx + 1 == rel_components.len();
+            let direct = walker.join(comp);
+            let next_path = if direct.exists() {
+                direct
+            } else if let Ok(rd) = fs::read_dir(&walker) {
+                let comp_str = comp.to_string_lossy();
+                rd.filter_map(|e| e.ok())
+                    .find(|e| {
+                        let name = e.file_name();
+                        #[cfg(windows)]
+                        {
+                            name.to_string_lossy().eq_ignore_ascii_case(&comp_str)
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            name.to_string_lossy() == comp_str
+                        }
+                    })
+                    .map(|e| e.path())
+                    .unwrap_or(direct)
+            } else {
+                direct
+            };
+            if !is_last {
+                self.expanded_dirs.insert(next_path.clone());
+            }
+            walker = next_path;
+        }
+
+        self.rebuild();
+        let idx = self
+            .visible_entries
+            .iter()
+            .position(|e| paths_equal_tree(&e.path, &walker))?;
+        self.selected_path = Some(self.visible_entries[idx].path.clone());
+        Some(idx)
     }
 
     pub fn toggle_dir(&mut self, dir: &Path) {
@@ -1281,6 +1449,9 @@ impl ProjectTreeState {
                 LanguageId::Go => "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"Ready\")\n}\n".to_string(),
                 LanguageId::Kotlin => "fun main() {\n    println(\"Ready\")\n}\n".to_string(),
                 LanguageId::Dart => "void main() {\n  print('Ready');\n}\n".to_string(),
+                LanguageId::Vue => "<script setup lang=\"ts\">\nimport { ref } from 'vue'\n\nconst count = ref(0)\n</script>\n\n<template>\n  <div class=\"container\">\n    <button @click=\"count++\">Count: {{ count }}</button>\n  </div>\n</template>\n\n<style scoped>\n.container {\n  padding: 16px;\n}\n</style>\n".to_string(),
+                LanguageId::Svelte => "<script lang=\"ts\">\n  let count = $state(0);\n</script>\n\n<main>\n  <button onclick={() => count++}>Count: {count}</button>\n</main>\n\n<style>\n  main {\n    padding: 16px;\n  }\n</style>\n".to_string(),
+                LanguageId::Astro => "---\nconst title = 'Astro Component';\n---\n\n<section>\n  <h1>{title}</h1>\n</section>\n".to_string(),
                 _ => String::new(),
             };
             fs::write(&target, content)?;
@@ -1343,6 +1514,39 @@ impl ProjectTreeState {
         Ok(())
     }
 
+    /// Copy a file or directory into `target_dir` without modifying the source (copy mode).
+    pub fn copy_path_to_dir(&mut self, src: &Path, target_dir: &Path) -> Result<PathBuf> {
+        if !src.exists() {
+            bail!("Source path does not exist: {}", src.display());
+        }
+        if !target_dir.is_dir() {
+            bail!("Target directory does not exist: {}", target_dir.display());
+        }
+        if path_is_same_or_descendant_tree(src, target_dir) {
+            bail!(
+                "Cannot copy '{}' into itself or a subdirectory",
+                src.display()
+            );
+        }
+        let file_name = src
+            .file_name()
+            .context("Source path has no file name")?;
+        let dest = next_available_copy_path(target_dir, file_name, src.is_dir());
+        if src.is_dir() {
+            copy_dir_recursive_tree(src, &dest)?;
+        } else {
+            fs::copy(src, &dest).with_context(|| {
+                format!("Failed to copy {} to {}", src.display(), dest.display())
+            })?;
+        }
+        self.expanded_dirs.insert(target_dir.to_path_buf());
+        if self.reveal_path(&dest).is_none() {
+            self.selected_path = Some(dest.clone());
+            self.rebuild();
+        }
+        Ok(dest)
+    }
+
     fn expand_recursive(&mut self, dir: &Path, depth: usize) {
         if depth > 4 {
             return;
@@ -1366,7 +1570,7 @@ impl ProjectTreeState {
     }
 
     fn collect_visible(&mut self, dir: &Path, depth: usize, max_entries: usize) {
-        if self.visible_entries.len() >= max_entries || depth > 8 {
+        if self.visible_entries.len() >= max_entries || depth > 16 {
             return;
         }
         let Ok(read_dir) = fs::read_dir(dir) else {
@@ -1410,6 +1614,97 @@ impl ProjectTreeState {
             }
         }
     }
+}
+
+fn paths_equal_tree(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+pub fn path_is_same_or_descendant_tree(ancestor: &Path, candidate: &Path) -> bool {
+    let anc = fs::canonicalize(ancestor).unwrap_or_else(|_| ancestor.to_path_buf());
+    let cand = fs::canonicalize(candidate).unwrap_or_else(|_| candidate.to_path_buf());
+    if paths_equal_tree(&anc, &cand) {
+        return true;
+    }
+    let mut cur = cand.parent();
+    while let Some(p) = cur {
+        if paths_equal_tree(p, &anc) {
+            return true;
+        }
+        cur = p.parent();
+    }
+    false
+}
+
+fn next_available_copy_path(
+    target_dir: &Path,
+    file_name: &std::ffi::OsStr,
+    is_dir: bool,
+) -> PathBuf {
+    let direct = target_dir.join(file_name);
+    if !direct.exists() {
+        return direct;
+    }
+    let name_str = file_name.to_string_lossy();
+    let (stem, ext) = if !is_dir {
+        match name_str.rsplit_once('.') {
+            Some((s, e)) if !s.is_empty() => (s.to_string(), Some(e.to_string())),
+            _ => (name_str.to_string(), None),
+        }
+    } else {
+        (name_str.to_string(), None)
+    };
+    for idx in 1..1000usize {
+        let candidate_name = match (&ext, idx) {
+            (Some(e), 1) => format!("{stem}_copy.{e}"),
+            (Some(e), n) => format!("{stem}_copy_{n}.{e}"),
+            (None, 1) => format!("{stem}_copy"),
+            (None, n) => format!("{stem}_copy_{n}"),
+        };
+        let candidate = target_dir.join(candidate_name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    direct
+}
+
+fn copy_dir_recursive_tree(src: &Path, dest: &Path) -> Result<()> {
+    fs::create_dir_all(dest)
+        .with_context(|| format!("Failed to create directory: {}", dest.display()))?;
+    for entry in fs::read_dir(src)
+        .with_context(|| format!("Failed to read directory: {}", src.display()))?
+    {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        let child_src = entry.path();
+        let child_dest = dest.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive_tree(&child_src, &child_dest)?;
+        } else if file_type.is_file() {
+            fs::copy(&child_src, &child_dest).with_context(|| {
+                format!(
+                    "Failed to copy {} to {}",
+                    child_src.display(),
+                    child_dest.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
 }
 
 pub fn scan_workspace_tree(root: &Path, _max_entries: usize) -> Vec<FileTreeEntry> {
@@ -1472,6 +1767,418 @@ fn build_java_file_template(target: &Path) -> String {
         out.push_str(&format!("public class {class_name} {{\n    \n}}\n"));
     }
     out
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MdFmtAlign {
+    None,
+    Left,
+    Center,
+    Right,
+}
+
+fn md_display_width(s: &str) -> usize {
+    s.chars()
+        .map(|c| {
+            let u = c as u32;
+            if (0x1100..=0x115F).contains(&u)
+                || (0x2E80..=0xA4CF).contains(&u)
+                || (0xAC00..=0xD7A3).contains(&u)
+                || (0xF900..=0xFAFF).contains(&u)
+                || (0xFE10..=0xFE6F).contains(&u)
+                || (0xFF00..=0xFF60).contains(&u)
+                || (0xFFE0..=0xFFE6).contains(&u)
+                || (0x1F300..=0x1FAFF).contains(&u)
+            {
+                2
+            } else {
+                1
+            }
+        })
+        .sum()
+}
+
+fn md_split_table_cells(line: &str) -> Vec<String> {
+    let mut trimmed = line.trim();
+    if let Some(rest) = trimmed.strip_prefix('|') {
+        trimmed = rest;
+    }
+    if let Some(rest) = trimmed.strip_suffix('|') {
+        if !rest.ends_with('\\') {
+            trimmed = rest;
+        }
+    }
+    let mut cells = Vec::new();
+    let mut cur = String::new();
+    let mut in_code = false;
+    let mut chars = trimmed.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(&next) = chars.peek() {
+                if next == '|' {
+                    cur.push('\\');
+                    cur.push(chars.next().unwrap());
+                    continue;
+                }
+            }
+            cur.push(c);
+        } else if c == '`' {
+            in_code = !in_code;
+            cur.push(c);
+        } else if c == '|' && !in_code {
+            cells.push(cur.trim().to_string());
+            cur.clear();
+        } else {
+            cur.push(c);
+        }
+    }
+    cells.push(cur.trim().to_string());
+    cells
+}
+
+fn md_parse_table_separator(line: &str) -> Option<Vec<MdFmtAlign>> {
+    if !line.contains('|') && !line.contains('-') {
+        return None;
+    }
+    let trimmed = line.trim();
+    if !trimmed.contains('|') {
+        return None;
+    }
+    let cells = md_split_table_cells(trimmed);
+    if cells.is_empty() {
+        return None;
+    }
+    let mut aligns = Vec::with_capacity(cells.len());
+    for cell in cells {
+        let c = cell.trim();
+        if c.is_empty() {
+            return None;
+        }
+        let left = c.starts_with(':');
+        let right = c.ends_with(':');
+        let inner = c.trim_start_matches(':').trim_end_matches(':');
+        if inner.is_empty() || !inner.chars().all(|ch| ch == '-') {
+            return None;
+        }
+        aligns.push(match (left, right) {
+            (true, true) => MdFmtAlign::Center,
+            (true, false) => MdFmtAlign::Left,
+            (false, true) => MdFmtAlign::Right,
+            (false, false) => MdFmtAlign::None,
+        });
+    }
+    Some(aligns)
+}
+
+fn md_is_horizontal_rule(trimmed: &str) -> bool {
+    if trimmed.len() < 3 {
+        return false;
+    }
+    let mut marker: Option<char> = None;
+    let mut count = 0usize;
+    for c in trimmed.chars() {
+        if c == ' ' || c == '\t' {
+            continue;
+        }
+        if matches!(c, '-' | '*' | '_') {
+            if let Some(m) = marker {
+                if m != c {
+                    return false;
+                }
+            } else {
+                marker = Some(c);
+            }
+            count += 1;
+        } else {
+            return false;
+        }
+    }
+    count >= 3
+}
+
+fn md_fence_opener(trimmed: &str) -> Option<(char, usize)> {
+    let ch = trimmed.chars().next()?;
+    if ch != '`' && ch != '~' {
+        return None;
+    }
+    let count = trimmed.chars().take_while(|&c| c == ch).count();
+    if count >= 3 {
+        let rest = &trimmed[count..];
+        if ch == '`' && rest.contains('`') {
+            return None;
+        }
+        Some((ch, count))
+    } else {
+        None
+    }
+}
+
+fn md_parse_atx_heading(trimmed: &str) -> Option<(usize, String)> {
+    let hashes = trimmed.chars().take_while(|&c| c == '#').count();
+    if !(1..=6).contains(&hashes) {
+        return None;
+    }
+    let rest = trimmed[hashes..].trim();
+    if rest.is_empty() {
+        return None;
+    }
+    let cleaned = rest
+        .trim_end_matches(|c: char| c == '#' || c == ' ' || c == '\t')
+        .trim();
+    if cleaned.is_empty() {
+        return None;
+    }
+    Some((hashes, cleaned.to_string()))
+}
+
+fn md_format_list_line(line: &str) -> Option<String> {
+    let indent_bytes = line.len() - line.trim_start_matches([' ', '\t']).len();
+    let indent_spaces = line[..indent_bytes]
+        .chars()
+        .map(|c| if c == '\t' { 2 } else { 1 })
+        .sum::<usize>();
+    let normalized_indent = " ".repeat((indent_spaces / 2) * 2);
+    let rest = &line[indent_bytes..];
+    for marker in ["- ", "* ", "+ "] {
+        if let Some(after) = rest.strip_prefix(marker) {
+            let trimmed_after = after.trim_start();
+            if let Some(task) = trimmed_after
+                .strip_prefix("[ ]")
+                .or_else(|| trimmed_after.strip_prefix("[x]"))
+                .or_else(|| trimmed_after.strip_prefix("[X]"))
+            {
+                let checked = !trimmed_after.starts_with("[ ]");
+                let box_str = if checked { "[x]" } else { "[ ]" };
+                let task_body = task.trim();
+                return Some(if task_body.is_empty() {
+                    format!("{normalized_indent}- {box_str}")
+                } else {
+                    format!("{normalized_indent}- {box_str} {task_body}")
+                });
+            }
+            return Some(format!("{normalized_indent}- {}", trimmed_after.trim_end()));
+        }
+    }
+    let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digits > 0 {
+        let after_digits = &rest[digits..];
+        if let Some(after_dot) = after_digits
+            .strip_prefix(". ")
+            .or_else(|| after_digits.strip_prefix(") "))
+        {
+            let num = &rest[..digits];
+            return Some(format!(
+                "{normalized_indent}{num}. {}",
+                after_dot.trim_start().trim_end()
+            ));
+        }
+    }
+    None
+}
+
+fn md_format_blockquote_line(trimmed: &str) -> Option<String> {
+    if !trimmed.starts_with('>') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut rest = trimmed;
+    while let Some(after) = rest.strip_prefix('>') {
+        depth += 1;
+        rest = after.trim_start();
+    }
+    let prefix = "> ".repeat(depth);
+    if rest.is_empty() {
+        Some(prefix.trim_end().to_string())
+    } else {
+        Some(format!("{prefix}{}", rest.trim_end()))
+    }
+}
+
+fn md_pad_cell(text: &str, width: usize, align: MdFmtAlign) -> String {
+    let cur = md_display_width(text);
+    let pad = width.saturating_sub(cur);
+    match align {
+        MdFmtAlign::Right => format!("{}{}", " ".repeat(pad), text),
+        MdFmtAlign::Center => {
+            let left = pad / 2;
+            let right = pad - left;
+            format!("{}{}{}", " ".repeat(left), text, " ".repeat(right))
+        }
+        MdFmtAlign::Left | MdFmtAlign::None => format!("{}{}", text, " ".repeat(pad)),
+    }
+}
+
+/// Format Markdown source text cleanly: aligns GFM tables, normalizes headings, lists,
+/// blockquotes, horizontal rules, and blank lines while preserving fenced code blocks verbatim.
+pub fn format_markdown_source(raw: &str) -> String {
+    let normalized = raw.replace("\r\n", "\n");
+    let lines: Vec<&str> = normalized.lines().collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut fence: Option<(char, usize)> = None;
+    let mut i = 0usize;
+
+    let push_blank_if_needed = |out: &mut Vec<String>| {
+        if let Some(last) = out.last() {
+            if !last.is_empty() {
+                out.push(String::new());
+            }
+        }
+    };
+
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim();
+
+        if let Some((fch, flen)) = fence {
+            out.push(line.to_string());
+            let close_cnt = trimmed.chars().take_while(|&c| c == fch).count();
+            if close_cnt >= flen && trimmed[close_cnt..].trim().is_empty() {
+                fence = None;
+            }
+            i += 1;
+            continue;
+        }
+
+        if let Some((fch, flen)) = md_fence_opener(trimmed) {
+            fence = Some((fch, flen));
+            out.push(line.trim_end().to_string());
+            i += 1;
+            continue;
+        }
+
+        if trimmed.is_empty() {
+            push_blank_if_needed(&mut out);
+            i += 1;
+            continue;
+        }
+
+        // GFM Table block (header + separator + body rows)
+        if line.contains('|') && i + 1 < lines.len() {
+            if let Some(aligns) = md_parse_table_separator(lines[i + 1]) {
+                let mut rows: Vec<Vec<String>> = vec![md_split_table_cells(line)];
+                let mut j = i + 2;
+                while j < lines.len() {
+                    let row_line = lines[j];
+                    if row_line.trim().is_empty() || !row_line.contains('|') {
+                        break;
+                    }
+                    rows.push(md_split_table_cells(row_line));
+                    j += 1;
+                }
+                let cols = aligns
+                    .len()
+                    .max(rows.iter().map(|r| r.len()).max().unwrap_or(0));
+                let mut col_widths = vec![3usize; cols];
+                for r in &rows {
+                    for (ci, cell) in r.iter().enumerate() {
+                        col_widths[ci] = col_widths[ci].max(md_display_width(cell));
+                    }
+                }
+                push_blank_if_needed(&mut out);
+                for (r_idx, r) in rows.iter().enumerate() {
+                    let mut row_s = String::from("|");
+                    for ci in 0..cols {
+                        let cell = r.get(ci).map(|s| s.as_str()).unwrap_or("");
+                        let align = aligns.get(ci).copied().unwrap_or(MdFmtAlign::None);
+                        row_s.push(' ');
+                        row_s.push_str(&md_pad_cell(cell, col_widths[ci], align));
+                        row_s.push_str(" |");
+                    }
+                    out.push(row_s);
+                    if r_idx == 0 {
+                        let mut sep_s = String::from("|");
+                        for ci in 0..cols {
+                            let w = col_widths[ci];
+                            let align = aligns.get(ci).copied().unwrap_or(MdFmtAlign::None);
+                            sep_s.push(' ');
+                            match align {
+                                MdFmtAlign::None => sep_s.push_str(&"-".repeat(w)),
+                                MdFmtAlign::Left => {
+                                    sep_s.push(':');
+                                    sep_s.push_str(&"-".repeat(w.saturating_sub(1).max(2)));
+                                }
+                                MdFmtAlign::Right => {
+                                    sep_s.push_str(&"-".repeat(w.saturating_sub(1).max(2)));
+                                    sep_s.push(':');
+                                }
+                                MdFmtAlign::Center => {
+                                    sep_s.push(':');
+                                    sep_s.push_str(&"-".repeat(w.saturating_sub(2).max(1)));
+                                    sep_s.push(':');
+                                }
+                            }
+                            sep_s.push_str(" |");
+                        }
+                        out.push(sep_s);
+                    }
+                }
+                if j < lines.len() && !lines[j].trim().is_empty() {
+                    out.push(String::new());
+                }
+                i = j;
+                continue;
+            }
+        }
+
+        if let Some((level, title)) = md_parse_atx_heading(trimmed) {
+            push_blank_if_needed(&mut out);
+            out.push(format!("{} {}", "#".repeat(level), title));
+            if i + 1 < lines.len() && !lines[i + 1].trim().is_empty() {
+                out.push(String::new());
+            }
+            i += 1;
+            continue;
+        }
+
+        // Preserve Setext heading underlines without turning them into HR spacing
+        if i > 0
+            && !lines[i - 1].trim().is_empty()
+            && (trimmed.chars().all(|c| c == '=') || trimmed.chars().all(|c| c == '-'))
+            && trimmed.len() >= 3
+        {
+            let ch = trimmed.chars().next().unwrap();
+            out.push(ch.to_string().repeat(trimmed.len()));
+            i += 1;
+            continue;
+        }
+
+        if md_is_horizontal_rule(trimmed) {
+            push_blank_if_needed(&mut out);
+            out.push("---".to_string());
+            if i + 1 < lines.len() && !lines[i + 1].trim().is_empty() {
+                out.push(String::new());
+            }
+            i += 1;
+            continue;
+        }
+
+        if let Some(q) = md_format_blockquote_line(trimmed) {
+            out.push(q);
+            i += 1;
+            continue;
+        }
+
+        if let Some(li) = md_format_list_line(line) {
+            out.push(li);
+            i += 1;
+            continue;
+        }
+
+        out.push(line.trim_end().to_string());
+        i += 1;
+    }
+
+    while out.first().is_some_and(|l| l.is_empty()) {
+        out.remove(0);
+    }
+    while out.last().is_some_and(|l| l.is_empty()) {
+        out.pop();
+    }
+    let mut res = out.join("\n");
+    if !res.is_empty() || !normalized.is_empty() {
+        res.push('\n');
+    }
+    res
 }
 
 #[cfg(test)]
@@ -1577,6 +2284,205 @@ mod tests {
         let test_src = fs::read_to_string(&test_file).unwrap();
         assert!(test_src.contains("package com.example;"));
         assert!(test_src.contains("@Test"));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_format_markdown_source_and_buffer_reformat() {
+        let raw = "#Title   \nSome text\n|Name|Value|\n|:---|---:|\n|foo|12|\n|longer|3|\n*  item 1\n- [X]  done\n>quote\n```rust\nlet   x=1;\n```\n***\n";
+        let mut buf = TextBuffer::from_text(PathBuf::from("README.md"), raw);
+        buf.reformat_basic();
+        let out = buf.text();
+        assert!(out.contains("# Title\n\nSome text\n"));
+        assert!(out.contains("| Name   | Value |\n| :----- | ----: |\n| foo    |    12 |\n| longer |     3 |\n"));
+        assert!(out.contains("- item 1\n- [x] done\n"));
+        assert!(out.contains("> quote\n"));
+        assert!(out.contains("```rust\nlet   x=1;\n```"));
+        assert!(out.contains("\n---\n"));
+    }
+
+    #[test]
+    fn test_vue_sfc_section_aware_line_comment_toggle() {
+        let src = "<script setup lang=\"ts\">\nconst a = 1\n</script>\n<template>\n  <div>hi</div>\n</template>\n<style scoped>\n  .box { color: red; }\n</style>\n";
+        let mut buf = TextBuffer::from_text(PathBuf::from("App.vue"), src);
+        buf.set_cursor(1, 0, false);
+        buf.toggle_line_comment();
+        assert_eq!(buf.line_text(1), "// const a = 1");
+        buf.toggle_line_comment();
+        assert_eq!(buf.line_text(1), "const a = 1");
+
+        buf.set_cursor(4, 0, false);
+        buf.toggle_line_comment();
+        assert_eq!(buf.line_text(4), "  <!-- <div>hi</div> -->");
+        buf.toggle_line_comment();
+        assert_eq!(buf.line_text(4), "  <div>hi</div>");
+
+        buf.set_cursor(7, 0, false);
+        buf.toggle_line_comment();
+        assert_eq!(buf.line_text(7), "  /* .box { color: red; } */");
+        buf.toggle_line_comment();
+        assert_eq!(buf.line_text(7), "  .box { color: red; }");
+    }
+
+    #[test]
+    fn test_project_tree_reveal_path_expands_collapsed_ancestors() {
+        let unique = format!(
+            "rust_ai_ide_vfs_reveal_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let tmp = std::env::temp_dir().join(unique);
+        let nested_dir = tmp.join("apps/web/src/components");
+        fs::create_dir_all(&nested_dir).unwrap();
+        let target_file = nested_dir.join("Header.vue");
+        fs::write(&target_file, "<template><header/></template>\n").unwrap();
+
+        let mut tree = ProjectTreeState::new(&tmp);
+        // Initially collapsed: Header.vue should not be in visible_entries.
+        assert!(!tree
+            .visible_entries
+            .iter()
+            .any(|e| paths_equal_tree(&e.path, &target_file)));
+
+        let idx = tree
+            .reveal_path(&target_file)
+            .expect("target file should be revealed in project tree");
+        assert!(paths_equal_tree(&tree.visible_entries[idx].path, &target_file));
+        assert_eq!(
+            tree.selected_path.as_deref(),
+            Some(tree.visible_entries[idx].path.as_path())
+        );
+        assert!(tree.expanded_dirs.contains(&tmp.join("apps")));
+        assert!(tree.expanded_dirs.contains(&nested_dir));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_hyphenated_identifiers_indexed_and_selected_together() {
+        let src = "const pkg = \"antigravity-cli\"; // a - b, x->y, n--, -1\n<EstimateModalThFilter v-model=\"m\" col-key=\"k\" />\n";
+        let mut buf = TextBuffer::from_text(PathBuf::from("App.vue"), src);
+
+        // Double-click / word lookup on left half, hyphen, and right half of `antigravity-cli`
+        buf.select_word_at(0, 15);
+        assert_eq!(buf.selected_text().as_deref(), Some("antigravity-cli"));
+        buf.select_word_at(0, 24);
+        assert_eq!(buf.selected_text().as_deref(), Some("antigravity-cli"));
+        buf.select_word_at(0, 26);
+        assert_eq!(buf.selected_text().as_deref(), Some("antigravity-cli"));
+        assert_eq!(
+            buf.word_at_pos(0, 24).map(|(w, _, _)| w).as_deref(),
+            Some("antigravity-cli")
+        );
+        assert_eq!(buf.word_at_cursor().as_deref(), Some("antigravity-cli"));
+
+        // Kebab-case Vue attributes are also selected/indexed together
+        buf.select_word_at(1, 25);
+        assert_eq!(buf.selected_text().as_deref(), Some("v-model"));
+        buf.select_word_at(1, 37);
+        assert_eq!(buf.selected_text().as_deref(), Some("col-key"));
+
+        // Non-connector hyphens (`a - b`, `x->y`, `n--`, `-1`) remain separated
+        buf.select_word_at(0, 34);
+        assert_eq!(buf.selected_text().as_deref(), Some("a"));
+        buf.select_word_at(0, 41);
+        assert_eq!(buf.selected_text().as_deref(), Some("x"));
+        buf.select_word_at(0, 47);
+        assert_eq!(buf.selected_text().as_deref(), Some("n"));
+        buf.select_word_at(0, 53);
+        assert_eq!(buf.selected_text().as_deref(), Some("1"));
+
+        // Renaming `antigravity` must not match inside `antigravity-cli`, while renaming `antigravity-cli` works
+        assert_eq!(buf.rename_identifier_in_buffer("antigravity", "agy"), 0);
+        assert_eq!(buf.rename_identifier_in_buffer("antigravity-cli", "agy-cli"), 1);
+        assert!(buf.line_text(0).contains("\"agy-cli\""));
+    }
+
+    #[test]
+    fn test_project_tree_copy_path_to_dir_copies_files_folders_and_avoids_collisions() {
+        let unique = format!(
+            "rust_ai_ide_vfs_copy_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let tmp = std::env::temp_dir().join(unique);
+        let src_ws = tmp.join("ws_a");
+        let dst_ws = tmp.join("ws_b");
+        let dst_sub = dst_ws.join("nested");
+        fs::create_dir_all(src_ws.join("folder/inner")).unwrap();
+        fs::create_dir_all(&dst_sub).unwrap();
+        let src_file = src_ws.join("hello.rs");
+        fs::write(&src_file, "fn main() {}\n").unwrap();
+        fs::write(src_ws.join("folder/a.txt"), "alpha").unwrap();
+        fs::write(src_ws.join("folder/inner/b.txt"), "beta").unwrap();
+
+        let mut tree = ProjectTreeState::new(&dst_ws);
+        // 1. Copy file into target subdirectory
+        let copied_1 = tree.copy_path_to_dir(&src_file, &dst_sub).unwrap();
+        assert_eq!(copied_1, dst_sub.join("hello.rs"));
+        assert_eq!(fs::read_to_string(&copied_1).unwrap(), "fn main() {}\n");
+        assert!(src_file.exists(), "copy mode must preserve original file");
+
+        // 2. Copy same file again -> generates non-colliding copy name
+        let copied_2 = tree.copy_path_to_dir(&src_file, &dst_sub).unwrap();
+        assert_eq!(copied_2, dst_sub.join("hello_copy.rs"));
+        assert!(copied_2.exists());
+
+        // 3. Copy folder recursively into workspace root
+        let copied_dir = tree.copy_path_to_dir(&src_ws.join("folder"), &dst_ws).unwrap();
+        assert_eq!(copied_dir, dst_ws.join("folder"));
+        assert_eq!(fs::read_to_string(copied_dir.join("a.txt")).unwrap(), "alpha");
+        assert_eq!(
+            fs::read_to_string(copied_dir.join("inner/b.txt")).unwrap(),
+            "beta"
+        );
+
+        // 4. Reject copying a folder into itself or its descendant
+        assert!(tree.copy_path_to_dir(&copied_dir, &copied_dir).is_err());
+        assert!(tree
+            .copy_path_to_dir(&copied_dir, &copied_dir.join("inner"))
+            .is_err());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_project_tree_refresh_syncs_external_changes_and_prunes_deleted() {
+        let unique = format!(
+            "rust_ai_ide_vfs_refresh_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let tmp = std::env::temp_dir().join(unique);
+        let sub = tmp.join("sub");
+        let gone_dir = tmp.join("gone_dir");
+        fs::create_dir_all(&sub).unwrap();
+        fs::create_dir_all(&gone_dir).unwrap();
+        fs::write(sub.join("existing.rs"), "// ok\n").unwrap();
+
+        let mut tree = ProjectTreeState::new(&tmp);
+        tree.toggle_dir(&sub);
+        tree.toggle_dir(&gone_dir);
+        tree.selected_path = Some(gone_dir.clone());
+        assert!(tree.visible_entries.iter().any(|e| e.name == "existing.rs"));
+
+        // External FS changes: add a file inside `sub`, remove `gone_dir`
+        fs::write(sub.join("external_new.rs"), "// new\n").unwrap();
+        fs::remove_dir_all(&gone_dir).unwrap();
+
+        tree.refresh();
+        assert!(tree.visible_entries.iter().any(|e| e.name == "external_new.rs"));
+        assert!(!tree.visible_entries.iter().any(|e| e.name == "gone_dir"));
+        assert!(!tree.expanded_dirs.contains(&gone_dir));
+        assert!(tree.expanded_dirs.contains(&sub));
+        assert!(tree.selected_path.is_none());
 
         let _ = fs::remove_dir_all(&tmp);
     }

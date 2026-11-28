@@ -6,6 +6,7 @@ use crate::image_preview::{
     read_windows_clipboard_payload, ClipboardPastePayload, DecodedPreviewImage, MediaKind,
     MediaPreviewTab,
 };
+use crate::markdown::{render_markdown_preview_body, MarkdownPreviewCache};
 use crate::persistence::{
     self, PersistedGlobalSettings, PersistedOpenTab, PersistedProviderPref, PersistedWorkspaceState,
 };
@@ -17,9 +18,9 @@ use ide_agent_hub::{
     NODEJS_DOWNLOAD_URL,
 };
 use ide_core::{
-    detect_mobile_project, probe_mobile_environment, IdeAction, IdeaTheme, MainMenuCategory,
-    MenuEntry, MobileDeviceState, MobileEnvironmentReport, MobileProjectKind, MobileSdkLocations,
-    RunConfigSource, RunConfiguration, ThemeKind, ToolWindowId, UiLanguage,
+    detect_mobile_project, probe_mobile_environment, IdeAction, IdeaTheme, KeymapScheme,
+    MainMenuCategory, MenuEntry, MobileDeviceState, MobileEnvironmentReport, MobileProjectKind,
+    MobileSdkLocations, RunConfigSource, RunConfiguration, ThemeKind, ToolWindowId, UiLanguage,
 };
 use ide_dap::{DapDebugEngine, DebugSessionState};
 use ide_git::{
@@ -29,15 +30,16 @@ use ide_git::{
 use ide_lsp::{DiagnosticSeverityLevel, LspHub};
 use ide_search::{
     find_in_files, find_in_files_indexed, find_workspace_symbol_definition, index_workspace_files,
-    search_everywhere, search_everywhere_indexed, ContentSearchHit, SearchEverywhereItem,
-    WorkspaceFileEntry,
+    search_everywhere, search_everywhere_indexed_with_keymap, ContentSearchHit,
+    SearchEverywhereItem, WorkspaceFileEntry,
 };
 use ide_syntax::{
-    detect_runnable_gutter_entries, extract_structure_symbols, find_symbol_definition,
-    highlight_line, HighlightSpan, RunnableGutterEntry, StructureSymbol, TokenKind,
+    advance_highlight_state, detect_runnable_gutter_entries, extract_structure_symbols,
+    find_symbol_definition, highlight_line_with_state, HighlightSpan, HighlightState,
+    RunnableGutterEntry, StructureSymbol, TokenKind,
 };
 use ide_terminal::TerminalSession;
-use ide_vfs::{ProjectTreeState, TextBuffer};
+use ide_vfs::{path_is_same_or_descendant_tree, ProjectTreeState, TextBuffer};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -266,6 +268,37 @@ pub enum IdeCursorKind {
     Pointer,
     EwResize,
     NsResize,
+    Copy,
+    Grabbing,
+    NoDrop,
+}
+
+/// 跨窗口 / 外部 / 内部文件拖拽投放目标类型
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdeDropTarget {
+    /// 拖拽到文件管理器（Project Tree）执行复制模式
+    ProjectTreeCopy {
+        target_dir: PathBuf,
+        highlight_rect: Rect,
+    },
+    /// 拖拽到 AI 助手面板 / 输入框作为上下文附件
+    AgentAssistant,
+    /// 拖拽到任意 IDE 文本输入框插入文件路径或引用
+    TextInput {
+        target: FocusTarget,
+        rect: Rect,
+    },
+    /// 拖拽到终端插入带引号的文件路径
+    Terminal(Rect),
+    /// 拖拽到中央编辑器打开文件
+    EditorOpen,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkdownViewMode {
+    Preview,
+    Split,
+    Source,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,6 +306,7 @@ pub enum DragScrollbar {
     LeftTree,
     CenterEditor,
     CenterEditorHoriz,
+    MarkdownPreview,
     RightPanel,
     BottomTerminal,
     GitLogCommits,
@@ -344,6 +378,7 @@ pub enum ContextMenuAction {
     TreeCopyPath(PathBuf),
     TreeExpandAll,
     TreeCollapseAll,
+    TreeRefresh,
     RunFile(PathBuf),
     TabClose(usize),
     TabCloseOthers(usize),
@@ -660,7 +695,7 @@ const SETTINGS_NAV: &[SettingsNavItem] = &[
         depth: 0,
         zh: "按键映射",
         en: "Keymap",
-        keywords: "keymap shortcut key binding 按键 快捷键 intellij",
+        keywords: "keymap shortcut key binding 按键 快捷键 intellij eclipse",
     },
     SettingsNavItem {
         page: Some(SettingsPage::Plugins),
@@ -695,7 +730,7 @@ const SETTINGS_NAV: &[SettingsNavItem] = &[
         depth: 1,
         zh: "调试器",
         en: "Debugger",
-        keywords: "debug breakpoint dap codelldb 调试 断点",
+        keywords: "debug breakpoint dap codelldb vue inspector vite react launch_editor protocol 调试 断点 外部跳转",
     },
     SettingsNavItem {
         page: None,
@@ -760,6 +795,7 @@ pub enum HitAction {
     WindowControl(WindowControlCmd),
     // 顶部主菜单与弹窗
     ToggleHamburgerMenu,
+    OpenHamburgerFileMenu,
     OpenMenuCategory(MainMenuCategory),
     ExecuteIdeAction(IdeAction),
     ToggleProjectPopup,
@@ -787,6 +823,7 @@ pub enum HitAction {
     CloseTab(usize),
     DragDockPane(DockPane),
     OpenFile(PathBuf),
+    LocateActiveFileInTree,
     JumpToLine(usize),
     ClickEditorLine,
     FocusEditorBody,
@@ -796,6 +833,7 @@ pub enum HitAction {
     PromptNewFolder,
     ExpandAllDirs,
     CollapseAllDirs,
+    RefreshProjectTree,
     // 左右底部面板切换
     ToggleLeftTool(ToolWindowId),
     ToggleRightAgentHub,
@@ -813,6 +851,8 @@ pub enum HitAction {
     GenerateAiCommitMessage,
     RollbackGitFile(PathBuf),
     RefreshGitStatus,
+    InitGitRepository,
+    InitGitRepositoryWithGitIgnore,
     GitFetchAll,
     FocusGitCommitMessageInput,
     InspectGitWorkingFileDiff(PathBuf),
@@ -882,6 +922,8 @@ pub enum HitAction {
     OpenMediaAsText(PathBuf),
     OpenExternalMedia(PathBuf),
     AdjustMediaZoom(i32),
+    SetMarkdownViewMode(MarkdownViewMode),
+    FormatActiveDocument,
     ToggleComposerPastedSnippet(String),
     RemoveComposerPastedSnippet(String),
     RemoveComposerAttachment(PathBuf),
@@ -890,6 +932,7 @@ pub enum HitAction {
     CopyAgentMessage(usize),
     CopyAgentCodeBlock(Arc<str>),
     OpenFileAtLine(PathBuf, Option<usize>),
+    OpenFileAtLineCol(PathBuf, Option<usize>, Option<usize>),
     OpenExternalUrl(String),
     FocusAgentChatStream,
     RunAgentQuickPrompt(&'static str),
@@ -956,8 +999,13 @@ pub enum HitAction {
     OpenAddDebugWatchModal,
     RemoveDebugWatch(usize),
     SendDebugContextToAgent,
+    RegisterIdeUrlProtocol,
+    ToggleUserLaunchEditorEnv,
+    InstallCliToUserPath,
+    CopyLaunchEditorCommand,
     // 设置、语言、DPI 缩放、工作区与主题切换
     SelectTheme(ThemeKind),
+    SelectKeymap(KeymapScheme),
     SetUiLanguage(UiLanguage),
     SetUiScale(u16),
     SelectSettingsPage(SettingsPage),
@@ -1033,6 +1081,7 @@ pub struct IdeApplicationState {
     pub system_dpi_scale: f32,
     pub ui_scale: f32,
     pub theme: IdeaTheme,
+    pub keymap_scheme: KeymapScheme,
     pub project_tree: ProjectTreeState,
     pub open_buffers: Vec<TextBuffer>,
     /// 没有打开文件时给状态栏和动作一个空缓冲，避免下标崩溃。不写入磁盘。
@@ -1088,6 +1137,8 @@ pub struct IdeApplicationState {
     pub ctrl_hover_symbol: Option<(usize, usize, usize, String)>,
     pub last_hover_hit_idx: Option<usize>,
     pub last_hover_splitter: Option<DragSplitter>,
+    pub last_hover_editor_header: bool,
+    pub pending_tree_reveal_idx: Option<usize>,
     pub last_win_size: (i32, i32),
     pub window_maximized: bool,
     pub pending_window_cmd: Option<WindowControlCmd>,
@@ -1112,6 +1163,8 @@ pub struct IdeApplicationState {
     // 面板边界与滚动条信息
     pub left_pane_rect: Rect,
     pub editor_pane_rect: Rect,
+    pub editor_header_rect: Rect,
+    pub editor_locate_btn_rect: Rect,
     pub editor_code_rect: Rect,
     pub right_pane_rect: Rect,
     pub bottom_pane_rect: Rect,
@@ -1141,6 +1194,7 @@ pub struct IdeApplicationState {
     // 顶部主菜单与弹窗状态
     pub hamburger_menu_expanded: bool,
     pub active_menu_category: Option<MainMenuCategory>,
+    pub hamburger_trigger_rect: Rect,
     pub menu_category_rects: Vec<(MainMenuCategory, Rect)>,
     pub menu_trigger_and_bar_rect: Rect,
     pub menu_dropdown_rect: Rect,
@@ -1206,6 +1260,8 @@ pub struct IdeApplicationState {
     pub clone_modal_field_focus: u8,
     pub clone_modal_field_rects: [Rect; 2],
     pub terminal: TerminalSession,
+    pub terminal_launch_env: Vec<(String, String)>,
+    pub external_integration: Option<crate::external_open::EditorIntegrationPaths>,
     pub agent_hub: AgentHub,
     pub node_env: NodeEnvironmentStatus,
     pub cli_install_in_progress: Option<AgentProviderKind>,
@@ -1242,6 +1298,11 @@ pub struct IdeApplicationState {
     pub active_editor_diff: Option<ActiveEditorDiff>,
     pub media_tabs: Vec<MediaPreviewTab>,
     pub active_media_tab: Option<usize>,
+    pub markdown_view_modes: HashMap<PathBuf, MarkdownViewMode>,
+    pub markdown_preview_scrolls: HashMap<PathBuf, usize>,
+    pub md_preview_rect: Rect,
+    pub md_preview_scroll_info: ScrollTrackInfo,
+    pub(crate) cached_md_preview: MarkdownPreviewCache,
     pub agent_chat_signature_salt: u64,
     pub image_preview_cache: HashMap<PathBuf, Arc<DecodedPreviewImage>>,
     pub active_image_preview: Option<PathBuf>,
@@ -1280,7 +1341,7 @@ pub struct IdeApplicationState {
     pub startup_load_alpha: f32,
     pub git_load_alpha: f32,
     pub tree_load_alpha: f32,
-    wakeup_enabled: bool,
+    pub(crate) wakeup_enabled: bool,
     wakeup: Option<Arc<dyn Fn() + Send + Sync>>,
     pub persistence_dir: Option<PathBuf>,
     folder_pick_tx: mpsc::Sender<PathBuf>,
@@ -1292,6 +1353,7 @@ pub struct IdeApplicationState {
     cached_runnables: Option<(PathBuf, usize, Vec<RunnableGutterEntry>)>,
     cached_structure: Option<(PathBuf, usize, Vec<StructureSymbol>)>,
     cached_highlight_lines: (PathBuf, usize, HashMap<usize, Vec<HighlightSpan>>),
+    cached_highlight_states: (PathBuf, usize, Vec<HighlightState>),
     cached_max_editor_line_w: (PathBuf, usize, i32, i32),
     pending_diagnostics_refresh: bool,
     pub(crate) cached_chat_rows: AgentChatCache,
@@ -1307,6 +1369,7 @@ enum SearchWorkerCmd {
         seq: u64,
         query: String,
         max_results: usize,
+        keymap: KeymapScheme,
     },
     FindInFiles {
         seq: u64,
@@ -1380,6 +1443,7 @@ fn spawn_search_worker(
                         seq,
                         query,
                         max_results,
+                        keymap,
                     } => {
                         if seq != latest_seq.load(Ordering::Acquire) {
                             continue;
@@ -1390,7 +1454,12 @@ fn spawn_search_worker(
                         }
                         let items = if let Ok(guard) = files_cache.read() {
                             if let Some(files) = guard.as_ref() {
-                                search_everywhere_indexed(files, &query, max_results)
+                                search_everywhere_indexed_with_keymap(
+                                    files,
+                                    &query,
+                                    max_results,
+                                    keymap,
+                                )
                             } else {
                                 search_everywhere(&root, &query, max_results)
                             }
@@ -1618,8 +1687,28 @@ fn terminal_token_action(token: &str, workspace: &Path, cwd: &Path) -> Option<Hi
     if token.len() < 3 {
         return None;
     }
+    if let Some(crate::external_open::ExternalOpenTarget::OpenFile {
+        path,
+        line,
+        column,
+        ..
+    }) = crate::external_open::parse_external_uri(token)
+    {
+        if path.is_file() {
+            return Some(match column {
+                Some(_) => HitAction::OpenFileAtLineCol(path, line, column),
+                None => HitAction::OpenFileAtLine(path, line),
+            });
+        }
+    }
     if let Some(path) = file_url_to_path(token) {
         return Some(HitAction::OpenFileAtLine(path, None));
+    }
+    let (raw_path, split_line, split_col) = crate::external_open::split_path_and_position(token);
+    if split_col.is_some() && looks_like_path_token(&raw_path) {
+        if let Some(path) = resolve_terminal_link_path(workspace, cwd, &raw_path) {
+            return Some(HitAction::OpenFileAtLineCol(path, split_line, split_col));
+        }
     }
     let (path_str, line) = parse_path_and_line_token(token)?;
     if !looks_like_path_token(path_str) {
@@ -1779,6 +1868,7 @@ impl IdeApplicationState {
             system_dpi_scale: 1.0,
             ui_scale: 1.0,
             theme: IdeaTheme::jetbrains_islands_dark(),
+            keymap_scheme: KeymapScheme::IntelliJIdea,
             project_tree,
             open_buffers,
             idle_editor: TextBuffer::from_text(PathBuf::new(), ""),
@@ -1832,6 +1922,8 @@ impl IdeApplicationState {
             ctrl_hover_symbol: None,
             last_hover_hit_idx: None,
             last_hover_splitter: None,
+            last_hover_editor_header: false,
+            pending_tree_reveal_idx: None,
             last_win_size: (1560, 940),
             window_maximized: false,
             pending_window_cmd: None,
@@ -1854,6 +1946,8 @@ impl IdeApplicationState {
             active_scrollbar_drag: None,
             left_pane_rect: Rect::new(0, 0, 0, 0),
             editor_pane_rect: Rect::new(0, 0, 0, 0),
+            editor_header_rect: Rect::new(0, 0, 0, 0),
+            editor_locate_btn_rect: Rect::new(0, 0, 0, 0),
             editor_code_rect: Rect::new(0, 0, 0, 0),
             right_pane_rect: Rect::new(0, 0, 0, 0),
             bottom_pane_rect: Rect::new(0, 0, 0, 0),
@@ -1882,6 +1976,7 @@ impl IdeApplicationState {
             git_change_row_rects: Vec::new(),
             hamburger_menu_expanded: false,
             active_menu_category: None,
+            hamburger_trigger_rect: Rect::new(0, 0, 0, 0),
             menu_category_rects: Vec::new(),
             menu_trigger_and_bar_rect: Rect::new(0, 0, 0, 0),
             menu_dropdown_rect: Rect::new(0, 0, 0, 0),
@@ -1968,7 +2063,7 @@ impl IdeApplicationState {
                 "将 unwrap() 替换为安全错误处理并补充文档注释",
             ),
             agent_chat_input: TextInputField::multi_line(),
-            git_commit_input: TextInputField::single_line(),
+            git_commit_input: TextInputField::multi_line(),
             git_log_search_input: TextInputField::single_line(),
             modal_text_input: TextInputField::single_line(),
             search_query_input: TextInputField::single_line(),
@@ -1990,6 +2085,11 @@ impl IdeApplicationState {
             active_editor_diff: None,
             media_tabs: Vec::new(),
             active_media_tab: None,
+            markdown_view_modes: HashMap::new(),
+            markdown_preview_scrolls: HashMap::new(),
+            md_preview_rect: Rect::new(0, 0, 0, 0),
+            md_preview_scroll_info: ScrollTrackInfo::default(),
+            cached_md_preview: MarkdownPreviewCache::default(),
             agent_chat_signature_salt: 1,
             image_preview_cache: HashMap::new(),
             active_image_preview: None,
@@ -2042,9 +2142,12 @@ impl IdeApplicationState {
             cached_runnables: None,
             cached_structure: None,
             cached_highlight_lines: (PathBuf::new(), usize::MAX, HashMap::new()),
+            cached_highlight_states: (PathBuf::new(), usize::MAX, Vec::new()),
             cached_max_editor_line_w: (PathBuf::new(), usize::MAX, 0, 0),
             pending_diagnostics_refresh: false,
             cached_chat_rows: AgentChatCache::default(),
+            terminal_launch_env: Vec::new(),
+            external_integration: None,
             hit_regions: Vec::new(),
             status_notification:
                 "IDEA Islands UI 就绪 | 真实文档选区拖拽 · 原生 ConPTY VT100 终端 · AI Agent 工具链"
@@ -2097,6 +2200,7 @@ impl IdeApplicationState {
             self.ui_lang = gs.ui_lang;
             self.ui_scale = gs.ui_scale.clamp(0.85, 2.0);
             self.theme = IdeaTheme::from_kind(gs.theme_kind);
+            self.keymap_scheme = gs.keymap_scheme;
             self.settings_page = gs.settings_page;
             self.left_tool = gs.left_tool;
             self.left_panel_width = gs.left_panel_width.clamp(48, 2000);
@@ -2229,6 +2333,7 @@ impl IdeApplicationState {
             ui_lang: self.ui_lang,
             ui_scale: self.ui_scale,
             theme_kind: self.theme.kind,
+            keymap_scheme: self.keymap_scheme,
             settings_page: self.settings_page,
             last_workspace: Some(self.workspace_root.clone()),
             recent_workspaces: recent,
@@ -2671,6 +2776,8 @@ impl IdeApplicationState {
     pub fn trim_caches_when_background_idle(&mut self) {
         self.cached_highlight_lines.2.clear();
         self.cached_highlight_lines.2.shrink_to_fit();
+        self.cached_highlight_states.2.clear();
+        self.cached_highlight_states.2.shrink_to_fit();
         self.cached_structure = None;
         self.cached_runnables = None;
         self.cached_chat_rows = AgentChatCache::default();
@@ -2910,6 +3017,9 @@ impl IdeApplicationState {
         };
         let term_title = self.tr("本地", "Local");
         self.terminal = TerminalSession::new_with_wakeup(term_title, &clean, self.wakeup.clone());
+        if !self.terminal_launch_env.is_empty() {
+            self.terminal.set_extra_env(self.terminal_launch_env.clone());
+        }
         self.last_pty_size = (0, 0);
         self.agent_hub = AgentHub::new_with_wakeup(&clean, self.wakeup.clone());
         let api_cfg = self.agent_hub.api_config.clone();
@@ -2969,6 +3079,7 @@ impl IdeApplicationState {
         self.cached_runnables = None;
         self.cached_structure = None;
         self.cached_highlight_lines = (PathBuf::new(), usize::MAX, HashMap::new());
+        self.cached_highlight_states = (PathBuf::new(), usize::MAX, Vec::new());
         self.project_popup_open = false;
         self.git_branch_popup_open = false;
         self.run_config_popup_open = false;
@@ -3042,16 +3153,24 @@ impl IdeApplicationState {
 
     pub fn trigger_search_everywhere(&mut self, max_results: usize) {
         let query = self.search_query_input.as_str().to_string();
+        let keymap = self.keymap_scheme;
         if let Ok(guard) = self.workspace_files_cache.try_read() {
             if let Some(files) = guard.as_ref() {
                 self.search_seq.fetch_add(1, Ordering::AcqRel);
-                self.search_results = search_everywhere_indexed(files, &query, max_results);
+                self.search_results =
+                    search_everywhere_indexed_with_keymap(files, &query, max_results, keymap);
                 self.search_loading = false;
                 return;
             }
         }
         if !self.wakeup_enabled {
-            self.search_results = search_everywhere(&self.workspace_root, &query, max_results);
+            let mut items = search_everywhere(&self.workspace_root, &query, max_results);
+            for item in &mut items {
+                if let SearchEverywhereItem::Action { action, shortcut, .. } = item {
+                    *shortcut = action.shortcut_label_for(keymap).to_string();
+                }
+            }
+            self.search_results = items;
             self.search_loading = false;
             return;
         }
@@ -3061,6 +3180,7 @@ impl IdeApplicationState {
             seq,
             query,
             max_results,
+            keymap,
         });
     }
 
@@ -3138,14 +3258,46 @@ impl IdeApplicationState {
             self.cached_highlight_lines.1 = rev;
             self.cached_highlight_lines.2.clear();
         }
+        if self.cached_highlight_states.0 != *path || self.cached_highlight_states.1 != rev {
+            self.cached_highlight_states.0 = path.clone();
+            self.cached_highlight_states.1 = rev;
+            self.cached_highlight_states.2.clear();
+            self.cached_highlight_states.2.push(HighlightState::default());
+        }
         if self.cached_highlight_lines.2.len() > 2048 {
             self.cached_highlight_lines.2.clear();
         }
-        for (line_idx, line_str) in visible_lines {
-            self.cached_highlight_lines
+        let Some(&(max_line_idx, _)) = visible_lines.last() else {
+            return;
+        };
+        if self.cached_highlight_states.2.len() <= max_line_idx {
+            let start_l = self.cached_highlight_states.2.len().saturating_sub(1);
+            let mut st = self
+                .cached_highlight_states
                 .2
-                .entry(*line_idx)
-                .or_insert_with(|| highlight_line(line_str, lang));
+                .get(start_l)
+                .copied()
+                .unwrap_or_default();
+            let line_count = self.active_buffer().line_count();
+            let target_end = max_line_idx.min(line_count.saturating_sub(1));
+            for l in start_l..target_end {
+                let text = self.active_buffer().line_text(l);
+                advance_highlight_state(&text, lang, &mut st);
+                self.cached_highlight_states.2.push(st);
+            }
+        }
+        for (line_idx, line_str) in visible_lines {
+            if self.cached_highlight_lines.2.contains_key(line_idx) {
+                continue;
+            }
+            let mut st = self
+                .cached_highlight_states
+                .2
+                .get(*line_idx)
+                .copied()
+                .unwrap_or_default();
+            let spans = highlight_line_with_state(line_str, lang, &mut st);
+            self.cached_highlight_lines.2.insert(*line_idx, spans);
         }
     }
 
@@ -3218,10 +3370,25 @@ impl IdeApplicationState {
         true
     }
 
+    pub fn set_external_integration(
+        &mut self,
+        paths: crate::external_open::EditorIntegrationPaths,
+    ) {
+        let env = crate::external_open::terminal_launch_env(&paths);
+        self.terminal_launch_env = env.clone();
+        self.terminal.set_extra_env(env);
+        self.external_integration = Some(paths);
+    }
+
     pub fn open_file(&mut self, path: PathBuf) {
+        let path = clean_workspace_path(path);
         self.active_editor_diff = None;
         self.project_tree.selected_path = Some(path.clone());
-        if let Some(existing_idx) = self.open_buffers.iter().position(|b| b.path == path) {
+        if let Some(existing_idx) = self
+            .open_buffers
+            .iter()
+            .position(|b| workspace_paths_equal(&b.path, &path))
+        {
             self.active_media_tab = None;
             self.active_tab = existing_idx;
             self.scroll_line = 0;
@@ -3246,10 +3413,15 @@ impl IdeApplicationState {
     }
 
     pub fn open_file_as_text(&mut self, path: PathBuf) {
+        let path = clean_workspace_path(path);
         self.active_editor_diff = None;
         self.active_media_tab = None;
         self.project_tree.selected_path = Some(path.clone());
-        if let Some(existing_idx) = self.open_buffers.iter().position(|b| b.path == path) {
+        if let Some(existing_idx) = self
+            .open_buffers
+            .iter()
+            .position(|b| workspace_paths_equal(&b.path, &path))
+        {
             self.active_tab = existing_idx;
             self.scroll_line = 0;
             self.editor_scroll_x = 0;
@@ -3269,9 +3441,14 @@ impl IdeApplicationState {
 
     /// 在中央编辑器标签栏打开图片 / SVG / 音频 / 视频媒体预览标签
     pub fn open_media_file(&mut self, path: PathBuf) {
+        let path = clean_workspace_path(path);
         self.active_editor_diff = None;
         self.project_tree.selected_path = Some(path.clone());
-        if let Some(idx) = self.media_tabs.iter().position(|m| m.path == path) {
+        if let Some(idx) = self
+            .media_tabs
+            .iter()
+            .position(|m| workspace_paths_equal(&m.path, &path))
+        {
             self.active_media_tab = Some(idx);
             return;
         }
@@ -3414,32 +3591,116 @@ impl IdeApplicationState {
         self.open_editor_diff_from_texts(path.to_path_buf(), subtitle, &old_text, &new_text);
     }
 
+    pub fn active_markdown_view_mode(&self, path: &Path) -> MarkdownViewMode {
+        self.markdown_view_modes
+            .get(path)
+            .copied()
+            .unwrap_or(MarkdownViewMode::Split)
+    }
+
     pub fn open_file_at_line(&mut self, path: PathBuf, line_1_based: Option<usize>) {
-        if line_1_based.is_some()
-            && detect_media_kind(&path).is_some_and(|k| k == MediaKind::Svg)
-        {
+        self.open_file_at_line_col(path, line_1_based, None);
+    }
+
+    pub fn open_file_at_line_col(
+        &mut self,
+        path: PathBuf,
+        line_1_based: Option<usize>,
+        col_1_based: Option<usize>,
+    ) {
+        let path = clean_workspace_path(path);
+        let has_pos = line_1_based.is_some() || col_1_based.is_some();
+        if has_pos && detect_media_kind(&path).is_some_and(|k| k == MediaKind::Svg) {
             self.open_file_as_text(path.clone());
         } else {
             self.open_file(path.clone());
         }
         if self.active_media_tab.is_none() {
-            if let Some(l1) = line_1_based {
+            if has_pos {
+                if self.active_buffer().language == ide_core::LanguageId::Markdown
+                    && self.active_markdown_view_mode(&path) == MarkdownViewMode::Preview
+                {
+                    self.markdown_view_modes
+                        .insert(path.clone(), MarkdownViewMode::Split);
+                }
+                let l1 = line_1_based.unwrap_or(1).max(1);
                 let line_0 = l1.saturating_sub(1);
                 let max_line = self.active_buffer().line_count().saturating_sub(1);
-                let target = line_0.min(max_line);
+                let target_line = line_0.min(max_line);
+                let line_len = self.active_buffer().line_len_chars(target_line);
+                let target_col = col_1_based
+                    .unwrap_or(1)
+                    .saturating_sub(1)
+                    .min(line_len);
                 let buf = self.active_buffer_mut();
-                buf.cursor_line = target;
-                buf.cursor_col = 0;
+                buf.cursor_line = target_line;
+                buf.cursor_col = target_col;
                 buf.clear_selection();
-                self.scroll_line = target.saturating_sub(4);
+                self.scroll_line = target_line.saturating_sub(4);
+                self.ensure_editor_cursor_visible();
                 self.focus = FocusTarget::Editor;
                 self.touch_caret_activity();
-                self.status_notification = format!("已跳转至 {}:{}", path.display(), l1);
+                self.save_workspace_state();
+                self.status_notification = match col_1_based.filter(|&c| c > 0) {
+                    Some(c1) => format!("已跳转至 {}:{}:{}", path.display(), l1, c1),
+                    None => format!("已跳转至 {}:{}", path.display(), l1),
+                };
                 return;
             }
         }
         self.focus = FocusTarget::Editor;
         self.touch_caret_activity();
+    }
+
+    pub fn locate_active_file_in_project_tree(&mut self) -> bool {
+        let target_path = if let Some(diff) = &self.active_editor_diff {
+            Some(diff.path.clone())
+        } else if let Some(m_idx) = self.active_media_tab.filter(|&i| i < self.media_tabs.len()) {
+            Some(self.media_tabs[m_idx].path.clone())
+        } else if !self.open_buffers.is_empty() {
+            Some(self.active_buffer().path.clone())
+        } else {
+            None
+        };
+        let Some(raw_path) = target_path else {
+            return false;
+        };
+        let target = clean_workspace_path(raw_path);
+        self.left_tool = Some(ToolWindowId::Project);
+        if let Some(idx) = self.project_tree.reveal_path(&target) {
+            let visible_rows = if self.left_scroll_info.visible > 0 {
+                self.left_scroll_info.visible
+            } else {
+                12
+            };
+            let max_scroll = self
+                .project_tree
+                .visible_entries
+                .len()
+                .saturating_sub(visible_rows);
+            if idx < self.tree_scroll || idx >= self.tree_scroll + visible_rows {
+                self.tree_scroll = idx.saturating_sub(visible_rows / 2).min(max_scroll);
+            }
+            self.pending_tree_reveal_idx = Some(idx);
+            let rel = target
+                .strip_prefix(&self.workspace_root)
+                .unwrap_or(&target)
+                .to_string_lossy()
+                .replace('\\', "/");
+            self.status_notification = format!(
+                "{}: {rel}",
+                self.tr("已在项目视图中定位", "Located in Project view")
+            );
+            true
+        } else {
+            self.status_notification = self
+                .tr(
+                    "当前文件不在项目树工作区目录中",
+                    "Current file is not in the workspace project tree",
+                )
+                .to_string();
+            false
+        }
     }
 
     pub fn close_tab(&mut self, idx: usize) {
@@ -3584,9 +3845,11 @@ impl IdeApplicationState {
                 }
                 self.active_buffer_mut().redo();
                 self.ensure_editor_cursor_visible();
-                self.status_notification = self
-                    .tr("已重做编辑 (Ctrl+Shift+Z)", "Redid edit (Ctrl+Shift+Z)")
-                    .to_string();
+                let sc = IdeAction::RedoEdit.shortcut_label_for(self.keymap_scheme);
+                self.status_notification = format!(
+                    "{} ({sc})",
+                    self.tr("已重做编辑", "Redid edit")
+                );
             }
             IdeAction::DuplicateLine => {
                 if self.abort_without_open_file() {
@@ -3594,9 +3857,11 @@ impl IdeApplicationState {
                 }
                 self.active_buffer_mut().duplicate_current_line();
                 self.ensure_editor_cursor_visible();
-                self.status_notification = self
-                    .tr("已复制当前行 (IDEA Ctrl+D)", "Duplicated line (Ctrl+D)")
-                    .to_string();
+                let sc = IdeAction::DuplicateLine.shortcut_label_for(self.keymap_scheme);
+                self.status_notification = format!(
+                    "{} ({sc})",
+                    self.tr("已复制当前行", "Duplicated line")
+                );
             }
             IdeAction::DeleteLine => {
                 if self.abort_without_open_file() {
@@ -3604,21 +3869,22 @@ impl IdeApplicationState {
                 }
                 self.active_buffer_mut().delete_current_line();
                 self.ensure_editor_cursor_visible();
-                self.status_notification = self
-                    .tr("已删除当前行 (IDEA Ctrl+Y)", "Deleted line (Ctrl+Y)")
-                    .to_string();
+                let sc = IdeAction::DeleteLine.shortcut_label_for(self.keymap_scheme);
+                self.status_notification = format!(
+                    "{} ({sc})",
+                    self.tr("已删除当前行", "Deleted line")
+                );
             }
             IdeAction::ToggleLineComment => {
                 if self.abort_without_open_file() {
                     return;
                 }
                 self.active_buffer_mut().toggle_line_comment();
-                self.status_notification = self
-                    .tr(
-                        "已切换行注释 (IDEA Ctrl+/)",
-                        "Toggled line comment (Ctrl+/)",
-                    )
-                    .to_string();
+                let sc = IdeAction::ToggleLineComment.shortcut_label_for(self.keymap_scheme);
+                self.status_notification = format!(
+                    "{} ({sc})",
+                    self.tr("已切换行注释", "Toggled line comment")
+                );
             }
             IdeAction::ReformatCode => {
                 if self.abort_without_open_file() {
@@ -3628,12 +3894,11 @@ impl IdeApplicationState {
                 let _ = self.active_buffer_mut().save();
                 self.refresh_active_buffer_diagnostics();
                 self.ensure_editor_cursor_visible();
-                self.status_notification = self
-                    .tr(
-                        "已整理空白并保存文件 (Ctrl+Alt+L)",
-                        "Reformatted & saved file (Ctrl+Alt+L)",
-                    )
-                    .to_string();
+                let sc = IdeAction::ReformatCode.shortcut_label_for(self.keymap_scheme);
+                self.status_notification = format!(
+                    "{} ({sc})",
+                    self.tr("已整理空白并保存文件", "Reformatted & saved file")
+                );
             }
             IdeAction::RenameSymbol => {
                 if !self.open_buffers.is_empty() {
@@ -5509,8 +5774,421 @@ impl IdeApplicationState {
         };
     }
 
-    pub fn handle_os_dropped_file(&mut self, path: PathBuf, lx: i32, ly: i32) {
+    pub(crate) fn active_drag_hover(&self) -> Option<(&Path, (i32, i32), bool)> {
+        if let Some((ref path, pos)) = self.active_ide_drag {
+            Some((path.as_path(), pos, false))
+        } else if let Some((ref path, pos)) = self.external_drag_hover {
+            Some((path.as_path(), pos, true))
+        } else {
+            None
+        }
+    }
+
+    pub fn resolve_drop_target(
+        &self,
+        path: &Path,
+        lx: i32,
+        ly: i32,
+        is_cross_or_external: bool,
+    ) -> Option<IdeDropTarget> {
+        let modal_open = matches!(
+            self.focus,
+            FocusTarget::SearchEverywhereModal
+                | FocusTarget::FindInFilesModal
+                | FocusTarget::NewFileModal
+                | FocusTarget::NewFolderModal
+                | FocusTarget::NewRunConfigModal
+                | FocusTarget::NewGitBranchModal
+                | FocusTarget::NewGitTagModal
+                | FocusTarget::NewGitStashModal
+                | FocusTarget::GitAddRemoteModal
+                | FocusTarget::GitMergeModal
+                | FocusTarget::GitRebaseModal
+                | FocusTarget::GitUnstashModal
+                | FocusTarget::GitResetModal
+                | FocusTarget::GitRollbackModal
+                | FocusTarget::GitRemotesModal
+                | FocusTarget::RenamePathModal
+                | FocusTarget::RenameSymbolModal
+                | FocusTarget::GoToLineModal
+                | FocusTarget::AddDebugWatchModal
+                | FocusTarget::SettingsModal
+                | FocusTarget::AiConfigModal(_)
+                | FocusTarget::CloneGitRepoModal
+                | FocusTarget::NodeMissingModal
+                | FocusTarget::OpenProjectChoiceModal
+                | FocusTarget::RecentProjectsModal
+                | FocusTarget::EditMessageRewindModal
+                | FocusTarget::ImagePreviewModal
+        );
+        if modal_open {
+            match self.focus {
+                FocusTarget::SearchEverywhereModal | FocusTarget::FindInFilesModal
+                    if self.search_modal_input_rect.contains(lx, ly) =>
+                {
+                    return Some(IdeDropTarget::TextInput {
+                        target: self.focus,
+                        rect: self.search_modal_input_rect,
+                    });
+                }
+                FocusTarget::RecentProjectsModal
+                    if self.recent_projects_input_rect.contains(lx, ly) =>
+                {
+                    return Some(IdeDropTarget::TextInput {
+                        target: self.focus,
+                        rect: self.recent_projects_input_rect,
+                    });
+                }
+                FocusTarget::NewFileModal
+                | FocusTarget::NewFolderModal
+                | FocusTarget::NewRunConfigModal
+                | FocusTarget::NewGitBranchModal
+                | FocusTarget::NewGitTagModal
+                | FocusTarget::NewGitStashModal
+                | FocusTarget::GitAddRemoteModal
+                | FocusTarget::RenamePathModal
+                | FocusTarget::RenameSymbolModal
+                | FocusTarget::GoToLineModal
+                | FocusTarget::AddDebugWatchModal
+                    if self.prompt_modal_input_rect.contains(lx, ly) =>
+                {
+                    return Some(IdeDropTarget::TextInput {
+                        target: self.focus,
+                        rect: self.prompt_modal_input_rect,
+                    });
+                }
+                FocusTarget::SettingsModal => {
+                    if self.settings_search_rect.contains(lx, ly) {
+                        return Some(IdeDropTarget::TextInput {
+                            target: FocusTarget::SettingsModal,
+                            rect: self.settings_search_rect,
+                        });
+                    }
+                    if let Some(r) = self
+                        .mobile_sdk_field_rects
+                        .iter()
+                        .copied()
+                        .find(|r| r.w > 0 && r.contains(lx, ly))
+                    {
+                        return Some(IdeDropTarget::TextInput {
+                            target: FocusTarget::SettingsModal,
+                            rect: r,
+                        });
+                    }
+                }
+                FocusTarget::AiConfigModal(_) => {
+                    if let Some((slot, r)) = self
+                        .ai_cfg_field_rects
+                        .iter()
+                        .copied()
+                        .enumerate()
+                        .find(|(_, r)| r.w > 0 && r.contains(lx, ly))
+                    {
+                        return Some(IdeDropTarget::TextInput {
+                            target: FocusTarget::AiConfigModal(slot),
+                            rect: r,
+                        });
+                    }
+                }
+                FocusTarget::CloneGitRepoModal => {
+                    if let Some(r) = self
+                        .clone_modal_field_rects
+                        .iter()
+                        .copied()
+                        .find(|r| r.w > 0 && r.contains(lx, ly))
+                    {
+                        return Some(IdeDropTarget::TextInput {
+                            target: FocusTarget::CloneGitRepoModal,
+                            rect: r,
+                        });
+                    }
+                }
+                _ => {}
+            }
+            if self.active_overlay_rects.iter().any(|r| r.contains(lx, ly)) {
+                return None;
+            }
+        }
+
+        if self
+            .agent_hub
+            .inline_edit
+            .as_ref()
+            .is_some_and(|s| s.active)
+            && self.ctrl_k_input_box_rect.contains(lx, ly)
+        {
+            return Some(IdeDropTarget::TextInput {
+                target: FocusTarget::CtrlKPrompt,
+                rect: self.ctrl_k_input_box_rect,
+            });
+        }
+        if self.editor_find_open && self.editor_find_input_rect.contains(lx, ly) {
+            return Some(IdeDropTarget::TextInput {
+                target: FocusTarget::EditorFindInput,
+                rect: self.editor_find_input_rect,
+            });
+        }
+        if self.editor_find_open
+            && self.editor_replace_open
+            && self.editor_replace_input_rect.contains(lx, ly)
+        {
+            return Some(IdeDropTarget::TextInput {
+                target: FocusTarget::EditorReplaceInput,
+                rect: self.editor_replace_input_rect,
+            });
+        }
+
+        if self.right_agent_open
+            && (self.agent_input_text_rect.contains(lx, ly) || self.right_pane_rect.contains(lx, ly))
+        {
+            return Some(IdeDropTarget::AgentAssistant);
+        }
+
+        if self.left_tool == Some(ToolWindowId::Commit)
+            && self.git_commit_input_box_rect.contains(lx, ly)
+        {
+            return Some(IdeDropTarget::TextInput {
+                target: FocusTarget::GitCommitInput,
+                rect: self.git_commit_input_box_rect,
+            });
+        }
+
+        if self.left_tool == Some(ToolWindowId::Project) && self.left_pane_rect.contains(lx, ly) {
+            let tree_area = Rect::new(
+                self.left_pane_rect.x + 4,
+                self.left_pane_rect.y + 36,
+                (self.left_pane_rect.w - 8).max(24),
+                (self.left_pane_rect.h - 40).max(24),
+            );
+            let (target_dir, highlight_rect) = if let Some((row_rect, entry_path, is_dir)) = self
+                .project_entry_rects
+                .iter()
+                .find(|(r, _, _)| r.contains(lx, ly))
+            {
+                if *is_dir {
+                    (entry_path.clone(), *row_rect)
+                } else {
+                    let parent = entry_path
+                        .parent()
+                        .unwrap_or(&self.project_tree.root)
+                        .to_path_buf();
+                    let hl = self
+                        .project_entry_rects
+                        .iter()
+                        .find(|(_, p, d)| *d && workspace_paths_equal(p, &parent))
+                        .map(|(r, _, _)| *r)
+                        .unwrap_or(tree_area);
+                    (parent, hl)
+                }
+            } else {
+                (self.project_tree.root.clone(), tree_area)
+            };
+
+            let same_parent = path
+                .parent()
+                .is_some_and(|p| workspace_paths_equal(p, &target_dir));
+            if !path_is_same_or_descendant_tree(path, &target_dir)
+                && (is_cross_or_external || !same_parent)
+            {
+                return Some(IdeDropTarget::ProjectTreeCopy {
+                    target_dir,
+                    highlight_rect,
+                });
+            }
+            return None;
+        }
+
+        if self.bottom_tool == Some(ToolWindowId::GitLog)
+            && self.git_log_search_rect.contains(lx, ly)
+        {
+            return Some(IdeDropTarget::TextInput {
+                target: FocusTarget::GitLogSearchInput,
+                rect: self.git_log_search_rect,
+            });
+        }
+
+        if self.bottom_tool == Some(ToolWindowId::Terminal)
+            && self.terminal_content_rect.contains(lx, ly)
+        {
+            return Some(IdeDropTarget::Terminal(self.terminal_content_rect));
+        }
+
+        if self.editor_pane_rect.contains(lx, ly) && path.is_file() {
+            return Some(IdeDropTarget::EditorOpen);
+        }
+
+        None
+    }
+
+    fn format_dropped_path_for_input(&self, path: &Path, target: FocusTarget) -> String {
+        let clean = clean_workspace_path(path.to_path_buf());
+        let fname = clean
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| clean.display().to_string());
+        let rel_or_full = clean
+            .strip_prefix(&self.workspace_root)
+            .map(|r| r.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| clean.display().to_string());
+
+        match target {
+            FocusTarget::CtrlKPrompt => {
+                if rel_or_full.contains(char::is_whitespace) {
+                    format!("@\"{rel_or_full}\" ")
+                } else {
+                    format!("@{rel_or_full} ")
+                }
+            }
+            FocusTarget::GitCommitInput => rel_or_full,
+            FocusTarget::EditorFindInput
+            | FocusTarget::EditorReplaceInput
+            | FocusTarget::SearchEverywhereModal
+            | FocusTarget::FindInFilesModal
+            | FocusTarget::GitLogSearchInput
+            | FocusTarget::NewFileModal
+            | FocusTarget::NewFolderModal
+            | FocusTarget::RenamePathModal => fname,
+            FocusTarget::SettingsModal => {
+                if self.settings_sdk_focus.is_some() {
+                    clean.display().to_string()
+                } else {
+                    fname
+                }
+            }
+            _ => clean.display().to_string(),
+        }
+    }
+
+    fn format_dropped_path_for_terminal(&self, path: &Path) -> String {
+        let clean = clean_workspace_path(path.to_path_buf());
+        let raw = clean.display().to_string();
+        if raw.contains(char::is_whitespace) || raw.contains('"') {
+            format!("\"{}\" ", raw.replace('"', "\\\""))
+        } else {
+            format!("{raw} ")
+        }
+    }
+
+    pub fn handle_ide_drag_drop_at(
+        &mut self,
+        path: PathBuf,
+        lx: i32,
+        ly: i32,
+        is_cross_or_external: bool,
+    ) -> bool {
         self.external_drag_hover = None;
+        self.pending_ide_drag = None;
+        self.active_ide_drag = None;
+
+        let Some(target) = self.resolve_drop_target(&path, lx, ly, is_cross_or_external) else {
+            return false;
+        };
+
+        let fname = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| path.display().to_string());
+
+        match target {
+            IdeDropTarget::ProjectTreeCopy { target_dir, .. } => {
+                match self.project_tree.copy_path_to_dir(&path, &target_dir) {
+                    Ok(dest) => {
+                        if let Some(idx) = self
+                            .project_tree
+                            .visible_entries
+                            .iter()
+                            .position(|e| workspace_paths_equal(&e.path, &dest))
+                        {
+                            self.pending_tree_reveal_idx = Some(idx);
+                        }
+                        self.git_engine.request_refresh();
+                        self.refresh_workspace_file_index_async();
+                        let dir_label = target_dir
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("root");
+                        let dest_name = dest
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or(&fname);
+                        self.status_notification = format!(
+                            "📋 {} `{dest_name}` → `{dir_label}/`",
+                            self.tr("已复制", "Copied")
+                        );
+                        true
+                    }
+                    Err(err) => {
+                        self.status_notification = format!(
+                            "❌ {}: {err}",
+                            self.tr("复制失败", "Copy failed")
+                        );
+                        false
+                    }
+                }
+            }
+            IdeDropTarget::AgentAssistant => {
+                self.attach_path_to_agent(path);
+                true
+            }
+            IdeDropTarget::TextInput { target, .. } => {
+                match target {
+                    FocusTarget::SettingsModal => {
+                        if self.settings_search_rect.contains(lx, ly) {
+                            self.settings_sdk_focus = None;
+                        } else if let Some(slot) = (0..3u8).find(|&s| {
+                            self.mobile_sdk_field_rects
+                                .get(s as usize)
+                                .is_some_and(|r| r.w > 0 && r.contains(lx, ly))
+                        }) {
+                            self.settings_sdk_focus = Some(slot);
+                        }
+                    }
+                    FocusTarget::CloneGitRepoModal => {
+                        if let Some(slot) = (0..2u8).find(|&s| {
+                            self.clone_modal_field_rects
+                                .get(s as usize)
+                                .is_some_and(|r| r.w > 0 && r.contains(lx, ly))
+                        }) {
+                            self.clone_modal_field_focus = slot;
+                        }
+                    }
+                    _ => {}
+                }
+                self.focus = target;
+                let text = self.format_dropped_path_for_input(&path, target);
+                self.insert_text_at_focus(&text);
+                self.status_notification = format!(
+                    "⤵ {} `{fname}`",
+                    self.tr("已插入路径到输入框", "Inserted path into input")
+                );
+                true
+            }
+            IdeDropTarget::Terminal(_) => {
+                self.focus = FocusTarget::TerminalInput;
+                let quoted = self.format_dropped_path_for_terminal(&path);
+                self.terminal.active_pty_mut().paste_text(&quoted);
+                self.touch_caret_activity();
+                self.status_notification = format!(
+                    "⤵ {} `{fname}`",
+                    self.tr("已插入路径到终端", "Inserted path into terminal")
+                );
+                true
+            }
+            IdeDropTarget::EditorOpen => {
+                self.open_file(path);
+                self.focus = FocusTarget::Editor;
+                self.touch_caret_activity();
+                true
+            }
+        }
+    }
+
+    pub fn handle_os_dropped_file(&mut self, path: PathBuf, lx: i32, ly: i32) {
+        if self.handle_ide_drag_drop_at(path.clone(), lx, ly, true) {
+            return;
+        }
         let is_img = is_image_file_path(&path);
         let in_agent_zone =
             (self.right_agent_open && self.right_pane_rect.contains(lx, ly)) || is_img;
@@ -5592,6 +6270,19 @@ impl IdeApplicationState {
             .find(|(r, _, _)| r.contains(x, y))
         {
             self.pending_ide_drag = Some((p.clone(), (x, y)));
+            return;
+        }
+        if let Some((tab_rect, buf_idx)) = self
+            .tab_rects
+            .iter()
+            .find(|(r, _)| r.contains(x, y))
+            .copied()
+        {
+            if x < tab_rect.x + tab_rect.w - 24 {
+                if let Some(buf) = self.open_buffers.get(buf_idx) {
+                    self.pending_ide_drag = Some((buf.path.clone(), (x, y)));
+                }
+            }
         }
     }
 
@@ -5616,10 +6307,7 @@ impl IdeApplicationState {
         let Some((path, _)) = self.active_ide_drag.take() else {
             return false;
         };
-        if self.right_agent_open && self.right_pane_rect.contains(x, y) {
-            self.attach_path_to_agent(path);
-            return true;
-        }
+        let _ = self.handle_ide_drag_drop_at(path, x, y, false);
         true
     }
 
@@ -5705,6 +6393,44 @@ impl IdeApplicationState {
         self.focus = FocusTarget::CloneGitRepoModal;
         self.git_engine.request_refresh();
         self.touch_caret_activity();
+    }
+
+    pub fn refresh_project_tree(&mut self) {
+        self.project_tree.refresh();
+        self.tree_load_alpha = 0.85;
+        self.refresh_workspace_file_index_async();
+        self.git_engine.request_refresh();
+        self.status_notification = self
+            .tr("已刷新项目文件树", "Refreshed project file tree")
+            .to_string();
+    }
+
+    pub fn init_git_repository(&mut self, create_gitignore: bool) {
+        self.git_branch_popup_open = false;
+        if !self.git_engine.git_installed {
+            self.status_notification = self
+                .tr(
+                    "本机未安装 Git，请先下载并安装 Git",
+                    "Git is not installed. Please install Git first.",
+                )
+                .to_string();
+            return;
+        }
+        self.git_load_alpha = 0.85;
+        self.git_engine.request_init_repo(create_gitignore);
+        self.status_notification = if create_gitignore {
+            self.tr(
+                "正在初始化 Git 仓库并生成 .gitignore...",
+                "Initializing Git repository and creating .gitignore...",
+            )
+            .to_string()
+        } else {
+            self.tr(
+                "正在初始化 Git 仓库 (git init)...",
+                "Initializing Git repository (git init)...",
+            )
+            .to_string()
+        };
     }
 
     pub fn submit_git_clone(&mut self, new_window: bool) {
@@ -6012,14 +6738,42 @@ impl IdeApplicationState {
         was_open
     }
 
-    /// 鼠标移动悬浮追踪：支持菜单栏划动切换展开子菜单 + 移出菜单区域自动恢复标题 + 分割线/控件悬浮高亮按需重绘
+    /// 鼠标移动悬浮追踪：支持左上角菜单悬停自动展开 + 菜单栏划动切换子菜单 + 移出自动收起 + 分割线/控件悬浮高亮
     pub fn handle_mouse_move(&mut self, x: i32, y: i32) -> bool {
         self.hover_pos = (x, y);
         let mut changed = false;
 
+        let modal_open = !matches!(
+            self.focus,
+            FocusTarget::Editor
+                | FocusTarget::AgentChatInput
+                | FocusTarget::AgentChatStream
+                | FocusTarget::TerminalInput
+                | FocusTarget::GitCommitInput
+                | FocusTarget::GitLogSearchInput
+                | FocusTarget::CtrlKPrompt
+                | FocusTarget::EditorFindInput
+                | FocusTarget::EditorReplaceInput
+        );
+        let other_toolbar_popup_open = self.project_popup_open
+            || self.git_branch_popup_open
+            || self.run_config_popup_open
+            || self.mobile_popup_open
+            || self.more_menu_popup_open;
+
+        // 鼠标移动到左上角菜单图标区（Logo / ≡）即刻展示顶部菜单栏内容；
         // 展开主菜单后，鼠标移动经过任意一级菜单分类立即展开对应子菜单；
         // 当鼠标移出菜单条及当前下拉子菜单区域后，自动收起菜单并恢复标题显示
-        if self.hamburger_menu_expanded {
+        if !self.hamburger_menu_expanded
+            && !modal_open
+            && !other_toolbar_popup_open
+            && self.context_menu.is_none()
+            && self.hamburger_trigger_rect.w > 0
+            && self.hamburger_trigger_rect.contains(x, y)
+        {
+            self.hamburger_menu_expanded = true;
+            changed = true;
+        } else if self.hamburger_menu_expanded {
             if let Some((cat, _)) = self
                 .menu_category_rects
                 .iter()
@@ -6030,12 +6784,14 @@ impl IdeApplicationState {
                     changed = true;
                 }
             } else if !self.menu_category_rects.is_empty() {
+                let in_trigger = self.hamburger_trigger_rect.w > 0
+                    && self.hamburger_trigger_rect.contains(x, y);
                 let in_bar = self.menu_trigger_and_bar_rect.w > 0
                     && self.menu_trigger_and_bar_rect.contains(x, y);
                 let in_dropdown = self.active_menu_category.is_some()
                     && self.menu_dropdown_rect.w > 0
                     && self.menu_dropdown_rect.contains(x, y);
-                if !in_bar && !in_dropdown && self.close_top_menu() {
+                if !in_trigger && !in_bar && !in_dropdown && self.close_top_menu() {
                     changed = true;
                 }
             }
@@ -6051,6 +6807,12 @@ impl IdeApplicationState {
         let hover_splitter = self.splitter_at(x, y, win_w, win_h);
         if hover_splitter != self.last_hover_splitter {
             self.last_hover_splitter = hover_splitter;
+            changed = true;
+        }
+        let hover_editor_header =
+            self.editor_header_rect.w > 0 && self.editor_header_rect.contains(x, y);
+        if hover_editor_header != self.last_hover_editor_header {
+            self.last_hover_editor_header = hover_editor_header;
             changed = true;
         }
         if self.ctrl_held && !self.open_buffers.is_empty() && self.editor_code_rect.contains(x, y) {
@@ -6165,6 +6927,13 @@ impl IdeApplicationState {
     /// 根据鼠标所在控件返回应切换的原生指针形态
     pub fn cursor_kind_at(&self, x: i32, y: i32, win_w: i32, win_h: i32) -> IdeCursorKind {
         // 1. 拖拽进行中锁定指针，防止快速移动闪烁
+        if let Some((drag_path, (dx, dy), is_cross)) = self.active_drag_hover() {
+            return match self.resolve_drop_target(drag_path, dx, dy, is_cross) {
+                Some(IdeDropTarget::ProjectTreeCopy { .. }) => IdeCursorKind::Copy,
+                Some(_) => IdeCursorKind::Grabbing,
+                None => IdeCursorKind::NoDrop,
+            };
+        }
         if let Some(drag) = self.active_splitter_drag {
             return match drag {
                 DragSplitter::LeftPanel | DragSplitter::RightPanel => IdeCursorKind::EwResize,
@@ -6303,6 +7072,7 @@ impl IdeApplicationState {
         // 6. 滚动条轨道保持标准箭头，避免落入下层 I-beam
         let on_scrollbar = (self.left_tool.is_some() && self.left_scroll_info.track.contains(x, y))
             || self.editor_scroll_info.track.contains(x, y)
+            || self.md_preview_scroll_info.track.contains(x, y)
             || (self.right_agent_open && self.right_scroll_info.track.contains(x, y))
             || (self.bottom_tool == Some(ToolWindowId::Terminal)
                 && self.terminal_scroll_info.track.contains(x, y))
@@ -6477,9 +7247,14 @@ impl IdeApplicationState {
 
     pub fn poll_background_updates(&mut self) -> bool {
         let mut changed = false;
+        let was_git_repo = self.git_engine.is_git_repo;
         let git_outcome = self.git_engine.poll_updates();
         if git_outcome.changed {
             changed = true;
+        }
+        if !was_git_repo && self.git_engine.is_git_repo {
+            self.project_tree.refresh();
+            self.refresh_workspace_file_index_async();
         }
         if self.lsp_hub.poll_updates() {
             let (err_cnt, warn_cnt, _) = self.lsp_hub.diagnostic_counts();
@@ -6505,10 +7280,14 @@ impl IdeApplicationState {
         if let Some(msg) = git_outcome.notification {
             self.status_notification = msg;
         }
-        if let Some((diff_text, changed_files)) = git_outcome.ai_diff_ready {
-            self.agent_hub
-                .request_ai_commit_message(diff_text, changed_files);
-            self.status_notification = "正在请求 AI 根据 Git Diff 生成 Commit 信息...".to_string();
+        if let Some(ai_ctx) = git_outcome.ai_diff_ready {
+            self.agent_hub.request_ai_commit_message(ai_ctx);
+            self.status_notification = self
+                .tr(
+                    "正在请求 AI 根据历史规范与 Git Diff 生成 Commit 信息...",
+                    "Requesting AI commit message from history & Git diff...",
+                )
+                .to_string();
         }
         while let Ok(ev) = self.search_event_rx.try_recv() {
             let cur_seq = self.search_seq.load(Ordering::Acquire);
@@ -6586,9 +7365,11 @@ impl IdeApplicationState {
             match res {
                 Ok(msg) => {
                     self.git_commit_input.set_text(&msg);
-                    self.git_engine.commit_message_draft = msg.clone();
+                    self.git_engine.commit_message_draft =
+                        self.git_commit_input.as_str().to_string();
+                    let preview = msg.lines().next().unwrap_or(msg.as_str());
                     self.status_notification = format!(
-                        "{}: {msg}",
+                        "{}: {preview}",
                         self.tr("AI 已生成 Commit 信息", "AI generated commit message")
                     );
                 }
@@ -6762,6 +7543,16 @@ impl IdeApplicationState {
     pub fn touch_caret_activity(&mut self) {
         self.caret_visible = true;
         self.last_input_activity = Instant::now();
+    }
+
+    pub fn is_text_input_focused(&self) -> bool {
+        self.active_text_input().is_some() || self.focus == FocusTarget::TerminalInput
+    }
+
+    pub fn suppresses_double_shift(&self) -> bool {
+        self.is_text_input_focused()
+            || !matches!(self.focus, FocusTarget::Editor | FocusTarget::AgentChatStream)
+            || self.context_menu.is_some()
     }
 
     pub fn active_text_input(&self) -> Option<&TextInputField> {
@@ -7099,6 +7890,41 @@ impl IdeApplicationState {
         None
     }
 
+    pub fn move_git_commit_input_vertical(
+        &mut self,
+        delta: isize,
+        extend: bool,
+        canvas: &SurfaceCanvas,
+    ) -> bool {
+        if self.focus != FocusTarget::GitCommitInput {
+            return false;
+        }
+        let (text_rect, _) = self.git_commit_text_rect();
+        let max_w = text_rect.w.max(120);
+        self.git_commit_input.move_vertical_in_wrapped(
+            delta,
+            extend,
+            canvas,
+            max_w,
+            FontStyle::UiSmall,
+        );
+        self.touch_caret_activity();
+        true
+    }
+
+    fn git_commit_text_rect(&self) -> (Rect, usize) {
+        let box_rect = self.git_commit_input_box_rect;
+        let line_h = 18;
+        let text_rect = Rect::new(
+            box_rect.x + 8,
+            box_rect.y + 6,
+            (box_rect.w - 16).max(24),
+            (box_rect.h - 12).max(line_h),
+        );
+        let vis_lines = (text_rect.h / line_h).max(1) as usize;
+        (text_rect, vis_lines)
+    }
+
     pub fn move_agent_input_vertical(
         &mut self,
         delta: isize,
@@ -7258,11 +8084,16 @@ impl IdeApplicationState {
                 return true;
             }
             FocusTarget::GitCommitInput => {
-                let start_x = self.git_commit_input_box_rect.x + 8;
-                let idx = self.git_commit_input.hit_test_singleline(
+                let (r, vis_lines) = self.git_commit_text_rect();
+                let idx = self.git_commit_input.hit_test_multiline(
                     canvas,
                     x,
-                    start_x,
+                    y,
+                    r.x,
+                    r.y,
+                    r.w,
+                    18,
+                    vis_lines,
                     FontStyle::UiSmall,
                 );
                 self.git_commit_input.set_cursor_at(idx, true);
@@ -7447,10 +8278,16 @@ impl IdeApplicationState {
                 true
             }
             FocusTarget::GitCommitInput if self.git_commit_input_box_rect.contains(x, y) => {
-                let idx = self.git_commit_input.hit_test_singleline(
+                let (r, vis_lines) = self.git_commit_text_rect();
+                let idx = self.git_commit_input.hit_test_multiline(
                     canvas,
                     x,
-                    self.git_commit_input_box_rect.x + 8,
+                    y,
+                    r.x,
+                    r.y,
+                    r.w,
+                    18,
+                    vis_lines,
                     FontStyle::UiSmall,
                 );
                 self.git_commit_input.select_word_at(idx);
@@ -7670,6 +8507,9 @@ impl IdeApplicationState {
                 Some(ToolWindowId::Problems) => self.problems_scroll_info.visible.max(3),
                 _ => self.terminal_scroll_info.visible.max(6),
             };
+        }
+        if self.md_preview_rect.w > 0 && self.md_preview_rect.contains(x, y) {
+            return self.md_preview_scroll_info.visible.max(8);
         }
         if self.active_editor_diff.is_some() && self.editor_scroll_info.visible > 0 {
             return self.editor_scroll_info.visible;
@@ -7928,6 +8768,49 @@ impl IdeApplicationState {
                 };
                 ed_diff.scroll_x = (ed_diff.scroll_x + horiz_px_delta).clamp(0, limit_hx);
             }
+        } else if self.md_preview_rect.w > 0
+            && self.md_preview_rect.contains(x, y)
+            && !self.cached_md_preview.row_tops.is_empty()
+        {
+            let active_path = self.active_buffer().path.clone();
+            let view_h = (self.md_preview_rect.h - 12).max(24);
+            let max_s = self.cached_md_preview.max_scroll_row_for_height(view_h);
+            let cur = self
+                .markdown_preview_scrolls
+                .get(&active_path)
+                .copied()
+                .unwrap_or(0)
+                .min(max_s);
+            let next_scroll = if lines_delta < 0 {
+                let cur_px = self.cached_md_preview.row_tops[cur];
+                let target_px = cur_px + lines_delta.saturating_mul(24);
+                if target_px <= 0 {
+                    0
+                } else {
+                    let next = self
+                        .cached_md_preview
+                        .row_tops
+                        .partition_point(|&top| top < target_px);
+                    next.min(cur.saturating_sub(1))
+                }
+            } else if lines_delta > 0 {
+                if cur >= max_s {
+                    max_s
+                } else {
+                    let cur_px = self.cached_md_preview.row_tops[cur];
+                    let max_px = self.cached_md_preview.row_tops[max_s];
+                    let target_px = (cur_px + lines_delta.saturating_mul(24)).min(max_px);
+                    let next = self
+                        .cached_md_preview
+                        .row_tops
+                        .partition_point(|&top| top < target_px);
+                    next.max(cur + 1).min(max_s)
+                }
+            } else {
+                cur
+            };
+            self.markdown_preview_scrolls
+                .insert(active_path, next_scroll);
         } else if self
             .active_media_tab
             .is_some_and(|i| i < self.media_tabs.len())
@@ -7976,6 +8859,11 @@ impl IdeApplicationState {
         }
         if check(self.editor_scroll_info) {
             self.active_scrollbar_drag = Some(DragScrollbar::CenterEditor);
+            self.update_scrollbar_drag(x, y);
+            return true;
+        }
+        if check(self.md_preview_scroll_info) {
+            self.active_scrollbar_drag = Some(DragScrollbar::MarkdownPreview);
             self.update_scrollbar_drag(x, y);
             return true;
         }
@@ -8030,6 +8918,33 @@ impl IdeApplicationState {
                     ed_diff.scroll = ratio_for(self.editor_scroll_info);
                 } else {
                     self.scroll_line = ratio_for(self.editor_scroll_info);
+                }
+            }
+            DragScrollbar::MarkdownPreview => {
+                let active_path = self.active_buffer().path.clone();
+                if !self.cached_md_preview.row_tops.is_empty() && self.md_preview_rect.h > 12 {
+                    let info = self.md_preview_scroll_info;
+                    let view_h = (self.md_preview_rect.h - 12).max(24);
+                    let max_s = self.cached_md_preview.max_scroll_row_for_height(view_h);
+                    let max_px = self
+                        .cached_md_preview
+                        .row_tops
+                        .get(max_s)
+                        .copied()
+                        .unwrap_or(0)
+                        .max(0) as f32;
+                    let rel = ((y - info.track.y) as f32 / (info.track.h.max(1) as f32))
+                        .clamp(0.0, 1.0);
+                    let target_px = (rel * max_px).round() as i32;
+                    let row = self
+                        .cached_md_preview
+                        .row_tops
+                        .partition_point(|&top| top < target_px)
+                        .min(max_s);
+                    self.markdown_preview_scrolls.insert(active_path, row);
+                } else {
+                    self.markdown_preview_scrolls
+                        .insert(active_path, ratio_for(self.md_preview_scroll_info));
                 }
             }
             DragScrollbar::CenterEditorHoriz => {
@@ -8497,7 +9412,9 @@ impl IdeApplicationState {
 
         // 点击非菜单控制区（含菜单项、编辑器等）时自动收起顶部菜单并恢复标题显示
         match &act {
-            HitAction::OpenMenuCategory(_) | HitAction::ToggleHamburgerMenu => {}
+            HitAction::OpenMenuCategory(_)
+            | HitAction::ToggleHamburgerMenu
+            | HitAction::OpenHamburgerFileMenu => {}
             _ => {
                 self.close_top_menu();
             }
@@ -8563,6 +9480,22 @@ impl IdeApplicationState {
                     self.git_branch_popup_open = false;
                 } else {
                     self.active_menu_category = None;
+                }
+            }
+            HitAction::OpenHamburgerFileMenu => {
+                if self.hamburger_menu_expanded
+                    && self.active_menu_category == Some(MainMenuCategory::File)
+                {
+                    if self.hamburger_trigger_rect.contains(x, y) {
+                        self.active_menu_category = None;
+                    } else {
+                        self.close_top_menu();
+                    }
+                } else {
+                    self.hamburger_menu_expanded = true;
+                    self.active_menu_category = Some(MainMenuCategory::File);
+                    self.project_popup_open = false;
+                    self.git_branch_popup_open = false;
                 }
             }
             HitAction::OpenMenuCategory(cat) => {
@@ -8758,6 +9691,9 @@ impl IdeApplicationState {
                 self.project_tree.toggle_dir(&dir);
                 self.status_notification = format!("已切换目录: {}", dir.display());
             }
+            HitAction::LocateActiveFileInTree => {
+                self.locate_active_file_in_project_tree();
+            }
             HitAction::PromptNewFile => self.execute_ide_action(IdeAction::NewFileInProject),
             HitAction::PromptNewFolder => self.execute_ide_action(IdeAction::NewFolderInProject),
             HitAction::ExpandAllDirs => {
@@ -8767,6 +9703,9 @@ impl IdeApplicationState {
             HitAction::CollapseAllDirs => {
                 self.project_tree.collapse_all();
                 self.status_notification = "已折叠全部项目目录".to_string();
+            }
+            HitAction::RefreshProjectTree => {
+                self.refresh_project_tree();
             }
             HitAction::ToggleLeftTool(tool) => {
                 if self.left_tool == Some(tool) {
@@ -8937,6 +9876,12 @@ impl IdeApplicationState {
                 self.git_engine.request_refresh();
                 self.status_notification = "正在后台刷新 Git 状态...".to_string();
             }
+            HitAction::InitGitRepository => {
+                self.init_git_repository(false);
+            }
+            HitAction::InitGitRepositoryWithGitIgnore => {
+                self.init_git_repository(true);
+            }
             HitAction::GitFetchAll => {
                 self.git_branch_popup_open = false;
                 self.git_engine.request_fetch();
@@ -8946,11 +9891,16 @@ impl IdeApplicationState {
             }
             HitAction::FocusGitCommitMessageInput => {
                 self.focus = FocusTarget::GitCommitInput;
-                let start_x = self.git_commit_input_box_rect.x + 8;
-                let idx = self.git_commit_input.hit_test_singleline(
+                let (r, vis_lines) = self.git_commit_text_rect();
+                let idx = self.git_commit_input.hit_test_multiline(
                     canvas,
                     x,
-                    start_x,
+                    y,
+                    r.x,
+                    r.y,
+                    r.w,
+                    18,
+                    vis_lines,
                     FontStyle::UiSmall,
                 );
                 self.git_commit_input.set_cursor_at(idx, shift);
@@ -9461,6 +10411,26 @@ impl IdeApplicationState {
                     }
                 }
             }
+            HitAction::SetMarkdownViewMode(mode) => {
+                if !self.open_buffers.is_empty() {
+                    let p = self.active_buffer().path.clone();
+                    self.markdown_view_modes.insert(p, mode);
+                    self.status_notification = match mode {
+                        MarkdownViewMode::Preview => self
+                            .tr("已切换为 Markdown 格式化预览", "Switched to Markdown Preview")
+                            .to_string(),
+                        MarkdownViewMode::Split => self
+                            .tr("已切换为 Markdown 分屏 (源码 + 预览)", "Switched to Markdown Split View")
+                            .to_string(),
+                        MarkdownViewMode::Source => self
+                            .tr("已切换为 Markdown 源码编辑", "Switched to Markdown Source")
+                            .to_string(),
+                    };
+                }
+            }
+            HitAction::FormatActiveDocument => {
+                self.execute_ide_action(IdeAction::ReformatCode);
+            }
             HitAction::ToggleComposerPastedSnippet(id) => {
                 if self.expanded_composer_snippet_id.as_deref() == Some(id.as_str()) {
                     self.expanded_composer_snippet_id = None;
@@ -9496,6 +10466,9 @@ impl IdeApplicationState {
             }
             HitAction::OpenFileAtLine(path, line_opt) => {
                 self.open_file_at_line(path, line_opt);
+            }
+            HitAction::OpenFileAtLineCol(path, line_opt, col_opt) => {
+                self.open_file_at_line_col(path, line_opt, col_opt);
             }
             HitAction::OpenExternalUrl(url) => {
                 if open_http_url(&url) {
@@ -9822,12 +10795,104 @@ impl IdeApplicationState {
             HitAction::SendDebugContextToAgent => {
                 self.send_debug_context_to_agent();
             }
+            HitAction::RegisterIdeUrlProtocol => {
+                if let Some(paths) = &self.external_integration {
+                    match crate::external_open::ensure_windows_url_protocol(&paths.exe_path) {
+                        Ok(()) => {
+                            self.status_notification = self
+                                .tr(
+                                    "已注册 rust-ai-ide:// URL 跳转协议",
+                                    "Registered rust-ai-ide:// URL protocol",
+                                )
+                                .to_string();
+                        }
+                        Err(err) => {
+                            self.status_notification = format!(
+                                "{}: {err}",
+                                self.tr("注册 URL 协议失败", "Failed to register URL protocol")
+                            );
+                        }
+                    }
+                }
+            }
+            HitAction::ToggleUserLaunchEditorEnv => {
+                if let Some(paths) = &self.external_integration {
+                    let currently_enabled = crate::external_open::is_user_launch_editor_enabled(
+                        &paths.launch_editor_value,
+                    );
+                    match crate::external_open::set_user_launch_editor_enabled(
+                        &paths.launch_editor_value,
+                        !currently_enabled,
+                    ) {
+                        Ok(()) => {
+                            self.status_notification = if !currently_enabled {
+                                self.tr(
+                                    "已为外部终端配置 LAUNCH_EDITOR / REACT_EDITOR（新终端生效）",
+                                    "Configured LAUNCH_EDITOR / REACT_EDITOR for external terminals",
+                                )
+                                .to_string()
+                            } else {
+                                self.tr(
+                                    "已取消外部终端 LAUNCH_EDITOR / REACT_EDITOR 环境变量",
+                                    "Cleared external terminal LAUNCH_EDITOR / REACT_EDITOR env",
+                                )
+                                .to_string()
+                            };
+                        }
+                        Err(err) => {
+                            self.status_notification = format!(
+                                "{}: {err}",
+                                self.tr("更新环境变量失败", "Failed to update environment variable")
+                            );
+                        }
+                    }
+                }
+            }
+            HitAction::InstallCliToUserPath => {
+                if let Some(paths) = &self.external_integration {
+                    match crate::external_open::add_cli_dir_to_user_path(&paths.cli_bin_dir) {
+                        Ok(()) => {
+                            self.status_notification = self
+                                .tr(
+                                    "已将 rust-ai-ide CLI 添加到用户 PATH（新终端生效）",
+                                    "Added rust-ai-ide CLI to user PATH (applies to new terminals)",
+                                )
+                                .to_string();
+                        }
+                        Err(err) => {
+                            self.status_notification = format!(
+                                "{}: {err}",
+                                self.tr("添加 PATH 失败", "Failed to add to PATH")
+                            );
+                        }
+                    }
+                }
+            }
+            HitAction::CopyLaunchEditorCommand => {
+                if let Some(paths) = &self.external_integration {
+                    let cmd = format!("$env:LAUNCH_EDITOR=\"{}\"", paths.launch_editor_value);
+                    write_windows_clipboard_text(&cmd);
+                    self.status_notification = format!(
+                        "{}: {cmd}",
+                        self.tr("已复制环境变量命令", "Copied env command")
+                    );
+                }
+            }
             HitAction::SelectTheme(kind) => {
                 self.theme = IdeaTheme::from_kind(kind);
                 self.status_notification = format!(
                     "{}: {}",
                     self.tr("已应用主题", "Applied theme"),
                     kind.display_name()
+                );
+                self.save_global_settings();
+            }
+            HitAction::SelectKeymap(scheme) => {
+                self.keymap_scheme = scheme;
+                self.status_notification = format!(
+                    "{}: {}",
+                    self.tr("已切换快捷键方案", "Switched keymap"),
+                    scheme.display_name()
                 );
                 self.save_global_settings();
             }
@@ -10106,10 +11171,16 @@ impl IdeApplicationState {
                     false,
                 ));
                 items.push(item(
+                    self.tr("刷新文件树", "Refresh"),
+                    "",
+                    ContextMenuAction::TreeRefresh,
+                    true,
+                ));
+                items.push(item(
                     self.tr("展开全部目录", "Expand All"),
                     "",
                     ContextMenuAction::TreeExpandAll,
-                    true,
+                    false,
                 ));
                 items.push(item(
                     self.tr("折叠全部目录", "Collapse All"),
@@ -10141,10 +11212,16 @@ impl IdeApplicationState {
                     false,
                 ),
                 item(
+                    self.tr("刷新文件树", "Refresh"),
+                    "",
+                    ContextMenuAction::TreeRefresh,
+                    true,
+                ),
+                item(
                     self.tr("展开全部目录", "Expand All"),
                     "",
                     ContextMenuAction::TreeExpandAll,
-                    true,
+                    false,
                 ),
                 item(
                     self.tr("折叠全部目录", "Collapse All"),
@@ -10686,6 +11763,9 @@ impl IdeApplicationState {
                     .tr("已折叠全部项目目录", "Collapsed all project folders")
                     .to_string();
             }
+            ContextMenuAction::TreeRefresh => {
+                self.refresh_project_tree();
+            }
             ContextMenuAction::RunFile(path) => {
                 self.run_file_in_terminal(&path);
             }
@@ -10937,7 +12017,17 @@ impl IdeApplicationState {
         self.context_menu_rect = Rect::new(0, 0, 0, 0);
         self.search_modal_input_rect = Rect::new(0, 0, 0, 0);
         self.prompt_modal_input_rect = Rect::new(0, 0, 0, 0);
+        self.recent_projects_input_rect = Rect::new(0, 0, 0, 0);
         self.git_log_search_rect = Rect::new(0, 0, 0, 0);
+        self.git_commit_input_box_rect = Rect::new(0, 0, 0, 0);
+        self.ctrl_k_input_box_rect = Rect::new(0, 0, 0, 0);
+        self.editor_find_input_rect = Rect::new(0, 0, 0, 0);
+        self.editor_replace_input_rect = Rect::new(0, 0, 0, 0);
+        self.agent_input_text_rect = Rect::new(0, 0, 0, 0);
+        self.terminal_content_rect = Rect::new(0, 0, 0, 0);
+        self.left_pane_rect = Rect::new(0, 0, 0, 0);
+        self.right_pane_rect = Rect::new(0, 0, 0, 0);
+        self.bottom_pane_rect = Rect::new(0, 0, 0, 0);
         let w = canvas.width as i32;
         let h = canvas.height as i32;
         self.last_win_size = (w, h);
@@ -11366,11 +12456,12 @@ impl IdeApplicationState {
             t.border_color,
         );
 
-        // 1. 左侧：RI 品牌徽标 + ≡ 主菜单图标（点击展开/收起 IDEA 菜单栏）
+        // 1. 左侧：RI 品牌徽标 + ≡ 主菜单图标（悬停展示菜单内容，点击直接打开文件菜单）
+        self.hamburger_trigger_rect = Rect::new(10, 6, 54, 26);
         let logo_rect = Rect::new(10, 7, 24, 24);
         canvas.draw_ri_logo_icon(logo_rect);
         self.hit_regions
-            .push((logo_rect, HitAction::ToggleHamburgerMenu));
+            .push((logo_rect, HitAction::OpenHamburgerFileMenu));
 
         let ham_btn = Rect::new(38, 6, 26, 26);
         if self.hamburger_menu_expanded {
@@ -11380,7 +12471,7 @@ impl IdeApplicationState {
         }
         canvas.draw_hamburger_icon(44, 13, t.text_secondary);
         self.hit_regions
-            .push((ham_btn, HitAction::ToggleHamburgerMenu));
+            .push((ham_btn, HitAction::OpenHamburgerFileMenu));
 
         // 2. 顶部主工具栏左侧内容：
         // 展开主菜单时隐藏项目名称和 Git 分支，直接在顶部工具栏原位展示主菜单栏
@@ -11452,8 +12543,15 @@ impl IdeApplicationState {
                 .push((proj_box, HitAction::ToggleProjectPopup));
             cur_x += proj_w + 6;
 
-            // 3. Git 分支 Widget: ⎇ master ▾ (+ 柔和加载旋转弧)
-            let branch_name = self.git_engine.current_branch.clone();
+            // 3. Git 分支 Widget: ⎇ master ▾ (+ 柔和加载旋转弧 / 未初始化提示)
+            let git_uninit = self.git_engine.has_loaded_snapshot
+                && self.git_engine.git_installed
+                && !self.git_engine.is_git_repo;
+            let branch_name = if git_uninit {
+                self.tr("未初始化 Git", "Init Git").to_string()
+            } else {
+                self.git_engine.current_branch.clone()
+            };
             let (btw, _) = canvas.measure_text(&branch_name, FontStyle::UiRegular);
             let git_extra = if self.git_load_alpha > 0.02 { 16 } else { 0 };
             let git_w = (btw + 44 + git_extra).clamp(84, 170);
@@ -11977,12 +13075,14 @@ impl IdeApplicationState {
 
         match tool {
             ToolWindowId::Project => {
-                // 顶部矢量图标工具栏：[打开文件夹] [新建文件] [新建文件夹] [展开全部] [折叠全部]
+                // 顶部矢量图标工具栏：[打开文件夹] [新建文件] [新建文件夹] [↻ 刷新] [展开全部] [折叠全部]
                 let btn_y = rect.y + 5;
                 let title_end = rect.x + 22 + title_w + 18;
-                let mut bx = (rect.x + rect.w - 144).max(title_end);
+                let show_open_folder = rect.w >= (title_end - rect.x) + 172;
+                let needed_w = if show_open_folder { 172 } else { 144 };
+                let mut bx = (rect.x + rect.w - needed_w).max(title_end);
 
-                if bx + 140 <= rect.x + rect.w {
+                if show_open_folder {
                     let of_btn = Rect::new(bx, btn_y, 24, 22);
                     canvas.fill_rounded_rect(
                         of_btn,
@@ -12026,6 +13126,21 @@ impl IdeApplicationState {
                 self.hit_regions.push((nd_btn, HitAction::PromptNewFolder));
                 bx += 28;
 
+                let ref_btn = Rect::new(bx, btn_y, 24, 22);
+                canvas.fill_rounded_rect(
+                    ref_btn,
+                    4,
+                    if ref_btn.contains(hx, hy) {
+                        t.popup_hover_bg
+                    } else {
+                        t.window_bg
+                    },
+                );
+                canvas.draw_refresh_icon(bx + 5, btn_y + 4, t.text_secondary);
+                self.hit_regions
+                    .push((ref_btn, HitAction::RefreshProjectTree));
+                bx += 28;
+
                 let exp_btn = Rect::new(bx, btn_y, 24, 22);
                 canvas.fill_rounded_rect(
                     exp_btn,
@@ -12063,6 +13178,13 @@ impl IdeApplicationState {
                 let visible_rows = (list_h / 22).max(1) as usize;
                 let total_rows = self.project_tree.visible_entries.len();
                 let max_scroll = total_rows.saturating_sub(visible_rows);
+                if let Some(reveal_idx) = self.pending_tree_reveal_idx.take() {
+                    if reveal_idx < self.tree_scroll
+                        || reveal_idx >= self.tree_scroll + visible_rows
+                    {
+                        self.tree_scroll = reveal_idx.saturating_sub(visible_rows / 2);
+                    }
+                }
                 if self.tree_scroll > max_scroll {
                     self.tree_scroll = max_scroll;
                 }
@@ -12233,8 +13355,16 @@ impl IdeApplicationState {
                 let mut y = rect.y + 37;
 
                 if self.git_engine.has_loaded_snapshot && !self.git_engine.git_installed {
+                    self.git_commit_input_box_rect = Rect::new(0, 0, 0, 0);
+                    self.git_change_row_rects.clear();
                     let card = Rect::new(rect.x + 8, y, (rect.w - 16).max(80), 156);
                     self.render_git_missing_card(canvas, card);
+                } else if self.git_engine.has_loaded_snapshot && !self.git_engine.is_git_repo {
+                    self.git_commit_input_box_rect = Rect::new(0, 0, 0, 0);
+                    self.git_change_row_rects.clear();
+                    let card_h = (rect.h - (y - rect.y) - 10).clamp(150, 224);
+                    let card = Rect::new(rect.x + 8, y, (rect.w - 16).max(80), card_h);
+                    self.render_git_not_initialized_card(canvas, card);
                 } else {
                 // 1. 当前分支胶囊与 Ahead/Behind 指示器 + 快捷 Fetch / Pull / Push 按钮
                 let branch_name = self.git_engine.current_branch.clone();
@@ -12395,7 +13525,7 @@ impl IdeApplicationState {
                 }
 
                 let list_top = y;
-                let commit_box_y = rect.y + rect.h - 114;
+                let commit_box_y = rect.y + rect.h - 134;
                 let list_h = (commit_box_y - list_top - 6).max(24);
                 let row_h = 23;
                 let visible_rows = (list_h / row_h).max(1) as usize;
@@ -12816,8 +13946,8 @@ impl IdeApplicationState {
                         .push((ai_msg_btn, HitAction::GenerateAiCommitMessage));
                 }
 
-                // 4. Commit Message 输入框 + 双按钮：[提交 Commit (N)]  [提交并推送…]
-                let msg_box = Rect::new(rect.x + 8, commit_box_y + 26, rect.w - 16, 46);
+                // 4. Commit Message 多行输入框 + 双按钮：[提交 Commit (N)]  [提交并推送…]
+                let msg_box = Rect::new(rect.x + 8, commit_box_y + 26, rect.w - 16, 66);
                 self.git_commit_input_box_rect = msg_box;
                 if self.focus != FocusTarget::GitCommitInput
                     && self.git_engine.commit_message_draft != self.git_commit_input.as_str()
@@ -12837,14 +13967,14 @@ impl IdeApplicationState {
                     t.window_bg,
                 );
                 let commit_ph = self.tr(
-                    "输入 Git 提交说明 (Enter 提交)...",
-                    "Commit message (Enter to commit)...",
+                    "输入 Git 提交说明 (Enter 提交 / Shift+Enter 换行)...",
+                    "Commit message (Enter to commit, Shift+Enter newline)...",
                 );
-                let ime = self.git_commit_input.render_singleline(
+                let (commit_text_rect, _) = self.git_commit_text_rect();
+                let ime = self.git_commit_input.render_multiline(
                     canvas,
-                    msg_box,
-                    8,
-                    msg_box.y + 13,
+                    commit_text_rect,
+                    18,
                     commit_ph,
                     is_git_focused,
                     self.caret_visible,
@@ -12860,7 +13990,7 @@ impl IdeApplicationState {
                 self.hit_regions
                     .push((msg_box, HitAction::FocusGitCommitMessageInput));
 
-                let btn_row_y = commit_box_y + 78;
+                let btn_row_y = commit_box_y + 98;
                 let half_w = ((rect.w - 22) / 2).max(60);
                 let commit_btn = Rect::new(rect.x + 8, btn_row_y, half_w - 6, 28);
                 let can_commit = checked_total > 0 || self.git_amend_commit;
@@ -12983,9 +14113,13 @@ impl IdeApplicationState {
 
     fn render_editor_welcome(&mut self, canvas: &mut SurfaceCanvas, rect: Rect) {
         let t = self.theme;
+        self.editor_header_rect = Rect::new(0, 0, 0, 0);
+        self.editor_locate_btn_rect = Rect::new(0, 0, 0, 0);
         self.editor_code_rect = Rect::new(0, 0, 0, 0);
         self.editor_scroll_info = ScrollTrackInfo::default();
         self.editor_horiz_scroll_info = ScrollTrackInfo::default();
+        self.md_preview_rect = Rect::new(0, 0, 0, 0);
+        self.md_preview_scroll_info = ScrollTrackInfo::default();
 
         let title = self.tr("没有打开的文件", "No files open");
         let hint = self.tr(
@@ -13012,9 +14146,31 @@ impl IdeApplicationState {
         }
     }
 
+    fn render_editor_locate_button(&mut self, canvas: &mut SurfaceCanvas, btn: Rect) {
+        let t = self.theme;
+        let (hx, hy) = self.hover_pos;
+        let hov = btn.contains(hx, hy);
+        canvas.stroke_rounded_rect(
+            btn,
+            4,
+            if hov { t.accent_blue } else { t.border_color },
+            if hov { t.popup_hover_bg } else { t.panel_bg },
+        );
+        canvas.draw_locate_file_icon(
+            btn.x + (btn.w - 14) / 2,
+            btn.y + (btn.h - 14) / 2,
+            if hov { 0xFFFFFF } else { t.text_primary },
+        );
+        self.hit_regions
+            .push((btn, HitAction::LocateActiveFileInTree));
+    }
+
     fn render_center_editor(&mut self, canvas: &mut SurfaceCanvas, rect: Rect) {
         let t = self.theme;
         let (hx, hy) = self.hover_pos;
+        self.editor_locate_btn_rect = Rect::new(0, 0, 0, 0);
+        self.md_preview_rect = Rect::new(0, 0, 0, 0);
+        self.md_preview_scroll_info = ScrollTrackInfo::default();
         canvas.stroke_rounded_rect(rect, 8, t.border_color, t.editor_bg);
 
         if self.open_buffers.is_empty()
@@ -13270,6 +14426,17 @@ impl IdeApplicationState {
             t.border_color,
         );
 
+        let header_rect = Rect::new(rect.x + 1, rect.y + 1, rect.w - 2, 58);
+        self.editor_header_rect = header_rect;
+        let header_hovered = header_rect.contains(hx, hy) && self.context_menu.is_none();
+        if header_hovered && rect.w > 48 {
+            let loc_btn = Rect::new(rect.x + rect.w - 30, rect.y + 37, 22, 19);
+            self.editor_locate_btn_rect = loc_btn;
+            self.render_editor_locate_button(canvas, loc_btn);
+        } else {
+            self.editor_locate_btn_rect = Rect::new(0, 0, 0, 0);
+        }
+
         if self.active_editor_diff.is_some() {
             self.render_active_editor_diff(canvas, rect, rect.y + 60);
             return;
@@ -13288,11 +14455,90 @@ impl IdeApplicationState {
             return;
         }
 
-        let active_path_str = self
-            .active_buffer()
-            .path
+        let (active_path_buf, active_buf_lang) = {
+            let b = self.active_buffer();
+            (b.path.clone(), b.language)
+        };
+        let is_markdown_doc = active_buf_lang == ide_core::LanguageId::Markdown;
+        let locate_reserve = if self.editor_locate_btn_rect.w > 0 { 26 } else { 0 };
+        let mut crumb_right_limit = rect.x + rect.w - 14 - locate_reserve;
+        if is_markdown_doc {
+            let cur_mode = self.active_markdown_view_mode(&active_path_buf);
+            let mut rx = rect.x + rect.w - 8 - locate_reserve;
+
+            // 格式化源文件按钮 (Ctrl+Alt+L)
+            let fmt_w = 56;
+            rx -= fmt_w;
+            let fmt_btn = Rect::new(rx, rect.y + 37, fmt_w, 19);
+            let fmt_hov = fmt_btn.contains(hx, hy);
+            canvas.stroke_rounded_rect(
+                fmt_btn,
+                4,
+                if fmt_hov { t.accent_blue } else { t.border_color },
+                if fmt_hov { t.popup_hover_bg } else { t.panel_bg },
+            );
+            canvas.draw_text_centered(
+                fmt_btn,
+                self.tr("格式化", "Format"),
+                if fmt_hov { 0xFFFFFF } else { t.text_primary },
+                FontStyle::UiSmall,
+            );
+            self.hit_regions
+                .push((fmt_btn, HitAction::FormatActiveDocument));
+
+            rx -= 6;
+            let modes = [
+                (MarkdownViewMode::Source, self.tr("源码", "Source"), 48),
+                (MarkdownViewMode::Split, self.tr("分屏", "Split"), 48),
+                (MarkdownViewMode::Preview, self.tr("预览", "Preview"), 52),
+            ];
+            for (mode, lbl, bw) in modes {
+                rx -= bw;
+                let btn = Rect::new(rx, rect.y + 37, bw, 19);
+                let active = cur_mode == mode;
+                let hov = btn.contains(hx, hy);
+                canvas.stroke_rounded_rect(
+                    btn,
+                    4,
+                    if active || hov {
+                        t.accent_blue
+                    } else {
+                        t.border_color
+                    },
+                    if active {
+                        blend_rgb(t.panel_bg, t.accent_blue, 0.24)
+                    } else if hov {
+                        t.popup_hover_bg
+                    } else {
+                        t.panel_bg
+                    },
+                );
+                canvas.draw_text_centered(
+                    btn,
+                    lbl,
+                    if active {
+                        t.accent_blue
+                    } else if hov {
+                        0xFFFFFF
+                    } else {
+                        t.text_secondary
+                    },
+                    if active {
+                        FontStyle::UiBold
+                    } else {
+                        FontStyle::UiSmall
+                    },
+                );
+                self.hit_regions
+                    .push((btn, HitAction::SetMarkdownViewMode(mode)));
+                rx -= 3;
+            }
+            crumb_right_limit = (rx - 8).max(rect.x + 60);
+        }
+
+        let active_path_str = active_path_buf
             .strip_prefix(&self.workspace_root)
-            .unwrap_or(&self.active_buffer().path)
+            .unwrap_or(&active_path_buf)
             .to_string_lossy()
             .replace('\\', "  ›  ");
         canvas.draw_text_ellipsis(
@@ -13300,7 +14546,7 @@ impl IdeApplicationState {
             rect.y + 39,
             &active_path_str,
             t.text_muted,
-            rect.w - 28,
+            (crumb_right_limit - (rect.x + 14)).max(36),
             FontStyle::UiSmall,
         );
 
@@ -13688,6 +14934,30 @@ impl IdeApplicationState {
                 buf.selection_range(),
             )
         };
+        let md_mode = if buf_lang == ide_core::LanguageId::Markdown {
+            Some(self.active_markdown_view_mode(&buf_path))
+        } else {
+            None
+        };
+        if md_mode == Some(MarkdownViewMode::Preview) {
+            self.editor_code_rect = Rect::new(0, 0, 0, 0);
+            self.editor_scroll_info = ScrollTrackInfo::default();
+            self.editor_horiz_scroll_info = ScrollTrackInfo::default();
+            let preview_rect = Rect::new(
+                rect.x + 1,
+                code_top_y,
+                (rect.w - 2).max(80),
+                (rect.y + rect.h - code_top_y - 2).max(24),
+            );
+            self.render_markdown_preview_pane(canvas, &buf_path, buf_rev, preview_rect);
+            return;
+        }
+
+        let editor_pane_w = if md_mode == Some(MarkdownViewMode::Split) && rect.w >= 460 {
+            ((rect.w * 48) / 100).max(220)
+        } else {
+            rect.w
+        };
         self.ensure_runnables_cached(&buf_path, buf_rev, buf_lang);
 
         let char_w = canvas.measure_text("8", FontStyle::CodeMono).0.max(8);
@@ -13704,7 +14974,7 @@ impl IdeApplicationState {
 
         let code_start_x = rect.x + gutter_w + 14;
         self.editor_code_start_x = code_start_x;
-        let right_limit = rect.x + rect.w - 14;
+        let right_limit = rect.x + editor_pane_w - 14;
         let horiz_avail_w = (right_limit - code_start_x).max(24);
         let max_line_px =
             self.ensure_editor_max_line_width_cached(&buf_path, buf_rev, char_w, canvas);
@@ -13719,7 +14989,7 @@ impl IdeApplicationState {
         let code_body_rect = Rect::new(
             rect.x + gutter_w + 1,
             code_top_y,
-            rect.w - gutter_w - 12,
+            (editor_pane_w - gutter_w - 12).max(24),
             code_area_h,
         );
         self.editor_code_rect = code_body_rect;
@@ -13794,12 +15064,12 @@ impl IdeApplicationState {
 
             if is_dap_paused_line {
                 canvas.fill_rect(
-                    Rect::new(rect.x + gutter_w + 1, row_y, rect.w - gutter_w - 12, line_h),
+                    Rect::new(rect.x + gutter_w + 1, row_y, code_body_rect.w, line_h),
                     blend_rgb(t.editor_bg, t.debug_orange, 0.24),
                 );
             } else if line_idx == cursor_line {
                 canvas.fill_rect(
-                    Rect::new(rect.x + gutter_w + 1, row_y, rect.w - gutter_w - 12, line_h),
+                    Rect::new(rect.x + gutter_w + 1, row_y, code_body_rect.w, line_h),
                     t.editor_current_line_bg,
                 );
             }
@@ -13895,7 +15165,7 @@ impl IdeApplicationState {
                 }
             }
 
-            let code_row = Rect::new(rect.x + gutter_w + 1, row_y, rect.w - gutter_w - 12, line_h);
+            let code_row = Rect::new(rect.x + gutter_w + 1, row_y, code_body_rect.w, line_h);
             self.hit_regions
                 .push((code_row, HitAction::ClickEditorLine));
 
@@ -14049,7 +15319,7 @@ impl IdeApplicationState {
         }
 
         // 编辑器垂直滚动条
-        let track = Rect::new(rect.x + rect.w - 10, code_top_y, 7, code_area_h);
+        let track = Rect::new(rect.x + editor_pane_w - 10, code_top_y, 7, code_area_h);
         self.editor_scroll_info = ScrollTrackInfo {
             track,
             visible: max_visible_lines,
@@ -14086,6 +15356,74 @@ impl IdeApplicationState {
         } else {
             self.editor_horiz_scroll_info = ScrollTrackInfo::default();
         }
+
+        if md_mode == Some(MarkdownViewMode::Split) && rect.w >= 460 {
+            let split_x = rect.x + editor_pane_w;
+            canvas.fill_rect(
+                Rect::new(split_x, code_top_y, 1, (rect.y + rect.h - code_top_y - 2).max(24)),
+                t.border_color,
+            );
+            let preview_rect = Rect::new(
+                split_x + 1,
+                code_top_y,
+                (rect.w - editor_pane_w - 2).max(80),
+                (rect.y + rect.h - code_top_y - 2).max(24),
+            );
+            self.render_markdown_preview_pane(canvas, &buf_path, buf_rev, preview_rect);
+        }
+    }
+
+    fn render_markdown_preview_pane(
+        &mut self,
+        canvas: &mut SurfaceCanvas,
+        buf_path: &Path,
+        buf_rev: usize,
+        preview_rect: Rect,
+    ) {
+        self.md_preview_rect = preview_rect;
+        let t = self.theme;
+        canvas.fill_rect(preview_rect, t.editor_bg);
+        let content_pad_x = if preview_rect.w >= 760 { 28 } else { 16 };
+        let wrap_w = (preview_rect.w - content_pad_x * 2 - 12).max(120);
+        let scale_bits = canvas.scale_factor.to_bits();
+        let needs_rebuild = self.cached_md_preview.path != buf_path
+            || self.cached_md_preview.revision != buf_rev
+            || self.cached_md_preview.wrap_w != wrap_w
+            || self.cached_md_preview.scale_bits != scale_bits;
+        if needs_rebuild {
+            let md_text = self.active_buffer().text();
+            self.cached_md_preview.ensure_built(
+                canvas,
+                &self.workspace_root,
+                buf_path,
+                buf_rev,
+                &md_text,
+                wrap_w,
+                scale_bits,
+            );
+        }
+        let mut scroll_row = self
+            .markdown_preview_scrolls
+            .get(buf_path)
+            .copied()
+            .unwrap_or(0);
+        let (vis_count, total_rows, track) = render_markdown_preview_body(
+            canvas,
+            &t,
+            self.ui_lang,
+            self.hover_pos,
+            &mut self.hit_regions,
+            &self.cached_md_preview,
+            preview_rect,
+            &mut scroll_row,
+        );
+        self.markdown_preview_scrolls
+            .insert(buf_path.to_path_buf(), scroll_row);
+        self.md_preview_scroll_info = ScrollTrackInfo {
+            track,
+            visible: vis_count,
+            total: total_rows,
+        };
     }
 
     /// 在中央文件编辑器窗口内渲染常见媒体格式（位图图片 / SVG 矢量 / 音频波形 / 视频缩略图与属性）预览视图
@@ -14106,7 +15444,8 @@ impl IdeApplicationState {
         let (hx, hy) = self.hover_pos;
 
         // 1. 面包屑栏右侧操作按钮（系统打开、SVG 查看源码、图片缩放 +/-/100%）
-        let mut right_x = rect.x + rect.w - 8;
+        let locate_reserve = if self.editor_locate_btn_rect.w > 0 { 26 } else { 0 };
+        let mut right_x = rect.x + rect.w - 8 - locate_reserve;
         let ext_w = 78;
         right_x -= ext_w;
         let ext_btn = Rect::new(right_x, rect.y + 37, ext_w, 19);
@@ -14532,7 +15871,8 @@ impl IdeApplicationState {
             .unwrap_or(&diff_snap.path)
             .to_string_lossy()
             .replace('\\', "  ›  ");
-        let close_btn = Rect::new(rect.x + rect.w - 78, rect.y + 37, 70, 19);
+        let locate_reserve = if self.editor_locate_btn_rect.w > 0 { 26 } else { 0 };
+        let close_btn = Rect::new(rect.x + rect.w - 78 - locate_reserve, rect.y + 37, 70, 19);
         let open_btn = Rect::new(close_btn.x - 84, rect.y + 37, 78, 19);
         let stats_str = format!("+{}  -{}", diff_snap.added_lines, diff_snap.removed_lines);
         let crumb_txt = format!("{rel_path}  ·  {}   ({stats_str})", diff_snap.subtitle);
@@ -15639,6 +16979,7 @@ impl IdeApplicationState {
                 self.git_log_diff_scroll_info = ScrollTrackInfo::default();
 
                 if self.git_engine.has_loaded_snapshot && !self.git_engine.git_installed {
+                    self.git_log_search_rect = Rect::new(0, 0, 0, 0);
                     let card = Rect::new(
                         content_rect.x + 12,
                         content_rect.y + 10,
@@ -15646,6 +16987,17 @@ impl IdeApplicationState {
                         148.min(content_rect.h - 20).max(110),
                     );
                     self.render_git_missing_card(canvas, card);
+                    return;
+                }
+                if self.git_engine.has_loaded_snapshot && !self.git_engine.is_git_repo {
+                    self.git_log_search_rect = Rect::new(0, 0, 0, 0);
+                    let card = Rect::new(
+                        content_rect.x + 12,
+                        content_rect.y + 10,
+                        (content_rect.w - 24).min(600).max(240),
+                        152.min(content_rect.h - 20).max(120),
+                    );
+                    self.render_git_not_initialized_card(canvas, card);
                     return;
                 }
 
@@ -16637,7 +17989,7 @@ impl IdeApplicationState {
         for entry in &entries {
             if let MenuEntry::Action(act) = entry {
                 let title = act.menu_title_i18n(self.ui_lang);
-                let sc = act.shortcut_label();
+                let sc = act.shortcut_label_for(self.keymap_scheme);
                 let (tw, _) = canvas.measure_text(title, FontStyle::UiRegular);
                 let (sw, _) = canvas.measure_text(sc, FontStyle::UiSmall);
                 let needed = tw + sw + 76;
@@ -16710,7 +18062,7 @@ impl IdeApplicationState {
                             if hovered { 0xFFFFFF } else { t.accent_blue },
                         );
                     }
-                    let sc = act.shortcut_label();
+                    let sc = act.shortcut_label_for(self.keymap_scheme);
                     let (sw, _) = canvas.measure_text(sc, FontStyle::UiSmall);
                     let text_y = iy + (row_h - 18).max(2) / 2;
                     canvas.draw_text_ellipsis(
@@ -16756,7 +18108,10 @@ impl IdeApplicationState {
         };
         let (ahead, behind) = self.git_engine.ahead_behind;
         let git_missing = self.git_engine.has_loaded_snapshot && !self.git_engine.git_installed;
-        let missing_h = if git_missing { 34 } else { 0 };
+        let git_uninit = self.git_engine.has_loaded_snapshot
+            && self.git_engine.git_installed
+            && !self.git_engine.is_git_repo;
+        let missing_h = if git_missing || git_uninit { 34 } else { 0 };
         let popup_h = (branches.len() as i32) * 28 + remote_h + 236 + missing_h;
         let popup_x = if self.git_pane_popup_anchor_x() > 0 {
             self.git_pane_popup_anchor_x()
@@ -16816,6 +18171,31 @@ impl IdeApplicationState {
                 FontStyle::UiSmall,
             );
             self.hit_regions.push((inst_row, HitAction::InstallGit));
+            y += 34;
+        } else if git_uninit {
+            let init_row = Rect::new(popup_rect.x + 8, y, popup_w - 16, 28);
+            let ihov = init_row.contains(hx, hy);
+            canvas.stroke_rounded_rect(
+                init_row,
+                5,
+                t.accent_blue,
+                if ihov {
+                    t.accent_blue
+                } else {
+                    blend_rgb(t.popup_bg, t.accent_blue, 0.16)
+                },
+            );
+            canvas.draw_text_centered(
+                init_row,
+                self.tr(
+                    "⚡ 当前目录未初始化 Git · 点击初始化 (git init)",
+                    "⚡ Not a Git repository · Click to Initialize (git init)",
+                ),
+                if ihov { 0xFFFFFF } else { t.accent_blue },
+                FontStyle::UiSmall,
+            );
+            self.hit_regions
+                .push((init_row, HitAction::InitGitRepository));
             y += 34;
         }
         let actions = [
@@ -18852,7 +20232,7 @@ impl IdeApplicationState {
             .push((done_btn, HitAction::CloseModalOrPopup));
     }
 
-    fn render_git_missing_card(&mut self, canvas: &mut SurfaceCanvas, rect: Rect) {
+    pub(crate) fn render_git_missing_card(&mut self, canvas: &mut SurfaceCanvas, rect: Rect) {
         let t = self.theme;
         let (hx, hy) = self.hover_pos;
         canvas.stroke_rounded_rect(
@@ -18941,6 +20321,212 @@ impl IdeApplicationState {
             );
             self.hit_regions
                 .push((ref_btn, HitAction::RefreshGitStatus));
+        }
+    }
+
+    pub(crate) fn render_git_not_initialized_card(
+        &mut self,
+        canvas: &mut SurfaceCanvas,
+        rect: Rect,
+    ) {
+        let t = self.theme;
+        let (hx, hy) = self.hover_pos;
+        canvas.stroke_rounded_rect(
+            rect,
+            8,
+            t.border_color,
+            blend_rgb(t.panel_bg, t.accent_blue, 0.06),
+        );
+        canvas.draw_git_branch_icon(rect.x + 12, rect.y + 13, t.accent_blue);
+        canvas.draw_text_styled(
+            rect.x + 30,
+            rect.y + 10,
+            self.tr("当前工作区未初始化 Git", "Git Not Initialized"),
+            t.text_primary,
+            rect.w - 42,
+            FontStyle::UiBold,
+        );
+
+        let lang = self.ui_lang;
+        let draw_secondary_btn =
+            |canvas: &mut SurfaceCanvas,
+             hit_regions: &mut Vec<(Rect, HitAction)>,
+             btn: Rect,
+             zh: &str,
+             en: &str,
+             act: HitAction| {
+                let label = match lang {
+                    UiLanguage::ZhCn => zh,
+                    UiLanguage::EnUs => en,
+                };
+                let hot = btn.contains(hx, hy);
+                canvas.stroke_rounded_rect(
+                    btn,
+                    6,
+                    if hot { t.accent_blue } else { t.border_color },
+                    if hot { t.popup_hover_bg } else { t.window_bg },
+                );
+                canvas.draw_text_centered(
+                    btn,
+                    label,
+                    if hot { 0xFFFFFF } else { t.text_secondary },
+                    FontStyle::UiSmall,
+                );
+                hit_regions.push((btn, act));
+            };
+
+        if rect.w >= 420 {
+            canvas.draw_text_styled(
+                rect.x + 12,
+                rect.y + 34,
+                self.tr(
+                    "初始化 Git 仓库后，即可使用变更追踪、分支管理、代码提交与历史记录功能。",
+                    "Initialize a Git repository to track file changes, branches, commits, and history.",
+                ),
+                t.text_secondary,
+                rect.w - 24,
+                FontStyle::UiSmall,
+            );
+            let btn_y = (rect.y + rect.h - 40).max(rect.y + 64);
+            let mut bx = rect.x + 12;
+
+            let init_btn = Rect::new(bx, btn_y, 144, 28);
+            let init_hot = init_btn.contains(hx, hy);
+            canvas.fill_rounded_rect(
+                init_btn,
+                6,
+                if init_hot {
+                    blend_rgb(t.accent_blue, 0xFFFFFF, 0.12)
+                } else {
+                    t.accent_blue
+                },
+            );
+            canvas.draw_text_centered(
+                init_btn,
+                self.tr("⚡ 初始化 Git 仓库", "⚡ Initialize Git"),
+                0xFFFFFF,
+                FontStyle::UiSmall,
+            );
+            self.hit_regions
+                .push((init_btn, HitAction::InitGitRepository));
+            bx += init_btn.w + 8;
+
+            if bx + 168 <= rect.x + rect.w - 10 {
+                let gi_btn = Rect::new(bx, btn_y, 168, 28);
+                draw_secondary_btn(
+                    canvas,
+                    &mut self.hit_regions,
+                    gi_btn,
+                    "+ 初始化并生成 .gitignore",
+                    "+ Init & .gitignore",
+                    HitAction::InitGitRepositoryWithGitIgnore,
+                );
+                bx += gi_btn.w + 8;
+            }
+            if bx + 102 <= rect.x + rect.w - 10 {
+                let clone_btn = Rect::new(bx, btn_y, 102, 28);
+                draw_secondary_btn(
+                    canvas,
+                    &mut self.hit_regions,
+                    clone_btn,
+                    "克隆仓库...",
+                    "Clone Repo...",
+                    HitAction::OpenCloneGitRepoModal,
+                );
+                bx += clone_btn.w + 8;
+            }
+            if bx + 72 <= rect.x + rect.w - 10 {
+                let ref_btn = Rect::new(bx, btn_y, 72, 28);
+                draw_secondary_btn(
+                    canvas,
+                    &mut self.hit_regions,
+                    ref_btn,
+                    "↻ 检测",
+                    "↻ Check",
+                    HitAction::RefreshGitStatus,
+                );
+            }
+        } else {
+            canvas.draw_text_styled(
+                rect.x + 12,
+                rect.y + 33,
+                self.tr(
+                    "当前目录还不是 Git 仓库，",
+                    "This folder is not a Git repository.",
+                ),
+                t.text_secondary,
+                rect.w - 24,
+                FontStyle::UiSmall,
+            );
+            canvas.draw_text_styled(
+                rect.x + 12,
+                rect.y + 50,
+                self.tr(
+                    "初始化后可追踪变更与管理提交。",
+                    "Initialize Git to track changes & commits.",
+                ),
+                t.text_secondary,
+                rect.w - 24,
+                FontStyle::UiSmall,
+            );
+
+            let full_w = (rect.w - 24).max(80);
+            let mut by = rect.y + 74;
+            let init_btn = Rect::new(rect.x + 12, by, full_w, 28);
+            let init_hot = init_btn.contains(hx, hy);
+            canvas.fill_rounded_rect(
+                init_btn,
+                6,
+                if init_hot {
+                    blend_rgb(t.accent_blue, 0xFFFFFF, 0.12)
+                } else {
+                    t.accent_blue
+                },
+            );
+            canvas.draw_text_centered(
+                init_btn,
+                self.tr("⚡ 初始化 Git 仓库 (git init)", "⚡ Initialize Git (git init)"),
+                0xFFFFFF,
+                FontStyle::UiSmall,
+            );
+            self.hit_regions
+                .push((init_btn, HitAction::InitGitRepository));
+            by += 34;
+
+            if by + 26 <= rect.y + rect.h - 6 {
+                let gi_btn = Rect::new(rect.x + 12, by, full_w, 26);
+                draw_secondary_btn(
+                    canvas,
+                    &mut self.hit_regions,
+                    gi_btn,
+                    "+ 初始化并生成 .gitignore",
+                    "+ Init & .gitignore",
+                    HitAction::InitGitRepositoryWithGitIgnore,
+                );
+                by += 32;
+            }
+
+            if by + 26 <= rect.y + rect.h - 6 {
+                let half_w = ((full_w - 6) / 2).max(48);
+                let clone_btn = Rect::new(rect.x + 12, by, half_w, 26);
+                draw_secondary_btn(
+                    canvas,
+                    &mut self.hit_regions,
+                    clone_btn,
+                    "克隆仓库...",
+                    "Clone...",
+                    HitAction::OpenCloneGitRepoModal,
+                );
+                let ref_btn = Rect::new(rect.x + 12 + half_w + 6, by, full_w - half_w - 6, 26);
+                draw_secondary_btn(
+                    canvas,
+                    &mut self.hit_regions,
+                    ref_btn,
+                    "↻ 检测",
+                    "↻ Check",
+                    HitAction::RefreshGitStatus,
+                );
+            }
         }
     }
 
@@ -20503,7 +22089,7 @@ impl IdeApplicationState {
             (w - 156).max(40),
             FontStyle::UiRegular,
         );
-        let shortcut = action.shortcut_label();
+        let shortcut = action.shortcut_label_for(self.keymap_scheme);
         if !shortcut.is_empty() {
             let (sw, _) = canvas.measure_text(shortcut, FontStyle::CodeMono);
             canvas.draw_text_styled(
@@ -20688,10 +22274,20 @@ impl IdeApplicationState {
         hx: i32,
         hy: i32,
     ) {
-        let intro = self.tr(
-            "编辑器行为与 IntelliJ IDEA 快捷键保持一致。",
-            "Editor behavior follows the IntelliJ IDEA keymap.",
-        );
+        let intro = match (self.keymap_scheme, self.ui_lang) {
+            (KeymapScheme::IntelliJIdea, UiLanguage::ZhCn) => {
+                "编辑器行为与 IntelliJ IDEA 快捷键保持一致。"
+            }
+            (KeymapScheme::IntelliJIdea, UiLanguage::EnUs) => {
+                "Editor behavior follows the IntelliJ IDEA keymap."
+            }
+            (KeymapScheme::Eclipse, UiLanguage::ZhCn) => {
+                "编辑器行为已切换为 Eclipse 经典快捷键方案。"
+            }
+            (KeymapScheme::Eclipse, UiLanguage::EnUs) => {
+                "Editor behavior follows the Eclipse keymap."
+            }
+        };
         self.settings_note(canvas, flow, x, w, intro);
         let title = self.tr("编辑器", "Editor");
         self.settings_section(canvas, flow, x, w, title);
@@ -20878,11 +22474,16 @@ impl IdeApplicationState {
         );
         let fmt = self.tr("重新格式化代码", "Reformat Code");
         self.settings_section(canvas, flow, x, w, fmt);
-        let fmt_note = self.tr(
-            "Ctrl+Alt+L 去除行尾空白，并保证文件以换行结束。",
-            "Ctrl+Alt+L trims trailing whitespace and keeps a final newline.",
-        );
-        self.settings_note(canvas, flow, x, w, fmt_note);
+        let fmt_sc = IdeAction::ReformatCode.shortcut_label_for(self.keymap_scheme);
+        let fmt_note = match self.ui_lang {
+            UiLanguage::ZhCn => {
+                format!("{fmt_sc} 去除行尾空白，并保证文件以换行结束。")
+            }
+            UiLanguage::EnUs => {
+                format!("{fmt_sc} trims trailing whitespace and keeps a final newline.")
+            }
+        };
+        self.settings_note(canvas, flow, x, w, &fmt_note);
         if let Some(y) = flow.place(26, 2) {
             self.draw_settings_action_row(canvas, x, y, w, IdeAction::ReformatCode, hx, hy, true);
         }
@@ -20897,31 +22498,104 @@ impl IdeApplicationState {
         hx: i32,
         hy: i32,
     ) {
-        let intro = self.tr(
-            "当前方案为 IntelliJ IDEA。点击条目会直接执行。",
-            "Active keymap: IntelliJ IDEA. Click an entry to run it.",
-        );
-        self.settings_note(canvas, flow, x, w, intro);
-        if let Some(y) = flow.place(32, 10) {
+        let intro = match self.ui_lang {
+            UiLanguage::ZhCn => format!(
+                "当前快捷键方案为 {}（支持 IntelliJ IDEA / Eclipse 切换）。点击条目会直接执行。",
+                self.keymap_scheme.display_name()
+            ),
+            UiLanguage::EnUs => format!(
+                "Active keymap: {} (switch between IntelliJ IDEA & Eclipse). Click an entry to run it.",
+                self.keymap_scheme.display_name()
+            ),
+        };
+        self.settings_note(canvas, flow, x, w, &intro);
+        if let Some(y) = flow.place(34, 10) {
             let label = self.tr("按键映射", "Keymap");
             canvas.draw_text_styled(
                 x,
                 y + 6,
                 label,
                 self.theme.text_primary,
-                120,
+                110,
                 FontStyle::UiRegular,
             );
-            let box_r = Rect::new(x + 128, y, (w - 128).min(360), 30);
-            canvas.stroke_rounded_rect(box_r, 6, self.theme.border_color, self.theme.editor_bg);
-            canvas.draw_text_styled(
-                box_r.x + 10,
-                box_r.y + 6,
-                "IntelliJ IDEA",
-                self.theme.text_primary,
-                box_r.w - 20,
-                FontStyle::UiRegular,
-            );
+            let schemes = KeymapScheme::all();
+            let mut sx = x + 118;
+            let btn_w = ((w - 118 - 10) / schemes.len() as i32).clamp(110, 210);
+            for &scheme in schemes {
+                let btn = Rect::new(sx, y, btn_w, 30);
+                let active = self.keymap_scheme == scheme;
+                let hot = btn.contains(hx, hy);
+                let fill = if active {
+                    self.theme.accent_blue
+                } else if hot {
+                    self.theme.popup_hover_bg
+                } else {
+                    self.theme.editor_bg
+                };
+                let border = if active || hot {
+                    self.theme.accent_blue
+                } else {
+                    self.theme.border_color
+                };
+                canvas.stroke_rounded_rect(btn, 6, border, fill);
+                let fg = if active {
+                    0xFFFFFF
+                } else {
+                    self.settings_row_fg(hot)
+                };
+                canvas.draw_text_centered(
+                    btn,
+                    scheme.display_name_i18n(self.ui_lang),
+                    fg,
+                    if active {
+                        FontStyle::UiBold
+                    } else {
+                        FontStyle::UiRegular
+                    },
+                );
+                self.hit_regions.push((btn, HitAction::SelectKeymap(scheme)));
+                sx += btn_w + 10;
+            }
+        }
+        let ed_dbg_title = self.tr("编辑器与调试器快捷键", "Editor & Debugger Shortcuts");
+        self.settings_section(canvas, flow, x, w, ed_dbg_title);
+        let ks = self.keymap_scheme;
+        let extra_shortcuts = [
+            (
+                self.tr("文件内查找 Find", "Find in Active File"),
+                ks.editor_find_label(),
+            ),
+            (
+                self.tr("文件内替换 Replace", "Replace in Active File"),
+                ks.editor_replace_label(),
+            ),
+            (
+                self.tr("转到指定行 Go to Line", "Go to Line"),
+                ks.go_to_line_label(),
+            ),
+            (
+                self.tr("调试单步进入 Step Into", "Debug: Step Into"),
+                ks.debug_step_into_label(),
+            ),
+            (
+                self.tr("调试单步跳过 Step Over", "Debug: Step Over"),
+                ks.debug_step_over_label(),
+            ),
+            (
+                self.tr("调试步出 Step Return / Out", "Debug: Step Out"),
+                ks.debug_step_out_label(),
+            ),
+            (
+                self.tr("调试继续运行 Resume / Continue", "Debug: Continue"),
+                ks.debug_continue_label(),
+            ),
+        ];
+        for (title, sc) in extra_shortcuts {
+            if let Some(y) = flow.place(24, 2) {
+                self.settings_kv(canvas, flow, x, w, title, sc);
+                let _ = y;
+            }
         }
         let mut seen = Vec::new();
         for cat in MainMenuCategory::all() {
@@ -21137,6 +22811,126 @@ impl IdeApplicationState {
                 self.draw_settings_action_row(canvas, x, y, w, action, hx, hy, true);
             }
         }
+
+        let ext_title = self.tr(
+            "外部调试与 Inspector 跳转（Vue Inspector / Vite / React / 浏览器）",
+            "External Debugger & Inspector Jump (Vue Inspector / Vite / React / Browser)",
+        );
+        self.settings_section(canvas, flow, x, w, ext_title);
+        let ext_note = self.tr(
+            "IDE 内置终端已自动注入 LAUNCH_EDITOR / REACT_EDITOR，支持点击元素直接唤起窗口并定位到行列。",
+            "IDE terminals auto-inject LAUNCH_EDITOR / REACT_EDITOR so Vue/React Inspectors focus this window and jump to line:col.",
+        );
+        self.settings_note(canvas, flow, x, w, ext_note);
+        self.settings_status(
+            canvas,
+            flow,
+            x,
+            w,
+            self.tr(
+                "IDE 内置终端 / 运行配置 (LAUNCH_EDITOR)",
+                "IDE Terminal / Run Config (LAUNCH_EDITOR)",
+            ),
+            !self.terminal_launch_env.is_empty(),
+        );
+        if let Some(paths) = self.external_integration.clone() {
+            let proto_ok =
+                crate::external_open::is_windows_url_protocol_registered(&paths.exe_path);
+            let env_ok =
+                crate::external_open::is_user_launch_editor_enabled(&paths.launch_editor_value);
+            let path_ok = crate::external_open::is_cli_dir_in_user_path(&paths.cli_bin_dir);
+            self.settings_status(
+                canvas,
+                flow,
+                x,
+                w,
+                self.tr(
+                    "rust-ai-ide:// URL 协议注册",
+                    "rust-ai-ide:// URL protocol handler",
+                ),
+                proto_ok,
+            );
+            self.settings_status(
+                canvas,
+                flow,
+                x,
+                w,
+                self.tr(
+                    "外部终端全局 LAUNCH_EDITOR / REACT_EDITOR",
+                    "External terminal global LAUNCH_EDITOR / REACT_EDITOR",
+                ),
+                env_ok,
+            );
+            self.settings_status(
+                canvas,
+                flow,
+                x,
+                w,
+                self.tr("用户 PATH 中的 rust-ai-ide CLI", "rust-ai-ide CLI in user PATH"),
+                path_ok,
+            );
+            if let Some(y) = flow.place(32, 4) {
+                let mut bx = x;
+                let proto_lbl = self.tr("注册 URL 协议", "Register URL Protocol");
+                self.draw_settings_button(
+                    canvas,
+                    Rect::new(bx, y, 138, 28),
+                    proto_lbl,
+                    !proto_ok,
+                    hx,
+                    hy,
+                    HitAction::RegisterIdeUrlProtocol,
+                );
+                bx += 146;
+                let env_lbl = if env_ok {
+                    self.tr("关闭外部终端变量", "Disable External Env")
+                } else {
+                    self.tr("启用外部终端跳转", "Enable External Terminals")
+                };
+                self.draw_settings_button(
+                    canvas,
+                    Rect::new(bx, y, 158, 28),
+                    env_lbl,
+                    !env_ok,
+                    hx,
+                    hy,
+                    HitAction::ToggleUserLaunchEditorEnv,
+                );
+                bx += 166;
+                if bx + 132 <= x + w {
+                    let path_lbl = self.tr("添加到 PATH", "Add CLI to PATH");
+                    self.draw_settings_button(
+                        canvas,
+                        Rect::new(bx, y, 132, 28),
+                        path_lbl,
+                        false,
+                        hx,
+                        hy,
+                        HitAction::InstallCliToUserPath,
+                    );
+                }
+            }
+            if let Some(y) = flow.place(32, 4) {
+                let copy_lbl = self.tr(
+                    "复制 PowerShell LAUNCH_EDITOR 命令",
+                    "Copy PowerShell LAUNCH_EDITOR",
+                );
+                self.draw_settings_button(
+                    canvas,
+                    Rect::new(x, y, 250.min(w), 28),
+                    copy_lbl,
+                    false,
+                    hx,
+                    hy,
+                    HitAction::CopyLaunchEditorCommand,
+                );
+            }
+            let formats = self.tr(
+                "支持格式: -g file:line:col · --line N --column M file · +line:col · file(line,col) · rust-ai-ide:// · vscode:// · idea://",
+                "Formats: -g file:line:col · --line N --column M file · +line:col · file(line,col) · rust-ai-ide:// · vscode:// · idea://",
+            );
+            self.settings_note(canvas, flow, x, w, formats);
+        }
     }
 
     fn render_settings_terminal_page(
@@ -21196,6 +22990,9 @@ impl IdeApplicationState {
             ("Rust", "rust-analyzer", "codelldb"),
             ("TypeScript", "vtsls", "js-debug"),
             ("JavaScript", "vtsls", "js-debug"),
+            ("Vue", "vue-language-server", "js-debug"),
+            ("Svelte", "svelteserver", "js-debug"),
+            ("Astro", "astro-ls", "js-debug"),
             ("Python", "pyright-langserver", "debugpy"),
             ("Java", "jdtls", "java-debug"),
             (
@@ -21247,7 +23044,7 @@ impl IdeApplicationState {
         let lang_label = self.tr("语言", "Language");
         self.settings_kv(canvas, flow, x, w, lang_label, self.ui_lang.display_name());
         let map_label = self.tr("按键映射", "Keymap");
-        self.settings_kv(canvas, flow, x, w, map_label, "IntelliJ IDEA");
+        self.settings_kv(canvas, flow, x, w, map_label, self.keymap_scheme.display_name());
         let ui_mode = self.tr("界面", "UI");
         self.settings_kv(canvas, flow, x, w, ui_mode, "New UI / Islands");
     }
@@ -23147,15 +24944,16 @@ mod tests {
             .any(|(_, act)| matches!(act, HitAction::ToggleGitBranchPopup)));
         assert!(state.menu_category_rects.is_empty());
 
-        // Clicking the hamburger icon expands the menu directly into the top toolbar
+        // Hovering the top-left hamburger icon expands the menu directly into the top toolbar
         // and hides the project / git branch widgets.
         let ham_rect = state
             .hit_regions
             .iter()
-            .find(|(_, act)| matches!(act, HitAction::ToggleHamburgerMenu))
+            .rev()
+            .find(|(_, act)| matches!(act, HitAction::OpenHamburgerFileMenu))
             .map(|(r, _)| *r)
             .expect("hamburger button rect");
-        state.handle_mouse_click_with_mods(ham_rect.x + 4, ham_rect.y + 4, false, &canvas);
+        assert!(state.handle_mouse_move(ham_rect.x + 4, ham_rect.y + 4));
         assert!(state.hamburger_menu_expanded);
         assert!(state.active_menu_category.is_none());
 
@@ -23178,18 +24976,16 @@ mod tests {
             );
         }
 
-        // Moving the mouse over a category opens its submenu immediately without clicking.
-        let (first_cat, first_rect) = state.menu_category_rects[0];
-        let (second_cat, second_rect) = state.menu_category_rects[1];
-        assert!(state.handle_mouse_move(first_rect.x + 4, first_rect.y + 4));
-        assert_eq!(state.active_menu_category, Some(first_cat));
-
+        // Clicking the top-left menu trigger opens the File menu dropdown directly.
+        state.handle_mouse_click_with_mods(ham_rect.x + 4, ham_rect.y + 4, false, &canvas);
+        assert!(state.hamburger_menu_expanded);
+        assert_eq!(state.active_menu_category, Some(MainMenuCategory::File));
         state.render(&mut canvas);
-        assert!(state
-            .active_overlay_rects
-            .iter()
-            .any(|r| r.y == 38 && r.h > 80));
+        assert!(state.menu_dropdown_rect.w > 100 && state.menu_dropdown_rect.h > 80);
 
+        // Moving the mouse over another category switches its submenu immediately without clicking.
+        let (first_cat, _first_rect) = state.menu_category_rects[0];
+        let (second_cat, second_rect) = state.menu_category_rects[1];
         assert!(state.handle_mouse_move(second_rect.x + 4, second_rect.y + 4));
         assert_eq!(state.active_menu_category, Some(second_cat));
         state.render(&mut canvas);
@@ -23215,19 +25011,19 @@ mod tests {
             .iter()
             .any(|(_, act)| matches!(act, HitAction::ToggleGitBranchPopup)));
 
-        // Re-open menu, hover first category to open dropdown, then click an editor/menu target -> title restores
+        // Clicking the hamburger icon directly when collapsed expands toolbar & opens File menu;
+        // clicking editor closes it and restores title.
         let ham_rect2 = state
             .hit_regions
             .iter()
-            .find(|(_, act)| matches!(act, HitAction::ToggleHamburgerMenu))
+            .rev()
+            .find(|(_, act)| matches!(act, HitAction::OpenHamburgerFileMenu))
             .map(|(r, _)| *r)
             .expect("hamburger button rect");
         state.handle_mouse_click_with_mods(ham_rect2.x + 4, ham_rect2.y + 4, false, &canvas);
-        state.render(&mut canvas);
-        let first_r = state.menu_category_rects[0].1;
-        state.handle_mouse_move(first_r.x + 4, first_r.y + 4);
-        state.render(&mut canvas);
         assert!(state.hamburger_menu_expanded);
+        assert_eq!(state.active_menu_category, Some(first_cat));
+        state.render(&mut canvas);
 
         let ed_x = state.editor_code_rect.x + 20;
         let ed_y = state.editor_code_rect.y + 20;
@@ -23665,6 +25461,7 @@ mod tests {
         std::fs::write(root.join("lib.rs"), "pub fn x() -> i32 { 1 }\n").unwrap();
 
         let mut state = IdeApplicationState::new(root.clone());
+        state.git_engine.is_git_repo = true;
         let mut canvas = SurfaceCanvas::new(1400, 860);
 
         // 1. Full IDEA Git menu renders all operations cleanly
@@ -24535,6 +26332,7 @@ mod tests {
         state.left_tool = Some(ToolWindowId::Commit);
         state.git_engine.has_loaded_snapshot = true;
         state.git_engine.git_installed = true;
+        state.git_engine.is_git_repo = true;
         state.agent_hub.active_provider = AgentProviderKind::ClaudeCodeCli;
         state.agent_hub.providers.clear();
         state.agent_hub.api_config.api_key.clear();
@@ -24574,7 +26372,7 @@ mod tests {
         assert!(state.ai_commit_generating);
 
         // Once the background generation completes (Ok or Err), progress stops and button re-enables.
-        for _ in 0..80 {
+        for _ in 0..200 {
             state.poll_background_updates();
             if !state.ai_commit_generating {
                 break;
@@ -24583,6 +26381,7 @@ mod tests {
         }
         assert!(!state.ai_commit_generating);
 
+        state.git_engine.is_git_repo = true;
         state.render(&mut canvas);
         assert!(state
             .hit_regions
@@ -25182,6 +26981,568 @@ mod tests {
             clean_workspace_path(helper_rs),
         );
         assert_eq!(state.active_buffer().cursor_line, 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ai_assistant_renders_rich_markdown_and_editor_supports_markdown_preview_split_and_format() {
+        let unique = format!(
+            "rust_ai_ide_md_support_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let root = std::env::temp_dir().join(&unique);
+        std::fs::create_dir_all(&root).unwrap();
+        let md_path = root.join("GUIDE.md");
+        let raw_md = "\
+# Guide Title
+Paragraph with **bold**, *italic*, ~~strike~~, and [Rust](https://www.rust-lang.org).
+
+> [!TIP]
+> Helpful note with `inline_code`.
+
+- [x] Task completed
+1. Ordered step
+
+|ColA|ColB|
+|:---|---:|
+|alpha|42|
+
+---
+
+```rust
+fn hello() {}
+```
+";
+        std::fs::write(&md_path, raw_md).unwrap();
+
+        let mut state = IdeApplicationState::new(root.clone());
+        let mut canvas = SurfaceCanvas::new(1440, 900);
+        state.right_agent_open = true;
+        state.right_panel_tab = RightPanelTab::Chat;
+        state.agent_hub.messages.push(ide_agent_hub::AgentChatMessage {
+            role: "assistant".to_string(),
+            agent: AgentProviderKind::CursorCli,
+            content: raw_md.to_string(),
+            thought: None,
+            checkpoint_id: None,
+            patch: None,
+            modified_files: Vec::new(),
+            file_changes: Vec::new(),
+            attachments: Vec::new(),
+        });
+
+        state.open_file(md_path.clone());
+        assert_eq!(state.active_markdown_view_mode(&md_path), MarkdownViewMode::Split);
+        state.render(&mut canvas);
+
+        // 1. AI Assistant renders rich Markdown blocks (headings, quotes, lists, tables, HR, links)
+        let chat_rows = &state.cached_chat_rows.rows;
+        assert!(chat_rows
+            .iter()
+            .any(|r| matches!(r, crate::agent_panel::CachedChatRow::HeadingLine { level: 1, .. })));
+        assert!(chat_rows
+            .iter()
+            .any(|r| matches!(r, crate::agent_panel::CachedChatRow::BlockquoteLine { .. })));
+        assert!(chat_rows
+            .iter()
+            .any(|r| matches!(r, crate::agent_panel::CachedChatRow::ListItemLine { .. })));
+        assert!(chat_rows
+            .iter()
+            .any(|r| matches!(r, crate::agent_panel::CachedChatRow::TableRow { .. })));
+        assert!(chat_rows
+            .iter()
+            .any(|r| matches!(r, crate::agent_panel::CachedChatRow::HorizontalRule { .. })));
+        assert!(state.hit_regions.iter().any(|(_, a)| matches!(
+            a,
+            HitAction::OpenExternalUrl(u) if u == "https://www.rust-lang.org"
+        )));
+
+        // 2. Editor Split mode renders both source code rect and formatted Markdown preview rect
+        assert!(state.editor_code_rect.w > 0);
+        assert!(state.md_preview_rect.w > 0);
+        assert!(!state.cached_md_preview.rows.is_empty());
+
+        // 3. Switching to Preview mode hides source code rect and expands formatted preview
+        let split_preview_w = state.md_preview_rect.w;
+        let preview_btn = state
+            .hit_regions
+            .iter()
+            .rev()
+            .find_map(|(r, a)| matches!(a, HitAction::SetMarkdownViewMode(MarkdownViewMode::Preview)).then_some(*r))
+            .expect("Preview mode button should be in hit_regions");
+        state.handle_mouse_click_with_mods(
+            preview_btn.x + preview_btn.w / 2,
+            preview_btn.y + preview_btn.h / 2,
+            false,
+            &canvas,
+        );
+        state.render(&mut canvas);
+        assert_eq!(state.editor_code_rect.w, 0);
+        assert!(state.md_preview_rect.w > split_preview_w);
+
+        // 4. Switching to Source mode hides preview rect and shows full source editor
+        let source_btn = state
+            .hit_regions
+            .iter()
+            .rev()
+            .find_map(|(r, a)| matches!(a, HitAction::SetMarkdownViewMode(MarkdownViewMode::Source)).then_some(*r))
+            .expect("Source mode button should be in hit_regions");
+        state.handle_mouse_click_with_mods(
+            source_btn.x + source_btn.w / 2,
+            source_btn.y + source_btn.h / 2,
+            false,
+            &canvas,
+        );
+        state.render(&mut canvas);
+        assert_eq!(state.md_preview_rect.w, 0);
+        assert!(state.editor_code_rect.w > 0);
+
+        // 5. FormatActiveDocument formats Markdown headings and aligns GFM table columns
+        let fmt_btn = state
+            .hit_regions
+            .iter()
+            .rev()
+            .find_map(|(r, a)| matches!(a, HitAction::FormatActiveDocument).then_some(*r))
+            .expect("Format button should be in hit_regions");
+        state.handle_mouse_click_with_mods(
+            fmt_btn.x + fmt_btn.w / 2,
+            fmt_btn.y + fmt_btn.h / 2,
+            false,
+            &canvas,
+        );
+        let formatted = state.active_buffer().text();
+        assert!(formatted.contains("# Guide Title"));
+        assert!(formatted.contains("| ColA  | ColB |"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_vue_sfc_editor_highlighting_and_eclipse_keymap_switching() {
+        let root = std::env::temp_dir().join(format!(
+            "rust_ai_ide_vue_eclipse_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let vue_path = root.join("src/App.vue");
+        std::fs::write(
+            &vue_path,
+            "<script setup lang=\"ts\">\nimport { ref } from 'vue'\nconst total = ref<number>(1)\n</script>\n\n<template>\n  <CounterBtn @click=\"total++\" :value=\"total\">{{ total }}</CounterBtn>\n</template>\n\n<style scoped>\n.btn { color: #3574F0; }\n</style>\n",
+        )
+        .unwrap();
+
+        let storage_dir = root.join(".ide-storage");
+        let mut state = IdeApplicationState::new(root.clone());
+        state.wakeup_enabled = false;
+        state.persistence_dir = Some(storage_dir.clone());
+        state.open_file(vue_path.clone());
+        assert_eq!(state.active_buffer().language, ide_core::LanguageId::Vue);
+
+        // Scroll directly inside <template> and ensure stateful highlighting still knows section
+        state.scroll_line = 2;
+        let mut canvas = SurfaceCanvas::new_with_scale(1440, 900, 1.0);
+        state.render(&mut canvas);
+        let ts_line = state
+            .cached_highlight_lines
+            .2
+            .get(&2)
+            .expect("line 2 should be highlighted");
+        assert!(ts_line
+            .iter()
+            .any(|s| s.text == "const" && s.kind == TokenKind::Keyword));
+        let tmpl_line = state
+            .cached_highlight_lines
+            .2
+            .get(&6)
+            .expect("line 6 should be highlighted");
+        assert!(tmpl_line
+            .iter()
+            .any(|s| s.text == "CounterBtn" && s.kind == TokenKind::Type));
+        assert!(tmpl_line
+            .iter()
+            .any(|s| s.text == "@click" && s.kind == TokenKind::MacroOrDecorator));
+
+        // Switch keymap to Eclipse in Settings -> Keymap and verify persistence + UI + SearchEverywhere
+        state.execute_ide_action(IdeAction::OpenSettingsModal);
+        state.settings_page = SettingsPage::Keymap;
+        state.render(&mut canvas);
+        let eclipse_btn = state
+            .hit_regions
+            .iter()
+            .rev()
+            .find_map(|(r, a)| {
+                matches!(a, HitAction::SelectKeymap(KeymapScheme::Eclipse)).then_some(*r)
+            })
+            .expect("Eclipse keymap button should be rendered");
+        state.handle_mouse_click_with_mods(
+            eclipse_btn.x + eclipse_btn.w / 2,
+            eclipse_btn.y + eclipse_btn.h / 2,
+            false,
+            &canvas,
+        );
+        assert_eq!(state.keymap_scheme, KeymapScheme::Eclipse);
+
+        state.trigger_search_everywhere(12);
+        assert!(state.search_results.iter().any(|item| matches!(
+            item,
+            SearchEverywhereItem::Action { action: IdeAction::ToggleBreakpoint, shortcut, .. } if shortcut == "Ctrl+Shift+B"
+        )));
+
+        let mut restored = IdeApplicationState::new(root.clone());
+        restored.wakeup_enabled = false;
+        restored.restore_from_persistence_dir(storage_dir);
+        assert_eq!(restored.keymap_scheme, KeymapScheme::Eclipse);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn editor_header_hover_shows_locate_icon_and_locates_nested_file_in_tree() {
+        let root = std::env::temp_dir().join(format!(
+            "rust_ai_ide_locate_header_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let nested_dir = root.join("packages/ui/src/widgets");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+        let target_file = nested_dir.join("LocateMe.vue");
+        std::fs::write(&target_file, "<template><div>ok</div></template>\n").unwrap();
+
+        // Add sibling files so tree_scroll behavior is exercised as well.
+        for i in 0..24 {
+            std::fs::write(root.join(format!("aaa_pad_{i:02}.rs")), "// pad\n").unwrap();
+        }
+
+        let mut state = IdeApplicationState::new(root.clone());
+        state.wakeup_enabled = false;
+        state.open_file(target_file.clone());
+        state.left_tool = Some(ToolWindowId::Commit);
+        state.project_tree.collapse_all();
+        assert!(!state
+            .project_tree
+            .visible_entries
+            .iter()
+            .any(|e| workspace_paths_equal(&e.path, &target_file)));
+
+        let mut canvas = SurfaceCanvas::new_with_scale(1440, 820, 1.0);
+        // Before hovering file header: locate button must NOT appear.
+        state.hover_pos = (-1, -1);
+        state.render(&mut canvas);
+        assert!(state.editor_header_rect.w > 0);
+        assert_eq!(state.editor_locate_btn_rect.w, 0);
+        assert!(!state
+            .hit_regions
+            .iter()
+            .any(|(_, a)| matches!(a, HitAction::LocateActiveFileInTree)));
+
+        // Moving mouse into the file header triggers redraw and shows the locate button.
+        let hx = state.editor_header_rect.x + 24;
+        let hy = state.editor_header_rect.y + 42;
+        assert!(state.handle_mouse_move(hx, hy));
+        state.render(&mut canvas);
+        assert!(state.editor_locate_btn_rect.w > 0);
+        let loc_btn = state
+            .hit_regions
+            .iter()
+            .rev()
+            .find_map(|(r, a)| matches!(a, HitAction::LocateActiveFileInTree).then_some(*r))
+            .expect("locate button should be rendered when hovering editor file header");
+
+        // Clicking locate opens Project panel, expands ancestor dirs, selects & scrolls to target.
+        state.handle_mouse_click_with_mods(
+            loc_btn.x + loc_btn.w / 2,
+            loc_btn.y + loc_btn.h / 2,
+            false,
+            &canvas,
+        );
+        assert_eq!(state.left_tool, Some(ToolWindowId::Project));
+        let revealed_idx = state
+            .project_tree
+            .visible_entries
+            .iter()
+            .position(|e| workspace_paths_equal(&e.path, &target_file))
+            .expect("target file should now be visible in project tree");
+        assert!(workspace_paths_equal(
+            state.project_tree.selected_path.as_deref().unwrap(),
+            &target_file
+        ));
+
+        state.render(&mut canvas);
+        let vis = state.left_scroll_info.visible.max(1);
+        assert!(
+            revealed_idx >= state.tree_scroll && revealed_idx < state.tree_scroll + vis,
+            "revealed_idx={revealed_idx} must be visible within tree_scroll={}..{}",
+            state.tree_scroll,
+            state.tree_scroll + vis
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cross_window_drag_to_project_tree_copies_and_to_inputs_inserts_or_attaches() {
+        let unique = format!(
+            "rust_ai_ide_cross_drag_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let ws_a = root.join("window_a");
+        let ws_b = root.join("window_b");
+        std::fs::create_dir_all(ws_a.join("bundle")).unwrap();
+        std::fs::create_dir_all(ws_b.join("dest_dir")).unwrap();
+        let src_file = ws_a.join("shared.rs");
+        std::fs::write(&src_file, "pub fn shared() -> i32 { 42 }\n").unwrap();
+        std::fs::write(ws_a.join("bundle/item.txt"), "bundle-data").unwrap();
+        std::fs::write(ws_b.join("main.rs"), "fn main() {}\n").unwrap();
+
+        let mut win_a = IdeApplicationState::new(ws_a.clone());
+        win_a.wakeup_enabled = false;
+        let mut win_b = IdeApplicationState::new(ws_b.clone());
+        win_b.wakeup_enabled = false;
+
+        let mut canvas_a = SurfaceCanvas::new_with_scale(1440, 860, 1.0);
+        let mut canvas_b = SurfaceCanvas::new_with_scale(1440, 860, 1.0);
+        win_a.left_tool = Some(ToolWindowId::Project);
+        win_a.render(&mut canvas_a);
+        win_b.left_tool = Some(ToolWindowId::Project);
+        win_b.right_agent_open = true;
+        win_b.right_panel_tab = RightPanelTab::Chat;
+        win_b.render(&mut canvas_b);
+
+        // 1. Source window can initiate drag from its Project Tree
+        let (src_row, _, _) = win_a
+            .project_entry_rects
+            .iter()
+            .find(|(_, p, _)| workspace_paths_equal(p, &src_file))
+            .cloned()
+            .expect("shared.rs row in window A");
+        win_a.begin_ide_drag_candidate_at(src_row.x + 10, src_row.y + 10);
+        assert!(win_a.update_ide_drag(src_row.x + 25, src_row.y + 10));
+        assert!(win_a.active_ide_drag.is_some());
+
+        // 2. Hovering over Window B's dest_dir folder in Project Tree shows Copy cursor & ProjectTreeCopy target
+        let (dest_row, _, is_dir) = win_b
+            .project_entry_rects
+            .iter()
+            .find(|(_, p, _)| workspace_paths_equal(p, &ws_b.join("dest_dir")))
+            .cloned()
+            .expect("dest_dir row in window B");
+        assert!(is_dir);
+        let drop_tree_x = dest_row.x + 12;
+        let drop_tree_y = dest_row.y + 10;
+        win_b.external_drag_hover = Some((src_file.clone(), (drop_tree_x, drop_tree_y)));
+        assert_eq!(
+            win_b.cursor_kind_at(drop_tree_x, drop_tree_y, 1440, 860),
+            IdeCursorKind::Copy
+        );
+        win_b.render(&mut canvas_b);
+
+        // Dropping onto Window B's Project Tree copies in copy mode (source remains intact)
+        assert!(win_b.handle_ide_drag_drop_at(src_file.clone(), drop_tree_x, drop_tree_y, true));
+        let copied_file = ws_b.join("dest_dir/shared.rs");
+        assert!(src_file.exists(), "original file in window A must remain");
+        assert_eq!(
+            std::fs::read_to_string(&copied_file).unwrap(),
+            "pub fn shared() -> i32 { 42 }\n"
+        );
+        assert!(win_b
+            .project_tree
+            .visible_entries
+            .iter()
+            .any(|e| workspace_paths_equal(&e.path, &copied_file)));
+
+        // Copying the folder recursively into Window B's Project Tree empty area (workspace root)
+        let empty_tree_x = win_b.left_pane_rect.x + 24;
+        let empty_tree_y = win_b.left_pane_rect.y + win_b.left_pane_rect.h - 16;
+        assert!(win_b.handle_ide_drag_drop_at(
+            ws_a.join("bundle"),
+            empty_tree_x,
+            empty_tree_y,
+            true
+        ));
+        assert_eq!(
+            std::fs::read_to_string(ws_b.join("bundle/item.txt")).unwrap(),
+            "bundle-data"
+        );
+
+        // 3. Cross-window drop onto Window B's AI Assistant input box attaches the file
+        let ai_x = win_b.agent_input_text_rect.x + 12;
+        let ai_y = win_b.agent_input_text_rect.y + 10;
+        win_b.external_drag_hover = Some((src_file.clone(), (ai_x, ai_y)));
+        assert_eq!(
+            win_b.cursor_kind_at(ai_x, ai_y, 1440, 860),
+            IdeCursorKind::Grabbing
+        );
+        win_b.render(&mut canvas_b);
+        assert!(win_b.handle_ide_drag_drop_at(src_file.clone(), ai_x, ai_y, true));
+        assert_eq!(win_b.focus, FocusTarget::AgentChatInput);
+        assert!(win_b
+            .agent_hub
+            .active_session()
+            .attached_items
+            .iter()
+            .any(|it| it.display_name == "shared.rs"));
+
+        // 4. Cross-window drop onto Window B's Git Commit input box inserts the file path
+        win_b.git_engine.is_git_repo = true;
+        win_b.left_tool = Some(ToolWindowId::Commit);
+        win_b.render(&mut canvas_b);
+        let commit_x = win_b.git_commit_input_box_rect.x + 16;
+        let commit_y = win_b.git_commit_input_box_rect.y + 12;
+        assert!(win_b.handle_ide_drag_drop_at(src_file.clone(), commit_x, commit_y, true));
+        assert_eq!(win_b.focus, FocusTarget::GitCommitInput);
+        assert!(win_b.git_commit_input.as_str().contains("shared.rs"));
+        assert!(win_b.git_engine.commit_message_draft.contains("shared.rs"));
+
+        // 5. Cross-window drop onto Window B's Ctrl+K inline edit input box inserts @path
+        win_b.trigger_ctrl_k_inline_edit();
+        win_b.render(&mut canvas_b);
+        let ck_x = win_b.ctrl_k_input_box_rect.x + 32;
+        let ck_y = win_b.ctrl_k_input_box_rect.y + 10;
+        assert!(win_b.handle_ide_drag_drop_at(src_file.clone(), ck_x, ck_y, true));
+        assert_eq!(win_b.focus, FocusTarget::CtrlKPrompt);
+        assert!(win_b.ctrl_k_input.as_str().contains('@'));
+        assert!(win_b.ctrl_k_input.as_str().contains("shared.rs"));
+
+        // 6. Cross-window drop onto Window B's Editor Find input inserts the file name
+        win_b.agent_hub.inline_edit = None;
+        win_b.editor_find_open = true;
+        win_b.render(&mut canvas_b);
+        let find_x = win_b.editor_find_input_rect.x + 28;
+        let find_y = win_b.editor_find_input_rect.y + 10;
+        assert!(win_b.handle_ide_drag_drop_at(src_file, find_x, find_y, true));
+        assert_eq!(win_b.focus, FocusTarget::EditorFindInput);
+        assert_eq!(win_b.editor_find_input.as_str(), "shared.rs");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn project_tree_refresh_button_and_uninitialized_git_actions_work_end_to_end() {
+        let unique = format!(
+            "rust_ai_ide_refresh_and_git_init_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+        std::fs::write(root.join("lib.rs"), "pub fn demo() {}\n").unwrap();
+
+        let mut state = IdeApplicationState::new(root.clone());
+        state.wakeup_enabled = false;
+        let mut canvas = SurfaceCanvas::new_with_scale(1440, 860, 1.0);
+
+        // 1. Project panel exposes RefreshProjectTree button and clicking it picks up externally created files.
+        state.left_tool = Some(ToolWindowId::Project);
+        state.render(&mut canvas);
+        let ref_btn = state
+            .hit_regions
+            .iter()
+            .rev()
+            .find_map(|(r, a)| matches!(a, HitAction::RefreshProjectTree).then_some(*r))
+            .expect("RefreshProjectTree button should exist in Project panel header");
+
+        let external_file = root.join("created_externally.rs");
+        std::fs::write(&external_file, "pub fn ext() {}\n").unwrap();
+        assert!(!state
+            .project_tree
+            .visible_entries
+            .iter()
+            .any(|e| workspace_paths_equal(&e.path, &external_file)));
+
+        state.handle_mouse_click_with_mods(
+            ref_btn.x + ref_btn.w / 2,
+            ref_btn.y + ref_btn.h / 2,
+            false,
+            &canvas,
+        );
+        assert!(state
+            .project_tree
+            .visible_entries
+            .iter()
+            .any(|e| workspace_paths_equal(&e.path, &external_file)));
+
+        // 2. When Git is installed but workspace is NOT initialized, Commit / GitLog / Changes / BranchPopup
+        //    show initialization actions instead of normal repo views.
+        if state.git_engine.git_installed {
+            assert!(state.git_engine.has_loaded_snapshot);
+            assert!(!state.git_engine.is_git_repo);
+
+            state.left_tool = Some(ToolWindowId::Commit);
+            state.bottom_tool = Some(ToolWindowId::GitLog);
+            state.right_agent_open = true;
+            state.right_panel_tab = RightPanelTab::Changes;
+            state.git_branch_popup_open = true;
+            state.render(&mut canvas);
+
+            let init_hits = state
+                .hit_regions
+                .iter()
+                .filter(|(_, a)| matches!(a, HitAction::InitGitRepository))
+                .count();
+            assert!(
+                init_hits >= 4,
+                "expected InitGitRepository across Commit, GitLog, Changes, and BranchPopup; got {init_hits}"
+            );
+            assert!(state
+                .hit_regions
+                .iter()
+                .any(|(_, a)| matches!(a, HitAction::InitGitRepositoryWithGitIgnore)));
+
+            // Clicking "+ Init & .gitignore" initializes the repository and reveals .gitignore in Project tree.
+            let init_gi_btn = state
+                .hit_regions
+                .iter()
+                .rev()
+                .find_map(|(r, a)| matches!(a, HitAction::InitGitRepositoryWithGitIgnore).then_some(*r))
+                .expect("InitGitRepositoryWithGitIgnore button");
+            state.handle_mouse_click_with_mods(
+                init_gi_btn.x + init_gi_btn.w / 2,
+                init_gi_btn.y + init_gi_btn.h / 2,
+                false,
+                &canvas,
+            );
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                let _ = state.poll_background_updates();
+                if state.git_engine.is_git_repo {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(state.git_engine.is_git_repo);
+            assert!(root.join(".git").exists());
+            assert!(root.join(".gitignore").exists());
+            assert!(state
+                .project_tree
+                .visible_entries
+                .iter()
+                .any(|e| e.name == ".gitignore"));
+
+            // Normal Commit UI now renders with commit input box and no uninitialized card.
+            state.git_branch_popup_open = false;
+            state.render(&mut canvas);
+            assert!(!state
+                .hit_regions
+                .iter()
+                .any(|(_, a)| matches!(a, HitAction::InitGitRepository)));
+            assert!(state.git_commit_input_box_rect.w > 40);
+        }
 
         let _ = std::fs::remove_dir_all(&root);
     }

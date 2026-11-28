@@ -3,13 +3,21 @@ use crate::ide_state::{
     blend_rgb, write_windows_clipboard_text, DockPane, FocusTarget, HitAction, IdeApplicationState,
     RightPanelTab, ScrollTrackInfo,
 };
+use crate::markdown::{
+    draw_list_marker, draw_md_spans_text, heading_font_style, heading_row_height,
+    hit_test_md_spans_col, layout_table_rows, list_marker_width, measure_md_spans_x,
+    parse_markdown_blocks, project_md_spans_slice, render_prepared_table_row, table_row_height,
+    wrap_md_line_segments, MdAlign, MdBlock, MdCalloutKind, MdListKind, PreparedTableRow,
+};
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use crate::markdown::{MdSpan as ChatTextSpan, MdSpanKind as ChatSpanKind};
 use ide_agent_hub::{
-    detect_workspace_file_references, AgentAttachedItem, AgentProviderKind, AgentWorkbenchMode,
-    QueuedAgentPrompt, StreamingAgentProgress,
+    AgentAttachedItem, AgentProviderKind, AgentWorkbenchMode, QueuedAgentPrompt,
+    StreamingAgentProgress,
 };
 use ide_core::{LanguageId, ThemeKind, UiLanguage};
 use ide_git::DiffLineKind;
-use ide_syntax::{highlight_line, TokenKind};
+use ide_syntax::{highlight_line_with_state, HighlightState, TokenKind};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
@@ -95,21 +103,6 @@ fn stream_progress_signature(prog: Option<&StreamingAgentProgress>) -> u64 {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) enum ChatSpanKind {
-    Plain,
-    Bold,
-    InlineCode,
-    FileLink { path: PathBuf, line: Option<usize> },
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ChatTextSpan {
-    pub start_char: usize,
-    pub end_char: usize,
-    pub kind: ChatSpanKind,
-}
-
-#[derive(Debug, Clone)]
 pub(crate) enum CachedChatRow {
     UserHeader {
         msg_idx: usize,
@@ -149,6 +142,41 @@ pub(crate) enum CachedChatRow {
         text: String,
         spans: Vec<ChatTextSpan>,
         default_bold: bool,
+    },
+    HeadingLine {
+        level: u8,
+        text: String,
+        spans: Vec<ChatTextSpan>,
+        has_bottom_rule: bool,
+        is_user: bool,
+        bubble_w: i32,
+    },
+    ListItemLine {
+        kind: MdListKind,
+        text: String,
+        spans: Vec<ChatTextSpan>,
+        is_continuation: bool,
+        marker_w: i32,
+        is_user: bool,
+        bubble_w: i32,
+    },
+    BlockquoteLine {
+        depth: usize,
+        callout: Option<MdCalloutKind>,
+        is_callout_header: bool,
+        text: String,
+        spans: Vec<ChatTextSpan>,
+        is_user: bool,
+        bubble_w: i32,
+    },
+    HorizontalRule {
+        is_user: bool,
+        bubble_w: i32,
+    },
+    TableRow {
+        prepared: PreparedTableRow,
+        is_user: bool,
+        bubble_w: i32,
     },
     ParaSpacer {
         is_user: bool,
@@ -232,6 +260,11 @@ impl CachedChatRow {
             Self::Spacer => 14,
             Self::UserLine { .. } => 24,
             Self::AgentLine { .. } | Self::StreamingLine { .. } => 23,
+            Self::HeadingLine { level, .. } => heading_row_height(*level),
+            Self::ListItemLine { is_user, .. } => if *is_user { 24 } else { 23 },
+            Self::BlockquoteLine { .. } => 22,
+            Self::HorizontalRule { .. } => 14,
+            Self::TableRow { prepared, .. } => table_row_height(prepared.line_count),
         }
     }
 
@@ -239,6 +272,9 @@ impl CachedChatRow {
         match self {
             Self::UserLine { text, .. }
             | Self::AgentLine { text, .. }
+            | Self::HeadingLine { text, .. }
+            | Self::ListItemLine { text, .. }
+            | Self::BlockquoteLine { text, .. }
             | Self::ThoughtLine(text)
             | Self::LiveThoughtLine(text)
             | Self::LiveStepLine(text)
@@ -252,31 +288,10 @@ impl CachedChatRow {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ParsedProseLine {
-    pub clean: String,
-    pub line_bold: bool,
-    pub spans: Vec<ChatTextSpan>,
-    pub pill_reserve: i32,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) enum ParsedBodyBlock {
-    ParaSpacer,
-    ProseLine(ParsedProseLine),
-    CodeBlock {
-        lang_tag: String,
-        lang_id: LanguageId,
-        full_code: Arc<str>,
-        lines: Vec<String>,
-        line_count: usize,
-        preview: String,
-    },
-}
-
-#[derive(Debug, Clone)]
 pub(crate) struct ParsedChatMessage {
-    pub blocks: Vec<ParsedBodyBlock>,
+    pub blocks: Vec<MdBlock>,
     pub has_code_fence: bool,
+    pub has_table: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -370,398 +385,18 @@ impl AgentChatCache {
     }
 }
 
-fn language_from_fence_tag(tag: &str) -> LanguageId {
-    LanguageId::from_fence_tag(tag)
-}
-
-fn parse_markdown_inline_line(raw: &str) -> (String, bool, Vec<ChatTextSpan>) {
-    let trimmed_start = raw.trim_start();
-    let mut line_bold = false;
-    let mut working = raw.to_string();
-
-    if let Some(after_hash) = trimmed_start.strip_prefix("#### ") {
-        line_bold = true;
-        working = after_hash.to_string();
-    } else if let Some(after_hash) = trimmed_start.strip_prefix("### ") {
-        line_bold = true;
-        working = after_hash.to_string();
-    } else if let Some(after_hash) = trimmed_start.strip_prefix("## ") {
-        line_bold = true;
-        working = after_hash.to_string();
-    } else if let Some(after_hash) = trimmed_start.strip_prefix("# ") {
-        line_bold = true;
-        working = after_hash.to_string();
-    } else if let Some(rest) = trimmed_start.strip_prefix("- ") {
-        let indent = raw.len() - trimmed_start.len();
-        working = format!("{}• {}", &raw[..indent], rest);
-    } else if let Some(rest) = trimmed_start.strip_prefix("* ") {
-        let indent = raw.len() - trimmed_start.len();
-        working = format!("{}• {}", &raw[..indent], rest);
-    }
-
-    let chars: Vec<char> = working.chars().collect();
-    let mut clean = String::with_capacity(working.len());
-    let mut spans = Vec::new();
-    let mut clean_len = 0usize;
-    let mut i = 0usize;
-
-    while i < chars.len() {
-        if chars[i] == '`' {
-            if let Some(rel_end) = chars[i + 1..].iter().position(|&c| c == '`') {
-                if rel_end > 0 {
-                    let start = clean_len;
-                    for &c in &chars[i + 1..i + 1 + rel_end] {
-                        clean.push(c);
-                        clean_len += 1;
-                    }
-                    spans.push(ChatTextSpan {
-                        start_char: start,
-                        end_char: clean_len,
-                        kind: ChatSpanKind::InlineCode,
-                    });
-                    i += rel_end + 2;
-                    continue;
-                }
-            }
-        }
-        if i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == '*' {
-            let mut close_pos = None;
-            let mut j = i + 2;
-            while j + 1 < chars.len() {
-                if chars[j] == '*' && chars[j + 1] == '*' {
-                    close_pos = Some(j);
-                    break;
-                }
-                j += 1;
-            }
-            if let Some(end_idx) = close_pos {
-                if end_idx > i + 2 {
-                    let start = clean_len;
-                    for &c in &chars[i + 2..end_idx] {
-                        clean.push(c);
-                        clean_len += 1;
-                    }
-                    spans.push(ChatTextSpan {
-                        start_char: start,
-                        end_char: clean_len,
-                        kind: ChatSpanKind::Bold,
-                    });
-                    i = end_idx + 2;
-                    continue;
-                }
-            }
-        }
-        clean.push(chars[i]);
-        clean_len += 1;
-        i += 1;
-    }
-
-    (clean, line_bold, spans)
-}
-
-/// 按像素宽度对聊天文本折行，优先在英文空格/标点词边界断开，并返回每行在原行中的字符区间
-fn wrap_chat_line_segments(
-    canvas: &SurfaceCanvas,
-    line: &str,
-    max_width: i32,
-    style: FontStyle,
-) -> Vec<(usize, usize, String)> {
-    let max_w = max_width.max(36);
-    if line.is_empty() {
-        return vec![(0, 0, String::new())];
-    }
-    let total_chars = line.chars().count();
-    let (full_w, _) = canvas.measure_text(line, style);
-    if full_w <= max_w {
-        return vec![(0, total_chars, line.to_string())];
-    }
-
-    let char_bytes: Vec<usize> = line
-        .char_indices()
-        .map(|(b, _)| b)
-        .chain(std::iter::once(line.len()))
-        .collect();
-    let chars: Vec<char> = line.chars().collect();
-    let mut out = Vec::new();
-    let mut start_c = 0usize;
-
-    while start_c < total_chars {
-        let rem = &line[char_bytes[start_c]..];
-        let (rw, _) = canvas.measure_text(rem, style);
-        if rw <= max_w {
-            out.push((start_c, total_chars, rem.to_string()));
-            break;
-        }
-        let mut split_rel = canvas.measure_caret_col_in_line(rem, max_w, style).max(1);
-        let rem_chars = total_chars - start_c;
-        if split_rel >= rem_chars {
-            split_rel = rem_chars.saturating_sub(1).max(1);
-        }
-        while split_rel > 1 {
-            let head = &line[char_bytes[start_c]..char_bytes[start_c + split_rel]];
-            let (hw, _) = canvas.measure_text(head, style);
-            if hw <= max_w {
-                break;
-            }
-            split_rel -= 1;
-        }
-        // 优先在末尾 ~35% 范围的空白处断词，避免切断英文单词
-        let min_word_break = (split_rel * 62) / 100;
-        let mut chosen_rel = split_rel;
-        for cand in (min_word_break..=split_rel).rev() {
-            if cand > 0 && chars[start_c + cand - 1] == ' ' {
-                chosen_rel = cand;
-                break;
-            }
-        }
-        let end_c = start_c + chosen_rel;
-        let seg = line[char_bytes[start_c]..char_bytes[end_c]].to_string();
-        out.push((start_c, end_c, seg));
-        start_c = end_c;
-    }
-    out
-}
-
-fn project_spans_slice(
-    seg_start_char: usize,
-    seg_end_char: usize,
-    full_spans: &[ChatTextSpan],
-) -> Vec<ChatTextSpan> {
-    if full_spans.is_empty() || seg_end_char <= seg_start_char {
-        return Vec::new();
-    }
-    let mut spans = Vec::new();
-    for sp in full_spans {
-        let ov_s = sp.start_char.max(seg_start_char);
-        let ov_e = sp.end_char.min(seg_end_char);
-        if ov_e > ov_s {
-            spans.push(ChatTextSpan {
-                start_char: ov_s - seg_start_char,
-                end_char: ov_e - seg_start_char,
-                kind: sp.kind.clone(),
-            });
-        }
-    }
-    spans
-}
-
-fn project_and_merge_spans(
-    root: &std::path::Path,
-    seg_text: &str,
-    seg_start_char: usize,
-    seg_end_char: usize,
-    raw_spans: &[ChatTextSpan],
-) -> Vec<ChatTextSpan> {
-    let seg_len = seg_end_char.saturating_sub(seg_start_char);
-    let mut spans = project_spans_slice(seg_start_char, seg_end_char, raw_spans);
-
-    let refs = detect_workspace_file_references(root, seg_text);
-    for (tok, path, line_opt) in refs {
-        if let Some(byte_pos) = seg_text.find(&tok) {
-            let start_char = seg_text[..byte_pos].chars().count();
-            let end_char = (start_char + tok.chars().count()).min(seg_len);
-            if end_char <= start_char {
-                continue;
-            }
-            // FileLink 优先替换同区间或重叠的 InlineCode/Bold，确保路径可点击打开
-            spans.retain(|s| s.end_char <= start_char || s.start_char >= end_char);
-            spans.push(ChatTextSpan {
-                start_char,
-                end_char,
-                kind: ChatSpanKind::FileLink {
-                    path,
-                    line: line_opt,
-                },
-            });
-        }
-    }
-
-    spans.sort_by_key(|s| s.start_char);
-    spans
-}
-
-fn span_visual_metrics(kind: &ChatSpanKind, default_bold: bool) -> (FontStyle, i32, i32) {
-    match kind {
-        ChatSpanKind::Plain => (
-            if default_bold {
-                FontStyle::ChatBodyBold
-            } else {
-                FontStyle::ChatBody
-            },
-            0,
-            0,
-        ),
-        ChatSpanKind::Bold => (FontStyle::ChatBodyBold, 0, 0),
-        ChatSpanKind::InlineCode => (FontStyle::ChatCode, 6, 6),
-        ChatSpanKind::FileLink { .. } => (FontStyle::ChatCode, 4, 4),
-    }
-}
-
-fn build_normalized_segments(
-    char_len: usize,
-    spans: &[ChatTextSpan],
-) -> Vec<(usize, usize, ChatSpanKind)> {
-    let mut out = Vec::new();
-    let mut cur = 0usize;
-    for sp in spans {
-        let s = sp.start_char.min(char_len);
-        let e = sp.end_char.min(char_len);
-        if s > cur {
-            out.push((cur, s, ChatSpanKind::Plain));
-        }
-        if e > s {
-            out.push((s, e, sp.kind.clone()));
-            cur = e;
-        }
-    }
-    if cur < char_len {
-        out.push((cur, char_len, ChatSpanKind::Plain));
-    }
-    out
-}
-
-fn measure_chat_spans_x(
-    canvas: &SurfaceCanvas,
-    text: &str,
-    spans: &[ChatTextSpan],
-    default_bold: bool,
-    target_col: usize,
-) -> i32 {
-    let chars: Vec<char> = text.chars().collect();
-    let len = chars.len();
-    let col = target_col.min(len);
-    if col == 0 || len == 0 {
-        return 0;
-    }
-    let segs = build_normalized_segments(len, spans);
-    let mut x = 0i32;
-    for (s, e, kind) in segs {
-        if col <= s {
-            break;
-        }
-        let (style, pad_l, pad_r) = span_visual_metrics(&kind, default_bold);
-        if col >= e {
-            let chunk: String = chars[s..e].iter().collect();
-            let (cw, _) = canvas.measure_text(&chunk, style);
-            x += pad_l + cw + pad_r;
-        } else {
-            let chunk: String = chars[s..col].iter().collect();
-            let (cw, _) = canvas.measure_text(&chunk, style);
-            x += pad_l + cw;
-            break;
-        }
-    }
-    x
-}
-
-fn hit_test_chat_spans_col(
-    canvas: &SurfaceCanvas,
-    text: &str,
-    spans: &[ChatTextSpan],
-    default_bold: bool,
-    rel_x: i32,
-) -> usize {
-    if rel_x <= 0 || text.is_empty() {
-        return 0;
-    }
-    let chars: Vec<char> = text.chars().collect();
-    let len = chars.len();
-    let segs = build_normalized_segments(len, spans);
-    let mut x = 0i32;
-    for (s, e, kind) in segs {
-        let (style, pad_l, pad_r) = span_visual_metrics(&kind, default_bold);
-        let chunk: String = chars[s..e].iter().collect();
-        let (cw, _) = canvas.measure_text(&chunk, style);
-        let seg_total = pad_l + cw + pad_r;
-        if rel_x <= x + seg_total {
-            let local_x = (rel_x - x - pad_l).max(0);
-            let local_col = canvas.measure_caret_col_in_line(&chunk, local_x, style);
-            return (s + local_col).min(len);
-        }
-        x += seg_total;
-    }
-    len
-}
-
-/// Width-independent pre-parsing of a chat message body (markdown inline spans, file refs, code fences).
+/// Width-independent pre-parsing of a chat message body using the full Markdown block/inline parser.
 /// Cached across `wrap_w` changes so splitter dragging never re-runs filesystem file-ref resolution.
 fn parse_message_body(root: &std::path::Path, content: &str) -> ParsedChatMessage {
-    let mut blocks = Vec::new();
-    let mut in_fence = false;
-    let mut fence_lang = String::new();
-    let mut code_lines: Vec<String> = Vec::new();
-    let mut has_code_fence = false;
-
-    let push_prose = |raw_line: &str, blocks: &mut Vec<ParsedBodyBlock>| {
-        if raw_line.trim().is_empty() {
-            blocks.push(ParsedBodyBlock::ParaSpacer);
-            return;
-        }
-        let (clean, line_bold, raw_spans) = parse_markdown_inline_line(raw_line);
-        let char_len = clean.chars().count();
-        let spans = project_and_merge_spans(root, &clean, 0, char_len, &raw_spans);
-        let pill_reserve = chat_inline_pill_reserve(&spans);
-        blocks.push(ParsedBodyBlock::ProseLine(ParsedProseLine {
-            clean,
-            line_bold,
-            spans,
-            pill_reserve,
-        }));
-    };
-
-    let push_code = |tag: String, lines: Vec<String>, blocks: &mut Vec<ParsedBodyBlock>| {
-        let full_code: Arc<str> = Arc::from(lines.join("\n"));
-        let line_count = lines.len().max(1);
-        let preview = lines
-            .iter()
-            .map(|l| l.trim())
-            .find(|l| !l.is_empty())
-            .unwrap_or("...")
-            .to_string();
-        let lang_id = language_from_fence_tag(&tag);
-        let lang_tag = if tag.is_empty() {
-            "code".to_string()
-        } else {
-            tag
-        };
-        blocks.push(ParsedBodyBlock::CodeBlock {
-            lang_tag,
-            lang_id,
-            full_code,
-            lines,
-            line_count,
-            preview,
-        });
-    };
-
-    for raw in content.lines() {
-        let trimmed = raw.trim_start();
-        if !in_fence {
-            if let Some(after) = trimmed.strip_prefix("```") {
-                has_code_fence = true;
-                in_fence = true;
-                fence_lang = after.trim().to_string();
-                code_lines.clear();
-            } else {
-                push_prose(raw, &mut blocks);
-            }
-        } else if trimmed.starts_with("```") {
-            let taken = std::mem::take(&mut code_lines);
-            let tag = std::mem::take(&mut fence_lang);
-            push_code(tag, taken, &mut blocks);
-            in_fence = false;
-        } else {
-            code_lines.push(raw.to_string());
-        }
-    }
-
-    if in_fence && !code_lines.is_empty() {
-        push_code(fence_lang, code_lines, &mut blocks);
-    }
-
+    let blocks = parse_markdown_blocks(root, None, content);
+    let has_code_fence = blocks
+        .iter()
+        .any(|b| matches!(b, MdBlock::CodeBlock { .. }));
+    let has_table = blocks.iter().any(|b| matches!(b, MdBlock::Table { .. }));
     ParsedChatMessage {
         blocks,
         has_code_fence,
+        has_table,
     }
 }
 
@@ -773,6 +408,7 @@ fn append_message_body_rows_from_parsed(
     parsed: &ParsedChatMessage,
     wrap_w: i32,
     is_user: bool,
+    is_streaming: bool,
     bubble_w: i32,
     collapse_overrides: &std::collections::HashMap<(usize, usize), bool>,
     out: &mut Vec<CachedChatRow>,
@@ -787,39 +423,134 @@ fn append_message_body_rows_from_parsed(
 
     for block in &parsed.blocks {
         match block {
-            ParsedBodyBlock::ParaSpacer => {
+            MdBlock::Blank => {
                 if !out.is_empty() {
                     out.push(CachedChatRow::ParaSpacer { is_user, bubble_w });
                 }
             }
-            ParsedBodyBlock::ProseLine(pl) => {
-                let base_style = if pl.line_bold {
-                    FontStyle::ChatBodyBold
-                } else {
-                    FontStyle::ChatBody
-                };
-                let eff_wrap_w = (wrap_w - pl.pill_reserve).max(60);
+            MdBlock::Heading { level, content } => {
+                let style = heading_font_style(*level);
+                let eff_wrap_w = (wrap_w - content.pill_reserve).max(60);
+                let segs = wrap_md_line_segments(canvas, &content.text, eff_wrap_w, style);
+                let last_idx = segs.len().saturating_sub(1);
+                for (idx, (seg_s, seg_e, seg_txt)) in segs.into_iter().enumerate() {
+                    out.push(CachedChatRow::HeadingLine {
+                        level: *level,
+                        text: seg_txt,
+                        spans: project_md_spans_slice(seg_s, seg_e, &content.spans),
+                        has_bottom_rule: *level <= 2 && idx == last_idx && !is_user,
+                        is_user,
+                        bubble_w,
+                    });
+                }
+            }
+            MdBlock::ParagraphLine { content } => {
+                let eff_wrap_w = (wrap_w - content.pill_reserve).max(60);
                 for (seg_s, seg_e, seg_txt) in
-                    wrap_chat_line_segments(canvas, &pl.clean, eff_wrap_w, base_style)
+                    wrap_md_line_segments(canvas, &content.text, eff_wrap_w, FontStyle::ChatBody)
                 {
-                    let spans = project_spans_slice(seg_s, seg_e, &pl.spans);
+                    let spans = project_md_spans_slice(seg_s, seg_e, &content.spans);
                     if is_user {
                         out.push(CachedChatRow::UserLine {
                             text: seg_txt,
                             spans,
-                            default_bold: pl.line_bold,
+                            default_bold: false,
                             bubble_w,
+                        });
+                    } else if is_streaming {
+                        out.push(CachedChatRow::StreamingLine {
+                            text: seg_txt,
+                            spans,
                         });
                     } else {
                         out.push(CachedChatRow::AgentLine {
                             text: seg_txt,
                             spans,
-                            default_bold: pl.line_bold,
+                            default_bold: false,
                         });
                     }
                 }
             }
-            ParsedBodyBlock::CodeBlock {
+            MdBlock::ListItem { kind, content } => {
+                let indent_px = (kind.indent() as i32) * 14;
+                let marker_w = list_marker_width(canvas, *kind);
+                let eff_wrap_w = (wrap_w - indent_px - marker_w - content.pill_reserve).max(60);
+                for (idx, (seg_s, seg_e, seg_txt)) in
+                    wrap_md_line_segments(canvas, &content.text, eff_wrap_w, FontStyle::ChatBody)
+                        .into_iter()
+                        .enumerate()
+                {
+                    out.push(CachedChatRow::ListItemLine {
+                        kind: *kind,
+                        text: seg_txt,
+                        spans: project_md_spans_slice(seg_s, seg_e, &content.spans),
+                        is_continuation: idx > 0,
+                        marker_w,
+                        is_user,
+                        bubble_w,
+                    });
+                }
+            }
+            MdBlock::BlockquoteLine {
+                depth,
+                callout,
+                is_callout_header,
+                content,
+            } => {
+                let indent_px = (*depth as i32) * 10 + 14;
+                let eff_wrap_w = (wrap_w - indent_px - content.pill_reserve).max(60);
+                if *is_callout_header {
+                    out.push(CachedChatRow::BlockquoteLine {
+                        depth: *depth,
+                        callout: *callout,
+                        is_callout_header: true,
+                        text: String::new(),
+                        spans: Vec::new(),
+                        is_user,
+                        bubble_w,
+                    });
+                }
+                if !content.text.is_empty() || !*is_callout_header {
+                    for (seg_s, seg_e, seg_txt) in wrap_md_line_segments(
+                        canvas,
+                        &content.text,
+                        eff_wrap_w,
+                        FontStyle::ChatBody,
+                    ) {
+                        out.push(CachedChatRow::BlockquoteLine {
+                            depth: *depth,
+                            callout: *callout,
+                            is_callout_header: false,
+                            text: seg_txt,
+                            spans: project_md_spans_slice(seg_s, seg_e, &content.spans),
+                            is_user,
+                            bubble_w,
+                        });
+                    }
+                }
+            }
+            MdBlock::HorizontalRule => {
+                out.push(CachedChatRow::HorizontalRule { is_user, bubble_w });
+            }
+            MdBlock::Table {
+                alignments,
+                headers,
+                rows,
+            } => {
+                let tbl_w = if is_user {
+                    (bubble_w - 26).max(120)
+                } else {
+                    (wrap_w - 8).max(120)
+                };
+                for prepared in layout_table_rows(canvas, alignments, headers, rows, tbl_w) {
+                    out.push(CachedChatRow::TableRow {
+                        prepared,
+                        is_user,
+                        bubble_w,
+                    });
+                }
+            }
+            MdBlock::CodeBlock {
                 lang_tag,
                 lang_id,
                 full_code,
@@ -828,10 +559,14 @@ fn append_message_body_rows_from_parsed(
                 preview,
             } => {
                 let default_collapsed = is_user || *line_count >= 28;
-                let collapsed = collapse_overrides
-                    .get(&(msg_idx, blk_idx))
-                    .copied()
-                    .unwrap_or(default_collapsed);
+                let collapsed = if is_streaming {
+                    false
+                } else {
+                    collapse_overrides
+                        .get(&(msg_idx, blk_idx))
+                        .copied()
+                        .unwrap_or(default_collapsed)
+                };
                 out.push(CachedChatRow::CodeBlockHeader {
                     msg_idx,
                     blk_idx,
@@ -850,11 +585,12 @@ fn append_message_body_rows_from_parsed(
                         user_bubble_w,
                     });
                 } else {
+                    let mut hl_state = HighlightState::default();
                     for cl in lines {
                         for (_, _, wl) in
-                            wrap_chat_line_segments(canvas, cl, code_wrap_w, FontStyle::ChatCode)
+                            wrap_md_line_segments(canvas, cl, code_wrap_w, FontStyle::ChatCode)
                         {
-                            let spans = Arc::new(highlight_line(&wl, *lang_id));
+                            let spans = Arc::new(highlight_line_with_state(&wl, *lang_id, &mut hl_state));
                             out.push(CachedChatRow::CodeBlockLine {
                                 text: wl,
                                 spans,
@@ -867,19 +603,6 @@ fn append_message_body_rows_from_parsed(
             }
         }
     }
-}
-
-#[inline]
-fn chat_inline_pill_reserve(spans: &[ChatTextSpan]) -> i32 {
-    spans
-        .iter()
-        .map(|s| match s.kind {
-            ChatSpanKind::InlineCode => 12,
-            ChatSpanKind::FileLink { .. } => 8,
-            _ => 0,
-        })
-        .sum::<i32>()
-        .min(64)
 }
 
 #[inline]
@@ -913,42 +636,43 @@ fn measure_user_bubble_width_from_parsed(
     prose_max_content_w: i32,
     code_max_content_w: i32,
 ) -> i32 {
-    let has_code_fence = parsed.has_code_fence;
-    let max_content_w = if has_code_fence {
+    let wide_block = parsed.has_code_fence || parsed.has_table;
+    let max_content_w = if wide_block {
         code_max_content_w
     } else {
         prose_max_content_w
     };
-    let mut max_w = if has_code_fence {
-        code_max_content_w
-    } else {
-        0i32
-    };
+    let mut max_w = if wide_block { code_max_content_w } else { 0i32 };
     for block in &parsed.blocks {
-        let ParsedBodyBlock::ProseLine(pl) = block else {
-            continue;
+        let (content, base_style, extra_prefix) = match block {
+            MdBlock::ParagraphLine { content } => (content, FontStyle::ChatBody, 0),
+            MdBlock::Heading { level, content } => (content, heading_font_style(*level), 0),
+            MdBlock::ListItem { kind, content } => (
+                content,
+                FontStyle::ChatBody,
+                (kind.indent() as i32) * 14 + list_marker_width(canvas, *kind),
+            ),
+            MdBlock::BlockquoteLine { depth, content, .. } => {
+                (content, FontStyle::ChatBody, (*depth as i32) * 10 + 14)
+            }
+            _ => continue,
         };
-        let base_style = if pl.line_bold {
-            FontStyle::ChatBodyBold
-        } else {
-            FontStyle::ChatBody
-        };
-        let eff_wrap = (max_content_w - pl.pill_reserve).max(60);
-        let (full_w, _) = canvas.measure_text(&pl.clean, base_style);
+        let eff_wrap = (max_content_w - extra_prefix - content.pill_reserve).max(60);
+        let (full_w, _) = canvas.measure_text(&content.text, base_style);
         if full_w <= eff_wrap {
-            let w = if pl.spans.is_empty() {
+            let w = if content.spans.is_empty() {
                 full_w
             } else {
-                measure_chat_spans_x(canvas, &pl.clean, &pl.spans, pl.line_bold, usize::MAX)
+                measure_md_spans_x(canvas, &content.text, &content.spans, base_style, usize::MAX)
             };
-            max_w = max_w.max(w);
+            max_w = max_w.max(w + extra_prefix);
         } else {
             for (seg_s, seg_e, seg_txt) in
-                wrap_chat_line_segments(canvas, &pl.clean, eff_wrap, base_style)
+                wrap_md_line_segments(canvas, &content.text, eff_wrap, base_style)
             {
-                let spans = project_spans_slice(seg_s, seg_e, &pl.spans);
-                let w = measure_chat_spans_x(canvas, &seg_txt, &spans, pl.line_bold, usize::MAX);
-                max_w = max_w.max(w);
+                let spans = project_md_spans_slice(seg_s, seg_e, &content.spans);
+                let w = measure_md_spans_x(canvas, &seg_txt, &spans, base_style, usize::MAX);
+                max_w = max_w.max(w + extra_prefix);
             }
         }
     }
@@ -1070,9 +794,21 @@ impl IdeApplicationState {
                 text,
                 spans,
                 default_bold,
-            }) => hit_test_chat_spans_col(canvas, text, spans, *default_bold, rel_x),
-            Some(CachedChatRow::StreamingLine { text, spans }) => {
-                hit_test_chat_spans_col(canvas, text, spans, false, rel_x)
+            }) => {
+                let st = if *default_bold {
+                    FontStyle::ChatBodyBold
+                } else {
+                    FontStyle::ChatBody
+                };
+                hit_test_md_spans_col(canvas, text, spans, st, rel_x)
+            }
+            Some(CachedChatRow::HeadingLine {
+                level, text, spans, ..
+            }) => hit_test_md_spans_col(canvas, text, spans, heading_font_style(*level), rel_x),
+            Some(CachedChatRow::ListItemLine { text, spans, .. })
+            | Some(CachedChatRow::BlockquoteLine { text, spans, .. })
+            | Some(CachedChatRow::StreamingLine { text, spans }) => {
+                hit_test_md_spans_col(canvas, text, spans, FontStyle::ChatBody, rel_x)
             }
             _ => canvas.measure_caret_col_in_line(line_txt, rel_x, *style),
         };
@@ -1172,20 +908,33 @@ impl IdeApplicationState {
             char_len
         };
         if c1 > c0 {
+            let eff_style = if default_bold && matches!(style, FontStyle::ChatBody) {
+                FontStyle::ChatBodyBold
+            } else {
+                style
+            };
             let (w0, w1) = if !spans.is_empty()
-                || matches!(style, FontStyle::ChatBody | FontStyle::ChatBodyBold)
-            {
+                || matches!(
+                    eff_style,
+                    FontStyle::ChatBody
+                        | FontStyle::ChatBodyBold
+                        | FontStyle::ChatBodyItalic
+                        | FontStyle::ChatBodyBoldItalic
+                        | FontStyle::ChatH1
+                        | FontStyle::ChatH2
+                        | FontStyle::ChatH3
+                ) {
                 (
-                    measure_chat_spans_x(canvas, text, spans, default_bold, c0),
-                    measure_chat_spans_x(canvas, text, spans, default_bold, c1),
+                    measure_md_spans_x(canvas, text, spans, eff_style, c0),
+                    measure_md_spans_x(canvas, text, spans, eff_style, c1),
                 )
             } else {
                 let chars: Vec<char> = text.chars().collect();
                 let p0: String = chars[..c0].iter().collect();
                 let p1: String = chars[..c1].iter().collect();
                 (
-                    canvas.measure_text(&p0, style).0,
-                    canvas.measure_text(&p1, style).0,
+                    canvas.measure_text(&p0, eff_style).0,
+                    canvas.measure_text(&p1, eff_style).0,
                 )
             };
             let sx = text_x + w0;
@@ -1214,8 +963,6 @@ impl IdeApplicationState {
         max_w: i32,
         fallback_style: FontStyle,
     ) {
-        let t = self.theme;
-        let (hx, hy) = self.hover_pos;
         let base_style = if default_bold && matches!(fallback_style, FontStyle::ChatBody) {
             FontStyle::ChatBodyBold
         } else {
@@ -1240,171 +987,22 @@ impl IdeApplicationState {
             base_style,
         );
 
-        if spans.is_empty() {
-            canvas.draw_text_styled(text_x, text_y, text, base_color, max_w, base_style);
-            return;
-        }
-
-        let mut cur_x = text_x;
-        let right_edge = text_x + max_w;
-        let (_, body_h) = canvas.measure_text("Ag中文", FontStyle::ChatBody);
-        let (_, code_h) = canvas.measure_text("Ag", FontStyle::ChatCode);
-        let code_y_off = ((body_h - code_h) / 2).max(0);
-        let inline_pill_bg = if t.kind == ThemeKind::IslandsLight {
-            blend_rgb(t.panel_bg, t.border_color, 0.35)
-        } else {
-            blend_rgb(t.panel_bg, t.window_bg, 0.22)
-        };
-        let inline_pill_border = blend_rgb(t.border_color, t.panel_bg, 0.45);
-        let inline_code_fg = if t.kind == ThemeKind::IslandsLight {
-            t.text_primary
-        } else {
-            blend_rgb(t.text_primary, 0xFFFFFF, 0.25)
-        };
-
-        let mut char_cursor = 0usize;
-        let mut byte_cursor = 0usize;
-        let mut ci = text.char_indices();
-        let mut advance_to = |target_char: usize| -> usize {
-            while char_cursor < target_char {
-                if let Some((b, ch)) = ci.next() {
-                    byte_cursor = b + ch.len_utf8();
-                    char_cursor += 1;
-                } else {
-                    byte_cursor = text.len();
-                    break;
-                }
-            }
-            byte_cursor
-        };
-
-        let mut emit_segment = |cur_x: &mut i32, chunk: &str, kind: &ChatSpanKind, hit_regions: &mut Vec<(Rect, HitAction)>| -> bool {
-            if *cur_x >= right_edge {
-                return false;
-            }
-            if chunk.is_empty() {
-                return true;
-            }
-            match kind {
-                ChatSpanKind::Plain => {
-                    let st = if default_bold {
-                        FontStyle::ChatBodyBold
-                    } else {
-                        base_style
-                    };
-                    *cur_x = canvas.draw_text_styled(
-                        *cur_x,
-                        text_y,
-                        chunk,
-                        base_color,
-                        right_edge - *cur_x,
-                        st,
-                    );
-                }
-                ChatSpanKind::Bold => {
-                    *cur_x = canvas.draw_text_styled(
-                        *cur_x,
-                        text_y,
-                        chunk,
-                        base_color,
-                        right_edge - *cur_x,
-                        FontStyle::ChatBodyBold,
-                    );
-                }
-                ChatSpanKind::InlineCode => {
-                    if right_edge - *cur_x < 12 {
-                        return false;
-                    }
-                    let (cw, _) = canvas.measure_text(chunk, FontStyle::ChatCode);
-                    let pill_w = (cw + 8).min((right_edge - *cur_x - 2).max(10));
-                    let pill_h = (code_h + 3).min(row_rect.h - 2);
-                    let pill_rect = Rect::new(*cur_x + 2, text_y + code_y_off - 1, pill_w, pill_h);
-                    canvas.stroke_rounded_rect(pill_rect, 4, inline_pill_border, inline_pill_bg);
-                    canvas.draw_text_styled(
-                        pill_rect.x + 4,
-                        text_y + code_y_off,
-                        chunk,
-                        inline_code_fg,
-                        (pill_w - 6).max(4),
-                        FontStyle::ChatCode,
-                    );
-                    *cur_x += cw + 12;
-                }
-                ChatSpanKind::FileLink { path, line } => {
-                    if right_edge - *cur_x < 12 {
-                        return false;
-                    }
-                    let (lw, _) = canvas.measure_text(chunk, FontStyle::ChatCode);
-                    let pill_w = (lw + 6).min((right_edge - *cur_x - 1).max(8));
-                    let link_rect = Rect::new(
-                        *cur_x + 1,
-                        text_y + code_y_off - 1,
-                        pill_w,
-                        (code_h + 3).min(row_rect.h - 2),
-                    );
-                    let hovered = link_rect.contains(hx, hy);
-                    canvas.fill_rounded_rect(
-                        link_rect,
-                        4,
-                        if hovered {
-                            t.popup_hover_bg
-                        } else {
-                            inline_pill_bg
-                        },
-                    );
-                    canvas.fill_rect(
-                        Rect::new(
-                            link_rect.x + 2,
-                            link_rect.y + link_rect.h - 2,
-                            (pill_w - 4).max(2),
-                            1,
-                        ),
-                        if hovered { 0xFFFFFF } else { t.accent_blue },
-                    );
-                    canvas.draw_text_styled(
-                        link_rect.x + 3,
-                        text_y + code_y_off,
-                        chunk,
-                        if hovered { 0xFFFFFF } else { t.syn_function },
-                        (pill_w - 4).max(4),
-                        FontStyle::ChatCode,
-                    );
-                    hit_regions.push((link_rect, HitAction::OpenFileAtLine(path.clone(), *line)));
-                    *cur_x += lw + 8;
-                }
-            }
-            true
-        };
-
-        let mut cur_c = 0usize;
-        for sp in spans {
-            if cur_x >= right_edge {
-                break;
-            }
-            if sp.start_char > cur_c {
-                let b0 = advance_to(cur_c);
-                let b1 = advance_to(sp.start_char);
-                if !emit_segment(&mut cur_x, &text[b0..b1], &ChatSpanKind::Plain, &mut self.hit_regions) {
-                    return;
-                }
-                cur_c = sp.start_char;
-            }
-            let s = sp.start_char.max(cur_c);
-            if sp.end_char > s {
-                let b0 = advance_to(s);
-                let b1 = advance_to(sp.end_char);
-                if !emit_segment(&mut cur_x, &text[b0..b1], &sp.kind, &mut self.hit_regions) {
-                    return;
-                }
-                cur_c = sp.end_char;
-            }
-        }
-        if cur_x < right_edge {
-            let b0 = advance_to(cur_c);
-            if b0 < text.len() {
-                let _ = emit_segment(&mut cur_x, &text[b0..], &ChatSpanKind::Plain, &mut self.hit_regions);
-            }
-        }
+        let t = self.theme;
+        draw_md_spans_text(
+            canvas,
+            &t,
+            self.hover_pos,
+            &mut self.hit_regions,
+            row_rect,
+            text_x,
+            text_y,
+            text,
+            spans,
+            base_color,
+            max_w,
+            base_style,
+            MdAlign::Left,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1621,6 +1219,17 @@ impl IdeApplicationState {
 
     fn render_right_changes_tab(&mut self, canvas: &mut SurfaceCanvas, rect: Rect) {
         let t = self.theme;
+        if self.git_engine.has_loaded_snapshot && !self.git_engine.git_installed {
+            let card = Rect::new(rect.x + 10, rect.y + 44, (rect.w - 20).max(100), 156);
+            self.render_git_missing_card(canvas, card);
+            return;
+        }
+        if self.git_engine.has_loaded_snapshot && !self.git_engine.is_git_repo {
+            let card_h = (rect.h - 56).clamp(150, 210);
+            let card = Rect::new(rect.x + 10, rect.y + 44, (rect.w - 20).max(100), card_h);
+            self.render_git_not_initialized_card(canvas, card);
+            return;
+        }
         let chg_cnt = self.git_engine.changed_files.len();
         let header_y = rect.y + 41;
         canvas.draw_text_styled(
@@ -2118,13 +1727,18 @@ impl IdeApplicationState {
             is_busy,
         );
 
-        // 4. 若外部资源管理器或内部文件树正在向 AI 面板拖拽文件/图片，渲染高质感虚线投放指引
+        // 4. 若外部资源管理器或内部/跨窗口文件树正在向 AI 面板拖拽文件/图片，渲染高质感虚线投放指引
         let drag_hint = self
             .active_ide_drag
             .as_ref()
             .filter(|(_, (dx, dy))| rect.contains(*dx, *dy))
             .map(|(p, _)| p.clone())
-            .or_else(|| self.external_drag_hover.as_ref().map(|(p, _)| p.clone()));
+            .or_else(|| {
+                self.external_drag_hover
+                    .as_ref()
+                    .filter(|(_, (dx, dy))| rect.contains(*dx, *dy))
+                    .map(|(p, _)| p.clone())
+            });
         if let Some(drag_path) = drag_hint {
             let dz = Rect::new(
                 chat_area.x + 4,
@@ -2428,6 +2042,7 @@ impl IdeApplicationState {
                         parsed_msg,
                         (bubble_w - 26).max(60),
                         true,
+                        false,
                         bubble_w,
                         &self.collapsed_code_blocks,
                         &mut rebuilt,
@@ -2459,7 +2074,7 @@ impl IdeApplicationState {
                             });
                             if expanded {
                                 for raw_tl in thought.lines() {
-                                    for (_, _, tl) in wrap_chat_line_segments(
+                                    for (_, _, tl) in wrap_md_line_segments(
                                         canvas,
                                         raw_tl,
                                         (wrap_w - 20).max(60),
@@ -2476,6 +2091,7 @@ impl IdeApplicationState {
                         msg_idx,
                         parsed_msg,
                         (wrap_w - 8).max(60),
+                        false,
                         false,
                         0,
                         &self.collapsed_code_blocks,
@@ -2577,7 +2193,7 @@ impl IdeApplicationState {
                             if raw_tl.trim().is_empty() {
                                 continue;
                             }
-                            for (_, _, tl) in wrap_chat_line_segments(
+                            for (_, _, tl) in wrap_md_line_segments(
                                 canvas,
                                 raw_tl.trim(),
                                 (wrap_w - 22).max(60),
@@ -2593,40 +2209,24 @@ impl IdeApplicationState {
                     }
 
                     if !prog.reply_text.trim().is_empty() {
-                        for raw_l in prog.reply_text.lines() {
-                            if raw_l.trim().is_empty() {
-                                rebuilt.push(CachedChatRow::ParaSpacer {
-                                    is_user: false,
-                                    bubble_w: 0,
-                                });
-                                continue;
-                            }
-                            let (clean_l, _, raw_spans) = parse_markdown_inline_line(raw_l);
-                            for (seg_s, seg_e, seg_txt) in wrap_chat_line_segments(
-                                canvas,
-                                &clean_l,
-                                (wrap_w - 14).max(60),
-                                FontStyle::ChatBody,
-                            ) {
-                                let spans = project_and_merge_spans(
-                                    &self.workspace_root,
-                                    &seg_txt,
-                                    seg_s,
-                                    seg_e,
-                                    &raw_spans,
-                                );
-                                rebuilt.push(CachedChatRow::StreamingLine {
-                                    text: seg_txt,
-                                    spans,
-                                });
-                            }
-                        }
+                        let parsed_stream = parse_message_body(&self.workspace_root, &prog.reply_text);
+                        append_message_body_rows_from_parsed(
+                            canvas,
+                            usize::MAX,
+                            &parsed_stream,
+                            (wrap_w - 14).max(60),
+                            false,
+                            true,
+                            0,
+                            &self.collapsed_code_blocks,
+                            &mut rebuilt,
+                        );
                     }
 
                     if !prog.execution_steps.is_empty() {
                         let skip_steps = prog.execution_steps.len().saturating_sub(6);
                         for step in prog.execution_steps.iter().skip(skip_steps) {
-                            for (_, _, seg) in wrap_chat_line_segments(
+                            for (_, _, seg) in wrap_md_line_segments(
                                 canvas,
                                 step,
                                 (wrap_w - 22).max(60),
@@ -2639,7 +2239,7 @@ impl IdeApplicationState {
                         && prog.reply_text.trim().is_empty()
                         && !prog.phase.trim().is_empty()
                     {
-                        for (_, _, seg) in wrap_chat_line_segments(
+                        for (_, _, seg) in wrap_md_line_segments(
                             canvas,
                             prog.phase.trim(),
                             (wrap_w - 22).max(60),
@@ -3059,6 +2659,176 @@ impl IdeApplicationState {
                         prose_fg,
                         wrap_w - 4,
                         FontStyle::ChatBody,
+                    );
+                }
+                CachedChatRow::HeadingLine {
+                    level,
+                    text,
+                    spans,
+                    has_bottom_rule,
+                    is_user,
+                    bubble_w,
+                } => {
+                    let style = heading_font_style(*level);
+                    let (tx, max_tw, container_rect) = if *is_user {
+                        let brect = user_bubble_rect(row_rect, right_edge_x, *bubble_w);
+                        canvas.fill_rect(brect, user_bubble_bg);
+                        (brect.x + 13, (brect.w - 24).max(40), brect)
+                    } else {
+                        (row_rect.x + 4, wrap_w - 4, row_rect)
+                    };
+                    let color = match level {
+                        1 => t.text_primary,
+                        2 => blend_rgb(t.text_primary, t.accent_blue, 0.20),
+                        3 => blend_rgb(t.text_primary, t.syn_function, 0.20),
+                        _ => prose_fg,
+                    };
+                    self.draw_chat_line_with_spans_and_selection(
+                        canvas,
+                        container_rect,
+                        tx,
+                        cy + 3,
+                        *global_row_idx,
+                        text,
+                        spans,
+                        false,
+                        color,
+                        max_tw,
+                        style,
+                    );
+                    if *has_bottom_rule {
+                        canvas.fill_rect(
+                            Rect::new(tx, cy + row_h - 3, max_tw, 1),
+                            blend_rgb(t.border_color, t.panel_bg, 0.45),
+                        );
+                    }
+                }
+                CachedChatRow::ListItemLine {
+                    kind,
+                    text,
+                    spans,
+                    is_continuation,
+                    marker_w,
+                    is_user,
+                    bubble_w,
+                } => {
+                    let indent_px = (kind.indent() as i32) * 14;
+                    let (base_x, right_lim, container_rect) = if *is_user {
+                        let brect = user_bubble_rect(row_rect, right_edge_x, *bubble_w);
+                        canvas.fill_rect(brect, user_bubble_bg);
+                        (brect.x + 13, brect.x + brect.w - 11, brect)
+                    } else {
+                        (row_rect.x + 4, row_rect.x + wrap_w, row_rect)
+                    };
+                    if !*is_continuation {
+                        draw_list_marker(canvas, &t, base_x + indent_px, cy + 2, *kind, prose_fg);
+                    }
+                    let tx = base_x + indent_px + *marker_w;
+                    self.draw_chat_line_with_spans_and_selection(
+                        canvas,
+                        container_rect,
+                        tx,
+                        cy + 2,
+                        *global_row_idx,
+                        text,
+                        spans,
+                        false,
+                        prose_fg,
+                        (right_lim - tx).max(36),
+                        FontStyle::ChatBody,
+                    );
+                }
+                CachedChatRow::BlockquoteLine {
+                    depth,
+                    callout,
+                    is_callout_header,
+                    text,
+                    spans,
+                    is_user,
+                    bubble_w,
+                } => {
+                    let (bx, bw, container_rect) = if *is_user {
+                        let brect = user_bubble_rect(row_rect, right_edge_x, *bubble_w);
+                        canvas.fill_rect(brect, user_bubble_bg);
+                        (brect.x + 11, (brect.w - 22).max(40), brect)
+                    } else {
+                        (row_rect.x + 2, (row_rect.w - 4).max(40), row_rect)
+                    };
+                    let accent = callout
+                        .as_ref()
+                        .map(|c| c.color(&t))
+                        .unwrap_or_else(|| blend_rgb(t.accent_blue, t.border_color, 0.35));
+                    let qrect = Rect::new(bx, cy, bw, row_h);
+                    let qbg = blend_rgb(
+                        t.panel_bg,
+                        accent,
+                        if callout.is_some() { 0.09 } else { 0.05 },
+                    );
+                    canvas.fill_rect(qrect, qbg);
+                    for d in 0..(*depth).max(1) {
+                        canvas.fill_rect(Rect::new(bx + 2 + (d as i32) * 8, cy, 3, row_h), accent);
+                    }
+                    let tx = bx + (*depth as i32) * 8 + 10;
+                    if *is_callout_header {
+                        if let Some(c) = callout {
+                            canvas.draw_text_styled(
+                                tx,
+                                cy + 3,
+                                c.label(self.ui_lang),
+                                accent,
+                                (bx + bw - tx).max(32),
+                                FontStyle::ChatMetaBold,
+                            );
+                        }
+                    } else {
+                        self.draw_chat_line_with_spans_and_selection(
+                            canvas,
+                            container_rect,
+                            tx,
+                            cy + 2,
+                            *global_row_idx,
+                            text,
+                            spans,
+                            false,
+                            t.text_secondary,
+                            (bx + bw - tx).max(36),
+                            FontStyle::ChatBody,
+                        );
+                    }
+                }
+                CachedChatRow::HorizontalRule { is_user, bubble_w } => {
+                    let (lx, lw) = if *is_user {
+                        let brect = user_bubble_rect(row_rect, right_edge_x, *bubble_w);
+                        canvas.fill_rect(brect, user_bubble_bg);
+                        (brect.x + 12, (brect.w - 24).max(32))
+                    } else {
+                        (row_rect.x + 4, (row_rect.w - 8).max(32))
+                    };
+                    canvas.fill_rect(
+                        Rect::new(lx, cy + row_h / 2, lw, 1),
+                        blend_rgb(t.border_color, t.panel_bg, 0.30),
+                    );
+                }
+                CachedChatRow::TableRow {
+                    prepared,
+                    is_user,
+                    bubble_w,
+                } => {
+                    let trect = if *is_user {
+                        let brect = user_bubble_rect(row_rect, right_edge_x, *bubble_w);
+                        canvas.fill_rect(brect, user_bubble_bg);
+                        Rect::new(brect.x + 12, cy, (brect.w - 24).max(80), row_h)
+                    } else {
+                        Rect::new(row_rect.x + 2, cy, (row_rect.w - 4).max(80), row_h)
+                    };
+                    render_prepared_table_row(
+                        canvas,
+                        &t,
+                        self.hover_pos,
+                        &mut self.hit_regions,
+                        trect,
+                        prepared,
+                        prose_fg,
                     );
                 }
                 CachedChatRow::CodeBlockHeader {
@@ -4139,11 +3909,12 @@ impl IdeApplicationState {
                 HitAction::ToggleComposerPastedSnippet(snip.id.clone()),
             ));
             let mut dy = drect.y + 22;
-            let lang_id = language_from_fence_tag(&snip.language);
+            let lang_id = LanguageId::from_fence_tag(&snip.language);
+            let mut hl_state = HighlightState::default();
             for line in snip.content.lines().take(5) {
                 let mut cur_x = drect.x + 8;
                 let max_x = drect.x + drect.w - 8;
-                for sp in highlight_line(line, lang_id) {
+                for sp in highlight_line_with_state(line, lang_id, &mut hl_state) {
                     if cur_x >= max_x {
                         break;
                     }
@@ -4794,30 +4565,94 @@ impl IdeApplicationState {
     }
 
     pub(crate) fn render_drag_ghost_overlay(&self, canvas: &mut SurfaceCanvas) {
-        let Some((ref path, (cx, cy))) = self.active_ide_drag else {
+        let Some((path, (cx, cy), is_cross)) = self.active_drag_hover() else {
             return;
         };
         let t = self.theme;
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-        let over_agent = self.right_agent_open && self.right_pane_rect.contains(cx, cy);
-        let label = if over_agent {
-            format!("📎 附加 `{name}`")
-        } else {
-            format!("📄 {name}")
+        let drop_target = self.resolve_drop_target(path, cx, cy, is_cross);
+
+        // Draw target highlight for non-AI zones (AI panel renders its own full drop overlay)
+        match &drop_target {
+            Some(crate::ide_state::IdeDropTarget::ProjectTreeCopy { highlight_rect, .. }) => {
+                canvas.fill_rounded_rect_alpha(
+                    *highlight_rect,
+                    5,
+                    blend_rgb(t.panel_bg, t.run_green, 0.28),
+                    155,
+                );
+                canvas.draw_dashed_rounded_border(*highlight_rect, 5, t.run_green);
+            }
+            Some(crate::ide_state::IdeDropTarget::TextInput { rect, .. })
+            | Some(crate::ide_state::IdeDropTarget::Terminal(rect)) => {
+                canvas.fill_rounded_rect_alpha(
+                    *rect,
+                    5,
+                    blend_rgb(t.editor_bg, t.accent_blue, 0.22),
+                    135,
+                );
+                canvas.draw_dashed_rounded_border(*rect, 5, t.accent_blue);
+            }
+            _ => {}
+        }
+
+        let (label, border_col, bg_col) = match &drop_target {
+            Some(crate::ide_state::IdeDropTarget::ProjectTreeCopy { target_dir, .. }) => {
+                let dir_name = target_dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("root");
+                let text = match self.ui_lang {
+                    UiLanguage::ZhCn => format!("📋 复制 `{name}` → `{dir_name}/`"),
+                    UiLanguage::EnUs => format!("📋 Copy `{name}` → `{dir_name}/`"),
+                };
+                (text, t.run_green, t.popup_hover_bg)
+            }
+            Some(crate::ide_state::IdeDropTarget::AgentAssistant) => {
+                let text = if crate::image_preview::is_image_file_path(path) {
+                    match self.ui_lang {
+                        UiLanguage::ZhCn => format!("🖼 附加图片 `{name}`"),
+                        UiLanguage::EnUs => format!("🖼 Attach image `{name}`"),
+                    }
+                } else {
+                    match self.ui_lang {
+                        UiLanguage::ZhCn => format!("📎 附加到 AI: `{name}`"),
+                        UiLanguage::EnUs => format!("📎 Attach to AI: `{name}`"),
+                    }
+                };
+                (text, t.accent_blue, t.popup_hover_bg)
+            }
+            Some(crate::ide_state::IdeDropTarget::TextInput { .. }) => {
+                let text = match self.ui_lang {
+                    UiLanguage::ZhCn => format!("⤵ 插入路径到输入框: `{name}`"),
+                    UiLanguage::EnUs => format!("⤵ Insert path: `{name}`"),
+                };
+                (text, t.accent_blue, t.popup_hover_bg)
+            }
+            Some(crate::ide_state::IdeDropTarget::Terminal(_)) => {
+                let text = match self.ui_lang {
+                    UiLanguage::ZhCn => format!("⤵ 插入路径到终端: `{name}`"),
+                    UiLanguage::EnUs => format!("⤵ Paste path in terminal: `{name}`"),
+                };
+                (text, t.accent_blue, t.popup_hover_bg)
+            }
+            Some(crate::ide_state::IdeDropTarget::EditorOpen) => {
+                let text = match self.ui_lang {
+                    UiLanguage::ZhCn => format!("📄 打开 `{name}`"),
+                    UiLanguage::EnUs => format!("📄 Open `{name}`"),
+                };
+                (text, t.accent_blue, t.popup_bg)
+            }
+            None => (format!("📄 {name}"), t.border_color, t.popup_bg),
         };
+
         let (tw, _) = canvas.measure_text(&label, FontStyle::UiSmall);
-        let pill = Rect::new(cx + 12, cy + 12, (tw + 20).clamp(72, 220), 24);
+        let pill_w = (tw + 22).clamp(80, 320);
+        let max_x = (canvas.width as i32 - pill_w - 6).max(6);
+        let max_y = (canvas.height as i32 - 30).max(6);
+        let pill = Rect::new((cx + 12).clamp(6, max_x), (cy + 12).clamp(6, max_y), pill_w, 24);
         canvas.fill_rounded_shadow(pill, 6);
-        canvas.stroke_rounded_rect(
-            pill,
-            6,
-            t.accent_blue,
-            if over_agent {
-                t.popup_hover_bg
-            } else {
-                t.popup_bg
-            },
-        );
+        canvas.stroke_rounded_rect(pill, 6, border_col, bg_col);
         canvas.draw_text_centered(pill, &label, 0xFFFFFF, FontStyle::UiSmall);
     }
 

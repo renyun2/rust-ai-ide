@@ -1,6 +1,6 @@
 use crate::ide_state::{DockPane, RightPanelTab, SettingsPage};
 use ide_agent_hub::{AgentProviderKind, AgentWorkbenchMode, AiApiConfig, ReasoningEffort};
-use ide_core::{MobileSdkLocations, ThemeKind, ToolWindowId, UiLanguage};
+use ide_core::{KeymapScheme, MobileSdkLocations, ThemeKind, ToolWindowId, UiLanguage};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -97,6 +97,7 @@ pub struct PersistedGlobalSettings {
     pub ui_lang: UiLanguage,
     pub ui_scale: f32,
     pub theme_kind: ThemeKind,
+    pub keymap_scheme: KeymapScheme,
     pub settings_page: SettingsPage,
     pub last_workspace: Option<PathBuf>,
     pub recent_workspaces: Vec<PathBuf>,
@@ -129,6 +130,7 @@ impl Default for PersistedGlobalSettings {
             ui_lang: UiLanguage::default(),
             ui_scale: 1.0,
             theme_kind: ThemeKind::IslandsDark,
+            keymap_scheme: KeymapScheme::IntelliJIdea,
             settings_page: SettingsPage::Appearance,
             last_workspace: None,
             recent_workspaces: Vec::new(),
